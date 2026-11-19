@@ -6919,6 +6919,11 @@ def os_updates_api():
     # ops #963: same idea for Java: the new JDK is on disk but TAK Server still runs the old one.
     # A /proc read and a stat, so it is read fresh on every call like the kernel state.
     data['java_restart'] = _java_restart_state()
+    # ops #968: Docker installs: the Java inside the TAK Server image is older than the newest we build.
+    # Cached 5 minutes (a `docker exec`); never raises, claims nothing it could not read.
+    _jf = _tak_container_java_facts_cached()
+    data['java_image'] = {'stale': bool(_jf['applicable'] and _jf['stale']), 'running': _jf['running'],
+                          'newest': _jf['newest'], 'sig': _jf['sig'], 'how': _JAVA_IMAGE_HOW}
     return jsonify(data)
 
 
@@ -29687,7 +29692,8 @@ def _postgres_security_items(unknown):
 # Java process that started before the JDK on disk was last written is on the old Java.
 # Only the console user's own read access is needed: /proc/PID/{cmdline,stat} are world
 # readable and a stat of the JDK files needs no privilege. Native installs only: a Docker TAK
-# Server carries its own Java inside the image (see the --pull on its builds).
+# Server carries its own Java inside the image (see the --pull on its builds; ops #968 reports
+# that Java separately, _tak_container_java_facts).
 _JAVA_PKG_MAJOR_RE = re.compile(r'(?:java-(\d+)-openjdk|openjdk-(\d+)|temurin-(\d+))')
 
 
@@ -29869,6 +29875,115 @@ def _java_restart_items(unknown):
                           f"It fixes Java security flaws, including in the TLS code behind the client "
                           f"ports ({sec['how_known']}: {sec['pkg']} {sec['version']})."],
              'how': _JAVA_RESTART_HOW}]
+
+
+# ── ops #968: Docker TAK Server, the Java inside the image ──────────────────────────────────
+# A Docker TAK Server carries its OWN Java inside its image, so the host's package manager and
+# the restart check above never see it. The image is built from the takserver-docker zip when
+# TAK Server is installed or updated; _patch_tak_hardened_java_pin / `docker build --pull` (ops
+# #963) make a rebuild take the newest Java we know, but nothing said that a rebuild was due.
+# This compares the Java the RUNNING container reports with that same pin (_TEMURIN17_FIXED_TAG,
+# the one constant that moves when Docker Hub lists a newer Temurin 17 tag). Read only: one
+# `docker exec takserver java -version`, no restart, no change. A runtime we cannot read as
+# Temurin 17, or a container that is not running, claims nothing.
+_JAVA_RUNTIME_RE = re.compile(r'Temurin-(\d+(?:\.\d+){1,3})\+(\d+)')
+
+
+def _temurin_runtime_build(java_version_text):
+    """('17.0.19+10', sortable key) from the text `java -version` prints for a Temurin runtime
+    ("OpenJDK Runtime Environment Temurin-17.0.19+10 (build ...)"), else (None, None). The key
+    has the same shape as _temurin_tag_key's, so a runtime and a Docker tag compare directly."""
+    m = _JAVA_RUNTIME_RE.search(java_version_text or '')
+    if not m:
+        return None, None
+    parts = [int(x) for x in m.group(1).split('.')]
+    parts += [0] * (4 - len(parts))
+    return '%s+%s' % (m.group(1), m.group(2)), tuple(parts) + (int(m.group(2)),)
+
+
+def _temurin_tag_build(tag):
+    """'17.0.21+9' for a '17.0.21_9-jdk-ubi10-minimal' style tag, else ''."""
+    m = _TEMURIN_JDK_TAG_RE.fullmatch(tag or '')
+    return '%s+%s' % (m.group(1), m.group(2)) if m else ''
+
+
+def _tak_container_java_facts():
+    """What the console and the update email need about the Java inside the Docker TAK Server
+    container. Read only, never raises.
+    {'applicable': a Docker install whose running container we could ask,
+     'readable': False when it should have been answerable but was not (the email then carries
+                 its earlier state instead of guessing),
+     'stale': its Temurin 17 is OLDER than the newest we pin, 'running': '17.0.19+10',
+     'newest': '17.0.21+9', 'sig': identity of this gap, 'why': when nothing is claimed}."""
+    f = {'applicable': False, 'readable': True, 'stale': False, 'running': '', 'newest': '',
+         'sig': '', 'why': ''}
+    try:
+        if not _tak_is_container():
+            f['why'] = 'TAK Server does not run as a container here'
+            return f
+        if not _tak_container_running(TAK_CONTAINER):
+            f['readable'] = False
+            f['why'] = 'the TAK Server container is not running'
+            return f
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'java', '-version']),
+                           capture_output=True, text=True, timeout=30)
+        out = (r.stdout or '') + (r.stderr or '')      # java prints its version on stderr
+        if r.returncode != 0:
+            f['readable'] = False
+            f['why'] = 'could not ask the container for its Java'
+            return f
+        running, rkey = _temurin_runtime_build(out)
+        newest = _temurin_tag_build(_TEMURIN17_FIXED_TAG)
+        fkey = _temurin_tag_key(_TEMURIN17_FIXED_TAG)
+        if not running or not newest or not fkey:
+            f['why'] = 'the container does not run a Temurin Java we can compare'
+            return f
+        f.update({'applicable': True, 'running': running, 'newest': newest})
+        if rkey[0] == fkey[0] and rkey < fkey:        # same Java line (17), older build
+            f['stale'] = True
+            f['sig'] = 'java-image@%s>%s' % (running, newest)
+    except Exception as e:
+        f['readable'] = False
+        f['why'] = 'check failed: ' + str(e)[:120]
+    return f
+
+
+_tak_java_img_cache = {'at': 0.0, 'data': None}
+
+
+def _tak_container_java_facts_cached(max_age=300):
+    """The console page asks on every visit; a `docker exec` each time is not free."""
+    now = time.time()
+    if _tak_java_img_cache['data'] is not None and now - _tak_java_img_cache['at'] < max_age:
+        return _tak_java_img_cache['data']
+    d = _tak_container_java_facts()
+    _tak_java_img_cache.update({'at': now, 'data': d})
+    return d
+
+
+_JAVA_IMAGE_HOW = ('TAK Server page → Update TAK Server, with the next takserver-docker zip. The update '
+                   'rebuilds the image with the newer Java. Nothing changes until then.')
+
+
+def _java_image_items(unknown):
+    """Update-email item (ops #968): the Docker TAK Server image carries an older Java than the
+    newest we build. One mail per gap (the identity names both builds), gone once the image is
+    rebuilt. Not marked a security fix: we cannot say which advisories lie between two builds
+    without a source for them, and an unproven "security" claim is the thing we never send.
+    A container that could not be asked goes into `unknown` so its state is carried."""
+    f = _tak_container_java_facts_cached()
+    if not f['readable']:
+        unknown.add('java-image')
+        return []
+    if not (f['applicable'] and f['stale']):
+        return []
+    return [{'key': 'java-image', 'label': 'Java (TAK Server container)',
+             'installed': 'Java ' + f['running'], 'target': 'Java ' + f['newest'],
+             'summary': 'Java inside the TAK Server container: a newer Java is available',
+             'identity': f['sig'],
+             'detail': ['TAK Server in Docker carries its own Java inside its image, so system updates '
+                        'never change it. New Java releases include fixes for Java security flaws.'],
+             'how': _JAVA_IMAGE_HOW}]
 
 
 # ops #760: TAK Server's database on ANOTHER machine. The host check above only sees PostgreSQL
@@ -31232,6 +31347,8 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
     pending.extend(_postgres_security_items(unknown))
     # ops #963: a Java security update that is installed but that TAK Server has not restarted onto
     pending.extend(_java_restart_items(unknown))
+    # ops #968: the Java INSIDE the Docker TAK Server image (native installs are the line above)
+    pending.extend(_java_image_items(unknown))
     # ops #755: ...and the TAK Server database CONTAINER (built once at install, never refreshed)
     try:
         pending.extend(_tak_db_refresh_items())
