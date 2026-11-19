@@ -56554,6 +56554,13 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
         api = os.path.join(ct_dir, 'api')
         cfg = os.path.join(api, 'eslint.config.js')
         oxc = os.path.join(api, '.oxlintrc.json')
+        # GH #583: the api arm must never go quiet. 13.124.0 swapped the linter and the arm
+        # returned with no word, while the success line below (written for the web app arm)
+        # read as if the plugins were shielded. api_why is set whenever the api is not covered.
+        api_why = None
+        if not (os.path.isfile(cfg) or os.path.isfile(oxc)):
+            api_why = ("the CloudTAK api has no lint config this shield knows "
+                       "(api/eslint.config.js or api/.oxlintrc.json)")
         if os.path.isfile(cfg) or os.path.isfile(oxc):
             extras = set()
             routes = os.path.join(api, 'stateless', 'routes')
@@ -56583,6 +56590,9 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
                 new = text[:at] + '\n' + block + text[at:]
             else:
                 new = text
+                if not os.path.isfile(oxc):
+                    api_why = ("api/eslint.config.js has no `export default tseslint.config(` "
+                               "line to add the skip to")
             if new != text:
                 _cloudtak_rewrite_in_place(cfg, new)
                 changed.append(os.path.relpath(cfg, ct_dir))
@@ -56606,9 +56616,13 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
             except ValueError:
                 plog("  ⚠ api/.oxlintrc.json is not plain JSON, so the build was not set to skip "
                      "non-infra-TAK plugins for OXLint (non-fatal)")
+                api_why = ''          # said above
         if changed:
             plog(f"  Plugins not installed by infra-TAK ({', '.join(foreign)}): the image build skips "
                  f"lint/typecheck for them, as TAK Portal's marketplace set it ({', '.join(changed)})")
+        if api_why:
+            plog(f"  ⚠ The api lint is NOT set to skip those plugins: {api_why}. The api image build "
+                 f"may fail on lint errors in their files (non-fatal). Please report it with this log.")
     except Exception as e:
         plog(f"  ⚠ Could not set the build to skip non-infra-TAK plugins (non-fatal): {str(e)[:160]}")
 
@@ -57647,8 +57661,10 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
         rate_limited = False
         out_of_memory = None
         lint_fail = None
+        lint_tool = 'ESLint'
         lint_file = None
         lint_plugins = []
+        lint_files = []
         vite_fail = None
         vite_detail = None
         vite_wait = 0
@@ -57670,6 +57686,9 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
                 m = re.search(r'/app/plugins/([\w.-]+)/', lint_file)
                 if m and m.group(1) not in lint_plugins:
                     lint_plugins.append(m.group(1))
+            m = re.search(r'\[((?:[\w.-]+/)*[\w.-]+\.(?:ts|js|mjs|cjs)):\d+:\d+\]', ln)
+            if m and m.group(1) not in lint_files:
+                lint_files.append(m.group(1))
             if 'error TS' in ln:
                 m = re.search(r'(?:^|[\s/])(plugin-([\w.-]+)\.ts)\(', ln)
                 if m:
@@ -57701,6 +57720,11 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             # a passing lint prints "✖ 119 problems (0 errors, 119 warnings)" too
             elif lint_fail is None and re.search(r'✖ \d+ problems? \([1-9]\d* errors?', ln):
                 lint_fail = ln.strip()
+            # GH #583: CloudTAK 13.124.0 lints the api with OXLint: "Found 0 warnings and 17 errors."
+            # (a clean run prints "... and 0 errors."), each finding followed by ",-[path:line:col]"
+            elif lint_fail is None and re.search(r'Found \d+ warnings? and [1-9]\d* errors?', ln):
+                lint_fail = ln.strip()
+                lint_tool = 'OXLint'
             elif vite_fail is None and 'error during build' in ln:
                 vite_fail = ln.strip()
             if failed_step is None and 'did not complete successfully' in ln:
@@ -57745,8 +57769,11 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             out.append('  Check this server can reach registry.npmjs.org, then retry.')
         elif lint_fail:
             out.append('')
-            out.append('Likely cause: the CloudTAK lint check (ESLint) failed.')
+            out.append('Likely cause: the CloudTAK lint check (%s) failed.' % lint_tool)
             out.append('  %s' % lint_fail[:220])
+            if lint_files:
+                out.append('  Files with findings: %s%s' % (', '.join(lint_files[:6]),
+                                                           ' ...' if len(lint_files) > 6 else ''))
             if lint_plugins:
                 out.append('  Errors are in CloudTAK plugin folder(s): %s (app/plugins/)'
                            % ', '.join(lint_plugins))
@@ -59419,9 +59446,21 @@ def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None
         return False
 
 
-def _cloudtak_update_failed_note(plog):
+# GH #583: failures that come from code in the tree (a lint, type or bundler error) fail the
+# same way on every run. The footer must not tell the operator to just try again for those.
+_CT_REPEATABLE_CAUSES = ('Likely cause: a CloudTAK PLUGIN server route',
+                         'Likely cause: the CloudTAK TypeScript check',
+                         'Likely cause: the CloudTAK lint check',
+                         'Likely cause: the CloudTAK web app build (vite)')
+
+
+def _cloudtak_update_failed_note(plog, hints=None):
     plog("  CloudTAK is still running on the previous build — nothing was removed.")
-    plog("  Fix the cause above (a GitHub 5xx during the build is transient — just run Update again).")
+    if any(str(h).strip().startswith(_CT_REPEATABLE_CAUSES) for h in (hints or ())):
+        plog("  Fix the cause above first. Running Update again will fail the same way: this error "
+             "is in the code that is being built, it is not a one-off network problem.")
+    else:
+        plog("  Fix the cause above (a GitHub 5xx during the build is transient — just run Update again).")
 
 
 def _cloudtak_docker(argv, remote_cfg=None, timeout=60):
@@ -60093,14 +60132,15 @@ def run_cloudtak_update():
                 _cloudtak_drop_build_data(cloudtak_dir)
                 if proc.returncode != 0:
                     plog(f"✗ Build failed with exit code {proc.returncode}")
-                    for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
+                    _hints = _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir)
+                    for _hint in _hints:
                         plog(_hint)
                     _undo_plugin_moves()
                     _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
                     # ops #129: services that DID build were re-tagged; take the tags back so the
                     # next recreate (boot heal, Update config) cannot start a new image on the old tree.
                     _cloudtak_restore_images(_ct_snap, plog)
-                    _cloudtak_update_failed_note(plog)
+                    _cloudtak_update_failed_note(plog, _hints)
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
             except subprocess.TimeoutExpired:
