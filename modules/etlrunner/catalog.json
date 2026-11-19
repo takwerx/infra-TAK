@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "serial": 202611181508,
+  "serial": 202611190517,
   "entries": [
     {
       "prefix": "etl-active911",
@@ -547,13 +547,13 @@
       "name": "Esri ArcGIS",
       "description": "Synchronizes features with Esri ArcGIS: ingests ArcGIS Feature and Map Server layers to the map on a schedule and optionally pushes map features back out to ArcGIS.",
       "source": "dfpc-coe/etl-arcgis",
-      "ref": "v7.35.1",
-      "sha": "7c99969125671cef4256e98100a614fc841a3c59",
-      "version": "7.35.1",
+      "ref": "v7.36.0",
+      "sha": "910fc609a3f6e60735351e3c83d76870a14e1400",
+      "version": "7.36.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/7c99969125671cef4256e98100a614fc841a3c59/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/7c99969125671cef4256e98100a614fc841a3c59/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/910fc609a3f6e60735351e3c83d76870a14e1400/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/910fc609a3f6e60735351e3c83d76870a14e1400/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-arcgis",
       "compute": {
         "memory": 1024,
@@ -567,7 +567,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-17 /module-scan"
+      "reviewed": "2026-11-18 /module-scan"
     },
     {
       "prefix": "etl-everywhere-hub",

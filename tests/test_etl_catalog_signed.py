@@ -272,12 +272,13 @@ def test_refresh_only_while_runner_is_on():
 
 
 def test_bundled_catalog_carries_the_signed_ops911_bumps():
-    """The bundled copy must not be older than the signed public catalog (serial 202611181508).
+    """The bundled copy must not be older than the signed public catalog (serial 202611190517).
     A box on this release reads the bundled file when the fetch fails, and a lower bundled serial
     would put these 37 ETLs back on their old, already-superseded versions (ops #911; the 3 bumps
-    of ops #725 are inside this list at their newer versions)."""
+    of ops #725 are inside this list at their newer versions). etl-arcgis 7.36.0 came in with
+    serial 202611190517 (ops #975)."""
     d = etl.bundled_catalog()
-    assert etl.catalog_serial(d) >= 202611181508
+    assert etl.catalog_serial(d) >= 202611190517
     by = {e['prefix']: e for e in d['entries']}
     want = {
         'etl-active911': ('4.13.0', '68b546bd992e80e980657c71e2d9acc13fa52923'),
@@ -323,6 +324,10 @@ def test_bundled_catalog_carries_the_signed_ops911_bumps():
         e = by[prefix]
         assert (e['version'], e['sha'], e['ref']) == (ver, sha, 'v' + ver), prefix
         assert e.get('reviewed', '').startswith('2026-11-17'), prefix
+    arc = by['etl-arcgis']
+    assert (arc['version'], arc['sha'], arc['ref']) == (
+        '7.36.0', '910fc609a3f6e60735351e3c83d76870a14e1400', 'v7.36.0')
+    assert arc.get('reviewed', '').startswith('2026-11-18')
 
 
 # v10.4.0 T&E (test12, nuc): "Check now" failed with "HTTP Error 403: rate limit exceeded".
