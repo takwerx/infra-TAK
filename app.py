@@ -53555,6 +53555,234 @@ def _cloudtak_upload_limit_heal(plog=None, remote_cfg=None, wait=False):
         return False
 
 
+# ops #969 (infra-TAK #589): CloudTAK refuses to save the schedule or the login (environment) of a
+# server-wide ETL layer. Every ETL layer infra-TAK makes is server-wide (connection 0). The UI saves
+# it with PATCH /api/connection/0/layer/ID/incoming (and /outgoing), and CloudTAK's two routes declare
+# `connectionid: Type.Integer({ minimum: 1 })` and have no connection-0 branch (Create, Delete, Update
+# Layer and Get Layer have one), so the save is refused with "Validation Error" (400, then 404 once the
+# limit is relaxed). Reported upstream as dfpc-coe/CloudTAK#2042. Until a CloudTAK release carries the
+# fix, this gives both routes the branch the sibling routes use: connection 0 is allowed for an admin
+# only, and the layer must have no connection. It edits the compiled route inside the api container
+# (a recreate brings back the original, so it runs wherever the upload-limit heal runs) and restarts
+# the api once, because node has already loaded the route. A route that already declares minimum 0 is
+# left alone (upstream fixed it), and so is any file whose shape differs from what this expects: that
+# is never counted as drift. A restart rewrites nginx.conf, so the upload-limit heal runs again
+# straight after. The script prints OK <mtime> for a patched file: the console compares that time
+# with the container's start, so a patched file that the api never reloaded (a failed restart, a
+# console stopped between the edit and the restart) is drift too, and the restart is only done while
+# the api answers (never in the middle of first-boot migrations).
+_CT_ETL_LAYER_SH = r'''cd /home/etl/api 2>/dev/null || { echo NOCONF; exit 0; }
+F=dist/stateless/routes/connection-layer.js
+[ -f "$F" ] || { echo NOCONF; exit 0; }
+command -v node >/dev/null 2>&1 || { echo NOCONF; exit 0; }
+MODE=__MODE__ F="$F" node - <<'JS'
+const fs = require('fs');
+const cp = require('child_process');
+const F = process.env.F;
+const MODE = process.env.MODE;
+const t = fs.readFileSync(F, 'utf8');
+const MIN1 = 'connectionid: Type.Integer({ minimum: 1 })';
+const MIN0 = 'connectionid: Type.Integer({ minimum: 0 })';
+const OLDAUTH = [
+  '            const { connection } = await Auth.is_connection(config, req, {',
+  '                resources: [',
+  '                    { access: AuthResourceAccess.CONNECTION, id: req.params.connectionid },',
+  '                    { access: AuthResourceAccess.LAYER, id: req.params.layerid },',
+  '                ],',
+  '            }, req.params.connectionid);',
+  '            const layer = await layerControl.from(connection, req.params.layerid);',
+  ''].join('\n');
+const NEWAUTH = [
+  '            // ops #969 (infra-TAK #589): connection 0 is a server-wide layer, admin only (as in Create Incoming)',
+  '            let connection = null;',
+  '            let layer;',
+  '            if (req.params.connectionid === 0) {',
+  '                await Auth.as_user(config, req, { admin: true });',
+  '                layer = await layerControl.from(null, req.params.layerid);',
+  '                if (layer.connection !== null) {',
+  "                    throw new Err(400, null, 'Layer is not an admin layer');",
+  '                }',
+  '            }',
+  '            else {',
+  '                const auth = await Auth.is_connection(config, req, {',
+  '                    resources: [',
+  '                        { access: AuthResourceAccess.CONNECTION, id: req.params.connectionid },',
+  '                        { access: AuthResourceAccess.LAYER, id: req.params.layerid },',
+  '                    ],',
+  '                }, req.params.connectionid);',
+  '                connection = auth.connection;',
+  '                layer = await layerControl.from(connection, req.params.layerid);',
+  '            }',
+  ''].join('\n');
+const OLDCMP = 'if (layer.connection !== connection.id) {';
+const NEWCMP = 'if (connection && layer.connection !== connection.id) {';
+const shape = () => { console.log('SHAPE'); process.exit(0); };
+let out = t;
+let need = 0;
+for (const d of ['Update an incoming layer configuration', 'Update an outgoing layer configuration']) {
+  const i = out.indexOf(d);
+  if (i < 0) shape();
+  const j = out.indexOf(MIN1, i);
+  if (j < 0 || j - i > 200) {
+    const z = out.indexOf(MIN0, i);
+    if (z >= 0 && z - i <= 200) continue;   // this route already takes connection 0: upstream fixed it
+    shape();
+  }
+  const k = out.indexOf(OLDAUTH, j);
+  if (k < 0 || k - j > 1500) shape();
+  out = out.slice(0, j) + MIN0 + out.slice(j + MIN1.length, k) + NEWAUTH + out.slice(k + OLDAUTH.length);
+  if (d.indexOf('incoming') >= 0) {
+    // only inside this route: the check that the layer belongs to the connection must cope with no connection
+    const c = out.indexOf(OLDCMP, j);
+    if (c < 0 || c - j > 4000) shape();
+    out = out.slice(0, c) + NEWCMP + out.slice(c + OLDCMP.length);
+  }
+  need++;
+}
+if (need === 0) {
+  console.log(t.indexOf('connection 0 is a server-wide layer, admin only') >= 0
+    ? 'OK ' + Math.floor(fs.statSync(F).mtimeMs / 1000) : 'UPSTREAM');
+  process.exit(0);
+}
+if (MODE !== 'apply') { console.log('MISSING'); process.exit(0); }
+const tmp = F.replace(/\.js$/, '.ops969.' + process.pid + '.tmp.js');
+try {
+  fs.writeFileSync(tmp, out);
+  const chk = cp.spawnSync(process.execPath, ['--check', tmp]);
+  if (chk.status !== 0) {
+    console.log('FAIL');
+  } else {
+    if (!fs.existsSync(F + '.ops969.bak')) fs.copyFileSync(F, F + '.ops969.bak');
+    fs.renameSync(tmp, F);
+    console.log('HEALED');
+  }
+} catch (e) {
+  console.log('FAIL');
+} finally {
+  try { fs.unlinkSync(tmp); } catch (e) { /* already renamed or never written */ }
+}
+JS
+'''
+_cloudtak_etl_heal_lock = threading.Lock()
+
+
+def _ct_etl_stale(script_out, started):
+    """True when the script said OK <mtime> and the api container started before that time: the
+    route file was edited but the api never reloaded it. started = `docker inspect` StartedAt text."""
+    try:
+        parts = (script_out or '').split()
+        if len(parts) != 2 or parts[0] != 'OK':
+            return False
+        import calendar
+        s = calendar.timegm(time.strptime((started or '').strip()[:19], '%Y-%m-%dT%H:%M:%S'))
+        return int(parts[1]) > s + 1
+    except (ValueError, TypeError):
+        return False
+
+
+def _cloudtak_etl_layer_heal(plog=None, remote_cfg=None, wait=False):
+    """ops #969: let an admin save the schedule and login of a server-wide ETL layer (see the block
+    comment above). Convergence like _cloudtak_upload_limit_heal: it reads the live route first and
+    edits it only when it still has the minimum-1 connection id, so a converged box, or a CloudTAK
+    that already carries the upstream fix, is a no-op with no restart. After an edit (or when an
+    earlier edit was never reloaded) it restarts the api container once, but only while the api
+    answers, waits for it, then runs the upload-limit heal again (a start rewrites nginx.conf).
+    `wait=True` waits for the container to exist (use it right after `up -d`).
+    Returns True if converged (already there, applied, or not ours to touch: upstream fixed it or the
+    file differs from what the patch expects), False on error, no container, or an api that is not
+    answering yet (the drift check retries that)."""
+    def _log(m):
+        (plog or (lambda x: print(x, flush=True)))(m)
+    tries = 30 if wait else 1
+    script = _CT_ETL_LAYER_SH.replace('__MODE__', 'apply')
+    if not _cloudtak_etl_heal_lock.acquire(timeout=300):
+        _log("  ⚠ CloudTAK ETL layer fix: another run is still going; left for the next check")
+        return False
+    try:
+        if remote_cfg:
+            b64 = _b64.b64encode(script.encode()).decode()
+            cmd = (
+                "for i in $(seq 1 %d); do "
+                "m=$(docker ps --filter name=cloudtak-api- --format '{{.Names}}' | head -n1); "
+                "[ -n \"$m\" ] && out=$(echo %s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null) "
+                "&& [ \"$out\" != NOCONF ] && break; sleep 2; done; "
+                "if [ \"$out\" = HEALED ]; then "
+                "for i in $(seq 1 40); do c=$(docker exec \"$m\" curl -s -o /dev/null -w '%%{http_code}' "
+                "http://localhost:5000/api 2>/dev/null); [ \"$c\" = 200 ] && break; sleep 3; done; "
+                "if [ \"$c\" = 200 ] && docker restart \"$m\" >/dev/null 2>&1; then "
+                "for i in $(seq 1 40); do c=$(docker exec \"$m\" curl -s -o /dev/null -w '%%{http_code}' "
+                "http://localhost:5000/api 2>/dev/null); [ \"$c\" = 200 ] && break; sleep 3; done; "
+                "[ \"$c\" = 200 ] || out=NOAPI; else out=NOAPI; fi; fi; "
+                "echo \"${out:-NOCONTAINER}\""
+            ) % (tries, b64)
+            ok, out = _ssh_probe(remote_cfg, cmd, timeout=30 + 2 * tries + 300)
+            out = ((out or '').strip().splitlines()[-1:] or [''])[0]
+        else:
+            def _answers(name, polls):
+                for n in range(polls):
+                    c = subprocess.run(
+                        _sudo_wrap(['docker', 'exec', name, 'curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
+                                    'http://localhost:5000/api']),
+                        capture_output=True, text=True, timeout=20)
+                    if (c.stdout or '').strip() == '200':
+                        return True
+                    if n + 1 < polls:
+                        time.sleep(3)
+                return False
+            out = 'NOCONTAINER'
+            name = ''
+            for _ in range(tries):
+                r = subprocess.run(
+                    _sudo_wrap(['docker', 'ps', '--filter', 'name=cloudtak-api-', '--format', '{{.Names}}']),
+                    capture_output=True, text=True, timeout=15)
+                names = [n for n in (r.stdout or '').split() if n.strip()]
+                if names:
+                    name = names[0]
+                    ap = subprocess.run(
+                        _sudo_wrap(['docker', 'exec', '-i', name, 'sh']),
+                        input=script, capture_output=True, text=True, timeout=40)
+                    out = ((ap.stdout or '').strip().splitlines()[-1:] or [''])[0]
+                    if out != 'NOCONF':
+                        break
+                time.sleep(2)
+            restart = out == 'HEALED'
+            if out.startswith('OK '):
+                st = subprocess.run(
+                    _sudo_wrap(['docker', 'inspect', name, '--format', '{{.State.StartedAt}}']),
+                    capture_output=True, text=True, timeout=20)
+                restart = _ct_etl_stale(out, st.stdout)
+                if restart:
+                    _log("  ℹ CloudTAK ETL layer fix is in the route file but the api started before it: restarting it")
+                else:
+                    out = 'OK'
+            if restart:
+                # never restart in the middle of first-boot migrations: the file is edited either way,
+                # and the drift check sees the api started before the edit and restarts it later
+                if not _answers(name, 40 if wait else 1):
+                    out = 'NOAPI'
+                else:
+                    rs = subprocess.run(_sudo_wrap(['docker', 'restart', name]),
+                                        capture_output=True, text=True, timeout=120)
+                    out = 'HEALED' if rs.returncode == 0 and _answers(name, 40) else 'NOAPI'
+        if out == 'HEALED':
+            _log("  ✓ CloudTAK ETL layers: an admin can now save the schedule and login of a server-wide layer (api restarted once)")
+            _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # the restart rewrote nginx.conf
+            return True
+        if out in ('OK', 'UPSTREAM'):
+            return True  # already there, or CloudTAK carries the fix itself - silent
+        if out == 'SHAPE':
+            _log("  ℹ CloudTAK ETL layer fix not applied: the api's layer routes differ from what it expects (left unchanged)")
+            return True  # never counted as drift
+        if wait or out in ('FAIL', 'NOAPI'):
+            _log(f"  ⚠ CloudTAK ETL layer fix not applied ({out or 'no answer'}); saving the schedule or login of a server-wide ETL layer may fail")
+        return False
+    except Exception as e:
+        _log(f"  ⚠ CloudTAK ETL layer fix error (non-fatal): {e}")
+        return False
+    finally:
+        _cloudtak_etl_heal_lock.release()
+
+
 def _compose_cmd(remote_cfg=None):
     """Return the working Docker Compose invocation ('docker compose' or
     'docker-compose'), preferring v2, or None if neither is present.
@@ -57123,6 +57351,7 @@ def run_cloudtak_deploy(cfg=None):
             else:
                 plog("⚠ No FQDN configured. Use remote direct URL on port 5000.")
             # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware reaper) on the remote.
+            _cloudtak_etl_layer_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #969
             _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #470
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ CloudTAK remote deployment complete")
@@ -57866,6 +58095,7 @@ def run_cloudtak_deploy(cfg=None):
 
         # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware
         # reaper) — a fresh install creates the container from the image default.
+        _cloudtak_etl_layer_heal(plog=plog, wait=True)   # ops #969
         _cloudtak_upload_limit_heal(plog=plog, wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, wait=True)
         _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
@@ -58011,6 +58241,7 @@ def run_cloudtak_redeploy(cfg=None):
                 # "Caddy reloaded" printed even when the reload failed.
                 _caddy_apply_and_verify(plog, 'CloudTAK', [_get_service_domain(settings, 'cloudtak_map')], settings)
             # v0.9.48 (Part B+C/D): re-apply cloudtak-media self-heal (HLS + reaper) on remote.
+            _cloudtak_etl_layer_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #969
             _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #470
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ Update config & restart done (remote)")
@@ -58130,6 +58361,7 @@ def run_cloudtak_redeploy(cfg=None):
             _caddy_apply_and_verify(plog, 'CloudTAK', [_get_service_domain(settings, 'cloudtak_map')], settings)
         # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
+        _cloudtak_etl_layer_heal(plog=plog, wait=True)   # ops #969
         _cloudtak_upload_limit_heal(plog=plog, wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, wait=True)
         _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
@@ -59266,6 +59498,7 @@ def run_cloudtak_update():
         _cloudtak_postgis_extensions_upgrade(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
         # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
+        _cloudtak_etl_layer_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)   # ops #969
         _cloudtak_upload_limit_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
         if not is_remote:
@@ -112618,6 +112851,7 @@ def _cloudtak_recreate_and_heal(ct_dir, log, pull=False, wait_s=0):
     log("CloudTAK recreated with hardened port bindings")
     # v0.9.48 (Part B+C/D): recreate reverted cloudtak-media to image default —
     # re-apply the self-heal (HLS config + ephemeral-aware reaper).
+    _cloudtak_etl_layer_heal(plog=log, wait=True)   # ops #969
     _cloudtak_upload_limit_heal(plog=log, wait=True)   # ops #470: the recreate rewrote nginx.conf
     if not _cloudtak_media_hls_heal(wait=True):
         return 'heal'
@@ -112752,6 +112986,28 @@ def _startup_heal_cloudtak_media_hls():
 _startup_heal_cloudtak_media_hls()
 
 
+def _startup_heal_cloudtak_etl_layer():
+    """ops #969: the same check-before-apply heal as above for the ETL layer routes, after every console
+    start, but off the start path (an edit restarts the api, a minute or two) and only when no compose
+    or build run is changing the stack. If it is busy, Guard Dog's drift check ('etl') repairs it later."""
+    def _run():
+        try:
+            time.sleep(60)
+            _ct_dir = os.path.expanduser('~/CloudTAK')
+            if not (os.path.exists(os.path.join(_ct_dir, 'docker-compose.yml'))
+                    or os.path.exists(os.path.join(_ct_dir, 'compose.yaml'))):
+                return  # CloudTAK not installed locally (or split/remote) - nothing to heal here
+            busy = _cloudtak_stack_busy_procs()
+            if busy is None or busy:
+                return
+            _cloudtak_etl_layer_heal()
+        except Exception as _e:
+            print(f"Startup self-heal: CloudTAK ETL layer fix error (non-fatal): {_e}", flush=True)
+    threading.Thread(target=_run, daemon=True, name='cloudtak-etl-heal').start()
+
+_startup_heal_cloudtak_etl_layer()
+
+
 # ops #197: Guard Dog repairs CloudTAK by itself after a compose run that skipped our override.
 #
 # TAK Portal's marketplace rebuilds CloudTAK with its own command,
@@ -112809,8 +113065,9 @@ def _cloudtak_stack_busy_procs():
 
 def _cloudtak_drift(ct_dir):
     """What a compose run without infra-TAK's override left behind. Returns
-    {'kind': 'recreate'|'print'|'media'|'upload'|'', 'no_override': [names], 'print': [names],
-     'hls': True|False|None, 'upload': True|False|None, 'media_image': str, 'api_ca': True|False|None}.
+    {'kind': 'recreate'|'print'|'media'|'upload'|'etl'|'', 'no_override': [names], 'print': [names],
+     'hls': True|False|None, 'upload': True|False|None, 'etl': True|False|None, 'media_image': str,
+     'api_ca': True|False|None}.
     'recreate': a running CloudTAK container was created without docker-compose.override.yml
     (its compose config_files label) — image pins, console CA and the HLS profile all need the
     recreate. 'print' (ops #222): only TAK Portal's Print runs without infra-TAK's Print overlay
@@ -112819,10 +113076,13 @@ def _cloudtak_drift(ct_dir):
     (ops #161). 'upload' (ops #502): only the 25G /api/server/tileset rule is gone from the api's
     nginx.conf, which any recreate of the api (a TAK Portal plugin install or update) rewrites —
     the upload-limit heal alone fixes that. upload None = could not read, or nginx.conf.js has
-    not written the real config yet: not drift."""
+    not written the real config yet: not drift. 'etl' (ops #969): the api's layer routes were rewritten
+    by a recreate, so saving the schedule or login of a server-wide ETL layer is refused again; the ETL
+    layer heal alone fixes that. etl None = could not read, a CloudTAK that carries the fix itself, or a
+    file that differs from what the patch expects: not drift."""
     out = {'kind': '', 'no_override': _cloudtak_containers_without_override(ct_dir),
            'print': _cloudtak_print_drift(ct_dir),
-           'hls': None, 'upload': None, 'media_image': '', 'api_ca': None}
+           'hls': None, 'upload': None, 'etl': None, 'media_image': '', 'api_ca': None}
     media = ((_ct_docker_out(['ps', '--filter', 'name=cloudtak-media', '--format', '{{.Names}}']) or '').split() or [''])[0]
     if media:
         chk = _ct_docker_out(['exec', '-i', media, 'sh'], timeout=25, stdin=_CT_MEDIA_CHECK_SH)
@@ -112833,6 +113093,16 @@ def _cloudtak_drift(ct_dir):
     chk = (chk or '').strip().splitlines()[-1:] or ['']
     if chk[0] in ('OK', 'MISSING'):
         out['upload'] = chk[0] == 'OK'
+    chk = _ct_docker_out(['exec', '-i', 'cloudtak-api-1', 'sh'], timeout=25,
+                         stdin=_CT_ETL_LAYER_SH.replace('__MODE__', 'check'))
+    chk = (chk or '').strip().splitlines()[-1:] or ['']
+    if chk[0].split(' ')[0] in ('OK', 'UPSTREAM', 'MISSING'):
+        out['etl'] = chk[0].split(' ')[0] != 'MISSING'
+        if out['etl'] and chk[0].startswith('OK '):
+            # edited, but did the api reload it? (a failed restart, a console stopped between the two)
+            started = _ct_docker_out(['inspect', 'cloudtak-api-1', '--format', '{{.State.StartedAt}}'])
+            if _ct_etl_stale(chk[0], started):
+                out['etl'] = False
     env = _ct_docker_out(['inspect', 'cloudtak-api-1', '--format', '{{json .Config.Env}}'])
     if env:
         try:
@@ -112847,6 +113117,8 @@ def _cloudtak_drift(ct_dir):
         out['kind'] = 'media'
     elif out['upload'] is False:
         out['kind'] = 'upload'
+    elif out['etl'] is False:
+        out['kind'] = 'etl'
     return out
 
 
@@ -112861,6 +113133,8 @@ def _cloudtak_drift_summary(d):
         parts.append('HLS profile missing')
     if d.get('upload') is False:
         parts.append('tileset upload limit missing')
+    if d.get('etl') is False:
+        parts.append('ETL layer save fix missing')
     if d.get('media_image'):
         parts.append(f"media image {d['media_image']}")
     if d.get('api_ca') is not None:
@@ -113006,6 +113280,11 @@ def _cloudtak_autorepair_run(ct_dir, drift):
         if not why and drift['kind'] != 'recreate' and drift.get('upload') is False:
             if not _cloudtak_upload_limit_heal(plog=_log, wait=True):
                 why = 'the tileset upload limit did not re-apply'
+        # ops #969: the ETL layer fix. After a recreate it already ran inside _cloudtak_recreate_and_heal.
+        # It restarts the api, so it re-applies the upload limit itself.
+        if not why and drift['kind'] != 'recreate' and drift.get('etl') is False:
+            if not _cloudtak_etl_layer_heal(plog=_log, wait=True):
+                why = 'the ETL layer save fix did not re-apply'
         # ops #222: every repair ends with Print set up — the recreate above leaves cloudtak-print
         # alone (it isn't in COMPOSE_FILE), and TAK Portal starts it without our overlay.
         if not why and _cloudtak_print_converge(ct_dir, _log) == 'failed':
@@ -113042,7 +113321,9 @@ def _cloudtak_autorepair_notify(before, after):
                             "Portal's compose file and docker-compose.custom.yml kept), then re-applied "
                             "the HLS profile",
                 'print': "restarted TAK Portal's Print (cloudtak-print) on 127.0.0.1:5010 for /print-api",
-                'upload': "re-applied the 25G tileset upload limit to the CloudTAK api's nginx"
+                'upload': "re-applied the 25G tileset upload limit to the CloudTAK api's nginx",
+                'etl': "re-applied the fix that lets an admin save the schedule and login of a server-wide "
+                       "ETL layer (restarted the CloudTAK api once)"
                 }.get(before['kind'], 're-applied the HLS profile to cloudtak-media')
         line = (f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')} | cloudtak-watch | repaired automatically, "
                 f"nothing to do (likely a TAK Portal marketplace install) | "
