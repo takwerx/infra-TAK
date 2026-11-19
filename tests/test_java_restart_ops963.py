@@ -266,6 +266,12 @@ def test_dnf_needs_an_advisory_that_lists_the_installed_build():
                     advisories=[dict(adv[0], nevra='java-17-openjdk-headless-1:17.0.12.0.7-1.el9.x86_64')])
     other['_java_restart_state'] = n['_java_restart_state']
     assert other['_java_restart_items'](set()) == []
+    # dnf does not filter `updateinfo list --installed NAME` by name: an advisory for ANOTHER package
+    # that happens to carry the same build string must not be taken as this JDK's.
+    stranger = _sec_ns(mgr='dnf', versions={'java-17-openjdk-headless': ver},
+                       advisories=[dict(adv[0], nevra='NetworkManager-1:17.0.21.0.10-1.el9.x86_64')])
+    stranger['_java_restart_state'] = n['_java_restart_state']
+    assert stranger['_java_restart_items'](set()) == []
 
 
 def test_package_names_follow_the_java_major_in_the_path():
@@ -299,3 +305,46 @@ def test_tak_server_image_builds_pull_a_fresh_base():
     # deploy and update both build the takserver image; a cached old Temurin must not survive
     assert APP.count('docker build --pull -t {TAK_CONTAINER}') == 2
     assert 'docker build -t {TAK_CONTAINER}' not in APP
+
+
+def test_os_updates_answer_carries_the_java_state():
+    """The route itself, with its helpers stubbed: the answer has java_restart."""
+    n = {'request': types.SimpleNamespace(args={}), 'jsonify': lambda d: d,
+         '_os_updates_summary': lambda force=False: {'total': 0},
+         '_kernel_reboot_state': lambda: {'pending': False, 'kernel': False, 'running': 'k'},
+         '_kernel_cve_banner': lambda r: None,
+         '_java_restart_state': lambda: {'stale': [7], 'sig': 'java@9'}}
+    exec(compile(_cut('os_updates_api'), 'app.py', 'exec'), n)
+    assert n['os_updates_api']()['java_restart'] == {'stale': [7], 'sig': 'java@9'}
+
+
+_BANNER_JS_HARNESS = r'''
+const store = {};
+global.localStorage = {getItem: k => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); }};
+const el = {style: {}, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, getAttribute(k) { return this.attrs[k] || null; }};
+global.document = {getElementById: id => (id === 'java-restart-banner' ? el : null)};
+%s
+const out = [];
+function shown() { return el.style.display; }
+_javaRestartRender({java_restart: {stale: [1], sig: 'java@5'}});            out.push(shown());          // block
+_javaRestartRender({java_restart: {stale: [], sig: ''}});                    out.push(shown());          // none
+_javaRestartRender({});                                                      out.push(shown());          // none
+_javaRestartRender({java_restart: {stale: [1], sig: 'java@5'}});            out.push(shown());          // block
+dismissJavaRestart();                                                        out.push(shown());          // none
+_javaRestartRender({java_restart: {stale: [1], sig: 'java@5'}});            out.push(shown());          // none (dismissed)
+_javaRestartRender({java_restart: {stale: [1], sig: 'java@6'}});            out.push(shown());          // block (new install)
+store['java-restart-dismissed'] = JSON.stringify({sig: 'java@6', ts: Date.now() - 25 * 3600 * 1000});
+_javaRestartRender({java_restart: {stale: [1], sig: 'java@6'}});            out.push(shown());          // block (24 h passed)
+console.log(out.join(','));
+'''
+
+
+@pytest.mark.skipif(not shutil.which('node'), reason='node not installed')
+def test_banner_shows_hides_and_stays_quiet_for_a_day_per_java_install(tmp_path):
+    a = CONSOLE.index('// ops #963')
+    b = CONSOLE.index('async function checkKernelPatch(){')
+    js = tmp_path / 'banner.js'
+    js.write_text(_BANNER_JS_HARNESS % CONSOLE[a:b])
+    r = _real_subprocess.run(['node', str(js)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == 'block,none,none,block,none,none,block,block'

@@ -29754,8 +29754,10 @@ def _java_update_security(state):
         if not ver:
             continue
         if mgr == 'dnf':
+            # dnf lists EVERY installed package's advisories here (the name argument does not
+            # filter updateinfo), so match this package's own name and installed build.
             for a in _dnf_security_advisories(['--installed', name]):
-                if ver.split(':')[-1] in a['nevra']:
+                if a['nevra'].startswith(name + '-') and ver.split(':')[-1] in a['nevra']:
                     return {'pkg': name, 'version': ver,
                             'how_known': a['id'] + (' (%s)' % a['severity'] if a['severity'] else '')}
             return None
