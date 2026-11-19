@@ -90596,6 +90596,37 @@ rotate_intca_log = []
 rotate_intca_status = {'running': False, 'complete': False, 'error': False}
 
 
+def _ca_name_in_cert_folder(cert_dir, name):
+    """Files in `cert_dir` that already carry the CA name `name` (empty list: the name is free).
+
+    ops #942: `makeCert.sh ca NAME` on a name whose files are already there does not stop with
+    an error. keytool asks "Existing entry alias ... exists, overwrite? [no]" and takes the one
+    `y` the console pipes in, so the script's own "move files around so the new CA becomes the
+    working CA? [y/n]" gets end-of-file, prints "Ok, not overwriting existing keys", exits 0 and
+    leaves ca.pem on the root. The same files also belong to a client certificate or an older CA
+    of that name (`admin`, `takserver`, an earlier INT-CA-01): makeCert.sh would overwrite its
+    key. Names are compared in lower case: the rotation state and the truststore carry-forward
+    key every CA by its lower-case alias.
+    """
+    try:
+        present = {f.lower(): f for f in os.listdir(cert_dir)}
+    except OSError:
+        return []   # cannot tell: the check after makeCert.sh still catches a stopped rotation
+    n = (name or '').lower()
+    candidates = [f'{n}{s}' for s in ('.pem', '.key', '.csr', '.crl', '.jks', '.p12', '-trusted.pem',
+                                      '-signing.jks', '-signing.p12', '-signing.pem')]
+    candidates += [f'truststore-{n}.jks', f'truststore-{n}.p12']
+    return [present[c] for c in candidates if c in present]
+
+
+def _tak_working_ca_cn(cert_dir='/opt/tak/certs/files'):
+    """Subject CN of ca.pem, the CA that signs what TAK Server issues next ('' if unreadable)."""
+    try:
+        return _pem_cn_and_expiry(_read_priv(os.path.join(cert_dir, 'ca.pem')))[0]
+    except Exception:
+        return ''
+
+
 def _rotate_client_cert_names(cert_dir, skip=()):
     """Client certs Rotate Intermediate CA re-issues: each NAME.p12 that is not CA material.
 
@@ -91287,6 +91318,11 @@ def takserver_rotate_intca():
         return jsonify({'error': 'Could not detect current intermediate CA name from ca.pem'}), 500
     if new_ca_name == old_ca_name:
         return jsonify({'error': f'New CA name must be different from current ({old_ca_name})'}), 400
+    # ops #942: refuse before anything changes. makeCert.sh cannot make a CA over files of that name.
+    if _ca_name_in_cert_folder(cert_dir, new_ca_name):
+        return jsonify({'error': f'A certificate named {new_ca_name} is already in the certificate '
+                                 f'folder, choose another name (for example the next number after '
+                                 f'your earlier CAs).'}), 400
 
     # Optional new cert password (save so thread uses it for new keystores)
     new_cert_password = (data.get('new_cert_password') or '').strip()
@@ -91385,6 +91421,12 @@ def takserver_rotate_intca():
             _patch_cert_metadata_password(cert_pass)
             if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh ca "{new_ca_name}" 2>&1'):
                 raise Exception('Failed to create new intermediate CA')
+            # ops #942: makeCert.sh exits 0 even when it stops before it makes the new CA the
+            # working one. Only the file itself says whether it did.
+            _working = _tak_working_ca_cn(cert_dir)
+            if _working != new_ca_name:
+                raise Exception(f'makeCert.sh finished but the working CA (ca.pem) is '
+                                f'{_working or "unreadable"}, not {new_ca_name}. Nothing after Step 2 was done')
             log(f"✓ Intermediate CA {new_ca_name} created")
             # ops #831: the new CA's key files are for the TAK Server account only.
             try:
