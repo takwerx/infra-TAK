@@ -5555,6 +5555,19 @@ def _detect_modules_uncached():
             'route': _sim_desc['route'], 'priority': _sim_desc['priority'], 'conflicts': [],
             'requires_modules': list(_sim_desc.get('requires_modules') or [])}
 
+    # MeshRelay PTT server — registry-resident (modules/meshrelay.py), ops #973.
+    _mr_desc = mod_registry.MODULES.get('meshrelay')
+    if _mr_desc:
+        try:
+            _mr_state = _mr_desc['detect'](mod_registry.get_ctx())
+        except Exception:
+            _mr_state = {}
+        modules['meshrelay'] = {'name': _mr_desc['name'],
+            'installed': bool(_mr_state.get('installed')), 'running': bool(_mr_state.get('running')),
+            'description': _mr_desc['description'], 'icon': _mr_desc['icon'],
+            'route': _mr_desc['route'], 'priority': _mr_desc['priority'], 'conflicts': [],
+            'requires_modules': list(_mr_desc.get('requires_modules') or [])}
+
     # TAK Client Feed — registry-resident (modules/clientfeed.py), v10.1.76.
     # Tile identity + probes come from the descriptor, not an inline block.
     _ef_desc = mod_registry.MODULES.get('clientfeed')
@@ -6244,6 +6257,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     simm = modules.get('simulator', {})
     if simm.get('installed'):
         parts.append(link('/simulator', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F3AF</span><span>TAK Simulator</span>', 'TAK Simulator'))
+    mrm = modules.get('meshrelay', {})
+    if mrm.get('installed'):
+        parts.append(link('/meshrelay', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F4FB</span><span>MeshRelay</span>', 'MeshRelay'))
     cf = modules.get('clientfeed', {})
     if cf.get('installed'):
         parts.append(link('/clientfeed', '<img src="/static/logos/tak-client-skittle.png" alt="" class="nav-icon" style="height:22px;width:22px;object-fit:contain;display:block"><span>TAK Client Feed</span>', 'TAK Client Feed'))
@@ -17144,7 +17160,7 @@ def connectivity_anchor_disconnect_api():
 # bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
 _CONN_ANCHOR_BOOTSTRAP_COMMIT = '1e2d5e85f65dd7ca0b9891e9daab650353ad7304'
-_CONN_ANCHOR_BOOTSTRAP_SHA256 = '32a5b17458f0a8bcd97141464c9754ef05b9afb2d0d03f59577f738b9db61142'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = '6f51526762ed0ab4133772d49ca30bc2a84c5c39f47bf5f42ab233c18a70b741'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
@@ -37159,6 +37175,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'netbird': 'netbird',
     'remote_assist': 'remote',
     'atlas': 'atlas',
+    'meshrelay': 'meshrelay',
 }
 
 def _get_service_domain(settings, service_key):
@@ -42987,6 +43004,17 @@ def generate_caddyfile(settings=None):
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'tak_video_restreamer'), tvr_host)
+
+    mr_mod = modules.get('meshrelay', {})
+    if mr_mod.get('installed'):
+        # ops #973: MeshRelay dashboard. Phones use UDP 5000 only, so the whole HTTP host sits
+        # behind Authentik; the app keeps its own login as well. Without Authentik the host
+        # answers 503: the dashboard is never published bare.
+        mr_host = sd.get('meshrelay') or _get_service_domain(settings, 'meshrelay')
+        mod_registry.meshrelay.append_caddy_vhost(
+            lines, mr_host, bool(ak), ak_up, _CADDY_STRIP_AUTHENTIK_HEADERS,
+            _emit_outpost_callback_rescue, f"{_pub_url(mr_host, settings)}/")
+        _emit_alias_redirect(_get_service_alias(settings, 'meshrelay'), mr_host)
 
     nb_mod = modules.get('netbird', {})
     if nb_mod.get('installed'):
@@ -63794,6 +63822,122 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
     except Exception as e:
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
     return True
+
+
+_MESHRELAY_RUN_USER = 'ptt'
+
+
+def _meshrelay_account_ready():
+    """True when the `ptt` account exists and is fit: not root, in no group of the console's."""
+    try:
+        import pwd, grp
+        pw = pwd.getpwnam(_MESHRELAY_RUN_USER)
+    except (KeyError, ImportError):
+        return False
+    if pw.pw_uid == 0 or pw.pw_gid == 0:
+        return False
+    try:
+        g = grp.getgrnam('takwerx')
+        if _MESHRELAY_RUN_USER in g.gr_mem or pw.pw_gid == g.gr_gid:
+            return False
+    except KeyError:
+        pass
+    return True
+
+
+def _ensure_meshrelay_account(plog=None):
+    """ops #973: create the `ptt` account the MeshRelay unit runs as. True when it is there
+    and fit. Through the broker on a non-root console, directly as root otherwise. Never raises."""
+    def _log(m):
+        if plog:
+            plog(m)
+    try:
+        if _meshrelay_account_ready():
+            return True
+        if _broker_socket_present():
+            resp = _broker_request({'op': 'meshrelay_account'}, timeout=60)
+            if not resp.get('ok'):
+                _log(f"  ⚠ ptt account: {resp.get('error') or 'broker refused'}")
+        elif os.geteuid() == 0:
+            subprocess.run(['groupadd', '--system', _MESHRELAY_RUN_USER], capture_output=True, timeout=30)
+            subprocess.run(['useradd', '--system', '-g', _MESHRELAY_RUN_USER, '-M', '-d', '/nonexistent',
+                            '-s', '/usr/sbin/nologin', _MESHRELAY_RUN_USER], capture_output=True, timeout=30)
+        ok = _meshrelay_account_ready()
+        if ok:
+            _log("  ✓ ptt system account ready (MeshRelay does not run as the console's account)")
+        return ok
+    except Exception as e:
+        _log(f"  ⚠ ptt account error: {e}")
+        return False
+
+
+def _ensure_authentik_meshrelay_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
+    """ops #973: MeshRelay proxy provider + application in Authentik, added to the embedded
+    outpost. Same pattern as TAK Video Restreamer; Caddy forward_auth protects the dashboard host."""
+    if not fqdn or not ak_token:
+        return False
+    def log(msg):
+        if plog:
+            plog(msg)
+    import urllib.request as _urlreq
+    _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    _ak_url = _get_authentik_api_url(settings) if settings else 'http://127.0.0.1:9090'
+    try:
+        if not flow_pk or not inv_flow_pk:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+            flows = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
+            flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
+            req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
+            inv_flows = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
+            inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')), inv_flows[0]['pk'] if inv_flows else None)
+        if not flow_pk or not inv_flow_pk:
+            log("  ⚠ No authorization/invalidation flow — skipping MeshRelay proxy provider")
+            return False
+        host = f'https://{_pub_hostport(_get_service_domain(settings, "meshrelay") if settings else f"meshrelay.{fqdn}")}'
+        cookie = f'.{fqdn.split(":")[0]}'
+        provider_pk = None
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                data=json.dumps({'name': 'MeshRelay Proxy', 'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk, 'external_host': host, 'mode': 'forward_single',
+                    'token_validity': 'hours=24', 'cookie_domain': cookie}).encode(),
+                headers=_ak_headers, method='POST')
+            provider_pk = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['pk']
+            log("  ✓ Proxy provider created")
+        except Exception as e:
+            if getattr(e, 'code', None) != 400:
+                raise
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search=MeshRelay', headers=_ak_headers)
+            results = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
+            if results:
+                provider_pk = results[0]['pk']
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                    data=json.dumps({'external_host': host, 'cookie_domain': cookie}).encode(),
+                    headers=_ak_headers, method='PATCH')
+                _urlreq.urlopen(req, timeout=10)
+                log("  ✓ Proxy provider already exists (external_host updated)")
+        if not provider_pk:
+            log("  ⚠ Could not create or find the MeshRelay proxy provider")
+            return False
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                data=json.dumps({'name': 'MeshRelay', 'slug': 'meshrelay',
+                    'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                headers=_ak_headers, method='POST')
+            _urlreq.urlopen(req, timeout=10)
+            log("  ✓ Application 'MeshRelay' created")
+        except Exception as e:
+            if getattr(e, 'code', None) != 400:
+                raise
+            req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/meshrelay/',
+                data=json.dumps({'provider': provider_pk}).encode(), headers=_ak_headers, method='PATCH')
+            _urlreq.urlopen(req, timeout=10)
+            log("  ✓ Application 'MeshRelay' updated")
+        _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
+        return True
+    except Exception as e:
+        log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+        return False
 
 
 def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
@@ -121863,6 +122007,11 @@ _MODULE_CTX = {
     '_install_docker_engine': _install_docker_engine,
     '_get_authentik_env_value': _get_authentik_env_value,
     '_ensure_authentik_tvr_app': _ensure_authentik_tvr_app,
+    # meshrelay seams (ops #973): the `ptt` account (broker op), its Authentik proxy app, and
+    # the firewall "closed to the outside" call (ufw deny / firewalld remove)
+    '_ensure_meshrelay_account': _ensure_meshrelay_account,
+    '_ensure_authentik_meshrelay_app': _ensure_authentik_meshrelay_app,
+    '_fw_deny': _fw_deny,
     '_deregister_authentik_proxy_app': _deregister_authentik_proxy_app,
     # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION;
     # W10: the shared infratak network + the CloudTAK override refresh (api recreate)
@@ -122139,6 +122288,26 @@ def clientfeed_page():
         feed_host = f'{_ip}:5001' if _ip else ''
     return render_template('clientfeed.html', settings=settings, modules=modules,
                            clientfeed=state, feed_host=feed_host, version=VERSION)
+
+@app.route('/meshrelay')
+@login_required
+def meshrelay_page():
+    """MeshRelay PTT server page (ops #973)."""
+    from flask import abort
+    if not mod_registry.MODULES.get('meshrelay'):
+        abort(404)
+    settings = load_settings()
+    modules = detect_modules()
+    state = modules.get('meshrelay', {})
+    mr = mod_registry.meshrelay
+    host = _get_service_domain(settings, 'meshrelay')
+    _job = mod_registry.job_state('meshrelay')
+    return render_template('meshrelay.html', settings=settings, modules=modules, meshrelay=state,
+                           mr_host=host, mr_url=(f'https://{_pub_hostport(host)}' if host else ''),
+                           mr_version=(settings.get('meshrelay') or {}).get('tag', ''),
+                           mr_pinned=mr.RELEASE['tag'], mr_pin_problem=mr.pin_problem(arch=_host_arch()),
+                           mr_ptt_port=mr.PTT_PORT, mr_first_password=settings.get('meshrelay_first_admin_password', ''),
+                           deploying=_job.get('running', False), version=VERSION)
 
 try:
     import threading as _threading_sh

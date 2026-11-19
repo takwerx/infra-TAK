@@ -141,6 +141,7 @@ the only part you do by hand.
 | TCP | 18554 | CloudTAK video **RTSP** |
 | TCP | 11935 | CloudTAK video **RTMP** |
 | UDP | 18890 | CloudTAK video **SRT** |
+| UDP | 5000 | MeshRelay **push-to-talk** phones |
 | TCP | 9997 | CloudTAK video **control** — CloudTAK calls this to start every video opened from a map marker |
 | TCP | 8448 | **EUD Remote Assist device API — the enrolment QR points here** |
 | TCP | 8449 | **ATLAS MDM device channel — enrolled tablets connect here** |
@@ -209,6 +210,7 @@ cat > ingress.json <<'EOF'
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CloudTAK video RTSP","tcpOptions":{"destinationPortRange":{"min":18554,"max":18554}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CloudTAK video RTMP","tcpOptions":{"destinationPortRange":{"min":11935,"max":11935}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"CloudTAK video SRT","udpOptions":{"destinationPortRange":{"min":18890,"max":18890}}},
+  {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"17","isStateless":false,"description":"MeshRelay push-to-talk phones","udpOptions":{"destinationPortRange":{"min":5000,"max":5000}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"CloudTAK video control","tcpOptions":{"destinationPortRange":{"min":9997,"max":9997}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"EUD Remote Assist device API (QR target)","tcpOptions":{"destinationPortRange":{"min":8448,"max":8448}}},
   {"source":"0.0.0.0/0","sourceType":"CIDR_BLOCK","protocol":"6","isStateless":false,"description":"ATLAS MDM device channel","tcpOptions":{"destinationPortRange":{"min":8449,"max":8449}}},
