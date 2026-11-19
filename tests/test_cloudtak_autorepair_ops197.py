@@ -94,6 +94,8 @@ class Box:
         self.up_rc = 0
         self.heal_ok = True
         self.upload_heal_ok = True
+        self.etl_heal_ok = True
+        self.etl = 'UPSTREAM'   # ops #969: True (fix there), False (gone) or 'UPSTREAM' (CloudTAK has it, not drift)
         self.busy = None
         self.settings = {'guarddog_alert_email': 'ops@example.com'}
         self.takportal_recreate()
@@ -128,6 +130,9 @@ class Box:
             out = ''.join(f'{n}|{f}\n' for n, f in self.labels.items())
         elif argv[:2] == ['docker', 'ps'] and 'name=cloudtak-media' in argv:
             out = 'cloudtak-media-1\n'
+        elif argv[:4] == ['docker', 'exec', '-i', 'cloudtak-api-1'] and 'connection-layer' in (kw.get('input') or ''):
+            # ops #969: the ETL layer check script
+            out = {True: 'OK', False: 'MISSING'}.get(self.etl, 'UPSTREAM') + '\n'
         elif argv[:4] == ['docker', 'exec', '-i', 'cloudtak-api-1']:
             # ops #502: self.upload is True (rule there), False (rule gone) or 'NOCONF' (stock file)
             out = {True: 'OK', False: 'MISSING'}.get(self.upload, 'NOCONF') + '\n'
@@ -143,6 +148,8 @@ class Box:
                 self.labels = {n: files for n in self.labels}
                 self.media_image, self.api_ca, self.hls = PINNED_MEDIA, True, False
                 self.upload = False
+                if self.etl is True:
+                    self.etl = False     # ops #969: a recreate brings back CloudTAK's own routes
                 self.api_started = time.time()
         return types.SimpleNamespace(stdout=out, stderr='', returncode=rc)
 
@@ -158,8 +165,18 @@ class Box:
             self.upload = True
         return self.upload_heal_ok
 
+    def etl_heal(self, plog=None, remote_cfg=None, wait=False):
+        self.calls.append((['ETL'], None))
+        if self.etl_heal_ok:
+            self.etl = True
+            self.upload = True     # the real heal restarts the api, then re-applies the upload limit
+        return self.etl_heal_ok
+
     def uploads(self):
         return [c for c, _ in self.calls if c == ['UPLOAD']]
+
+    def etls(self):
+        return [c for c, _ in self.calls if c == ['ETL']]
 
     def ns(self):
         fake_threading = types.SimpleNamespace(
@@ -184,6 +201,7 @@ class Box:
             '_docker_compose_pull': lambda *a, **k: self.calls.append((['PULL'], k.get('services'))) or True,
             '_cloudtak_media_hls_heal': self.heal,
             '_cloudtak_upload_limit_heal': self.upload_heal,   # ops #470, #502
+            '_cloudtak_etl_layer_heal': self.etl_heal,         # ops #969
             '_write_priv': lambda path, content, mode='w', perm=None: self.guard_log.append((path, content, mode)),
             '_guarddog_server_identifier': lambda s: 'test-box (10.0.0.1)',
             '_guarddog_send_alert_email_via_relay': lambda to, subj, body: self.mails.append((to, subj, body)) or True,
@@ -195,6 +213,7 @@ class Box:
             [_assign(n) for n in (
                 '_CT_ENV_LINE_RE', 'CLOUDTAK_CUSTOM_COMPOSE', '_CLOUDTAK_CUSTOM_COMPOSE_SEED',
                 '_CLOUDTAK_TAKPORTAL_CSP_COMPOSE', '_CT_MEDIA_CHECK_SH', '_CT_NGINX_UPLOAD_CHECK_SH',
+                '_CT_ETL_LAYER_SH',   # ops #969
                 '_CLOUDTAK_RECREATE_PENDING', 'CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR',
                 'CLOUDTAK_AUTOREPAIR_SETTLE_S', 'CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S',
                 'CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S', '_CLOUDTAK_COMPOSE_UP_RE',   # ops #889
