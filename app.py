@@ -53404,6 +53404,153 @@ def _ct_media_converged(check_out):
     return len(p) >= 3 and p[0] == 'ok' and p[1] in ('ok', 'na') and p[2] in ('ok', 'na')
 
 
+# ops #950 (follow-up): a box that already holds a doubled hls key is stuck. MediaMTX refuses the file,
+# the media container exits and restarts in a loop, and `docker exec` into it fails, so the heal that
+# runs INSIDE the container can never run. These helpers fix /mediamtx.yml from OUTSIDE with `docker cp`
+# (which works on a stopped or restarting container) and then restart it.
+_CT_MEDIA_HLS_KEYS = ('hlsVariant', 'hlsAlwaysRemux', 'hlsSegmentCount', 'hlsSegmentDuration', 'hlsPartDuration')
+_CT_MEDIA_HLS_BLOCK = ('hlsVariant: mpegts', 'hlsAlwaysRemux: no', 'hlsSegmentCount: 3',
+                       'hlsSegmentDuration: 500ms', 'hlsPartDuration: 200ms')
+
+
+def _ct_media_fix_yml(text):
+    """Return (new_text, changed) for the contents of the media container's /mediamtx.yml.
+    Same rule as the in-container scripts: exactly one of each of the five hls keys, with our values.
+    A file that already holds exactly that comes back unchanged."""
+    key_re = re.compile(r'^(' + '|'.join(_CT_MEDIA_HLS_KEYS) + r'):')
+    lines = text.splitlines()
+    mine = [ln for ln in lines if key_re.match(ln)]
+    converged = (
+        len(mine) == 5
+        and len({ln.split(':', 1)[0] for ln in mine}) == 5
+        and any(ln.startswith('hlsVariant: mpegts') for ln in mine)
+        and any(re.match(r'^hlsAlwaysRemux: (no|false)', ln) for ln in mine)
+        and any(ln.startswith('hlsSegmentCount: 3') for ln in mine)
+        and any(ln.startswith('hlsSegmentDuration: 500ms') for ln in mine)
+        and any(ln.startswith('hlsPartDuration: 200ms') for ln in mine))
+    if converged:
+        return text, False
+    kept = [ln for ln in lines if not key_re.match(ln)]
+    return '\n'.join(kept + list(_CT_MEDIA_HLS_BLOCK)) + '\n', True
+
+
+# Remote (ssh) version of the same repair, run as `sh -s CONTAINER` on the remote host. Prints FIXED,
+# FINE (the file is already right, so the container fails for another reason) or FAIL.
+_CT_MEDIA_OUTSIDE_SH = r'''
+m="$1"
+[ -n "$m" ] || { echo FAIL; exit 0; }
+t=$(mktemp -d) || { echo FAIL; exit 0; }
+trap 'rm -rf "$t"' EXIT
+K='^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):'
+docker cp "$m:/mediamtx.yml" "$t/in.yml" >/dev/null 2>&1 || { echo FAIL; exit 0; }
+if [ "$(grep -cE "$K" "$t/in.yml")" = 5 ] \
+ && grep -q "^hlsVariant: mpegts" "$t/in.yml" \
+ && grep -qE "^hlsAlwaysRemux: (no|false)" "$t/in.yml" \
+ && grep -q "^hlsSegmentCount: 3" "$t/in.yml" \
+ && grep -q "^hlsSegmentDuration: 500ms" "$t/in.yml" \
+ && grep -q "^hlsPartDuration: 200ms" "$t/in.yml"; then echo FINE; exit 0; fi
+grep -vE "$K" "$t/in.yml" > "$t/out.yml"
+[ $? -le 1 ] || { echo FAIL; exit 0; }
+printf 'hlsVariant: mpegts\nhlsAlwaysRemux: no\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n' >> "$t/out.yml"
+docker cp "$t/out.yml" "$m:/mediamtx.yml" >/dev/null 2>&1 || { echo FAIL; exit 0; }
+docker cp "$m:/mediamtx.yml" "$t/back.yml" >/dev/null 2>&1 || { echo FAIL; exit 0; }
+[ "$(grep -cE "$K" "$t/back.yml")" = 5 ] || { echo FAIL; exit 0; }
+docker restart "$m" >/dev/null 2>&1 || { echo FAIL; exit 0; }
+echo FIXED
+'''
+
+
+def _ct_media_state(media):
+    """(status, exit_code) of the media container from docker inspect, or ('', 0) when unknown."""
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', '-f', '{{.State.Status}} {{.State.ExitCode}}', media]),
+            capture_output=True, text=True, timeout=15)
+        parts = (r.stdout or '').split()
+        if r.returncode == 0 and len(parts) >= 2:
+            return parts[0], int(parts[1])
+    except Exception:
+        pass
+    return '', 0
+
+
+def _ct_media_can_be_stuck(status, exit_code):
+    """Only a container that is looping or crashed can be stuck on a bad yml. One stopped on purpose
+    (exit 0) or not started yet is left alone."""
+    return status in ('restarting', 'running') or (status == 'exited' and exit_code != 0)
+
+
+def _cloudtak_media_repair_outside(media, plog=None):
+    """ops #950 follow-up: repair /mediamtx.yml of a media container that `docker exec` cannot reach.
+    Reads the file with `docker cp`, fixes the five hls keys, copies it back, checks the copy, and
+    restarts the container. Returns 'fixed', 'fine' (the file is already right) or 'error'."""
+    def _log(m):
+        (plog or (lambda x: print(x, flush=True)))(m)
+    import fcntl
+    import io as _io
+    import tarfile as _tarfile
+    lock_fd = None
+    tmp = None
+    try:
+        status, code = _ct_media_state(media)
+        if not _ct_media_can_be_stuck(status, code):
+            return 'error'
+        # One repair at a time on this console (several heal paths call this).
+        lock_fd = os.open(os.path.join(tempfile.gettempdir(), '.infratak-ct-media-repair.lock'),
+                          os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        cp = subprocess.run(_sudo_wrap(['docker', 'cp', f'{media}:/mediamtx.yml', '-']),
+                            capture_output=True, timeout=30)
+        if cp.returncode != 0 or not cp.stdout:
+            _log(f"  ⚠ cloudtak-media repair: could not read /mediamtx.yml ({(cp.stderr or b'').decode('utf-8', 'replace').strip()[:160]})")
+            return 'error'
+        with _tarfile.open(fileobj=_io.BytesIO(cp.stdout)) as tf:
+            member = next((m for m in tf.getmembers() if m.isfile()), None)
+            if member is None:
+                return 'error'
+            text = tf.extractfile(member).read().decode('utf-8', 'replace')
+        new_text, changed = _ct_media_fix_yml(text)
+        if not changed:
+            return 'fine'
+        fd, tmp = tempfile.mkstemp(prefix='ct-media-', suffix='.yml')
+        with os.fdopen(fd, 'w') as f:
+            f.write(new_text)
+        os.chmod(tmp, 0o644)
+        put = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, f'{media}:/mediamtx.yml']),
+                             capture_output=True, text=True, timeout=30)
+        if put.returncode != 0:
+            _log(f"  ⚠ cloudtak-media repair: could not write /mediamtx.yml ({(put.stderr or put.stdout or '').strip()[:160]})")
+            return 'error'
+        back = subprocess.run(_sudo_wrap(['docker', 'cp', f'{media}:/mediamtx.yml', '-']),
+                              capture_output=True, timeout=30)
+        try:
+            with _tarfile.open(fileobj=_io.BytesIO(back.stdout)) as tf:
+                member = next(m for m in tf.getmembers() if m.isfile())
+                check = tf.extractfile(member).read().decode('utf-8', 'replace')
+        except Exception:
+            check = ''
+        if not check or _ct_media_fix_yml(check)[1]:
+            _log("  ⚠ cloudtak-media repair: the file did not read back correct")
+            return 'error'
+        subprocess.run(_sudo_wrap(['docker', 'restart', media]), capture_output=True, text=True, timeout=60)
+        _log("  ✓ cloudtak-media was failing on a bad /mediamtx.yml: repaired from outside and restarted")
+        return 'fixed'
+    except Exception as e:
+        _log(f"  ⚠ cloudtak-media repair error (non-fatal): {e}")
+        return 'error'
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+
+
 def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
     """v0.9.48: self-heal the CloudTAK embedded MediaMTX (cloudtak-media) — CONVERGENCE,
     not an event handler. Reads the live container state first and only patches
@@ -53430,25 +53577,41 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
             import base64
             chk_b64 = _b64.b64encode(_CT_MEDIA_CHECK_SH.encode()).decode()
             apply_b64 = _b64.b64encode(_CT_MEDIA_APPLY_SH.encode()).decode()
+            outside_b64 = _b64.b64encode(_CT_MEDIA_OUTSIDE_SH.encode()).decode()
             # base64 strings are quoting-safe; decode on the remote host and pipe into
             # the container's sh via stdin (`docker exec -i`).
             cmd = (
-                "for i in $(seq 1 %d); do "
+                "for i in $(seq 1 %(tries)d); do "
                 "m=$(docker ps --filter name=cloudtak-media --format '{{.Names}}' | head -n1); "
                 "[ -n \"$m\" ] && break; sleep 1; done; "
+                # ops #950 follow-up: a container in a restart loop or exited is not always in `docker ps`.
+                "[ -n \"$m\" ] || m=$(docker ps -a --filter name=cloudtak-media --format '{{.Names}}' | head -n1); "
                 "if [ -z \"$m\" ]; then echo NOCONTAINER; exit 0; fi; "
-                "out=$(echo %s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null); "
+                "fixed=0; "
+                "out=$(echo %(chk)s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null); "
+                # docker exec printed nothing: the container is not running. If it is looping or crashed,
+                # its /mediamtx.yml may be bad (a doubled hls key), so fix the file from outside.
+                "if [ -z \"$out\" ]; then "
+                "st=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' \"$m\" 2>/dev/null); "
+                "case \"$st\" in \"restarting \"*|\"running \"*|\"exited \"[1-9]*) ;; *) echo NOCONTAINER; exit 0;; esac; "
+                "rr=$(echo %(outside)s | base64 -d | sh -s \"$m\"); "
+                "case \"$rr\" in *FIXED*) ;; *FINE*) echo STUCK-OTHER-CAUSE; exit 0;; *) echo FAIL; exit 0;; esac; "
+                "for i in $(seq 1 30); do [ \"$(docker inspect -f '{{.State.Running}}' \"$m\" 2>/dev/null)\" = true ] && break; sleep 1; done; "
+                "fixed=1; "
+                "out=$(echo %(chk)s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null); "
+                "fi; "
                 "set -- $out; "
                 # v10.1.8: compare against the check script's ACTUAL output ("ok ok na").
                 # The old comparison ("mpegts"/"true") never matched → every remote heal
                 # re-applied + restarted the media container needlessly.
-                "if [ \"$1\" = ok ] && { [ \"$2\" = ok ] || [ \"$2\" = na ]; } && { [ \"$3\" = ok ] || [ \"$3\" = na ]; }; then echo OK; exit 0; fi; "
+                "if [ \"$1\" = ok ] && { [ \"$2\" = ok ] || [ \"$2\" = na ]; } && { [ \"$3\" = ok ] || [ \"$3\" = na ]; }; then "
+                "if [ \"$fixed\" = 1 ]; then echo HEALED; else echo OK; fi; exit 0; fi; "
                 # ops #950: the apply script locks and re-checks inside the container; UNCHANGED means
                 # another heal already fixed it (and restarts it), so no second restart here.
-                "ao=$(echo %s | base64 -d | docker exec -i \"$m\" sh) || { echo FAIL; exit 0; }; "
+                "ao=$(echo %(apply)s | base64 -d | docker exec -i \"$m\" sh) || { echo FAIL; exit 0; }; "
                 "case \"$ao\" in *UNCHANGED*) echo OK;; "
                 "*) docker restart \"$m\" >/dev/null && echo HEALED || echo FAIL;; esac"
-            ) % (tries, chk_b64, apply_b64)
+            ) % {'tries': tries, 'chk': chk_b64, 'outside': outside_b64, 'apply': apply_b64}
             ok, out = _ssh_probe(remote_cfg, cmd, timeout=120)
             out = (out or '').strip()
             if ok and 'HEALED' in out:
@@ -53469,10 +53632,34 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
                 break
             time.sleep(1)
         if not media:
+            # ops #950 follow-up: a container that crashed and is not restarting is missing from plain `docker ps`.
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'ps', '-a', '--filter', 'name=cloudtak-media', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=15)
+            names = [n for n in (r.stdout or '').split() if n.strip()]
+            if names and _ct_media_can_be_stuck(*_ct_media_state(names[0])):
+                media = names[0]
+        if not media:
             return False  # CloudTAK media not up — nothing to heal (silent on the no-wait path)
         cur = subprocess.run(
             _sudo_wrap(['docker', 'exec', '-i', media, 'sh']),
             input=_CT_MEDIA_CHECK_SH, capture_output=True, text=True, timeout=25)
+        if not (cur.stdout or '').strip():
+            # ops #950 follow-up: docker exec printed nothing, so the container is not running (a restart
+            # loop on a doubled hls key). The heal inside it cannot run: fix /mediamtx.yml from outside.
+            fixed = _cloudtak_media_repair_outside(media, plog=plog)
+            if fixed != 'fixed':
+                if fixed == 'fine':
+                    _log("  ⚠ cloudtak-media is not running but its /mediamtx.yml is correct: another cause, not healed")
+                return False
+            for _ in range(30):
+                if _ct_media_state(media)[0] == 'running':
+                    break
+                time.sleep(1)
+            cur = subprocess.run(
+                _sudo_wrap(['docker', 'exec', '-i', media, 'sh']),
+                input=_CT_MEDIA_CHECK_SH, capture_output=True, text=True, timeout=25)
+            if _ct_media_converged(cur.stdout):
+                return True  # the repair restarted it and nothing else drifted
         if _ct_media_converged(cur.stdout):
             return True  # already converged — no restart
         ap = subprocess.run(

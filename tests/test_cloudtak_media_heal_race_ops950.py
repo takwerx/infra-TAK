@@ -198,7 +198,7 @@ def _remote_cmd(tmp_path, apply_mode):
         n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_cloudtak_media_hls_heal'))
     sent = []
     import base64 as _b
-    ns = {'_b64': _b, '_CT_MEDIA_CHECK_SH': 'echo check', '_CT_MEDIA_APPLY_SH': 'echo apply',
+    ns = {'_b64': _b, '_CT_MEDIA_CHECK_SH': 'echo check', '_CT_MEDIA_APPLY_SH': 'echo apply', '_CT_MEDIA_OUTSIDE_SH': 'echo outside',
           '_ssh_probe': lambda cfg, cmd, timeout=0: sent.append(cmd) or (True, ''),
           '_ct_media_converged': lambda o: False, 'time': types.SimpleNamespace(sleep=lambda s: None)}
     exec(compile(src, 'app.py', 'exec'), ns)
