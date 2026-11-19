@@ -1,0 +1,42 @@
+name: ETL catalog freshness
+
+# ops #977. Is the ETL catalog bundled in infra-TAK (modules/etlrunner/catalog.json) behind the
+# signed live one (takwerx/infratak-etl-catalog, main)?
+#
+# A box uses the bundled copy when it cannot fetch the live one. Before PR 576 it sat 20 hours
+# behind. This job fetches the live catalog.json and catalog.json.sig, checks the signature with
+# modules/etlrunner/catalog_signing.pub, and goes red when the live serial is newer than the
+# bundled serial (tools/etl_catalog_freshness.py has the exit codes).
+#
+# Weekly on purpose, and NOT a pull_request check: the live catalog moves on its own, so a PR
+# check would turn every open PR red for something the PR did not do.
+#
+# The fix when it is red: copy catalog.json as it is on catalog main into
+# modules/etlrunner/catalog.json and open a PR to dev. This is the last step of every
+# signed-catalog PR. Tests that name an ETL version must ask for "at least X", never an exact pin.
+#
+# Public repo, GitHub-hosted runner, no secrets, read-only token: no cost.
+
+on:
+  schedule:
+    - cron: '17 15 * * 1'   # Mondays, 8:17 AM PT (7:17 AM in winter)
+  workflow_dispatch:
+
+concurrency:
+  group: etl-catalog-freshness
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  freshness:
+    name: bundled catalog vs live catalog
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Compare serials
+        run: python3 -I tools/etl_catalog_freshness.py
