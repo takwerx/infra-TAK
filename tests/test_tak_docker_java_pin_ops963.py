@@ -4,8 +4,8 @@ Dockerfile.hardened-takserver pins one exact Temurin build:
 
     ARG BASE_DEPLOY_TAG=17.0.19_10-jdk-ubi10-minimal
 
-`docker build --pull` refreshes a mutable tag, never an exact pin, so the November 2026
-Java security fix (Temurin 17.0.21+9) never reached a Docker TAK box. _patch_tak_hardened_java_pin
+`docker build --pull` refreshes a mutable tag, never an exact pin, so no newer Java ever
+reached a Docker TAK box (17.0.19 is April 2026; Temurin 17.0.21+9 is October 2026). _patch_tak_hardened_java_pin
 moves that one line up to _TEMURIN17_FIXED_TAG on every build path. It must touch nothing else,
 leave a newer pin, another major or another image alone, and be a no-op the second time.
 
@@ -90,9 +90,10 @@ def test_second_run_is_a_noop(tmp_path):
     assert _read(tmp_path) == once
 
 
-def test_fixed_tag_is_the_november_security_build_and_not_older_than_shipped():
+def test_fixed_tag_is_the_newest_known_build_and_newer_than_shipped():
     ns = _consts()
     key = _patcher()[1]['_temurin_tag_key']
+    # Bump with the one constant when Docker Hub lists 17.0.21.1_2-jdk-ubi10-minimal (Adoptium's Nov 18 build).
     assert ns['_TEMURIN17_FIXED_TAG'] == '17.0.21_9-jdk-ubi10-minimal'
     assert key(ns['_TEMURIN17_FIXED_TAG']) > key('17.0.20.1_1-jdk-ubi10-minimal') > key('17.0.19_10-jdk-ubi10-minimal')
 

@@ -3652,11 +3652,14 @@ def _patch_tak_dockerfile_cacerts(build_ctx, app_dockerfile, log_fn=None):
 # ops #963 — TAK's 5.8 hardened bundle pins its Java in one line of Dockerfile.hardened-takserver:
 #     ARG BASE_DEPLOY_TAG=17.0.19_10-jdk-ubi10-minimal
 # (verified in takserver-docker-hardened-5.8-RELEASE-75.zip, 2026-11-19). `docker build --pull`
-# refreshes a MUTABLE tag, but a pin to one exact Temurin build never moves, so a TAK Server
-# built from this bundle ran Java 17.0.19 after the November 2026 security fix (17.0.21+9,
-# Docker Hub tag published 2026-11-18) with nothing on the box to say so. This is the one fleet
-# constant: bump it when Temurin publishes the next 17 security build, and a test pins it.
-# https://hub.docker.com/_/eclipse-temurin/tags?name=17.0.21_9-jdk-ubi10-minimal
+# refreshes a MUTABLE tag, but a pin to one exact Temurin build never moves, so a TAK Server built
+# from this bundle stays on Java 17.0.19 (April 2026) with nothing on the box to say so.
+# This constant is the newest Temurin 17 jdk-ubi10-minimal tag on Docker Hub. 17.0.21_9 is the
+# October 2026 release (Adoptium 2026-10-22). Adoptium's November 18 build, 17.0.21.1+2, has no
+# eclipse-temurin tag yet (checked 2026-11-19): bump this one constant to its
+# 17.0.21.1_2-jdk-ubi10-minimal tag when Docker Hub lists it. A test pins the value.
+# https://hub.docker.com/_/eclipse-temurin/tags?name=17.0.21
+# https://adoptium.net/temurin/release-notes/?version=jdk-17.0.21.1+2
 _TEMURIN17_FIXED_TAG = '17.0.21_9-jdk-ubi10-minimal'
 _TEMURIN_JDK_TAG_RE = re.compile(r'(\d+(?:\.\d+){1,3})_(\d+)-jdk-ubi10-minimal')
 _TEMURIN_PIN_LINE_RE = re.compile(
@@ -3711,7 +3714,7 @@ def _patch_tak_hardened_java_pin(build_ctx, app_dockerfile, log_fn=None):
         _log(f"  (could not patch {os.path.basename(app_dockerfile)}: {str(e)[:120]} — building as shipped)")
         return False
     _log(f"  Patched {os.path.basename(app_dockerfile)}: Java base {old_tags[0]} → {_TEMURIN17_FIXED_TAG} "
-         "(TAK pins an exact Temurin build, so the security fix would never arrive).")
+         "(TAK pins an exact Temurin build, so a newer Java would never arrive on its own).")
     return True
 
 
