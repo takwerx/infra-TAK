@@ -234,6 +234,7 @@ class FakeDocker:
         self.up_rc, self.ready = up_rc, ready
         self.cid = 'cid1' if running_container else ''
         self.calls, self.pulls = [], []
+        self.recycle_requests = []    # GH #549: TAK LDAP heal requests made
 
     def pull(self, compose_yml, cwd, plog, timeout=0, label='', services=None, **kw):
         self.pulls.append((cwd, services))
@@ -286,7 +287,8 @@ def _run_converge(fake, stacks=None, dirs=('~/authentik',)):
                                    isdir=lambda p: p.replace('/home/t', '~') in dirs)),
          'subprocess': types.SimpleNamespace(run=fake.run),
          '_sudo_wrap': lambda argv: ['BROKER'] + list(argv),
-         '_docker_compose_pull': fake.pull, '_authentik_compose_lock': fake_lock}
+         '_docker_compose_pull': fake.pull, '_authentik_compose_lock': fake_lock,
+         '_tak_ldap_recycle_request': lambda reason, *a, **k: fake.recycle_requests.append(reason)}
     src = '\n'.join([_const('POSTGRES_SECURITY_RELEASES'), _const('POSTGRES_COMPOSE_STACKS')]
                     + [_cut(f) for f in CONVERGE_FUNCS])
     exec(compile(src, 'app.py', 'exec'), n)
@@ -302,6 +304,25 @@ def test_old_database_container_is_pulled_and_recreated_when_the_pull_brings_a_n
     assert fake.recreates == [['docker', 'compose', 'up', '-d', '--no-deps', 'postgresql']]
     assert locks == ['postgres-security-update']      # Authentik: under its compose lock
     assert any('now runs PostgreSQL 16.16' in l for l in logs)
+
+
+def test_gh549_authentik_database_recreate_asks_for_a_tak_ldap_heal():
+    # field, v10.4.0: the recreate restarted authentik-server and the LDAP outpost ~90 s later
+    # under a running TAK, with no heal asked for; Data Sync lost its groups for 2.5 h.
+    fake = FakeDocker(pull_brings=('sha256:new', '16.16'))
+    res, _, _ = _run_converge(fake)
+    assert res == {'authentik': 'fixed'}
+    assert fake.recycle_requests == ['Authentik database recreated (PostgreSQL security update)']
+
+
+def test_gh549_other_database_recreates_and_no_ops_ask_for_no_tak_ldap_heal():
+    fake = FakeDocker(running=('sha256:old', '17.11'), tag=('sha256:old', '17.11'), pull_brings=('sha256:n', '17.12'))
+    res, _, _ = _run_converge(fake, dirs=('~/CloudTAK',))
+    assert res == {'cloudtak': 'fixed'} and fake.recycle_requests == []
+    for fake in (FakeDocker(running=('sha256:new', '16.16'), tag=('sha256:new', '16.16')),
+                 FakeDocker(pull_brings=('sha256:old', '16.15'))):
+        _run_converge(fake)
+        assert fake.recycle_requests == []
 
 
 def test_pull_that_finds_nothing_newer_recreates_nothing():

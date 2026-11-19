@@ -1889,8 +1889,8 @@ MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_edit
 # The tag picks the release; MEDIAMTX_EDITOR_SHA is what every fetch is checked against.
 # Bump both together, only after the editor release is box-tested. tests/test_pinned_third_party_ops637.py
 # fails if either goes back to a branch name.
-MEDIAMTX_EDITOR_REF = "v2.1.16"
-MEDIAMTX_EDITOR_SHA = "8d76bbec0c93804e0c7a5317cdeec18c28945f68"  # COMMIT of tag v2.1.16 (git rev-parse v2.1.16^{commit}; v2.1.16 is an annotated tag, so rev-parse v2.1.16 gives the tag object d8fde95 and raw.githubusercontent answers 404 for it). v2.1.15 added hashed passwords + a random first login (ops #877)
+MEDIAMTX_EDITOR_REF = "v2.1.17"
+MEDIAMTX_EDITOR_SHA = "af22db792889a0c93c24e52d6f69099afd676490"  # COMMIT of tag v2.1.17 (git rev-parse v2.1.17^{commit}; v2.1.17 is an annotated tag, so rev-parse v2.1.17 gives the tag object abf1281 and raw.githubusercontent answers 404 for it). v2.1.17 adds the share-link player start fix (mediamtx-installer PR 54, ops #900/#940); v2.1.15 added hashed passwords + a random first login (ops #877)
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
 # The local editor unit's pre-start line that runs the script below (dash: best-effort).
 _MEDIAMTX_EDITOR_PRESTART = 'ExecStartPre=-/usr/bin/python3 /opt/mediamtx-webeditor/ensure_overlay.py'
@@ -29930,6 +29930,9 @@ def _postgres_compose_converge(log, stacks=POSTGRES_COMPOSE_STACKS):
                         out[key] = 'waiting'
                         continue
                     r = _pg_run(argv, timeout=240, cwd=stack_dir)
+                # GH #549: a new database restarts authentik-server and the LDAP outpost (~90 s
+                # later) under a running TAK Server, so TAK's clients need the LDAP heal too.
+                _tak_ldap_recycle_request('Authentik database recreated (PostgreSQL security update)')
             else:
                 r = _pg_run(argv, timeout=240, cwd=stack_dir)
             if r.returncode != 0:
@@ -76071,6 +76074,22 @@ def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label, tag='p
 _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S = 300
 _TAK_RECYCLE_8089_TIMEOUT_S = 900       # Guard Dog's MAX_WAIT_TAK
 _TAK_RECYCLE_API_TIMEOUT_S = 300        # Guard Dog's api wait (_MAX_API)
+# GH #549: TAK's HTTPS side (groups/all, so ATAK Data Sync and CloudTAK) can stay without
+# groups after an LDAP outage while every 8089 client keeps its groups. ops #316 saw it come
+# back by itself in 75-204 s; the field (v10.4.0 Update Now) saw it stay broken 2.5 h, with
+# Data Sync feeds "removed" on every ATAK, until a TAK restart. So with clients connected the
+# heal keeps re-checking on every monitor tick, and restarts TAK once it has been broken this
+# long: broken Data Sync for everyone is worse than one reconnect.
+_TAK_HTTPS_BROKEN_RESTART_S = 900
+# GH #549: at box boot TAK and the outpost start together, so the outpost-start test above
+# never fires, and a TAK that came up while Authentik answered 502 was never checked. Once
+# per TAK start, this long after it, the HTTPS side is checked once (one login, quiet if OK).
+_TAK_BOOT_HTTPS_CHECK_AFTER_S = 600
+# GH #549: before the update's final heal, Authentik's database, server and LDAP outpost must
+# all be running, healthy and not restarted for this long. Field: a database recreate restarted
+# server and outpost 97 s later, after the final heal had already looked and found nothing.
+_AK_SETTLE_STABLE_S = 180
+_AK_SETTLE_TIMEOUT_S = 900
 _tak_ldap_recycle_lock = threading.Lock()
 
 
@@ -76905,6 +76924,36 @@ def _console_update_in_progress():
         return False
 
 
+def _tak_https_broken_alert(plog, outcome, detail):
+    """GH #549: Guard Dog says that the console restarted TAK Server because its HTTPS side
+    (ATAK Data Sync, CloudTAK) kept giving users no groups. Activity log line always, email
+    when a recipient is set. Never raises."""
+    when = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        line = ' '.join(f"{when} | tak-ldap-heal | {outcome} | {detail}".split())
+        _write_priv('/var/log/takguard/restarts.log', line + '\n', mode='a')
+    except Exception as e:
+        plog(f"  TAK LDAP recycle: Guard Dog activity line not written: {str(e)[:120]}")
+    try:
+        settings = load_settings()
+        to_addr = (settings.get('guarddog_alert_email') or '').strip()
+        if not to_addr:
+            plog("  TAK LDAP recycle: Guard Dog alert email SUPPRESSED (no recipient configured)")
+            return
+        ident = _guarddog_server_identifier(settings) or socket.gethostname()
+        subj = f"⚠ TAK Server restarted: Data Sync had no groups ({ident})"
+        body = (f"TAK Server's HTTPS side gave users no groups for over "
+                f"{_TAK_HTTPS_BROKEN_RESTART_S // 60} minutes after Authentik's LDAP was restarted. "
+                f"While that lasts, ATAK shows Data Sync feeds as removed and CloudTAK shows empty "
+                f"mission lists.\n\nThe console restarted TAK Server to fix it. Connected clients "
+                f"reconnected by themselves.\n\nResult: {outcome}\nDetail: {detail}\n\n"
+                f"If Data Sync still shows no feeds, open the TAK Server page and restart TAK Server."
+                f"\n\nConsole: {ident}\n\n— Guard Dog")
+        _guarddog_send_alert_email_via_relay(to_addr, subj, body)
+    except Exception as e:
+        plog(f"  TAK LDAP recycle: Guard Dog alert email failed: {str(e)[:120]}")
+
+
 def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=False):
     """Once LDAP is healthy again after TAK Server ran through an LDAP outage (see above),
     give its client connections their groups back without a restart
@@ -76928,7 +76977,7 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         need_groups = bool(st.get('need_groups', True)) if pending else True
         must_restart = False
 
-        def _finish(outcome, keep=None, healed_ldap_start=None, healed_gd_restart=None):
+        def _finish(outcome, keep=None, healed_ldap_start=None, healed_gd_restart=None, https_broken_since=None):
             try:
                 s = load_settings()
                 cur = dict(s.get('tak_ldap_recycle') or {})
@@ -76937,10 +76986,14 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                     cur['requested_epoch'] = max(float(cur.get('requested_epoch') or 0), time.time())
                     cur.setdefault('need_groups', need_groups)
                     cur['restart'] = bool(cur.get('restart') or must_restart)
-                elif float(cur.get('requested_epoch') or 0) <= req_at:
-                    # a request made while we worked stays pending for the next caller
-                    for k in ('pending', 'requested_epoch', 'need_groups', 'restart'):
-                        cur.pop(k, None)
+                    if https_broken_since is not None:
+                        cur['https_broken_since'] = https_broken_since
+                else:
+                    cur.pop('https_broken_since', None)   # GH #549: settled one way or the other
+                    if float(cur.get('requested_epoch') or 0) <= req_at:
+                        # a request made while we worked stays pending for the next caller
+                        for k in ('pending', 'requested_epoch', 'need_groups', 'restart'):
+                            cur.pop(k, None)
                 if healed_ldap_start is not None:
                     cur['healed_ldap_start'] = healed_ldap_start
                 if healed_gd_restart is not None:
@@ -76985,6 +77038,31 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                     and gd_restart > float(st.get('healed_gd_restart') or 0) + 1):
                 up = int(gd_restart - tak_start)
                 reasons.append(f"Guard Dog restarted Authentik while TAK Server was running (TAK up {up // 3600}h{up % 3600 // 60:02d}m at the time)")
+        # GH #549 (box boot): TAK and the local outpost started within the window above, so
+        # neither start counts as an outage, and a TAK that came up while Authentik answered
+        # 502 was never looked at. Once per TAK start, after it has settled: one HTTPS login.
+        if (check_outpost and not reasons and ldap_start is not None
+                and abs(ldap_start - tak_start) < _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S
+                and time.time() - tak_start >= _TAK_BOOT_HTTPS_CHECK_AFTER_S
+                and abs(float(st.get('boot_checked_tak_start') or 0) - tak_start) > 1
+                and (final or not _console_update_in_progress())):
+            try:
+                s = load_settings()
+                cur = dict(s.get('tak_ldap_recycle') or {})
+                cur['boot_checked_tak_start'] = tak_start
+                s['tak_ldap_recycle'] = cur
+                save_settings(s)
+            except Exception:
+                pass
+            boot_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+            if boot_pass and _ensure_ldapsearch():
+                try:
+                    boot_verdict, _boot_summary = _tak_api_user_check(plog, tag, boot_pass, wait_s=0)
+                except Exception:
+                    boot_verdict = 'unknown'
+                if boot_verdict == 'broken':
+                    reasons.append("TAK Server started together with Authentik (box boot) and its HTTPS "
+                                   "side gives users no groups")
         reasons = list(dict.fromkeys(reasons))   # a kept reason is also found again above
         if not reasons:
             if pending:
@@ -77040,6 +77118,15 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 verdict, summary = _tak_heal_ldap_sessions(plog, tag, ldap_pass)
             except Exception as e:
                 verdict, summary = 'unknown', f"client heal error: {str(e)[:120]}"
+        escalated = False
+
+        def _alert(result):
+            if escalated:
+                try:
+                    _tak_https_broken_alert(plog, result, summary)
+                except Exception:
+                    pass
+
         if verdict in ('ok', 'healed'):
             # ops #316: a restart drops every connected client to fix the HTTPS side alone, and
             # on test6 that side came back by itself 75-204 s after an outpost restart (the
@@ -77065,16 +77152,28 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             if grouped != 0:
                 who = (f"{grouped} connected client(s) have their groups" if grouped
                        else "TAK's client list can't be read")
-                plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side still gives users no groups: {api_summary}. "
-                     f"TAK Server NOT restarted: {who}, and a restart would drop them all. ATAK Data Sync and "
-                     f"CloudTAK may show empty mission lists until it recovers; if they still do, restart TAK "
-                     f"Server at a quiet moment")
-                _finish(outcome + ' (HTTPS still broken, clients kept)',
-                        healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
-                return False
-            plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side is broken: {api_summary}. ATAK Data Sync and "
-                 f"CloudTAK get no groups (empty mission lists, 403 on create) until TAK Server restarts")
-            summary = f"HTTPS/API side gives users no groups ({api_summary}); no connected clients to drop"
+                # GH #549: never marked healed while broken. Kept pending, so every monitor tick
+                # checks again; once broken this long, TAK is restarted after all.
+                since = float(st.get('https_broken_since') or 0) or time.time()
+                broken_for = time.time() - since
+                if broken_for < _TAK_HTTPS_BROKEN_RESTART_S:
+                    plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side still gives users no groups: {api_summary}. "
+                         f"TAK Server NOT restarted yet: {who}, and a restart would drop them all. ATAK Data "
+                         f"Sync and CloudTAK may show empty mission lists until it recovers. Checked again every "
+                         f"10 min; TAK Server is restarted if it is still broken "
+                         f"{_TAK_HTTPS_BROKEN_RESTART_S // 60} min after it was first seen")
+                    _finish(outcome + ' (HTTPS still broken, clients kept, re-checking)', keep=reasons,
+                            https_broken_since=since)
+                    return False
+                escalated = True
+                plog(f"  ✗ {tag}: TAK's HTTPS/API side still gives users no groups after "
+                     f"{int(broken_for // 60)} min: {api_summary}. ATAK Data Sync and CloudTAK are broken for "
+                     f"everyone, which is worse than one reconnect — restarting TAK Server ({who})")
+                summary = f"HTTPS/API side gave users no groups for {int(broken_for // 60)} min ({api_summary})"
+            else:
+                plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side is broken: {api_summary}. ATAK Data Sync and "
+                     f"CloudTAK get no groups (empty mission lists, 403 on create) until TAK Server restarts")
+                summary = f"HTTPS/API side gives users no groups ({api_summary}); no connected clients to drop"
 
         native = not _tak_is_container()
         plog(f"  {tag}: {summary} — {'restarting' if must_restart else 'falling back to restarting'} TAK Server "
@@ -77086,12 +77185,14 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=240)
             if r.returncode != 0:
                 plog(f"  ✗ {tag}: TAK Server restart failed: {((r.stderr or '') + (r.stdout or '')).strip()[-300:]}")
+                _alert('TAK Server restart FAILED, restart it by hand')
                 _finish('restart failed', keep=reasons)
                 return False
         except subprocess.TimeoutExpired:
             plog(f"  {tag}: restart command still running after 240s — waiting for the ports")
         ready = _tak_wait_ready(plog, tag)
         if not ready:
+            _alert('TAK Server restarted, but its ports were not up in time')
             _finish('restarted, ports not up in time')
             return True
         plog(f"  ✓ {tag}: TAK Server restarted after LDAP settled; clients reconnect and get their groups back")
@@ -77101,13 +77202,16 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
         if api_verdict == 'ok':
             plog(f"  ✓ {tag}: after the restart: {api_summary}")
+            _alert('TAK Server restarted; users have their groups again')
             _finish('restarted')
         elif api_verdict == 'unknown':
             plog(f"  {tag}: after the restart, HTTPS/API side NOT checked: {api_summary}")
+            _alert('TAK Server restarted; the HTTPS side could not be checked after it')
             _finish('restarted (HTTPS not checked)')
         else:
             plog(f"  ✗ {tag}: STILL BROKEN after the TAK Server restart: {api_summary}. Not restarting again — "
                  f"check CoreConfig's <ldap> settings and the LDAP outpost, then restart TAK Server by hand")
+            _alert(f'TAK Server restarted, but users STILL get no groups: {api_summary}')
             _finish('restarted, HTTPS still broken')
         return True
 
@@ -77115,6 +77219,55 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
 def _ak_ldap_path_starts():
     """Start times of the containers TAK's LDAP lookups go through (outpost, server)."""
     return tuple(_docker_started_epoch(c) for c in ('authentik-ldap-1', 'authentik-server-1'))
+
+
+def _ak_ldap_path_wait_settled(plog):
+    """GH #549: wait until Authentik's database, server and LDAP outpost all run, are healthy
+    (when they have a healthcheck) and none restarted in the last `_AK_SETTLE_STABLE_S`, at
+    most `_AK_SETTLE_TIMEOUT_S`. Field (v10.4.0 Update Now): a database recreate restarted the
+    server and the outpost 97 s later, after the update's final heal had looked and found
+    nothing. No local outpost (remote Authentik, not installed): returns at once.
+    True when settled, False on the time limit."""
+    names = ('authentik-postgresql-1', 'authentik-server-1', 'authentik-ldap-1')
+    fmt = '{{.State.Running}} {{.State.StartedAt}} {{if .State.Health}}{{.State.Health.Status}}{{end}}'
+    t0, said = time.time(), False
+    while True:
+        states = {}
+        for c in names:
+            try:
+                r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', fmt, c]),
+                                   capture_output=True, text=True, timeout=10)
+                states[c] = (r.stdout or '').split() if r.returncode == 0 else None
+            except Exception:
+                states[c] = None
+        if not states['authentik-ldap-1']:
+            return True
+        now = time.time()
+        waiting = []
+        for c, parts in states.items():
+            if not parts:
+                continue                     # not on this box (e.g. an external database)
+            if parts[0] != 'true':
+                waiting.append(f'{c} not running')
+                continue
+            started = _epoch_from_rfc3339(parts[1]) if len(parts) > 1 else None
+            health = parts[2] if len(parts) > 2 else ''
+            if health and health != 'healthy':
+                waiting.append(f'{c} {health}')
+            elif started is None or now - started < _AK_SETTLE_STABLE_S:
+                waiting.append(f"{c} started {int(now - started) if started else '?'}s ago")
+        if not waiting:
+            if said:
+                plog(f"  Authentik settled after {int(now - t0)}s — checking TAK Server's clients now")
+            return True
+        if now - t0 >= _AK_SETTLE_TIMEOUT_S:
+            plog(f"  ✗ Authentik not settled after {int(now - t0)}s ({'; '.join(waiting)}) — checking "
+                 f"TAK Server's clients anyway")
+            return False
+        if not said:
+            plog(f"  waiting for Authentik to settle before checking TAK Server's clients: {'; '.join(waiting)}")
+            said = True
+        time.sleep(10)
 
 
 def _authentik_reconfigure_heal_tak_clients(plog, before=None):
@@ -119292,6 +119445,19 @@ def _post_update_auto_deploy():
             except Exception as _mtx_f2b_err:
                 print(f"Post-update: MediaMTX Fail2ban setup skipped: {_mtx_f2b_err}")
 
+            # GH #549: Authentik's database first, before the Reconfigure. Recreating it restarts
+            # authentik-server and the LDAP outpost ~90 s later; run last (as before) those
+            # restarts landed after the final TAK client heal had looked. The later converge
+            # below then finds Authentik's database fixed and leaves it alone.
+            try:
+                _ak_pg_log = lambda m: print(f"Post-update: {m}", flush=True)
+                _ak_pg = _postgres_compose_converge(
+                    _ak_pg_log, stacks=[(k, l, d, sv) for k, l, d, sv in POSTGRES_COMPOSE_STACKS if k == 'authentik'])
+                if (_ak_pg or {}).get('authentik') in ('fixed', 'failed'):
+                    _ak_ldap_path_wait_settled(_ak_pg_log)
+            except Exception as _akpge:
+                print(f"Post-update: Authentik database security update error (non-fatal): {_akpge}", flush=True)
+
             # CloudTAK is independent (talks to TAK Server, not Authentik) — start it early
             cloudtak_t = threading.Thread(target=_auto_cloudtak, daemon=True)
             cloudtak_t.start()
@@ -119858,6 +120024,12 @@ def _post_update_auto_deploy():
             # update, the one-time catch-up for boxes already on v10.2.23), heal TAK's clients
             # once LDAP is settled: clients that connected during the outage hold empty groups
             # until they are looked up again. TAK restart only as the fallback.
+            # GH #549: first let Authentik settle, so a late knock-on restart (a database
+            # recreate restarts server and outpost ~90 s later) is seen by this check.
+            try:
+                _ak_ldap_path_wait_settled(lambda m: print(f"Post-update:{m}", flush=True))
+            except Exception as _ase:
+                print(f"Post-update: Authentik settle wait error (non-fatal): {_ase}", flush=True)
             try:
                 _tak_recycle_after_ldap_outage(lambda m: print(f"Post-update:{m}", flush=True),
                                                'end of console update', check_outpost=True, final=True)
