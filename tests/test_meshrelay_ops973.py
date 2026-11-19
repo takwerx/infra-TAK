@@ -125,6 +125,8 @@ class Box:
             '_deregister_authentik_proxy_app': lambda *a, **k: True,
             '_get_service_domain': lambda s, k: 'meshrelay.example.test',
             'meshrelay_fetch': self.fetch,
+            '_f2b_arm_meshrelay_jail': lambda plog=None: (self.fw.append(('jail', 'arm')) or (True, 'armed')),
+            '_f2b_disarm_meshrelay_jail': lambda: (self.fw.append(('jail', 'disarm')) or (True, 'removed')),
         }
 
     def cmds(self):
@@ -520,3 +522,56 @@ def test_failed_health_check_after_update_rolls_back(box, monkeypatch):
 def test_ptt_server_unit_name_is_written_by_module_code_the_broker_scan_sees():
     src = (REPO / 'modules/meshrelay.py').read_text()
     assert '/etc/systemd/system/ptt-server.service' in src
+
+
+# ── the phone-login jail (phones never touch Caddy, so a Caddy-log jail could not see them) ──
+
+def _jail_regexes():
+    m = re.search(r"'meshrelay-auth': \(\n(.*?)\n    \),", APP, re.S)
+    assert m, 'meshrelay-auth filter missing from _F2B_OWNED_FILTERS'
+    ns = {}
+    exec('F = (' + m.group(1) + ')', ns)
+    text = ns['F']
+    rx = re.search(r'failregex = (.*?)\nignoreregex', text, re.S).group(1)
+    pats = [ln.strip() for ln in rx.splitlines() if ln.strip()]
+    return text, [re.compile(p.replace('<HOST>', r'(?P<host>\d{1,3}(?:\.\d{1,3}){3})')) for p in pats]
+
+
+@pytest.mark.parametrize('line,host', [
+    ('2026/11/19 12:00:00 Auth failed: unknown user bob from 203.0.113.9:40001', '203.0.113.9'),
+    ('2026/11/19 12:00:00 Auth failed: wrong password for user alice from 203.0.113.9:40001', '203.0.113.9'),
+    ('2026/11/19 12:00:00 JOIN rejected: bob from 198.51.100.4:5000 (not authenticated)', '198.51.100.4'),
+    # a hostile name: the address is still the LAST one on the line
+    ('2026/11/19 12:00:00 Auth failed: unknown user x from 8.8.8.8:1 from 203.0.113.9:40001', '203.0.113.9'),
+    ('2026/11/19 12:00:00 JOIN rejected: x from 8.8.8.8:1 (not authenticated) from 198.51.100.4:7 (not authenticated)', '198.51.100.4'),
+])
+def test_phone_login_filter_matches_failures_and_takes_the_real_address(line, host):
+    _, rxs = _jail_regexes()
+    hits = [m.group('host') for r in rxs for m in [r.search(line)] if m]
+    assert hits == [host]
+
+
+@pytest.mark.parametrize('line', [
+    '2026/11/19 12:00:00 Auth (challenge-response) success: user bob from 203.0.113.9:40001',
+    '2026/11/19 12:00:00 Auth challenge sent to 203.0.113.9:40001 for user bob',
+    '2026/11/19 12:00:00 Auth failed: unknown user bob from 203.0.113.9:40001 and more',
+    '2026/11/19 12:00:00 JOIN ok: bob from 203.0.113.9:40001',
+])
+def test_phone_login_filter_ignores_success_and_trailing_text(line):
+    _, rxs = _jail_regexes()
+    assert not [r for r in rxs if r.search(line)]
+
+
+def test_phone_login_jail_reads_the_journal_and_bans_only_the_phone_port():
+    body = APP[APP.index('def _f2b_arm_meshrelay_jail'):APP.index('def _f2b_disarm_meshrelay_jail')]
+    assert 'backend  = systemd' in body and '_SYSTEMD_UNIT=ptt-server.service' in body
+    assert 'protocol=udp' in body and 'port=\\"5000\\"' in body
+    assert 'allports' not in body                    # never cut the TAK stack or the console
+    assert "'fail2ban-client', 'status', 'meshrelay-auth'" in body      # proves it loaded
+
+
+def test_deploy_arms_the_jail_and_uninstall_removes_it(box):
+    _run_deploy(box)
+    assert ('jail', 'arm') in box.fw
+    M.uninstall(box.ctx(), {}, {})
+    assert ('jail', 'disarm') in box.fw

@@ -20475,6 +20475,7 @@ def guarddog_page():
         {'id': 'takportal', 'name': 'TAK Portal', 'monitored': modules.get('takportal', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'takportal_ctr', 'interval': '1 min', 'desc': 'Checks TAK Portal container is running. Alert and auto-restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (GET /login on port 3100). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'meshrelay', 'name': 'MeshRelay', 'monitored': modules.get('meshrelay', {}).get('installed'), 'monitors': [{'name': 'Service / login / dashboard', 'id': 'meshrelay_http', 'interval': '1 min', 'desc': 'Checks the ptt-server service is running, the dashboard answers on its loopback port, and config.json still requires a login (auth_enabled true). Fails if anyone turns the login off.'}]},
         {'id': 'simulator', 'name': 'TAK Simulator', 'monitored': modules.get('simulator', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'simulator_ctr', 'interval': '1 min', 'desc': 'Checks the tak-simulator container is running (liveness only). A scenario that is not running is normal and never alerts.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': "Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops. Also repairs CloudTAK by itself when it was recreated without the infra-TAK settings (e.g. by a TAK Portal marketplace install), at most 3 times an hour; emails only if that repair does not work."}]},
@@ -22883,6 +22884,20 @@ def _f2b_selfheal_sshd_backend(plog=None):
 # the jail as configured. A security control that cannot fire must never be
 # reachable by a code path that leaves no trace.
 _F2B_OWNED_FILTERS = {
+    'meshrelay-auth': (
+        "[Definition]\n"
+        "# ops #973 — MeshRelay phone logins. Read from the app's own source (server.go, v4.6.0):\n"
+        "#     Auth failed: unknown user NAME from 1.2.3.4:5000\n"
+        "#     Auth failed: wrong password for user NAME from 1.2.3.4:5000\n"
+        "#     JOIN rejected: NAME from 1.2.3.4:5000 (not authenticated)\n"
+        "# Phones talk UDP straight to the app (no proxy), so this is the real client address.\n"
+        "# NAME is typed by the sender and can contain anything, so the address is taken from the\n"
+        "# END of the line: the app writes it last and the pattern is anchored there, so a name\n"
+        "# like 'x from 8.8.8.8:1' cannot make the jail ban someone else.\n"
+        "failregex = ^.*Auth failed: (?:unknown user|wrong password for user) .* from <HOST>:\\d+\\s*$\n"
+        "            ^.*JOIN rejected: .* from <HOST>:\\d+ \\(not authenticated\\)\\s*$\n"
+        "ignoreregex =\n"
+    ),
     'clientfeed': (
         "[Definition]\n"
         "# v10.1.77 — TAK Client Feed. The producer is _clientfeed_log_failure() in app.py,\n"
@@ -25769,6 +25784,75 @@ def _f2b_disarm_clientfeed_jail():
         return (False, 'jail removal failed: %s' % str(e)[:200])
 
 
+# ops #973 — MeshRelay phone-login jail. Fleet constants, not a UI knob. A phone that fails a
+# login 10 times in 10 minutes is a guesser; a typo or two is not.
+MESHRELAY_F2B_MAXRETRY = 10
+MESHRELAY_F2B_FINDTIME = 600
+MESHRELAY_F2B_BANTIME = 3600
+
+
+def _f2b_arm_meshrelay_jail(log_fn=None):
+    """Write the meshrelay-auth filter + jail, reload fail2ban, check it loaded. (ok, message).
+
+    Reads the ptt-server journal (no log file to prepare, no Caddy change, so nothing here can
+    stop Caddy). The ban blocks UDP 5000 only: a guesser loses the phone port, never the TAK
+    stack or the console (same reasoning as the MediaMTX jail). fail2ban missing is not an
+    error: MeshRelay works, it is just unthrottled, and the message says so."""
+    if not _f2b_is_available():
+        return (False, 'fail2ban is not installed — MeshRelay works, but repeated bad phone '
+                       'logins are not throttled. Deploy the fail2ban module to arm it.')
+    try:
+        _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+        _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+        _write_priv('/etc/fail2ban/filter.d/meshrelay-auth.conf', _F2B_OWNED_FILTERS['meshrelay-auth'])
+        guarddog_action = ""
+        if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
+            guarddog_action = "\n         infratak-guarddog"
+        jail_conf = (
+            "[meshrelay-auth]\n"
+            "enabled  = true\n"
+            "filter   = meshrelay-auth\n"
+            "backend  = systemd\n"
+            "journalmatch = _SYSTEMD_UNIT=ptt-server.service\n"
+            f"maxretry = {MESHRELAY_F2B_MAXRETRY}\n"
+            f"findtime = {MESHRELAY_F2B_FINDTIME}\n"
+            f"bantime  = {MESHRELAY_F2B_BANTIME}\n"
+            f"ignoreip = {_f2b_trusted_ignoreip()}\n"
+            "action   = iptables-multiport[name=meshrelay-udp, port=\"5000\", protocol=udp]"
+            f"{guarddog_action}\n"
+        )
+        _write_priv('/etc/fail2ban/jail.d/infratak-meshrelay-auth.conf', jail_conf)
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                           capture_output=True, text=True, timeout=45)
+        if r.returncode != 0:
+            return (False, 'jail written but fail2ban reload failed: %s' % ((r.stderr or r.stdout or '')[:160]))
+        v = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'meshrelay-auth']),
+                           capture_output=True, text=True, timeout=20)
+        if v.returncode != 0:
+            return (False, 'jail written and fail2ban reloaded, but the jail did not load: %s'
+                    % ((v.stderr or v.stdout or '')[:160]))
+        return (True, 'jail armed and loaded (%d strikes / %ds → %ds ban on UDP 5000)'
+                % (MESHRELAY_F2B_MAXRETRY, MESHRELAY_F2B_FINDTIME, MESHRELAY_F2B_BANTIME))
+    except Exception as e:
+        return (False, 'jail setup failed: %s' % str(e)[:200])
+
+
+def _f2b_disarm_meshrelay_jail():
+    """Remove the meshrelay-auth jail + filter and reload. (ok, message)."""
+    if not _f2b_is_available():
+        return (True, 'fail2ban not installed — nothing to remove')
+    try:
+        removed = _f2b_remove_jail('infratak-meshrelay-auth.conf', 'MeshRelay uninstalled')
+        fpath = '/etc/fail2ban/filter.d/meshrelay-auth.conf'
+        if _exists_priv(fpath):
+            subprocess.run(_sudo_wrap(['rm', '-f', fpath]), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, text=True, timeout=45)
+            removed = True
+        return (True, 'jail removed' if removed else 'no jail present')
+    except Exception as e:
+        return (False, 'jail removal failed: %s' % str(e)[:200])
+
+
 # ops #638 — the console password login jail. Fleet constants, not a UI knob (same rule as
 # the clientfeed jail). The login route already answers 429 past 12 tries per 5 minutes per
 # address, so 10 failures in 10 minutes is reachable by a guesser and not by a typo or two.
@@ -27401,6 +27485,7 @@ def _guarddog_service_monitor_ids(settings):
         'takportal': ['takportal_ctr'],
         'mediamtx': ['mediamtx_svc'],
         'tak_video_restreamer': ['tvr_http'],
+        'meshrelay': ['meshrelay_http'],
         'simulator': ['simulator_ctr'],
         'nodered': ['nodered_http'],
         'cloudtak': ['cloudtak_ctr'],
@@ -27433,6 +27518,8 @@ def _guarddog_monitored_service_ids(settings):
         ids.append('tak_video_restreamer')
     if modules.get('simulator', {}).get('installed'):
         ids.append('simulator')
+    if modules.get('meshrelay', {}).get('installed'):
+        ids.append('meshrelay')
     if modules.get('nodered', {}).get('installed'):
         ids.append('nodered')
     if modules.get('cloudtak', {}).get('installed'):
@@ -28093,6 +28180,12 @@ def _monitor_health_check(monitor_id):
                 req = urllib.request.Request('http://127.0.0.1:3100/login', method='GET')
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     return resp.status == 200
+            except Exception:
+                return False
+        if monitor_id == 'meshrelay_http':
+            # ops #973: running, dashboard up, and the login still required (auth_enabled true)
+            try:
+                return bool(mod_registry.meshrelay.health(mod_registry.get_ctx())[0])
             except Exception:
                 return False
         if monitor_id == 'simulator_ctr':
@@ -122031,6 +122124,8 @@ _MODULE_CTX = {
     'audit': audit,
     '_f2b_arm_clientfeed_jail': _f2b_arm_clientfeed_jail,
     '_f2b_disarm_clientfeed_jail': _f2b_disarm_clientfeed_jail,
+    '_f2b_arm_meshrelay_jail': _f2b_arm_meshrelay_jail,
+    '_f2b_disarm_meshrelay_jail': _f2b_disarm_meshrelay_jail,
     # ATLAS MDM needs this Authentik helper, which this file
     # already defines and did not previously hand to a module.
     '_outpost_add_providers_safe': _outpost_add_providers_safe,

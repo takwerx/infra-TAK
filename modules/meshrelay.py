@@ -13,7 +13,9 @@ tests/test_meshrelay_ops973.py:
   2. The dashboard port is loopback-only behind Caddy: a firewall deny rule plus the
      check from outside. (The app has no bind option yet, so it listens on every address.)
   3. Authentik forward_auth covers the dashboard host. The phones use UDP 5000 only (the
-     web router has no route they call), so nothing the phones need sits behind it.
+     web router has no route they call), so nothing the phones need sits behind it. They
+     never touch Caddy, so their brute-force protection is a fail2ban jail on the app's own
+     journal (real UDP source address) that blocks UDP 5000 only.
   4. Pinned release, SHA-256 checked here (not only the SHA256SUMS in the release). No git
      pull, no install.sh, no setcap, no chmod o+x on a parent folder. The in-app updater
      cannot write: the binary folder is read-only to `ptt`.
@@ -491,6 +493,8 @@ def deploy(ctx, job, params):
             ctx['_ensure_authentik_meshrelay_app'](fqdn, ak_token, plog=plog, settings=s)
         else:
             plog("⚠ Authentik token not found: the dashboard stays closed (Caddy answers 503) until it is set up")
+        ok, msg = ctx['_f2b_arm_meshrelay_jail'](plog)
+        plog(f"{'✓' if ok else '⚠'} Phone-login jail: {msg}")
         host = (ctx['_get_service_domain'](s, 'meshrelay') or '').strip()
         plog(f"✅ MeshRelay {RELEASE['tag']} is running. Phones connect to UDP {PTT_PORT}.")
         if host:
@@ -615,6 +619,8 @@ def uninstall(ctx, job, params):
     steps.append('Caddy subdomain removed')
     ctx['_deregister_authentik_proxy_app'](s, 'meshrelay', 'MeshRelay Proxy')
     steps.append('Authentik proxy app deregistered')
+    ctx['_f2b_disarm_meshrelay_jail']()
+    steps.append('Phone-login jail removed')
     return {'success': True, 'steps': steps}
 
 
