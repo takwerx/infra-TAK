@@ -22,22 +22,30 @@ An agency ATLAS today has one kind of administrator: everyone in
 some actions. Authentik says *who* is a standard admin; ATLAS keeps *what* each
 one may reach.
 
-This module is the InfraTAK half, and it ships first. For each agency
-deployment it makes:
+This module is the InfraTAK half. For each deployment it makes:
 
-* **The group `atlas-<slug>-standard-admins`.** Empty, not a superuser group.
-  ⚠️ **Not bound to the application, on purpose.** Today's ATLAS does not know
-  the role. ATLAS refuses anyone outside `TAKMDM_ADMIN_GROUP` with a 403, but a
-  deployment whose `TAKMDM_ADMIN_GROUP` was left blank (W240 left it blank on
-  every non-root install for a while) admits everyone Authentik admits. Binding
-  the group now would make its members full administrators on such a box. The
-  binding is added with the ATLAS release that understands the role.
-* **A read-only roster account `atlas-roster-<slug>`.** A service account with
-  one role, `atlas-roster-<slug>`, which may only *view* this agency's two
-  groups (`authentik_core.view_group` as an object permission on each). ATLAS
-  uses its token to list who is in them, so the super admin can see and set up
-  each person before their first sign-in. The roster never grants access: ATLAS
-  still decides every request from the groups Authentik sends with it.
+* **The group `atlas-<slug>-standard-admins`** (`atlas-standard-admins` for the
+  plain deployment). Empty, not a superuser group.
+* **Its binding to the deployment's Authentik application, only once the
+  installed ATLAS is 2.3.0 or newer** (`MIN_ATLAS`). ⚠️ An older ATLAS does
+  not know the role. It refuses anyone outside `TAKMDM_ADMIN_GROUP` with a 403,
+  but a deployment whose `TAKMDM_ADMIN_GROUP` is blank (the plain deployment,
+  on purpose; W240 left it blank on every non-root install for a while) admits
+  everyone Authentik admits as a full administrator. 2.3.0 resolves the
+  standard group *before* that blank-group rule, so its members stay standard
+  admins there. The binding is checked on every update, after the rebuild, so
+  the same press that installs 2.3.0 also admits the group.
+* **A read-only roster account `atlas-roster-<slug>`** (`atlas-roster` for the
+  plain deployment). A service account with one role of the same name, which
+  may only *view* this deployment's groups (`authentik_core.view_group` as an
+  object permission on each): the agency's admin group and its standard group,
+  or for the plain deployment the standard group alone. ⚠️ Never
+  `authentik Admins`: the plain deployment's super admins are the box's
+  Authentik administrators, and the roster has no business listing them. ATLAS
+  uses the token to list who is in the groups, so the super admin can see and
+  set up each person before their first sign-in. The roster never grants
+  access: ATLAS still decides every request from the groups Authentik sends
+  with it.
 
 ⚠️ **Measured on a live box (Authentik 2026.5.6) before this was written**, with
 a temporary account set up exactly like this one: the token lists only the two
@@ -55,6 +63,7 @@ Nothing here is fatal. A deployment without the roster works exactly as before.
 
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -73,30 +82,79 @@ ENV_URL = 'TAKMDM_AUTHENTIK_URL'
 VIEW_GROUP = 'authentik_core.view_group'
 GROUP_MODEL = 'authentik_core.group'
 
+#: The first ATLAS that knows the standard role (W495). Older releases would
+#: treat the group's members as full administrators on a box whose
+#: `TAKMDM_ADMIN_GROUP` is blank, so the group is not admitted before it.
+MIN_ATLAS = (2, 3, 0)
+
+#: ⚠️ After the agency admin group, which sits at 10 (`atlas.py`). Order does
+#: not decide the outcome under `policy_engine_mode: any`; it keeps the list
+#: readable in Authentik's own UI.
+BINDING_ORDER = 20
+
 
 def names(inst):
-    """Every name this deployment's roster uses, or None for the plain deployment.
+    """Every name this deployment's roster uses.
 
-    ⚠️ **Agency deployments only.** The plain deployment has no admin group of
-    its own (it uses the global administrators), so it has no standard group
-    either until that is decided.
+    ⚠️ **The plain deployment has no `admin_group` (None).** Its super admins
+    are the box's Authentik administrators, which the roster must not read.
 
     A slug is lowercase letters only (`atlas_instances._SLUG_RE`), so
     `atlas-<slug>-standard-admins` can never equal another agency's
-    `atlas-<other>-admins`.
+    `atlas-<other>-admins`. The plain deployment's `atlas-standard-admins`
+    would equal the admin group of an agency named 'standard', so that slug is
+    reserved, and `_clashes` guards a box that already has one.
     """
     derived = atlas_instances.derive(inst)
     slug = derived['slug']
-    if not slug:
-        return None
-    account = 'atlas-roster-%s' % slug
+    account = 'atlas-roster-%s' % slug if slug else 'atlas-roster'
     return {
-        'admin_group': derived['admin_group'],
-        'standard_group': 'atlas-%s-standard-admins' % slug,
+        'admin_group': derived['admin_group'] if slug else None,
+        'standard_group': ('atlas-%s-standard-admins' % slug if slug
+                           else 'atlas-standard-admins'),
         'username': account,
         'role': account,
         'token': account + '-api',
+        'application': derived['authentik_slug'],
     }
+
+
+#: The application an agency named 'standard' would have (see `names`).
+_CLASHING_APPLICATION = atlas_instances.derive({'slug': 'standard'})['authentik_slug']
+
+
+def _clashes(api, n):
+    """True when the plain deployment's group is another deployment's admin group.
+
+    ⚠️ Only possible on a box that deployed an agency named 'standard' before
+    the slug was reserved. Setting up, or removing, `atlas-standard-admins`
+    there would act on that agency's administrators.
+    """
+    if n['admin_group'] is not None:
+        return False
+    try:
+        api.call('core/applications/%s/' % _CLASHING_APPLICATION)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        raise
+    return True
+
+
+def admits_role(installed):
+    """Does this installed ATLAS version know the standard role?
+
+    ⚠️ Unknown or unreadable means no: binding too early makes the group's
+    members full administrators on a box with a blank admin group, while
+    binding a press late only delays their first sign-in.
+    """
+    parts = str(installed or '').strip().lstrip('vV').split('.')
+    if len(parts) != 3:
+        return False
+    try:
+        return tuple(int(p) for p in parts) >= MIN_ATLAS
+    except ValueError:
+        return False
 
 
 class AuthentikAdmin:
@@ -196,6 +254,35 @@ def ensure_role(api, n, user, groups):
     return role
 
 
+def ensure_binding(api, n, group, installed):
+    """Admit the standard group to this deployment's application. A note.
+
+    ⚠️ **Bound beside the existing bindings, never instead of them**, the same
+    as the agency admin group: the ATLAS applications run with
+    `policy_engine_mode: any`, so each binding is an alternative way in.
+
+    ⚠️ **A disabled or negated binding is left alone.** Somebody switched it
+    off in Authentik, and that is their decision to undo. It is reported,
+    because its members are turned away.
+    """
+    if not admits_role(installed):
+        return ('not admitted to ATLAS: ATLAS %s predates the standard role (%s)'
+                % (installed or '(version unknown)', '.'.join(map(str, MIN_ATLAS))))
+    app = api.call('core/applications/%s/' % n['application'])
+    bindings = api.results('policies/bindings/?target=%s&page_size=100' % app['pk'])
+    ours = [b for b in bindings if str(b.get('group')) == str(group['pk'])]
+    if ours and not any(b.get('enabled', True) and not b.get('negate') for b in ours):
+        return ('bound to ATLAS, but the binding is disabled or negated in Authentik; '
+                'its members are turned away until it is re-enabled there')
+    if ours:
+        return 'admitted to ATLAS'
+    api.call('policies/bindings/', {
+        'target': app['pk'], 'group': group['pk'], 'order': BINDING_ORDER,
+        'negate': False, 'enabled': True, 'timeout': 30,
+    }, method='POST')
+    return 'admitted to ATLAS now'
+
+
 def _no_global_grant(api, role):
     """Refuse a role that can view groups model-wide, and take that grant away."""
     for row in api.results('rbac/permissions/assigned_by_roles/?model=%s'
@@ -230,8 +317,11 @@ def ensure_token(api, n, user):
     return api.call('core/tokens/%s/view_key/' % urllib.parse.quote(ident))['key']
 
 
-def ensure(ctx, inst, dirpath, write_env_value, plog, opener=None):
+def ensure(ctx, inst, dirpath, write_env_value, plog, opener=None, installed=None):
     """Set the standard group and the roster up for one deployment.
+
+    `installed` is the ATLAS version on disk, read after the rebuild; it
+    decides whether the group is admitted (`ensure_binding`).
 
     Returns ``{'env_changed': bool}``; the caller restarts `api` when it is
     true. Called after the agency admin group is reconciled, on deploy and on
@@ -239,8 +329,6 @@ def ensure(ctx, inst, dirpath, write_env_value, plog, opener=None):
     """
     nothing = {'env_changed': False}
     n = names(inst)
-    if n is None:
-        return nothing
     try:
         settings = ctx['load_settings']()
         admin = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
@@ -253,27 +341,43 @@ def ensure(ctx, inst, dirpath, write_env_value, plog, opener=None):
             plog("  ⚠ Standard admins not set up: Authentik's public name is unknown.")
             return nothing
         api = AuthentikAdmin(ctx['_get_authentik_api_url'](settings), admin, opener)
-
-        admins = _find(api, 'core/groups/', 'name', n['admin_group'])
-        if admins is None:
-            # The agency group is reconciled just before this; if it is still
-            # missing, that step already said why. Never scope a role to a
-            # group that is not there (see `ensure_role`).
-            plog('  ⚠ Standard admins not set up: the group "%s" is missing.'
-                 % n['admin_group'])
+        if _clashes(api, n):
+            plog('  ⚠ Standard admins not set up: "%s" is the admin group of the '
+                 'agency deployment "standard".' % n['standard_group'])
             return nothing
+
+        scoped = []
+        if n['admin_group'] is not None:
+            admins = _find(api, 'core/groups/', 'name', n['admin_group'])
+            if admins is None:
+                # The agency group is reconciled just before this; if it is
+                # still missing, that step already said why. Never scope a role
+                # to a group that is not there (see `ensure_role`).
+                plog('  ⚠ Standard admins not set up: the group "%s" is missing.'
+                     % n['admin_group'])
+                return nothing
+            scoped.append(admins)
         standard, group_note = ensure_group(api, n['standard_group'])
         user = ensure_account(api, n)
-        ensure_role(api, n, user, [admins, standard])
+        ensure_role(api, n, user, scoped + [standard])
         key = ensure_token(api, n, user)
 
         env = os.path.join(dirpath, '.env')
         changed = write_env_value(env, ENV_GROUP, n['standard_group'])
         changed = write_env_value(env, ENV_URL, public) or changed
         changed = write_env_value(env, ENV_TOKEN, key) or changed
-        plog('  ✓ Standard admin group "%s" %s (not yet admitted to ATLAS); '
-             'roster account %s can read it and "%s"'
-             % (n['standard_group'], group_note, n['username'], n['admin_group']))
+        readable = 'it and "%s"' % n['admin_group'] if n['admin_group'] else 'it'
+        plog('  ✓ Standard admin group "%s" %s; roster account %s can read %s'
+             % (n['standard_group'], group_note, n['username'], readable))
+        # ⚠️ Last, and on its own: `.env` is already right, so a binding that
+        # fails still leaves the roster working and is said on its own line.
+        try:
+            note = ensure_binding(api, n, standard, installed)
+            mark = ('⚠' if 'disabled or negated' in note
+                    else '✓' if note.startswith('admitted') else '·')
+            plog('  %s "%s" %s' % (mark, n['standard_group'], note))
+        except Exception as exc:
+            plog('  ⚠ "%s" not admitted to ATLAS: %s' % (n['standard_group'], str(exc)[:120]))
         return {'env_changed': changed}
     except Exception as exc:
         # Never the token: the message comes from urllib or the filesystem.
@@ -300,8 +404,6 @@ def remove(ctx, inst, opener=None):
     teardown can be put right.
     """
     n = names(inst)
-    if n is None:
-        return None
     try:
         settings = ctx['load_settings']()
         admin = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
@@ -309,6 +411,9 @@ def remove(ctx, inst, opener=None):
         if not admin:
             return None
         api = AuthentikAdmin(ctx['_get_authentik_api_url'](settings), admin, opener)
+        if _clashes(api, n):
+            return ('standard admins not removed: "%s" is the admin group of the '
+                    'agency deployment "standard"' % n['standard_group'])
         gone = []
         user = _find(api, 'core/users/', 'username', n['username'])
         if user is not None and _is_ours(user):

@@ -4951,7 +4951,11 @@ def _reconcile_roster(ctx, inst, plog):
     """
     try:
         dirpath = instance_paths(ctx, inst)['dir']
-        if atlas_roster.ensure(ctx, inst, dirpath, write_env_value, plog)['env_changed']:
+        # ⚠️ The version on disk decides whether the standard group is
+        # admitted. Every call site runs after the checkout and rebuild, so the
+        # press that installs 2.3.0 also admits it.
+        if atlas_roster.ensure(ctx, inst, dirpath, write_env_value, plog,
+                               installed=_installed_version(ctx, inst))['env_changed']:
             _compose(ctx, 'up -d api', timeout=300, inst=inst)
     except Exception as exc:
         plog('  ⚠ Could not reconcile the standard admins: %s' % str(exc)[:80])

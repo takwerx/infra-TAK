@@ -26,6 +26,7 @@ import json
 import pathlib
 import re
 import sys
+import urllib.error
 import urllib.parse
 
 import pytest
@@ -48,8 +49,19 @@ class FakeAuthentik:
         self.groups, self.users, self.tokens, self.roles = {}, {}, {}, {}
         self.object_perms = []   # (role_pk, codename, object_pk)
         self.model_perms = []    # (role_pk, codename)
+        self.applications = {}   # slug -> row
+        self.bindings = []
         self.calls = []
         self._pk = 100
+
+    def add_application(self, slug):
+        app = {'pk': 'app-%s' % slug, 'slug': slug}
+        self.applications[slug] = app
+        return app
+
+    def bindings_of(self, group_name):
+        pks = {g['pk'] for g in self.groups.values() if g['name'] == group_name}
+        return [b for b in self.bindings if b['group'] in pks]
 
     def pk(self):
         self._pk += 1
@@ -68,11 +80,25 @@ class FakeAuthentik:
         method = req.get_method()
         body = json.loads(req.data.decode()) if req.data else None
         self.calls.append((method, path, body))
+        if path.startswith('core/applications/'):
+            slug = path.split('/')[2]
+            if slug not in self.applications:
+                raise urllib.error.HTTPError(req.full_url, 404, 'Not Found', {}, None)
         out = self.handle(method, path, query, body)
         return io.BytesIO(json.dumps(out).encode() if out is not None else b'')
 
     def handle(self, method, path, query, body):
         parts = [p for p in path.split('/') if p]
+        if parts[:2] == ['core', 'applications'] and method == 'GET':
+            return self.applications[parts[2]]
+        if parts[:2] == ['policies', 'bindings']:
+            if method == 'GET':
+                return {'results': [b for b in self.bindings
+                                    if b['target'] == query.get('target')]}
+            if method == 'POST':
+                b = dict(body, pk='b%d' % self.pk())
+                self.bindings.append(b)
+                return b
         if parts[:2] == ['core', 'groups']:
             if len(parts) == 2 and method == 'GET':
                 return {'results': [g for g in self.groups.values()
@@ -172,6 +198,8 @@ class FakeAuthentik:
 def ak():
     fake = FakeAuthentik()
     fake.add_group('atlas-corona-admins', users=[1])
+    fake.add_application('atlas-corona')
+    fake.add_application('atlas')
     return fake
 
 
@@ -192,10 +220,10 @@ def _ctx(token='admin-token', domain='auth.example.com'):
     }
 
 
-def _ensure(deployment, ak, inst=CORONA, ctx=None):
+def _ensure(deployment, ak, inst=CORONA, ctx=None, installed=None):
     log = []
     result = roster.ensure(ctx or _ctx(), inst, str(deployment), atlas.write_env_value,
-                           log.append, opener=ak)
+                           log.append, opener=ak, installed=installed)
     return result, log
 
 
@@ -219,14 +247,28 @@ def test_an_agency_gets_its_own_names():
         'username': 'atlas-roster-corona',
         'role': 'atlas-roster-corona',
         'token': 'atlas-roster-corona-api',
+        'application': 'atlas-corona',
     }
 
 
-def test_the_plain_deployment_gets_nothing_and_asks_nothing(deployment, ak):
-    assert roster.names(PLAIN) is None
-    result, log = _ensure(deployment, ak, inst=PLAIN)
-    assert result == {'env_changed': False}
-    assert ak.calls == [] and log == []
+def test_the_plain_deployment_gets_its_own_names_and_no_admin_group():
+    """⚠️ Its super admins are the box's Authentik administrators: the roster
+    must never be scoped to them."""
+    assert roster.names(PLAIN) == {
+        'admin_group': None,
+        'standard_group': 'atlas-standard-admins',
+        'username': 'atlas-roster',
+        'role': 'atlas-roster',
+        'token': 'atlas-roster-api',
+        'application': 'atlas',
+    }
+
+
+def test_an_agency_named_standard_is_refused():
+    """⚠️ Its admin group would be the plain deployment's standard group."""
+    slug, error = ai.validate_slug('standard')
+    assert slug is None and 'reserved' in error
+    assert ai.derive({'slug': 'standard'})['admin_group'] == roster.names(PLAIN)['standard_group']
 
 
 def test_a_standard_group_can_never_be_another_agencys_admin_group():
@@ -271,11 +313,96 @@ def test_the_role_sees_the_two_agency_groups_and_nothing_else(deployment, ak):
     assert role['users'] == [user['pk']], 'the role is given to the account directly'
 
 
-def test_the_group_is_not_admitted_to_the_application(deployment, ak):
-    """⚠️ Not yet: a box with a blank TAKMDM_ADMIN_GROUP would make its
-    members full administrators. The binding comes with the ATLAS release."""
-    _ensure(deployment, ak)
+@pytest.mark.parametrize('installed', [None, '', '2.2.2', 'v2.2.9', '2.3', 'garbage'])
+def test_an_older_or_unknown_atlas_does_not_admit_the_group(deployment, ak, installed):
+    """⚠️ Before 2.3.0 a box with a blank TAKMDM_ADMIN_GROUP would make the
+    group's members full administrators."""
+    result, log = _ensure(deployment, ak, installed=installed)
     assert not [c for c in ak.calls if c[1].startswith(('policies', 'core/applications'))]
+    assert 'predates the standard role (2.3.0)' in log[-1]
+    assert result == {'env_changed': True}, 'the roster is still set up'
+
+
+@pytest.mark.parametrize('installed', ['2.3.0', 'v2.3.0', '2.10.1', '3.0.0'])
+def test_atlas_2_3_0_or_newer_admits_the_group_to_its_own_application(deployment, ak, installed):
+    _ensure(deployment, ak, installed=installed)
+    [binding] = ak.bindings_of('atlas-corona-standard-admins')
+    assert binding['target'] == 'app-atlas-corona', 'this deployment only'
+    assert binding['order'] == 20 and binding['enabled'] is True and binding['negate'] is False
+    assert len(ak.bindings) == 1, 'nothing else bound or replaced'
+
+
+def test_the_binding_is_made_once(deployment, ak):
+    _ensure(deployment, ak, installed='2.3.0')
+    _result, log = _ensure(deployment, ak, installed='2.3.0')
+    assert len(ak.bindings_of('atlas-corona-standard-admins')) == 1
+    assert log[-1].endswith('admitted to ATLAS')
+
+
+def test_a_disabled_binding_is_left_alone_and_reported(deployment, ak):
+    """⚠️ Somebody switched it off in Authentik; that is theirs to undo."""
+    _ensure(deployment, ak, installed='2.3.0')
+    [binding] = ak.bindings_of('atlas-corona-standard-admins')
+    binding['enabled'] = False
+    _result, log = _ensure(deployment, ak, installed='2.3.0')
+    assert len(ak.bindings) == 1 and binding['enabled'] is False
+    assert log[-1].startswith('  ⚠') and 'disabled or negated' in log[-1]
+
+
+def test_a_failed_binding_still_leaves_the_roster_working(deployment, ak):
+    del ak.applications['atlas-corona']
+    result, log = _ensure(deployment, ak, installed='2.3.0')
+    assert result == {'env_changed': True}
+    assert _env(deployment)['TAKMDM_AUTHENTIK_ROSTER_TOKEN'] == 'key-for-atlas-roster-corona-api'
+    assert 'not admitted to ATLAS' in log[-1] and log[-1].startswith('  ⚠')
+
+
+@pytest.mark.parametrize('installed,admits', [
+    ('2.3.0', True), ('V2.3.1', True), (' 2.4.0 ', True), ('2.2.99', False),
+    ('1.99.0', False), (None, False), ('2.3.0-rc1', False), ('2.3.0.1', False),
+])
+def test_which_atlas_versions_know_the_role(installed, admits):
+    assert roster.admits_role(installed) is admits
+
+
+# --------------------------------------------------------------------------- #
+# The plain deployment
+# --------------------------------------------------------------------------- #
+
+def test_the_plain_deployment_gets_a_group_a_roster_and_on_2_3_0_a_binding(deployment, ak):
+    admins = ak.add_group('authentik Admins', superuser=True)
+    result, log = _ensure(deployment, ak, inst=PLAIN, installed='2.3.0')
+    standard = _by_name(ak, 'atlas-standard-admins')
+    assert standard['is_superuser'] is False and standard['users'] == []
+    [role] = ak.roles.values()
+    assert role['name'] == 'atlas-roster'
+    assert ak.visible_groups(role['pk']) == {standard['pk']}, 'never authentik Admins'
+    assert admins['pk'] not in ak.visible_groups(role['pk'])
+    [binding] = ak.bindings_of('atlas-standard-admins')
+    assert binding['target'] == 'app-atlas'
+    env = _env(deployment)
+    assert env['TAKMDM_STANDARD_ADMIN_GROUP'] == 'atlas-standard-admins'
+    assert env['TAKMDM_AUTHENTIK_ROSTER_TOKEN'] == 'key-for-atlas-roster-api'
+    assert result == {'env_changed': True}
+    assert 'roster account atlas-roster can read it' in log[-2]
+
+
+def test_the_plain_deployment_on_an_older_atlas_is_not_admitted(deployment, ak):
+    _ensure(deployment, ak, inst=PLAIN, installed='2.2.2')
+    assert ak.bindings == []
+
+
+def test_the_plain_deployment_stands_aside_for_an_agency_named_standard(deployment, ak):
+    """⚠️ A box that deployed agency 'standard' before the slug was reserved:
+    `atlas-standard-admins` is that agency's admin group."""
+    ak.add_application('atlas-standard')
+    theirs = ak.add_group('atlas-standard-admins', users=[5])
+    result, log = _ensure(deployment, ak, inst=PLAIN, installed='2.3.0')
+    assert result == {'env_changed': False}
+    assert ak.roles == {} and ak.users == {} and ak.bindings == []
+    assert 'agency deployment "standard"' in log[-1]
+    note = roster.remove(_ctx(), PLAIN, opener=ak)
+    assert theirs['pk'] in ak.groups and 'not removed' in note
 
 
 def test_atlas_gets_the_group_the_address_and_the_token(deployment, ak):
@@ -311,7 +438,7 @@ def test_a_superuser_flag_on_the_group_is_taken_off(deployment, ak):
     ak.add_group('atlas-corona-standard-admins', superuser=True)
     _result, log = _ensure(deployment, ak)
     assert _by_name(ak, 'atlas-corona-standard-admins')['is_superuser'] is False
-    assert 'superuser flag removed' in log[-1]
+    assert 'superuser flag removed' in log[-2]
 
 
 def test_a_missing_agency_group_sets_nothing_up(deployment, ak):
@@ -388,9 +515,15 @@ def test_removal_never_deletes_a_person_with_the_accounts_name(ak):
     assert 7 in ak.users
 
 
-def test_removal_of_the_plain_deployment_touches_nothing(ak):
-    assert roster.remove(_ctx(), PLAIN, opener=ak) is None
-    assert ak.calls == []
+def test_removal_of_the_plain_deployment_removes_its_own_and_nothing_else(deployment, ak):
+    ak.add_group('authentik Admins', superuser=True)
+    _ensure(deployment, ak, inst=PLAIN, installed='2.3.0')
+    note = roster.remove(_ctx(), PLAIN, opener=ak)
+    names = {g['name'] for g in ak.groups.values()}
+    assert 'atlas-standard-admins' not in names
+    assert {'authentik Admins', 'atlas-corona-admins'} <= names
+    assert ak.roles == {} and ak.users == {} and ak.tokens == {}
+    assert "account 'atlas-roster'" in note
 
 
 # --------------------------------------------------------------------------- #
@@ -414,3 +547,8 @@ def test_a_changed_env_restarts_api():
     src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
     helper = _body(src, '_reconcile_roster')
     assert "['env_changed']" in helper and "'up -d api'" in helper
+
+
+def test_the_installed_version_decides_the_binding():
+    src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
+    assert 'installed=_installed_version(ctx, inst)' in _body(src, '_reconcile_roster')
