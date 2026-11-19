@@ -91344,6 +91344,13 @@ def takserver_rotate_intca():
             log(f"  New CA: {new_ca_name}")
             log("")
 
+            # ops #941: files an old restore re-owned to uid 1000 stop makeCert.sh's chmod in
+            # the container (Step 3 failed). Give them back first; idempotent.
+            try:
+                _tak_cert_owner_repair(lambda m: log(f"  {m}"), cert_dir=cert_dir)
+            except Exception as _own_e:
+                log(f"  ⚠ Certificate folder owner repair skipped: {str(_own_e)[:120]}")
+
             # Save current (old) intermediate to a named file before we overwrite ca.pem — needed for transition bundle and truststore
             old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
             if not os.path.exists(old_pem):
@@ -103984,6 +103991,98 @@ def _ca_private_verdict_or_refuse_all(cert_dir):
         return _All()
 
 
+# ops #941: the uid an OLD restore (before ops #839) gave the whole certificate folder on a
+# Docker TAK box whose container could not be asked: a made-up 1000, with group 0.
+_RESTORE_MADE_UP_UID = 1000
+
+
+def _tak_cert_owner_repair(plog=None, cert_dir=None):
+    """ops #941 — give a Docker TAK box's certificate folder back to the TAK container's user.
+
+    A restore made by code older than ops #839 (every release up to 10.4.1) chowned the whole
+    folder to a made-up uid 1000 (group 0) when the container was stopped. The newer restore
+    keeps the right owner, but it does not repair a folder the old one already re-owned. On such
+    a box the container user (uid 1001 on the hardened image) can still write the files through
+    group 0, but makeCert.sh also runs `chmod og-rwx takserver.key`, and chmod on a file owned by
+    another uid fails with "Operation not permitted". So Rotate Intermediate CA stopped at
+    Step 3 ("Failed to create new server certificate") and TAK Server stayed "health: starting"
+    (verified on a throwaway ARM Docker box, ops #941).
+
+    Only the exact signature of that old restore is changed: owner uid 1000, group = the
+    container's group, and only when the container does NOT run as uid 1000 (the stock image
+    does, and there nothing is wrong). Any other owner is left alone. Links are re-owned
+    themselves (`-h`), never what they point at. If the container's ids cannot be read, nothing
+    changes: no guess (ops #839). Native TAK Server has no such folder owner: no-op.
+
+    Returns the number of entries repaired."""
+    d = cert_dir or _CERT_FILES_DIR
+
+    def _say(m):
+        (plog or (lambda x: print(f"Cert folder owner: {x}", flush=True)))(m)
+
+    if not _tak_is_container() or not os.path.isdir(d):
+        return 0
+    try:
+        cuid, cgid = (int(x) for x in _tak_container_ids())
+    except Exception:
+        return 0
+    if cuid == _RESTORE_MADE_UP_UID:
+        return 0
+
+    def _stale():
+        n = 0
+        try:
+            tops = [d]
+            for root, dirs, files in os.walk(d, followlinks=False):
+                tops += [os.path.join(root, x) for x in dirs + files]
+            for p in tops:
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if st.st_uid == _RESTORE_MADE_UP_UID and st.st_gid == cgid:
+                    n += 1
+        except OSError:
+            pass
+        return n
+
+    before = _stale()
+    if not before:
+        return 0
+    frm = f'--from={_RESTORE_MADE_UP_UID}:{cgid}'
+    try:
+        subprocess.run(_sudo_wrap(['chown', '-R', '-h', frm, f'{cuid}:{cgid}', d]),
+                       capture_output=True, text=True, timeout=120)
+    except Exception:
+        pass
+    left = _stale()
+    if left:
+        # A host chown on the bundle tree can report success and change nothing
+        # (_container_own_tree): do it as root inside the image, on the mounted folder.
+        try:
+            subprocess.run(_sudo_wrap(['docker', 'run', '--rm', '--user', '0',
+                                       '-v', f'{os.path.realpath(d)}:/mnt/certs',
+                                       '--entrypoint', 'sh', TAK_CONTAINER, '-c',
+                                       f'chown -R -h {frm} {cuid}:{cgid} /mnt/certs']),
+                           capture_output=True, text=True, timeout=120)
+        except Exception:
+            pass
+        left = _stale()
+    fixed = before - left
+    if fixed:
+        _say(f"{fixed} entr{'y' if fixed == 1 else 'ies'} in {d} were owned by uid "
+             f"{_RESTORE_MADE_UP_UID} (an old restore) and now belong to the TAK container's user "
+             f"{cuid}:{cgid}")
+        try:
+            audit('cert_owner_repair', f'dir={d} entries={fixed}')
+        except Exception:
+            pass
+    if left:
+        _say(f"⚠ {left} entr{'y' if left == 1 else 'ies'} in {d} could not be given to the TAK "
+             f"container's user {cuid}:{cgid}; Rotate CA may fail until they are")
+    return fixed
+
+
 def _tak_ca_private_lockdown(plog=None, cert_dir=None, live=True):
     """ops #831 — CA private key files are for the TAK Server account only.
 
@@ -116505,6 +116604,14 @@ def _startup_migrations():
             _heal_nodered_cert_read_access(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _nrh_e:
             print(f"Startup migration: Node-RED cert heal error (non-fatal): {_nrh_e}", flush=True)
+
+        # ops #941 — a Docker TAK box whose certificate folder an old restore re-owned to
+        # uid 1000: give it back to the container's user, or Rotate CA fails at Step 3.
+        # Before the lockdown, which reads the owners. Idempotent: a stat per entry.
+        try:
+            _tak_cert_owner_repair(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _cor_e:
+            print(f"Startup migration: cert folder owner repair error (non-fatal): {_cor_e}", flush=True)
 
         # ops #831 — existing boxes: the CA key files (and each snapshot's copy of them) get
         # the file modes a new deploy sets. Only CA private material; client files and the
