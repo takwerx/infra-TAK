@@ -29352,17 +29352,18 @@ NODE_SECURITY_RELEASES = (
     # responses. The same release fixes more HTTP/2 and TLS flaws (CVE-2026-123865, -123866,
     # -123872 High). https://nodejs.org/en/blog/vulnerability/november-2026-security-releases
     # `upstream_pending`: module keys whose image we cannot rebuild and whose upstream has not
-    # shipped the fix yet (nodered/node-red:4.1.17-22 is still on 22.23.4, last pushed
-    # 2026-10-21). They are left out of the flag and the email, because pressing Update could
-    # never clear them. Remove the key the day Node-RED ships a rebuilt tag and NODERED_IMAGE
-    # moves to it. A container name works too: `cloudtak-print` (Node 24, the TAK Portal
+    # shipped the fix yet. They are left out of the flag and the email, because pressing Update
+    # could never clear them. Remove the key the day the upstream ships a rebuilt tag and the
+    # pin moves to it (Node-RED did on 2026-11-17: nodered/node-red:4.1.18-22 is on 22.23.5, so
+    # its key left this list and NODERED_IMAGE moved, ops #935). A container name works too:
+    # `cloudtak-print` (Node 24, the TAK Portal
     # Marketplace Print plugin) is left out for the same reason. The CloudTAK card's Update
     # never builds it (its compose file is kept out of COMPOSE_FILE on purpose, see
     # _CLOUDTAK_PRINT_PLUGIN_COMPOSE), so a red CloudTAK flag for it could never clear. Print
     # also serves cleartext HTTP on a loopback port, which CVE-2026-123864 does not touch.
     {'id': 'CVE-2026-123864', 'released': '2026-11-11',
      'fixed': {22: '22.23.5', 24: '24.22.3', 26: '26.13.1'},
-     'upstream_pending': ('nodered', 'cloudtak-print'),
+     'upstream_pending': ('cloudtak-print',),
      'reason': 'several flaws in how Node.js handles HTTPS and HTTP/2, including one that can '
                'leak server memory into web responses'},
 )
@@ -65604,11 +65605,15 @@ def _nodered_port_holders_as_conflicts(port=1880):
 # (built 2025-03-17). Node 20 went end of life 2026-04-30, and the image carries jsonata
 # 2.0.5 (CVE-2026-77413/14/15, code execution from an attacker-controlled expression,
 # fixed 2.2.1), multer 1.4.5-lts.1 (DoS via http-in uploads) and ws 7.5.10 (CVE-2026-48779).
-# 4.1.17-22 = Node-RED 4.1.17 on Node 22.23.4 (2026-10-21), amd64 + arm64. 22.23.4 is
-# Node's October 2026 security release (4.1.16-22 shipped Node 22.23.3). Exact tag on
-# purpose: the plain `4.1` tag is stale and there is no bare `4.1.17`. Fresh deploys
-# write it, and Update moves every existing box onto it (_auto_nodered).
-NODERED_IMAGE = 'nodered/node-red:4.1.17-22'
+# 4.1.18-22 = Node-RED 4.1.18 on Node 22.23.5 (2026-11-17), amd64 + arm64. 22.23.5 is
+# Node's November 2026 security release (4.1.17-22 shipped Node 22.23.4, 4.1.16-22 shipped
+# 22.23.3). 4.1.18 is also a Node-RED hardening release: the editor's live-update channel
+# checks the session token, Projects file paths stay inside their folder, package and SSH key
+# names are validated, prototype writes are blocked (ops #935). Exact tag on purpose: the
+# plain `4.1` tag is stale and there is no bare `4.1.18`. Fresh deploys write it, and Update
+# moves every existing box onto it (_auto_nodered). Stay on the 4.x / Node 22 line: 5.0.x is
+# on Node 24, a bigger change.
+NODERED_IMAGE = 'nodered/node-red:4.1.18-22'
 _NODERED_IMAGE_LINE_RE = re.compile(r'^(\s*image:\s*)nodered/node-red:\S+[ \t]*$', re.M)
 
 
