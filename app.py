@@ -8044,10 +8044,11 @@ def _enforce_session_idle_lock():
             # came through Authentik): there it must run first, or a wrong password would
             # leave the Authentik session alive to sign the browser in again with no prompt.
             signin_post = request.method == 'POST' and request.path in ('/login', '/')
+            sso_signout = _widle_sso_logout_active(h)
             session.clear()  # local lock always holds, regardless of what follows
-            if signin_post and not _widle_sso_logout_active(h):
+            if signin_post and not sso_signout:
                 return None
-            if _widle_sso_logout_active(h):
+            if sso_signout:
                 # Sign out of the forward_auth outpost so the next request re-prompts. Must be an
                 # ABSOLUTE URL on the SSO vhost — request.host/host_url are the loopback upstream
                 # Caddy proxies to (127.0.0.1:5001). v10.1.60 (W5, GH #65): resolve it LIVE from
