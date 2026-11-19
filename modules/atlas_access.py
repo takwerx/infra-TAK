@@ -247,6 +247,54 @@ def _supersede(api, bindings, groups, log):
     return removed
 
 
+def revoke(api, app_slug, group, plog=None):
+    """Take `group` out of this application's way in. True when anything changed.
+
+    ⚠️ Two places can hold it: our policy (one name in the "or") and a direct
+    group binding made by older code (PR 596's first form bound the ATLAS
+    standard group directly). Both go: under `policy_engine_mode: any` a stale
+    direct binding is a door of its own.
+
+    ⚠️ **No policy is made here.** An application that has none (a plain
+    deployment still on the "Allow authentik Admins" binding) is left as it
+    is: there is nothing in it to take the group out of. Raises on an
+    Authentik error; the caller logs it.
+    """
+    def log(msg):
+        if plog:
+            plog(msg)
+
+    changed = False
+    pol = _find(api, 'policies/expression/', 'name', policy_name(app_slug))
+    if pol is not None and group in parse_groups(pol.get('expression')):
+        result = ensure(api, app_slug, remove=[group], plog=plog)
+        if result['status'] == 'failed':
+            raise RuntimeError(result['detail'])
+        changed = True
+    row = _find(api, 'core/groups/', 'name', group)
+    if row and row.get('pk'):
+        app = api.call('core/applications/%s/' % app_slug)
+        bindings = api.results('policies/bindings/?target=%s&page_size=100'
+                               % app['pk'])
+        direct = [b for b in bindings if str(b.get('group')) == str(row['pk'])]
+        rest = [b for b in bindings if b not in direct]
+        # ⚠️ Never the last way in. Authentik shows an application with no
+        # binding to every signed-in user, so a direct binding that is all the
+        # application has stays, and the operator is told.
+        if direct and not any(
+                b.get('enabled', True) and not b.get('negate') and (
+                    is_access_binding(b) or
+                    (b.get('policy_obj') or {}).get('name') == ALLOW_ADMINS_POLICY)
+                for b in rest):
+            raise RuntimeError('"%s" is bound directly and nothing else restricts '
+                               'this application; left in place' % group)
+        for b in direct:
+            api.call('policies/bindings/%s/' % b['pk'], method='DELETE')
+            log('  ✓ Removed the direct binding of "%s"' % group)
+            changed = True
+    return changed
+
+
 def remove(api, app_slug):
     """Delete this application's access policy. True when one was deleted.
 

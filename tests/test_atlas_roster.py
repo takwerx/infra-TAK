@@ -51,6 +51,7 @@ class FakeAuthentik:
         self.model_perms = []    # (role_pk, codename)
         self.applications = {}   # slug -> row
         self.bindings = []
+        self.policies = {}       # pk -> expression policy row
         self.calls = []
         self._pk = 100
 
@@ -61,7 +62,7 @@ class FakeAuthentik:
 
     def bindings_of(self, group_name):
         pks = {g['pk'] for g in self.groups.values() if g['name'] == group_name}
-        return [b for b in self.bindings if b['group'] in pks]
+        return [b for b in self.bindings if b.get('group') in pks]
 
     def pk(self):
         self._pk += 1
@@ -97,8 +98,28 @@ class FakeAuthentik:
                                     if b['target'] == query.get('target')]}
             if method == 'POST':
                 b = dict(body, pk='b%d' % self.pk())
+                if b.get('policy') in self.policies:
+                    b['policy_obj'] = {'name': self.policies[b['policy']]['name']}
                 self.bindings.append(b)
                 return b
+            if method == 'DELETE':
+                self.bindings = [b for b in self.bindings if b['pk'] != parts[2]]
+                return None
+        if parts[:2] == ['policies', 'expression']:
+            if len(parts) == 2 and method == 'GET':
+                return {'results': [p for p in self.policies.values()
+                                    if p['name'] == query.get('name')]}
+            if len(parts) == 2 and method == 'POST':
+                pol = dict(body, pk='p%d' % self.pk())
+                self.policies[pol['pk']] = pol
+                return pol
+            if method == 'PATCH':
+                self.policies[parts[2]].update(body)
+                return self.policies[parts[2]]
+            if method == 'DELETE':
+                del self.policies[parts[2]]
+                self.bindings = [b for b in self.bindings if b.get('policy') != parts[2]]
+                return None
         if parts[:2] == ['core', 'groups']:
             if len(parts) == 2 and method == 'GET':
                 return {'results': [g for g in self.groups.values()
@@ -193,6 +214,54 @@ class FakeAuthentik:
     def visible_groups(self, role_pk):
         return {obj for r, _c, obj in self.object_perms if r == role_pk}
 
+    def bind_policy(self, slug, name, expression='', order=0):
+        """A policy bound to an application, as app.py and Hardened leave them."""
+        pol = {'pk': 'p%d' % self.pk(), 'name': name, 'expression': expression}
+        self.policies[pol['pk']] = pol
+        b = {'pk': 'b%d' % self.pk(), 'target': self.applications[slug]['pk'],
+             'policy': pol['pk'], 'policy_obj': {'name': name}, 'order': order,
+             'enabled': True, 'negate': False}
+        self.bindings.append(b)
+        return b
+
+    def bind_group(self, slug, group_name, order=10):
+        b = {'pk': 'b%d' % self.pk(), 'target': self.applications[slug]['pk'],
+             'group': _by_name(self, group_name)['pk'], 'order': order,
+             'enabled': True, 'negate': False}
+        self.bindings.append(b)
+        return b
+
+    def can_open(self, slug, groups, mode):
+        """Authentik's decision for a user in `groups` (MFA always passed).
+
+        Its documented rule: `any` admits when one binding passes, `all` only
+        when every one does, and an application with no binding admits every
+        signed-in user.
+        """
+        target = self.applications[slug]['pk']
+        live = [b for b in self.bindings
+                if b['target'] == target and b.get('enabled', True)]
+        if not live:
+            return True
+        names = {g['pk']: g['name'] for g in self.groups.values()}
+        results = []
+        for b in live:
+            name = (b.get('policy_obj') or {}).get('name')
+            if b.get('group'):
+                ok = names.get(b['group']) in groups
+            elif name == 'Allow authentik Admins':
+                ok = 'authentik Admins' in groups
+            elif name and name.startswith('ATLAS access: '):
+                pol = self.policies[b['policy']]
+                ok = any(json.loads(q) in groups for q in
+                         re.findall(r'name=("(?:[^"\\]|\\.)*")', pol['expression']))
+            elif mode == 'any':
+                continue  # the Standard posture has no MFA binding
+            else:
+                ok = True  # the Hardened MFA binding; the user has a device
+            results.append(ok != bool(b.get('negate')))
+        return all(results) if mode == 'all' else any(results)
+
 
 @pytest.fixture
 def ak():
@@ -220,10 +289,16 @@ def _ctx(token='admin-token', domain='auth.example.com'):
     }
 
 
-def _ensure(deployment, ak, inst=CORONA, ctx=None, installed=None):
+def _ensure(deployment, ak, inst=CORONA, ctx=None, installed=None, running='same',
+            restarted=True):
+    """`ensure`, then (when `installed` is given) `admit`, as `_reconcile_roster` does."""
     log = []
     result = roster.ensure(ctx or _ctx(), inst, str(deployment), atlas.write_env_value,
-                           log.append, opener=ak, installed=installed)
+                           log.append, opener=ak)
+    if installed != 'skip':
+        roster.admit(ctx or _ctx(), inst, str(deployment), installed,
+                     installed if running == 'same' else running, log.append,
+                     restarted=restarted, opener=ak)
     return result, log
 
 
@@ -313,43 +388,152 @@ def test_the_role_sees_the_two_agency_groups_and_nothing_else(deployment, ak):
     assert role['users'] == [user['pk']], 'the role is given to the account directly'
 
 
+# --------------------------------------------------------------------------- #
+# Who gets in (ops #919): one access policy, under `any` and under `all`
+# --------------------------------------------------------------------------- #
+
+GLOBAL = {'authentik Admins'}
+AGENCY = {'atlas-corona-admins'}
+STANDARD = {'atlas-corona-standard-admins'}
+NOBODY = {'someone-else'}
+MODES = ['all', 'any']   # Hardened posture (MFA step), Standard posture
+
+
+@pytest.fixture
+def box(ak):
+    """An agency deployment as dev leaves it on a Hardened box before this change.
+
+    "Allow authentik Admins" at 0 (app.py), the MFA binding (Hardened), and the
+    agency group's access policy made by the agency reconcile (ops #979).
+    """
+    ak.add_group('authentik Admins', superuser=True)
+    ak.bind_policy('atlas-corona', 'Allow authentik Admins', order=0)
+    ak.bind_policy('atlas-corona', 'infratak-require-mfa', order=10)
+    from modules import atlas_access
+    api = roster.AuthentikAdmin('http://127.0.0.1:9090', 't', ak)
+    assert atlas_access.ensure(api, 'atlas-corona',
+                               add=['atlas-corona-admins'])['status'] == 'created'
+    return ak
+
+
+@pytest.mark.parametrize('mode', MODES)
+def test_on_2_3_0_every_kind_of_admin_gets_in_and_nobody_else(deployment, box, mode):
+    """The customer's question. The first form of this change bound the group
+    beside the others, and on a Hardened box (`all`) that locked the global and
+    agency admins out (test6, ops #919)."""
+    _ensure(deployment, box, installed='2.3.0')
+    assert box.can_open('atlas-corona', GLOBAL, mode), 'global admin'
+    assert box.can_open('atlas-corona', AGENCY, mode), 'agency admin'
+    assert box.can_open('atlas-corona', STANDARD, mode), 'standard admin'
+    assert not box.can_open('atlas-corona', NOBODY, mode), 'no group'
+    assert not box.can_open('atlas-corona', {'atlas-other-standard-admins'}, mode)
+
+
+def test_the_group_is_a_name_in_the_policy_not_a_binding(deployment, box):
+    _ensure(deployment, box, installed='2.3.0')
+    assert box.bindings_of('atlas-corona-standard-admins') == []
+    [pol] = [p for p in box.policies.values() if p['name'] == 'ATLAS access: atlas-corona']
+    assert 'atlas-corona-standard-admins' in pol['expression']
+    assert 'atlas-corona-admins' in pol['expression'], 'the agency group is kept'
+
+
+@pytest.mark.parametrize('mode', MODES)
 @pytest.mark.parametrize('installed', [None, '', '2.2.2', 'v2.2.9', '2.3', 'garbage'])
-def test_an_older_or_unknown_atlas_does_not_admit_the_group(deployment, ak, installed):
+def test_an_older_or_unknown_atlas_keeps_the_group_out(deployment, box, mode, installed):
     """⚠️ Before 2.3.0 a box with a blank TAKMDM_ADMIN_GROUP would make the
     group's members full administrators."""
-    result, log = _ensure(deployment, ak, installed=installed)
-    assert not [c for c in ak.calls if c[1].startswith(('policies', 'core/applications'))]
+    result, log = _ensure(deployment, box, installed=installed)
+    assert not box.can_open('atlas-corona', STANDARD, mode)
+    assert box.can_open('atlas-corona', AGENCY, mode)
+    assert box.can_open('atlas-corona', GLOBAL, mode)
     assert 'predates the standard role (2.3.0)' in log[-1]
     assert result == {'env_changed': True}, 'the roster is still set up'
 
 
-@pytest.mark.parametrize('installed', ['2.3.0', 'v2.3.0', '2.10.1', '3.0.0'])
-def test_atlas_2_3_0_or_newer_admits_the_group_to_its_own_application(deployment, ak, installed):
-    _ensure(deployment, ak, installed=installed)
-    [binding] = ak.bindings_of('atlas-corona-standard-admins')
-    assert binding['target'] == 'app-atlas-corona', 'this deployment only'
-    assert binding['order'] == 20 and binding['enabled'] is True and binding['negate'] is False
-    assert len(ak.bindings) == 1, 'nothing else bound or replaced'
+@pytest.mark.parametrize('running', [None, '2.2.2'])
+def test_the_running_atlas_must_be_2_3_0_too(deployment, box, running):
+    """Security read, ops #978: a failed rebuild leaves 2.3.0 on disk and the
+    old ATLAS serving."""
+    _result, log = _ensure(deployment, box, installed='2.3.0', running=running)
+    assert not box.can_open('atlas-corona', STANDARD, 'any')
+    assert 'the running ATLAS reports' in log[-1]
 
 
-def test_the_binding_is_made_once(deployment, ak):
-    _ensure(deployment, ak, installed='2.3.0')
-    _result, log = _ensure(deployment, ak, installed='2.3.0')
+@pytest.mark.parametrize('installed,running', [
+    ('2.2.2', '2.2.2'),     # Deploy run again checked out the main channel's tag
+    ('2.3.0', '2.2.2'),     # an update whose rebuild failed
+    ('2.3.0', None),        # api not answering
+])
+def test_a_group_let_in_before_is_taken_out_again(deployment, box, installed, running):
+    """Security read, ops #978, change 1: the old code never took it off."""
+    _ensure(deployment, box, installed='2.3.0')
+    assert box.can_open('atlas-corona', STANDARD, 'any')
+    _result, log = _ensure(deployment, box, installed=installed, running=running)
+    assert not box.can_open('atlas-corona', STANDARD, 'any')
+    assert box.can_open('atlas-corona', AGENCY, 'all')
+    assert box.can_open('atlas-corona', GLOBAL, 'all')
+    assert 'taken out of ATLAS access' in log[-1]
+
+
+def test_a_failed_restart_keeps_the_group_out(deployment, box):
+    """Security read, ops #978, change 2: ATLAS must know the group's name
+    before anyone in it is let in."""
+    _result, log = _ensure(deployment, box, installed='2.3.0', restarted=False)
+    assert not box.can_open('atlas-corona', STANDARD, 'any')
+    assert 'could not be restarted' in log[-1]
+
+
+def test_an_env_without_the_group_keeps_the_group_out(deployment, box, monkeypatch):
+    monkeypatch.setattr(roster, 'ensure_token',
+                        lambda *a: (_ for _ in ()).throw(RuntimeError('boom')))
+    _result, log = _ensure(deployment, box, installed='2.3.0')
+    assert 'TAKMDM_STANDARD_ADMIN_GROUP' not in _env(deployment)
+    assert not box.can_open('atlas-corona', STANDARD, 'any')
+    assert '.env does not name the group' in log[-1]
+
+
+def test_admitting_twice_changes_nothing(deployment, box):
+    _ensure(deployment, box, installed='2.3.0')
+    before = ([dict(b) for b in box.bindings], {k: dict(v) for k, v in box.policies.items()})
+    _result, log = _ensure(deployment, box, installed='2.3.0')
+    assert ([dict(b) for b in box.bindings], box.policies) == before
+    assert 'admitted to ATLAS' in log[-1]
+
+
+@pytest.mark.parametrize('installed', ['2.2.2', '2.3.0'])
+def test_a_direct_binding_from_the_first_form_is_removed(deployment, box, installed):
+    """PR 596 as first written bound the group directly. Under `any` that is a
+    door of its own, under `all` a lock on everybody else."""
+    box.add_group('atlas-corona-standard-admins')
+    box.bind_group('atlas-corona', 'atlas-corona-standard-admins', order=20)
+    _ensure(deployment, box, installed=installed)
+    assert box.bindings_of('atlas-corona-standard-admins') == []
+    assert box.can_open('atlas-corona', AGENCY, 'all')
+    assert box.can_open('atlas-corona', STANDARD, 'any') is (installed == '2.3.0')
+
+
+def test_a_direct_binding_that_is_the_only_way_in_is_left_and_reported(deployment, ak):
+    """⚠️ Deleting it would leave the application with no binding, which
+    Authentik opens to every signed-in user."""
+    ak.add_group('atlas-corona-standard-admins')
+    ak.bind_group('atlas-corona', 'atlas-corona-standard-admins')
+    _result, log = _ensure(deployment, ak, installed='2.2.2')
     assert len(ak.bindings_of('atlas-corona-standard-admins')) == 1
-    assert log[-1].endswith('admitted to ATLAS')
+    assert not ak.can_open('atlas-corona', NOBODY, 'any')
+    assert 'left in place' in log[-1] and log[-1].startswith('  ⚠')
 
 
-def test_a_disabled_binding_is_left_alone_and_reported(deployment, ak):
+def test_a_disabled_access_binding_is_left_alone_and_reported(deployment, box):
     """⚠️ Somebody switched it off in Authentik; that is theirs to undo."""
-    _ensure(deployment, ak, installed='2.3.0')
-    [binding] = ak.bindings_of('atlas-corona-standard-admins')
-    binding['enabled'] = False
-    _result, log = _ensure(deployment, ak, installed='2.3.0')
-    assert len(ak.bindings) == 1 and binding['enabled'] is False
+    [ours] = [b for b in box.bindings
+              if (b.get('policy_obj') or {}).get('name', '').startswith('ATLAS access')]
+    ours['enabled'] = False
+    _result, log = _ensure(deployment, box, installed='2.3.0')
+    assert ours in box.bindings and ours['enabled'] is False
     assert log[-1].startswith('  ⚠') and 'disabled or negated' in log[-1]
 
 
-def test_a_failed_binding_still_leaves_the_roster_working(deployment, ak):
+def test_a_failed_admit_still_leaves_the_roster_working(deployment, ak):
     del ak.applications['atlas-corona']
     result, log = _ensure(deployment, ak, installed='2.3.0')
     assert result == {'env_changed': True}
@@ -369,27 +553,50 @@ def test_which_atlas_versions_know_the_role(installed, admits):
 # The plain deployment
 # --------------------------------------------------------------------------- #
 
-def test_the_plain_deployment_gets_a_group_a_roster_and_on_2_3_0_a_binding(deployment, ak):
-    admins = ak.add_group('authentik Admins', superuser=True)
+@pytest.fixture
+def plain_box(ak):
+    """The plain deployment as dev leaves it on a Hardened box."""
+    ak.add_group('authentik Admins', superuser=True)
+    ak.bind_policy('atlas', 'Allow authentik Admins', order=0)
+    ak.bind_policy('atlas', 'infratak-require-mfa', order=10)
+    return ak
+
+
+@pytest.mark.parametrize('mode', MODES)
+def test_the_plain_deployment_on_2_3_0_lets_global_and_standard_admins_in(
+        deployment, plain_box, mode):
+    ak = plain_box
     result, log = _ensure(deployment, ak, inst=PLAIN, installed='2.3.0')
     standard = _by_name(ak, 'atlas-standard-admins')
     assert standard['is_superuser'] is False and standard['users'] == []
     [role] = ak.roles.values()
     assert role['name'] == 'atlas-roster'
     assert ak.visible_groups(role['pk']) == {standard['pk']}, 'never authentik Admins'
-    assert admins['pk'] not in ak.visible_groups(role['pk'])
-    [binding] = ak.bindings_of('atlas-standard-admins')
-    assert binding['target'] == 'app-atlas'
     env = _env(deployment)
     assert env['TAKMDM_STANDARD_ADMIN_GROUP'] == 'atlas-standard-admins'
     assert env['TAKMDM_AUTHENTIK_ROSTER_TOKEN'] == 'key-for-atlas-roster-api'
     assert result == {'env_changed': True}
-    assert 'roster account atlas-roster can read it' in log[-2]
+    assert ak.can_open('atlas', GLOBAL, mode)
+    assert ak.can_open('atlas', {'atlas-standard-admins'}, mode)
+    assert not ak.can_open('atlas', NOBODY, mode)
+    assert not ak.can_open('atlas', AGENCY, mode), 'an agency admin is not a plain admin'
+    assert ak.bindings_of('atlas-standard-admins') == []
 
 
-def test_the_plain_deployment_on_an_older_atlas_is_not_admitted(deployment, ak):
-    _ensure(deployment, ak, inst=PLAIN, installed='2.2.2')
-    assert ak.bindings == []
+def test_the_plain_deployment_on_an_older_atlas_is_left_as_it_was(deployment, plain_box):
+    """No policy is made just to keep a group out of it."""
+    before = [dict(b) for b in plain_box.bindings]
+    _ensure(deployment, plain_box, inst=PLAIN, installed='2.2.2')
+    assert [dict(b) for b in plain_box.bindings] == before
+    assert not plain_box.can_open('atlas', {'atlas-standard-admins'}, 'any')
+    assert plain_box.can_open('atlas', GLOBAL, 'all')
+
+
+def test_the_plain_deployment_takes_the_group_out_after_a_downgrade(deployment, plain_box):
+    _ensure(deployment, plain_box, inst=PLAIN, installed='2.3.0')
+    _ensure(deployment, plain_box, inst=PLAIN, installed='2.2.2')
+    assert not plain_box.can_open('atlas', {'atlas-standard-admins'}, 'any')
+    assert plain_box.can_open('atlas', GLOBAL, 'all')
 
 
 def test_the_plain_deployment_stands_aside_for_an_agency_named_standard(deployment, ak):
@@ -399,7 +606,7 @@ def test_the_plain_deployment_stands_aside_for_an_agency_named_standard(deployme
     theirs = ak.add_group('atlas-standard-admins', users=[5])
     result, log = _ensure(deployment, ak, inst=PLAIN, installed='2.3.0')
     assert result == {'env_changed': False}
-    assert ak.roles == {} and ak.users == {} and ak.bindings == []
+    assert ak.roles == {} and ak.users == {} and ak.bindings == [] and ak.policies == {}
     assert 'agency deployment "standard"' in log[-1]
     note = roster.remove(_ctx(), PLAIN, opener=ak)
     assert theirs['pk'] in ak.groups and 'not removed' in note
@@ -445,7 +652,7 @@ def test_a_missing_agency_group_sets_nothing_up(deployment, ak):
     """⚠️ Never scope a role to a group that is not there: Authentik would
     grant the permission on every group instead."""
     ak.groups.clear()
-    result, log = _ensure(deployment, ak)
+    result, log = _ensure(deployment, ak, installed='skip')
     assert result == {'env_changed': False}
     assert ak.roles == {} and ak.users == {} and ak.model_perms == []
     assert 'atlas-corona-admins" is missing' in log[-1]
@@ -458,7 +665,7 @@ def test_a_grant_on_every_group_is_taken_away_and_reported(deployment, ak, monke
         return real(api, n, user, groups + [{'pk': 'gone'}])
     monkeypatch.setattr(roster, 'ensure_role', scoped_to_a_ghost)
 
-    result, log = _ensure(deployment, ak)
+    result, log = _ensure(deployment, ak, installed='skip')
     assert ak.model_perms == [], 'the global grant was removed'
     assert 'permission on every group' in log[-1]
     assert result == {'env_changed': False}
@@ -468,7 +675,7 @@ def test_a_grant_on_every_group_is_taken_away_and_reported(deployment, ak, monke
 def test_a_person_with_the_accounts_name_is_refused(deployment, ak):
     ak.users[7] = {'pk': 7, 'username': 'atlas-roster-corona', 'type': 'internal',
                    'is_active': True, 'roles': []}
-    result, log = _ensure(deployment, ak)
+    result, log = _ensure(deployment, ak, installed='skip')
     assert result == {'env_changed': False}
     assert ak.roles == {} and ak.tokens == {}
     assert 'not a service account' in log[-1]
@@ -549,6 +756,63 @@ def test_a_changed_env_restarts_api():
     assert "['env_changed']" in helper and "'up -d api'" in helper
 
 
-def test_the_installed_version_decides_the_binding():
-    src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
-    assert 'installed=_installed_version(ctx, inst)' in _body(src, '_reconcile_roster')
+class _Ran:
+    def __init__(self, code):
+        self.returncode = code
+
+
+@pytest.mark.parametrize('env_changed,code,restarted', [
+    (True, 0, True), (True, 1, False), (False, None, True)])
+def test_reconcile_restarts_api_before_it_admits(monkeypatch, tmp_path, env_changed,
+                                                 code, restarted):
+    """Security read, ops #978, change 2: the group is let in only after ATLAS
+    restarted with its name, and on both the file's and the container's version."""
+    order = []
+    monkeypatch.setattr(atlas, 'instance_paths', lambda ctx, inst: {'dir': str(tmp_path)})
+    monkeypatch.setattr(atlas.atlas_roster, 'ensure',
+                        lambda *a, **k: order.append('ensure') or {'env_changed': env_changed})
+    monkeypatch.setattr(atlas, '_compose',
+                        lambda ctx, action, timeout=None, inst=None:
+                        order.append(action) or _Ran(code))
+    monkeypatch.setattr(atlas, '_installed_version', lambda ctx, inst: '2.3.0')
+    monkeypatch.setattr(atlas, '_settled_running_version',
+                        lambda ctx, inst: order.append('version') or '2.3.0')
+    seen = {}
+
+    def admit(ctx, inst, dirpath, installed, running, plog, restarted=True):
+        order.append('admit')
+        seen.update(installed=installed, running=running, restarted=restarted)
+    monkeypatch.setattr(atlas.atlas_roster, 'admit', admit)
+    atlas._reconcile_roster({}, CORONA, lambda m: None)
+    want = ['ensure'] + (['up -d api'] if env_changed else []) + ['version', 'admit']
+    assert order == want
+    assert seen == {'installed': '2.3.0', 'running': '2.3.0', 'restarted': restarted}
+
+
+def test_reconcile_does_not_wait_for_an_atlas_that_cannot_admit(monkeypatch, tmp_path):
+    monkeypatch.setattr(atlas, 'instance_paths', lambda ctx, inst: {'dir': str(tmp_path)})
+    monkeypatch.setattr(atlas.atlas_roster, 'ensure', lambda *a, **k: {'env_changed': False})
+    monkeypatch.setattr(atlas, '_installed_version', lambda ctx, inst: '2.2.2')
+    monkeypatch.setattr(atlas, '_settled_running_version',
+                        lambda ctx, inst: pytest.fail('waited for nothing'))
+    monkeypatch.setattr(atlas, '_running_version', lambda ctx, inst: '2.2.2')
+    monkeypatch.setattr(atlas.atlas_roster, 'admit', lambda *a, **k: None)
+    atlas._reconcile_roster({}, CORONA, lambda m: None)
+
+
+def test_the_running_version_is_waited_for(monkeypatch):
+    answers = iter([None, None, '2.3.0'])
+    monkeypatch.setattr(atlas, '_running_version', lambda ctx, inst: next(answers))
+    monkeypatch.setattr(atlas.time, 'sleep', lambda s: None)
+    assert atlas._settled_running_version({}, CORONA) == '2.3.0'
+    monkeypatch.setattr(atlas, '_running_version', lambda ctx, inst: None)
+    assert atlas._settled_running_version({}, CORONA, tries=3) is None
+
+
+def test_removal_of_the_plain_deployment_removes_its_access_policy(deployment, ak):
+    ak.add_group('authentik Admins', superuser=True)
+    _ensure(deployment, ak, inst=PLAIN, installed='2.3.0')
+    assert any(p['name'] == 'ATLAS access: atlas' for p in ak.policies.values())
+    note = roster.remove(_ctx(), PLAIN, opener=ak)
+    assert ak.policies == {}
+    assert 'access policy "ATLAS access: atlas"' in note

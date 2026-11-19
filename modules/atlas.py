@@ -4957,14 +4957,39 @@ def _reconcile_roster(ctx, inst, plog):
     """
     try:
         dirpath = instance_paths(ctx, inst)['dir']
-        # ⚠️ The version on disk decides whether the standard group is
-        # admitted. Every call site runs after the checkout and rebuild, so the
-        # press that installs 2.3.0 also admits it.
-        if atlas_roster.ensure(ctx, inst, dirpath, write_env_value, plog,
-                               installed=_installed_version(ctx, inst))['env_changed']:
-            _compose(ctx, 'up -d api', timeout=300, inst=inst)
+        restarted = True
+        if atlas_roster.ensure(ctx, inst, dirpath, write_env_value, plog)['env_changed']:
+            r = _compose(ctx, 'up -d api', timeout=300, inst=inst)
+            restarted = getattr(r, 'returncode', 1) == 0
+        # ⚠️ **After the restart** (Security read, ops #978), so ATLAS knows
+        # the group's name before its first member is let in, and on **both**
+        # versions: the file says what was checked out, the container what
+        # serves. A failed rebuild or Deploy run again on an older tag makes
+        # them differ, and then the group stays out.
+        installed = _installed_version(ctx, inst)
+        # Waited for only when the checkout could admit the group at all.
+        running = (_settled_running_version(ctx, inst)
+                   if atlas_roster.admits_role(installed)
+                   else _running_version(ctx, inst))
+        atlas_roster.admit(ctx, inst, dirpath, installed, running, plog,
+                           restarted=restarted)
     except Exception as exc:
         plog('  ⚠ Could not reconcile the standard admins: %s' % str(exc)[:80])
+
+
+def _settled_running_version(ctx, inst, tries=24, delay=5):
+    """`_running_version`, waiting up to two minutes for `api` to answer.
+
+    ⚠️ Right after a rebuild or a restart the container is still starting, and
+    None then would keep the standard group out until the next update.
+    """
+    for attempt in range(tries):
+        version = _running_version(ctx, inst)
+        if version:
+            return version
+        if attempt + 1 < tries:
+            time.sleep(delay)
+    return None
 
 
 def _reconcile_access(ctx, inst, plog):
