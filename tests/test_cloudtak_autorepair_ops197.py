@@ -96,6 +96,8 @@ class Box:
         self.upload_heal_ok = True
         self.etl_heal_ok = True
         self.etl = 'UPSTREAM'   # ops #969: True (fix there), False (gone) or 'UPSTREAM' (CloudTAK has it, not drift)
+        self.etl_mtime = 1       # when the route file was edited (epoch)
+        self.etl_started = None  # when the api container started (epoch); None = the fake does not say
         self.busy = None
         self.settings = {'guarddog_alert_email': 'ops@example.com'}
         self.takportal_recreate()
@@ -124,6 +126,8 @@ class Box:
                 out = json.dumps(env)
             elif '.State.Status' in fmt:
                 out = f'running {_iso(self.api_started)}\n'
+            elif '.State.StartedAt' in fmt and self.etl_started:
+                out = f'{_iso(self.etl_started)}\n'
         elif argv[:3] == ['docker', 'inspect', 'cloudtak-media-1']:
             out = self.media_image + '\n'
         elif argv[:2] == ['docker', 'ps'] and 'label=com.docker.compose.project=cloudtak' in argv:
@@ -132,7 +136,7 @@ class Box:
             out = 'cloudtak-media-1\n'
         elif argv[:4] == ['docker', 'exec', '-i', 'cloudtak-api-1'] and 'connection-layer' in (kw.get('input') or ''):
             # ops #969: the ETL layer check script
-            out = {True: 'OK', False: 'MISSING'}.get(self.etl, 'UPSTREAM') + '\n'
+            out = {True: f'OK {int(self.etl_mtime)}', False: 'MISSING'}.get(self.etl, 'UPSTREAM') + '\n'
         elif argv[:4] == ['docker', 'exec', '-i', 'cloudtak-api-1']:
             # ops #502: self.upload is True (rule there), False (rule gone) or 'NOCONF' (stock file)
             out = {True: 'OK', False: 'MISSING'}.get(self.upload, 'NOCONF') + '\n'
@@ -169,6 +173,7 @@ class Box:
         self.calls.append((['ETL'], None))
         if self.etl_heal_ok:
             self.etl = True
+            self.etl_started = time.time() + 5     # the api was restarted after the edit
             self.upload = True     # the real heal restarts the api, then re-applies the upload limit
         return self.etl_heal_ok
 
@@ -224,7 +229,7 @@ class Box:
                 '_open_secret_w',   # ops #632: _cloudtak_env_set writes the .env through it
                 '_cloudtak_env_read', '_cloudtak_env_set', '_cloudtak_compose_file_value',
                 '_cloudtak_ensure_custom_compose', '_ct_media_converged',
-                '_ct_recreate_pending', '_ct_recreate_arm', '_ct_recreate_clear',
+                '_ct_recreate_pending', '_ct_recreate_arm', '_ct_recreate_clear', '_ct_etl_stale',   # ops #969
                 '_ct_docker_out', '_ct_wait_compose_idle', '_cloudtak_override_services', '_cloudtak_containers_without_override',
                 '_cloudtak_write_override_file', '_cloudtak_recreate_and_heal',
                 '_cloudtak_drift', '_cloudtak_drift_summary', '_cloudtak_stack_busy_procs',

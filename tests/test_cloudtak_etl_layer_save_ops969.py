@@ -37,6 +37,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -140,8 +142,10 @@ def test_second_run_is_a_no_op(tmp_path):
     api, route = _api_dir(tmp_path)
     assert _run(api, 'apply') == 'HEALED'
     done = route.read_text()
-    assert _run(api, 'apply') == 'OK'
-    assert _run(api, 'check') == 'OK'
+    again = _run(api, 'apply')
+    assert re.fullmatch(r'OK \d+', again)                  # OK and when the file was edited
+    assert int(again.split()[1]) == int(route.stat().st_mtime)
+    assert re.fullmatch(r'OK \d+', _run(api, 'check'))
     assert route.read_text() == done
 
 
@@ -165,6 +169,39 @@ def test_heal_leaves_a_file_it_does_not_recognise_alone(tmp_path):
     assert _run(api, 'check') == 'SHAPE'
     assert _run(api, 'apply') == 'SHAPE'
     assert route.read_text() == changed
+
+
+def test_heal_does_not_mistake_moved_params_for_an_upstream_fix(tmp_path):
+    # the minimum is neither 1 nor 0 near the description (params reordered or reshaped): not "fixed"
+    moved = ROUTES.read_text().replace(
+        "        params: Type.Object({\n            connectionid: Type.Integer({ minimum: 1 }),\n            layerid: Type.Integer({ minimum: 1 }),\n        }),\n        body: Type.Object({\n            environment",
+        "        params: Type.Object({\n            layerid: Type.Integer({ minimum: 1 }),\n            // " + 'x' * 260 + "\n            connectionid: Type.Integer({ minimum: 1 }),\n        }),\n        body: Type.Object({\n            environment")
+    assert moved != ROUTES.read_text()
+    api, route = _api_dir(tmp_path, moved)
+    assert _run(api, 'check') == 'SHAPE'
+    assert route.read_text() == moved
+
+
+def test_the_belongs_to_connection_check_is_only_edited_inside_the_incoming_route(tmp_path):
+    # an identical comparison earlier in the file must not be the one that gets edited
+    cmp_line = 'if (layer.connection !== connection.id) {'
+    text = ROUTES.read_text()
+    early = text.replace("export default async function router(schema, config) {",
+                         "export default async function router(schema, config) {\n    " + cmp_line.replace('{', '{ /* unrelated */ }'), 1)
+    api, route = _api_dir(tmp_path, early)
+    assert _run(api, 'apply') == 'HEALED'
+    out = route.read_text()
+    assert out.count(cmp_line + ' /* unrelated */ }') == 1                 # the early one is untouched
+    assert 'if (connection && layer.connection !== connection.id) {' in out   # the route's own one is edited
+
+
+def test_heal_keeps_the_first_backup_and_leaves_no_temp_file(tmp_path):
+    api, route = _api_dir(tmp_path)
+    original = route.read_text()
+    assert _run(api, 'apply') == 'HEALED'
+    bak = route.parent / 'connection-layer.js.ops969.bak'
+    assert bak.read_text() == original
+    assert not list(route.parent.glob('*.tmp.js'))
 
 
 def test_heal_reports_noconf_when_the_route_file_is_not_there(tmp_path):
@@ -196,34 +233,39 @@ def _func(name):
 
 
 class _Docker:
-    """Fakes subprocess.run for the heal: docker ps / exec sh / restart / exec curl."""
-    def __init__(self, script_answer, curl_codes=('200',)):
+    """Fakes subprocess.run for the heal: docker ps / exec sh / inspect / restart / exec curl."""
+    def __init__(self, script_answer, curl_codes=('200',), started='', restart_rc=0):
         self.answer = script_answer
         self.curl_codes = list(curl_codes)
+        self.started = started
+        self.restart_rc = restart_rc
         self.calls = []
         self.scripts = []
 
     def run(self, argv, **kw):
         self.calls.append(list(argv))
-        out = ''
+        out, rc = '', 0
         if argv[:2] == ['docker', 'ps']:
             out = 'cloudtak-api-1\n'
         elif argv[:2] == ['docker', 'exec'] and argv[-1] == 'sh':
             self.scripts.append(kw.get('input'))
             out = self.answer + '\n'
+        elif argv[:2] == ['docker', 'inspect']:
+            out = self.started + '\n'
+        elif argv[:2] == ['docker', 'restart']:
+            rc = self.restart_rc
         elif argv[:2] == ['docker', 'exec'] and 'curl' in argv:
             out = self.curl_codes.pop(0) if self.curl_codes else '000'
-        return subprocess.CompletedProcess(argv, 0, out, '')
+        return subprocess.CompletedProcess(argv, rc, out, '')
 
 
-def _heal(answer, curl_codes=('200',)):
-    docker = _Docker(answer, curl_codes)
+def _heal(answer, curl_codes=('200', '200'), started='', restart_rc=0):
+    docker = _Docker(answer, curl_codes, started, restart_rc)
     order = []
 
     class _Time:
-        @staticmethod
-        def sleep(_s):
-            pass
+        sleep = staticmethod(lambda _s: None)
+        strptime = staticmethod(time.strptime)
 
     ns = {
         'subprocess': type('S', (), {'run': staticmethod(docker.run), 'CompletedProcess': subprocess.CompletedProcess}),
@@ -232,44 +274,85 @@ def _heal(answer, curl_codes=('200',)):
         '_b64': __import__('base64'),
         '_ssh_probe': lambda *a, **k: (True, ''),
         '_CT_ETL_LAYER_SH': _sh(),
+        '_cloudtak_etl_heal_lock': threading.Lock(),
         '_cloudtak_upload_limit_heal': lambda **k: order.append(('upload', k)) or True,
     }
+    exec(_func('_ct_etl_stale'), ns)
     exec(_func('_cloudtak_etl_layer_heal'), ns)
     logs = []
     ok = ns['_cloudtak_etl_layer_heal'](plog=logs.append, wait=True)
     return ok, docker, order, logs
 
 
+def _restarts(docker):
+    return [c for c in docker.calls if c[:2] == ['docker', 'restart']]
+
+
 def test_heal_restarts_the_api_once_then_reapplies_the_upload_limit():
     ok, docker, order, logs = _heal('HEALED')
     assert ok is True
-    restarts = [c for c in docker.calls if c[:2] == ['docker', 'restart']]
-    assert restarts == [['docker', 'restart', 'cloudtak-api-1']]
+    assert _restarts(docker) == [['docker', 'restart', 'cloudtak-api-1']]
     # the restart rewrites nginx.conf: the upload limit goes back on straight after
     assert [o[0] for o in order] == ['upload']
-    assert docker.calls.index(restarts[0]) < len(docker.calls) - 1     # waited for the api after it
     assert any('MODE=apply' in (s or '') for s in docker.scripts)
     assert any('an admin can now save' in m for m in logs)
 
 
+def test_heal_waits_for_the_api_before_the_restart_and_again_after_it():
+    # first curl: the api answers (so it is safe to restart); second: it answers again after the restart
+    _, docker, _, _ = _heal('HEALED')
+    seq = ['restart' if c[:2] == ['docker', 'restart'] else 'curl' for c in docker.calls
+           if c[:2] == ['docker', 'restart'] or 'curl' in c]
+    assert seq == ['curl', 'restart', 'curl']
+
+
+def test_heal_never_restarts_an_api_that_is_not_answering_yet():
+    # first-boot migrations can take 25 minutes: the file is edited, the restart is left for the drift check
+    ok, docker, order, logs = _heal('HEALED', curl_codes=())
+    assert ok is False
+    assert _restarts(docker) == [] and order == []
+    assert any('not applied (NOAPI)' in m for m in logs)
+
+
 def test_heal_does_not_restart_when_nothing_changed():
-    for answer in ('OK', 'UPSTREAM', 'SHAPE'):
-        ok, docker, order, _ = _heal(answer)
+    for answer in ('OK 1700000000', 'UPSTREAM', 'SHAPE'):
+        ok, docker, order, _ = _heal(answer, started='2026-11-19T10:00:00.123456789Z')
         assert ok is True, answer
-        assert not [c for c in docker.calls if c[:2] == ['docker', 'restart']], answer
+        assert _restarts(docker) == [], answer
         assert order == [], answer
 
 
-def test_heal_reports_failure_when_the_api_does_not_come_back():
-    ok, docker, _, logs = _heal('HEALED', curl_codes=())
-    assert ok is False
+def test_heal_restarts_when_the_file_was_edited_after_the_api_started():
+    # a failed restart, or a console stopped between the edit and the restart, left the old routes running
+    edited = 1795000000                       # epoch of the edit
+    started_before = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(edited - 600)) + '.123456789Z'
+    ok, docker, order, logs = _heal(f'OK {edited}', started=started_before)
+    assert ok is True
+    assert len(_restarts(docker)) == 1 and [o[0] for o in order] == ['upload']
+    assert any('started before it' in m for m in logs)
+    started_after = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(edited + 600)) + '.123456789Z'
+    ok, docker, order, _ = _heal(f'OK {edited}', started=started_after)
+    assert ok is True and _restarts(docker) == [] and order == []
+
+
+def test_heal_reports_failure_when_the_restart_fails_or_the_api_does_not_come_back():
+    ok, docker, order, logs = _heal('HEALED', restart_rc=1)
+    assert ok is False and order == []
+    ok, docker, order, logs = _heal('HEALED', curl_codes=('200',))      # answers before, never after
+    assert ok is False and order == []
     assert any('not applied (NOAPI)' in m for m in logs)
 
 
 def test_heal_reports_failure_when_the_edit_failed():
     ok, docker, _, logs = _heal('FAIL')
     assert ok is False
-    assert not [c for c in docker.calls if c[:2] == ['docker', 'restart']]
+    assert _restarts(docker) == []
+
+
+def test_two_overlapping_heals_cannot_run_at_once():
+    assert re.search(r'^_cloudtak_etl_heal_lock = threading\.Lock\(\)', APP, re.M)
+    body = _func('_cloudtak_etl_layer_heal')
+    assert '_cloudtak_etl_heal_lock.acquire(' in body and '_cloudtak_etl_heal_lock.release()' in body
 
 
 # ── wired in wherever the upload limit is, and into the drift check ──────────
@@ -297,7 +380,7 @@ def test_drift_check_and_repair_know_the_etl_fix():
     drift = APP[APP.index('def _cloudtak_drift(ct_dir):'):]
     drift = drift[:drift.index('def _cloudtak_drift_summary')]
     assert "_CT_ETL_LAYER_SH.replace('__MODE__', 'check')" in drift
-    assert "out['etl'] = chk[0] != 'MISSING'" in drift          # UPSTREAM and OK are converged, SHAPE is not drift
+    assert "'MISSING'" in drift and '_ct_etl_stale(' in drift     # UPSTREAM and OK are converged, SHAPE is not drift
     assert "out['kind'] = 'etl'" in drift
     repair = APP[APP.index('def _cloudtak_autorepair_run'):]
     repair = repair[:repair.index('def _cloudtak_autorepair_notify')]
@@ -363,3 +446,23 @@ def test_the_recreate_path_puts_the_fix_back_too(box):
     assert box.ups() == [['docker', 'compose', 'up', '-d', '--force-recreate']]
     assert box.etls() and box.etl is True
     assert box.record()['last']['result'] == 'repaired'
+
+
+def test_a_route_file_edited_after_the_api_started_is_drift_and_gets_the_etl_heal(box):
+    _converged(box)
+    box.etl = True
+    box.etl_mtime = time.time()
+    box.etl_started = time.time() - 3600          # the api never reloaded the edited file
+    assert box.request()['state'] == 'repairing'
+    box.finish()
+    assert box.etls() == [['ETL']] and box.record()['last']['result'] == 'repaired'
+    assert box.request()['state'] == 'ok'           # the api now started after the edit
+
+
+def test_an_edited_file_the_api_has_reloaded_is_not_drift(box):
+    _converged(box)
+    box.etl = True
+    box.etl_mtime = time.time() - 600
+    box.etl_started = time.time() - 300           # started after the edit
+    assert box.request()['state'] == 'ok'
+    assert box.etls() == []
