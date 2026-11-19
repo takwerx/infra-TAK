@@ -185,6 +185,7 @@ def test_stale_java_is_one_plain_update_item_with_the_step():
     assert 'security' not in item          # we cannot name an advisory between two builds: no claim
     assert 'Update TAK Server' in item['how'] and 'takserver-docker' in item['how']
     assert 'inside its image' in ' '.join(item['detail'])
+    assert item['detail'][0] == 'TAK Server runs Java 17.0.19+10. Java 17.0.21+9 is available.'
 
 
 def test_clear_not_applicable_and_native_say_nothing_and_carry_nothing():
@@ -233,6 +234,7 @@ def test_the_mail_names_both_builds_and_the_step_once_then_stays_quiet():
     assert subj == '⬆ Update pending on tak-docker-1'                    # not a "Security update" claim
     assert 'Java (TAK Server container): Java 17.0.19+10 → Java 17.0.21+9' not in body   # summary is used
     assert 'Java inside the TAK Server container: a newer Java is available' in body
+    assert '      TAK Server runs Java 17.0.19+10. Java 17.0.21+9 is available.' in body
     assert 'To install: TAK Server page → Update TAK Server' in body
     assert saved[-1]['java-image'] == 'java-image@17.0.19+10>17.0.21+9'
     r2, sent2, _ = _sweep([item], saved[-1])

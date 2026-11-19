@@ -29981,7 +29981,8 @@ def _java_image_items(unknown):
              'installed': 'Java ' + f['running'], 'target': 'Java ' + f['newest'],
              'summary': 'Java inside the TAK Server container: a newer Java is available',
              'identity': f['sig'],
-             'detail': ['TAK Server in Docker carries its own Java inside its image, so system updates '
+             'detail': [f"TAK Server runs Java {f['running']}. Java {f['newest']} is available.",
+                        'TAK Server in Docker carries its own Java inside its image, so system updates '
                         'never change it. New Java releases include fixes for Java security flaws.'],
              'how': _JAVA_IMAGE_HOW}]
 
