@@ -212,6 +212,25 @@ def test_deploy_never_overwrites_an_existing_good_config(monkeypatch, box):
     assert not [e for e in box.events if e[0] == 'WRITE' and e[1] == M.CONFIG_PATH]
 
 
+def test_deploy_stops_a_running_service_before_it_replaces_the_binary(box):
+    """A second Deploy on a running install: cp onto a running binary fails with
+    'Text file busy' (found on a real Ubuntu box, ops #973)."""
+    _run_deploy(box)
+    cmds = box.cmds()
+    stops = [i for i, e in enumerate(cmds) if e[:3] == ['systemctl', 'stop', M.UNIT]]
+    copies = [i for i, e in enumerate(cmds) if e[:1] == ['cp'] and e[2] == M.BIN_PATH]
+    assert stops and copies and stops[0] < copies[0]
+
+
+def test_rollback_leaves_no_stale_checksum_or_previous_in_the_record(box, monkeypatch):
+    box.files[M.CONFIG_PATH] = M.seed_config_text()
+    box.settings['meshrelay'] = {'tag': 'v4.6.0', 'arch': 'amd64', 'sha256': 'a' * 64, 'previous': 'v4.5.0'}
+    monkeypatch.setattr(M, '_have_backup', lambda: True)
+    monkeypatch.setattr(M, '_have_web_backup', lambda: False)
+    M.rollback(box.ctx(), plog=box.logs.append)
+    assert box.settings['meshrelay'] == {'tag': 'v4.5.0', 'arch': 'amd64'}
+
+
 def test_update_and_rollback_never_touch_config(box, monkeypatch):
     box.files[M.CONFIG_PATH] = M.seed_config_text()
     box.settings['meshrelay'] = {'tag': 'v4.5.0'}

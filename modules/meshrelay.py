@@ -451,6 +451,9 @@ def deploy(ctx, job, params):
         plog("📡 Step 2/7 — Download the pinned release")
         stage, binpath, web_root = _stage_release(ctx, plog, arch)
         plog("📡 Step 3/7 — Install files")
+        # A second Deploy meets a running binary: `cp` onto it fails with "Text file busy"
+        # (seen on a real box, ops #973). Stop it first; the restart in Step 5 starts it again.
+        _priv(ctx, ['systemctl', 'stop', UNIT], check=False)
         _priv(ctx, ['cp', binpath, BIN_PATH])
         _priv(ctx, ['chmod', '755', BIN_PATH])
         _priv(ctx, ['chown', 'root:root', BIN_PATH])
@@ -597,7 +600,8 @@ def rollback(ctx, plog=None):
     s = ctx['load_settings']()
     prev = (s.get('meshrelay') or {}).get('previous')
     if prev:
-        s['meshrelay']['tag'] = prev
+        # tag back to the old one; the recorded checksum and `previous` belonged to the version we left
+        s['meshrelay'] = {'tag': prev, 'arch': (s.get('meshrelay') or {}).get('arch', '')}
         ctx['save_settings'](s)
     plog("↩ Rolled back to the previous version")
 
