@@ -342,6 +342,21 @@ def test_removing_a_deployment_removes_its_policy(authentik):
     assert atlas_access.remove(api, APP) is False
 
 
+def test_removing_an_agency_removes_its_policy_and_group(authentik):
+    """The removal path (`remove_agency_admin_group`) takes the policy with the
+    group, so a later agency on the same name starts from the admins alone."""
+    from test_atlas_agency_group_reconcile import make_ctx
+    fake = authentik(hardened_box())
+    update(fake)
+    assert [p for p in fake.policies if p['name'] == 'ATLAS access: ' + APP]
+
+    note = atlas.remove_agency_admin_group(make_ctx(), CORONA)
+
+    assert not [p for p in fake.policies if p['name'].startswith('ATLAS access')]
+    assert 'removed' in (note or '')
+    assert any('core/groups/group-pk/' in url for url in fake.deleted)
+
+
 # --------------------------------------------------------------------------- #
 # The boot converge must not add the admins binding back
 # --------------------------------------------------------------------------- #
