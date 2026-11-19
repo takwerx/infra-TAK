@@ -365,14 +365,24 @@ SIGNOUT = CONSOLE + '/outpost.goauthentik.io/sign_out'
 
 
 def _arm_sso_signout(console):
-    """W-IDLE armed: an expired session is also signed out of Authentik."""
-    console.state['hardening'] = HARDENED
-    console.ns['_widle_sso_logout_active'] = lambda h: True
+    """W-IDLE armed and the console SSO-locked, with app.py's own test for it: an expired
+    session on a request that came through Authentik is also signed out of Authentik."""
+    console.state['hardening'] = {
+        'posture': 'hardened',
+        'applied': {'W2_session': {'idle_max_seconds': 1800},
+                    'W1_sso': {'caddy_login_locked': True},
+                    'WIDLE': {'mode': 'sso_signout', 'signout_url': SIGNOUT}}}
+    for name in ('_w1_console_locked', '_widle_sso_logout_active'):
+        exec(_func_src(name), console.ns)
     console.ns['_console_signout_url'] = lambda: SIGNOUT
 
 
+VIA_AUTHENTIK = {'X-Authentik-Username': 'akadmin'}      # what Caddy adds after forward_auth
+
+
 def test_sign_in_right_after_the_idle_lock_works_with_sso_signout_armed(console):
-    """test12 in the T&E: W-IDLE armed, a password session on the IP and port way in."""
+    """test12 in the T&E: W-IDLE armed, a password session on the IP and port way in
+    (no Authentik in front of it, so there is nothing to sign out of)."""
     _arm_sso_signout(console)
     c = console.app.test_client()
     _login(console, c, '/')
@@ -383,26 +393,40 @@ def test_sign_in_right_after_the_idle_lock_works_with_sso_signout_armed(console)
     assert c.get('/api/metrics', base_url=CONSOLE).status_code == 200
 
 
-@pytest.mark.parametrize('values,headers', [
-    ({'auth_via': 'sso', 'authentik_username': 'akadmin'}, {}),         # made by Authentik
-    ({'authentik_username': 'akadmin'}, {}),                            # cookie from before ops #813
-    ({'auth_via': 'password', 'authentik_username': 'akadmin'}, {}),    # password session seen through Authentik
-    ({'auth_via': 'password'}, {'X-Authentik-Username': 'akadmin'}),    # this request came through Authentik
-    ({}, {}),                                                           # no marker at all
+@pytest.mark.parametrize('values', [
+    {'auth_via': 'sso', 'authentik_username': 'akadmin'},         # made by Authentik
+    {'authentik_username': 'akadmin'},                            # cookie from before ops #813
+    {'auth_via': 'password', 'authentik_username': 'akadmin'},    # password session seen through Authentik
+    {'auth_via': 'password'},
 ])
 @pytest.mark.parametrize('password', [RIGHT, 'wrong-guess-123'])
-def test_sign_in_does_not_skip_the_authentik_sign_out(console, values, headers, password):
-    """With W-IDLE armed, a sign-in POST must not leave a live Authentik session behind an
-    ended console session: the next page would sign the browser in again with no prompt."""
+def test_sign_in_does_not_skip_the_authentik_sign_out(console, values, password):
+    """With W-IDLE armed, a sign-in POST that came through Authentik must not leave a live
+    Authentik session behind an ended console session: the next page would sign the
+    browser in again with no prompt."""
     _arm_sso_signout(console)
     c = console.app.test_client()
     _forge_session(c, authenticated=True, last_activity=int(time.time()) - 4000, **values)
     r = c.post('/login', data={'password': password}, base_url=CONSOLE,
-               headers=dict(headers, Origin=CONSOLE))
+               headers=dict(VIA_AUTHENTIK, Origin=CONSOLE))
     assert r.status_code == 302 and r.headers['Location'] == SIGNOUT, r.headers['Location']
     assert console.state['audits'] == [] and _log_lines(console) == []   # password not read
     with c.session_transaction(base_url=CONSOLE) as s:
         assert not s.get('authenticated')
+
+
+def test_an_expired_authentik_session_sent_to_the_port_gets_no_way_in(console):
+    """The Authentik-made cookie replayed on the IP and port way in, with a wrong password."""
+    _arm_sso_signout(console)
+    c = console.app.test_client()
+    _forge_session(c, authenticated=True, auth_via='sso', authentik_username='akadmin',
+                   last_activity=int(time.time()) - 4000)
+    r = c.post('/', data={'password': 'wrong-guess-123'}, base_url=CONSOLE,
+               headers={'Origin': CONSOLE})
+    assert r.status_code == 200 and 'Invalid password' in r.get_data(as_text=True)
+    with c.session_transaction(base_url=CONSOLE) as s:
+        assert dict(s) == {}
+    assert c.get('/console', base_url=CONSOLE).status_code == 401
 
 
 @pytest.mark.parametrize('method,path', [('POST', '/logout'), ('GET', '/login'), ('GET', '/'),

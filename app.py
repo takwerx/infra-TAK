@@ -8040,16 +8040,12 @@ def _enforce_session_idle_lock():
             # nothing and only the second one worked (10.4.2 T&E: a test tool that signs
             # in again on a 401 looked as if the lock was 10 s late). The session is
             # ended here either way; the sign-in route then checks the password itself.
-            # NOT when W-IDLE is armed and Authentik had a part in the expired session or
-            # in this request: there the sign-out below must run, or a wrong password
-            # would leave the Authentik session alive to sign the browser in again
-            # without a prompt.
+            # NOT when the Authentik sign-out below applies (W-IDLE armed and this request
+            # came through Authentik): there it must run first, or a wrong password would
+            # leave the Authentik session alive to sign the browser in again with no prompt.
             signin_post = request.method == 'POST' and request.path in ('/login', '/')
-            sso_side = (session.get('auth_via') != 'password'
-                        or bool(session.get('authentik_username'))
-                        or bool(request.headers.get('X-Authentik-Username')))
             session.clear()  # local lock always holds, regardless of what follows
-            if signin_post and not (sso_side and _widle_sso_logout_active(h)):
+            if signin_post and not _widle_sso_logout_active(h):
                 return None
             if _widle_sso_logout_active(h):
                 # Sign out of the forward_auth outpost so the next request re-prompts. Must be an
