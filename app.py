@@ -53256,7 +53256,8 @@ def _cloudtak_refresh_override(plog=None):
 # and runs COMPILED js from /dist (the v9.6.0 TS build rewrite): patch BOTH the old
 # .ts source paths (≤v9.1.1 runs them directly) and the new /dist/lib/*.js.
 _CT_MEDIA_CHECK_SH = r'''
-if grep -q "^hlsVariant: mpegts" /mediamtx.yml 2>/dev/null \
+if [ "$(grep -cE '^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):' /mediamtx.yml 2>/dev/null)" = 5 ] \
+ && grep -q "^hlsVariant: mpegts" /mediamtx.yml 2>/dev/null \
  && grep -qE "^hlsAlwaysRemux: (no|false)" /mediamtx.yml 2>/dev/null \
  && grep -q "^hlsSegmentCount: 3" /mediamtx.yml 2>/dev/null \
  && grep -q "^hlsSegmentDuration: 500ms" /mediamtx.yml 2>/dev/null \
@@ -53274,15 +53275,47 @@ done
 printf '%s %s %s\n' "$H" "$R" "$P"
 '''
 _CT_MEDIA_APPLY_SH = r'''
-sed -i "/^hlsVariant:/d; /^hlsAlwaysRemux:/d; /^hlsSegmentCount:/d; /^hlsSegmentDuration:/d; /^hlsPartDuration:/d" /mediamtx.yml
-printf 'hlsVariant: mpegts\nhlsAlwaysRemux: no\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n' >> /mediamtx.yml
+exec 8>/tmp/.ct-media-heal.lock
+command -v flock >/dev/null 2>&1 && flock 8
+F=/mediamtx.yml
+state() {
+if [ "$(grep -cE '^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):' $F 2>/dev/null)" = 5 ] \
+ && grep -q "^hlsVariant: mpegts" $F 2>/dev/null \
+ && grep -qE "^hlsAlwaysRemux: (no|false)" $F 2>/dev/null \
+ && grep -q "^hlsSegmentCount: 3" $F 2>/dev/null \
+ && grep -q "^hlsSegmentDuration: 500ms" $F 2>/dev/null \
+ && grep -q "^hlsPartDuration: 200ms" $F 2>/dev/null; then H=ok; else H=drift; fi
+R=na
+for f in /lib/persist.ts /dist/lib/persist.js; do
+  [ -f "$f" ] || continue
+  if grep -qF "'ephemeral', 'all'" "$f"; then [ "$R" = drift ] || R=ok; else R=drift; fi
+done
+P=na
+for f in /lib/payload.ts /dist/lib/payload.js; do
+  [ -f "$f" ] || continue
+  if grep -qF "replace(/#/g, '%23')" "$f"; then [ "$P" = drift ] || P=ok; else P=drift; fi
+done
+printf '%s %s %s\n' "$H" "$R" "$P"
+}
+converged() { set -- $(state); [ "$1" = ok ] && [ "$2" != drift ] && [ "$3" != drift ]; }
+if converged; then echo UNCHANGED; exit 0; fi
+set -- $(state)
+if [ "$1" != ok ]; then
+  grep -vE '^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):' "$F" > "$F.ops950.tmp"
+  [ $? -le 1 ] || { rm -f "$F.ops950.tmp"; echo "cannot read $F" >&2; exit 1; }
+  printf 'hlsVariant: mpegts\nhlsAlwaysRemux: no\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n' >> "$F.ops950.tmp"
+  cat "$F.ops950.tmp" > "$F"
+  rm -f "$F.ops950.tmp"
+fi
 for f in /lib/persist.ts /dist/lib/persist.js; do
   [ -f "$f" ] && sed -i "s/'ephemeral', 'false'/'ephemeral', 'all'/g" "$f"
 done
 for f in /lib/payload.ts /dist/lib/payload.js; do
   [ -f "$f" ] && sed -i "s|source: path.proxy,|source: path.proxy.startsWith('srt://') ? path.proxy.replace(/#/g, '%23') : path.proxy,|" "$f"
 done
-true
+if converged; then echo CHANGED; exit 0; fi
+echo "media profile did not converge: $(state)" >&2
+exit 1
 '''
 
 
@@ -53410,7 +53443,11 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
                 # The old comparison ("mpegts"/"true") never matched → every remote heal
                 # re-applied + restarted the media container needlessly.
                 "if [ \"$1\" = ok ] && { [ \"$2\" = ok ] || [ \"$2\" = na ]; } && { [ \"$3\" = ok ] || [ \"$3\" = na ]; }; then echo OK; exit 0; fi; "
-                "echo %s | base64 -d | docker exec -i \"$m\" sh && docker restart \"$m\" >/dev/null && echo HEALED || echo FAIL"
+                # ops #950: the apply script locks and re-checks inside the container; UNCHANGED means
+                # another heal already fixed it (and restarts it), so no second restart here.
+                "ao=$(echo %s | base64 -d | docker exec -i \"$m\" sh) || { echo FAIL; exit 0; }; "
+                "case \"$ao\" in *UNCHANGED*) echo OK;; "
+                "*) docker restart \"$m\" >/dev/null && echo HEALED || echo FAIL;; esac"
             ) % (tries, chk_b64, apply_b64)
             ok, out = _ssh_probe(remote_cfg, cmd, timeout=120)
             out = (out or '').strip()
@@ -53444,6 +53481,10 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
         if ap.returncode != 0:
             _log(f"  ⚠ cloudtak-media heal apply failed: {(ap.stderr or ap.stdout or '').strip()[:200]}")
             return False
+        if 'UNCHANGED' in (ap.stdout or ''):
+            # ops #950: the apply script holds a lock inside the container and re-checks under it.
+            # Another heal fixed the file while this one waited, and that heal restarts the container.
+            return True
         subprocess.run(_sudo_wrap(['docker', 'restart', media]), capture_output=True, text=True, timeout=60)
         _log("  ✓ cloudtak-media healed (HLS=mpegts/alwaysRemux + reaper ephemeral-aware)")
         return True
