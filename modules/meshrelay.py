@@ -374,6 +374,15 @@ def capture_initial_password(ctx):
     return parse_initial_password(r.stdout)
 
 
+def get_version_info(ctx):
+    """For the console card and the Guard Dog "update pending" email: what is installed
+    against the one release this infra-TAK pins. Empty `version` when not installed."""
+    have = installed_version(ctx)
+    want = RELEASE.get('tag') or ''
+    return {'version': have, 'latest': want,
+            'update_available': bool(have and want and have != want)}
+
+
 def installed_version(ctx):
     s = ctx['load_settings']()
     return (s.get('meshrelay') or {}).get('tag', '')

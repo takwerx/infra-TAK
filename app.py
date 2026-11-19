@@ -31298,6 +31298,7 @@ _MODULE_UPDATE_ROWS = (
     ('tak_video_restreamer', 'TAK Video Restreamer', None, False,
      'TAK Video Restreamer page → Update Now.'),
     ('simulator', 'TAK Simulator', None, False, 'TAK Simulator page → Rebuild Now.'),
+    ('meshrelay', 'MeshRelay', None, False, 'MeshRelay page → Update.'),
 )
 
 
@@ -31323,6 +31324,8 @@ def _module_update_info(key):
         return mod_registry.tvr.get_version_info(mod_registry.get_ctx())
     if key == 'simulator':
         return mod_registry.simulator.get_version_info(mod_registry.get_ctx())
+    if key == 'meshrelay':
+        return mod_registry.meshrelay.get_version_info(mod_registry.get_ctx())
     return {}
 
 
@@ -46038,6 +46041,8 @@ def get_all_module_versions():
     if modules.get('simulator', {}).get('installed'):
         # v10.1.61: engine ships inside the console — 'update' = rebuild on a version change
         _set('simulator', lambda: mod_registry.simulator.get_version_info(mod_registry.get_ctx()))
+    if modules.get('meshrelay', {}).get('installed'):
+        _set('meshrelay', lambda: mod_registry.meshrelay.get_version_info(mod_registry.get_ctx()))
     if modules.get('netbird', {}).get('installed'):
         _set('netbird', _get_netbird_version_info)
     if modules.get('remote_assist', {}).get('installed'):
@@ -109784,6 +109789,14 @@ def run_full_uninstall():
         except Exception as e:
             plog(f"⚠ TAK Video Restreamer removal error (non-fatal): {e}")
         plog("✓ TAK Video Restreamer removed")
+
+        # 1b2. MeshRelay — ops #973: registry uninstall path (modules/meshrelay.py).
+        plog("━━━ MeshRelay ━━━")
+        try:
+            mod_registry.uninstall_module('meshrelay', log_fn=plog)
+        except Exception as e:
+            plog(f"⚠ MeshRelay removal error (non-fatal): {e}")
+        plog("✓ MeshRelay removed")
 
         # 1c. TAK Simulator — v10.1.61: registry uninstall path (modules/simulator.py).
         plog("━━━ TAK Simulator ━━━")

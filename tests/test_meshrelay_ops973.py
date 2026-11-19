@@ -575,3 +575,22 @@ def test_deploy_arms_the_jail_and_uninstall_removes_it(box):
     assert ('jail', 'arm') in box.fw
     M.uninstall(box.ctx(), {}, {})
     assert ('jail', 'disarm') in box.fw
+
+
+# ── update emails, full uninstall ─────────────────────────────────────────────────────
+
+def test_version_info_feeds_the_pending_update_email(box):
+    box.settings['meshrelay'] = {'tag': 'v4.5.0'}
+    info = M.get_version_info(box.ctx())
+    assert info == {'version': 'v4.5.0', 'latest': 'v4.6.0', 'update_available': True}
+    box.settings['meshrelay'] = {'tag': 'v4.6.0'}
+    assert M.get_version_info(box.ctx())['update_available'] is False
+    box.settings.pop('meshrelay')
+    assert M.get_version_info(box.ctx())['update_available'] is False     # not installed: no email
+
+
+def test_app_lists_meshrelay_for_update_emails_version_cards_and_full_uninstall():
+    assert "('meshrelay', 'MeshRelay', None, False, 'MeshRelay page → Update.')," in APP
+    assert "mod_registry.meshrelay.get_version_info(mod_registry.get_ctx())" in APP
+    assert "mod_registry.uninstall_module('meshrelay', log_fn=plog)" in APP
+    assert "'meshrelay': ['meshrelay_http']" in APP
