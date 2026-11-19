@@ -19630,7 +19630,9 @@ def remote_assist_page():
 
 
 # CoTURN image is PINNED (never :latest) — supply-chain rule. Bump deliberately.
-COTURN_IMAGE = 'coturn/coturn:4.19.1'   # ops #816: SECURITY — 4.19.0 fixes reads past a short key, a mismatched
+COTURN_IMAGE = 'coturn/coturn:4.19.2'   # ops #962: SECURITY — upstream 4.19.2 (Nov 18, 2026) security fixes in the
+# UDP and DTLS listeners; no CVE or GHSA at the time of the bump.
+# ops #816: 4.19.0 fixes reads past a short key, a mismatched
 # realm accepted on connection-bind, a Redis reply offset and a blacklist race; 4.19.1 adds per-source DTLS half-open
 # limits, plaintext on a DTLS port, an oversize TCP/TLS frame and the admin HTTP server (no CVE published
 # at the time of the bump). Earlier: v10.2.8 W8 moved 4.14.0 -> 4.18.0
