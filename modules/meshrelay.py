@@ -265,16 +265,24 @@ def safe_web_members(tf):
 
 
 def extract_web(archive, stage):
+    """Unpack web.tar.gz into `stage`/web. Only vetted members (plain files and folders under
+    web/) are written, one by one through extractfile(): no extractall(), no links, and every
+    target is checked to stay inside the stage folder."""
+    root_abs = os.path.realpath(stage)
     with tarfile.open(archive, 'r:gz') as tf:
         members = safe_web_members(tf)
         for m in members:
-            m.mode = 0o755 if m.isdir() else 0o644
-            m.uid = m.gid = 0
-            m.uname = m.gname = ''
-        try:
-            tf.extractall(stage, members=members, filter='data')   # Python 3.12+ (and later 3.9-3.11 patches)
-        except TypeError:
-            tf.extractall(stage, members=members)                  # members were validated above
+            target = os.path.realpath(os.path.join(stage, m.name))
+            if target != root_abs and not target.startswith(root_abs + os.sep):
+                raise RuntimeError(f'unsafe entry in web.tar.gz: {m.name[:80]!r}')
+            if m.isdir():
+                os.makedirs(target, mode=0o755, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
+            src = tf.extractfile(m)
+            with open(target, 'wb') as out:
+                shutil.copyfileobj(src, out)
+            os.chmod(target, 0o644)
     root = os.path.join(stage, 'web')
     if not os.path.isfile(os.path.join(root, 'index.html')) and not os.path.isdir(root):
         raise RuntimeError('web.tar.gz has no web/ folder')
