@@ -76,8 +76,9 @@ def test_arm_prepull_includes_media_when_the_pin_is_multiarch():
 def test_media_patch_still_replaces_upstream_hls_variant():
     # v9.10.0 started shipping `hlsVariant: fmp4`; ours must replace it, not duplicate it.
     apply = re.search(r"^_CT_MEDIA_APPLY_SH = r'''(.*?)'''", APP, re.S | re.M).group(1)
-    assert '/^hlsVariant:/d' in apply
-    assert apply.index('/^hlsVariant:/d') < apply.index('hlsVariant: mpegts')
+    # ops #950: the old keys are filtered out (grep -v, every one of the five) before ours is added
+    assert "grep -vE '^(hlsVariant|" in apply
+    assert apply.index("grep -vE '^(hlsVariant|") < apply.rindex('hlsVariant: mpegts')
 
 
 def test_pin_has_node_26_and_libatomic_ops821():
