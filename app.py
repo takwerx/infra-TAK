@@ -6847,6 +6847,9 @@ def os_updates_api():
     rb['cve_banner'] = _kernel_cve_banner(rb['running']) if rb['kernel'] else None
     data['reboot'] = rb
     data['reboot_required'] = bool(data.get('reboot_required') or rb['pending'])
+    # ops #963: same idea for Java: the new JDK is on disk but TAK Server still runs the old one.
+    # A /proc read and a stat, so it is read fresh on every call like the kernel state.
+    data['java_restart'] = _java_restart_state()
     return jsonify(data)
 
 
@@ -29606,6 +29609,197 @@ def _postgres_security_items(unknown):
         return []
 
 
+# ── ops #963: a Java update the running TAK Server has not picked up ────────────────────────
+# apt (unattended-upgrades) and dnf install a new JDK on disk by themselves, but a running JVM
+# keeps the OLD one in memory until its process restarts. needrestart is list-only here
+# (NEEDRESTART_MODE='l') and TAK Server is never restarted behind the operator's back, so a
+# box could run a Java with known TLS/JGSS flaws for weeks while every panel said "up to date".
+# The signal is what is INSTALLED vs what is RUNNING (like the kernel, ops #154): a TAK Server
+# Java process that started before the JDK on disk was last written is on the old Java.
+# Only the console user's own read access is needed: /proc/PID/{cmdline,stat} are world
+# readable and a stat of the JDK files needs no privilege. Native installs only: a Docker TAK
+# Server carries its own Java inside the image (see the --pull on its builds).
+_JAVA_PKG_MAJOR_RE = re.compile(r'(?:java-(\d+)-openjdk|openjdk-(\d+)|temurin-(\d+))')
+
+
+def _java_proc_start_epoch(stat_text, btime, hz):
+    """Start time (epoch seconds) of a process from the text of /proc/PID/stat, or None.
+    Field 22 is the start in clock ticks since boot; the command name (field 2) may hold
+    spaces and parentheses, so count from the LAST ')'."""
+    try:
+        rest = stat_text[stat_text.rindex(')') + 2:].split()
+        return float(btime) + int(rest[19]) / float(hz)
+    except (ValueError, IndexError, TypeError, ZeroDivisionError):
+        return None
+
+
+def _java_is_tak_cmdline(argv):
+    """True when `argv` (a /proc cmdline split on NUL) is one of TAK Server's own JVMs:
+    a `java` that is run with a TAK Spring profile or from /opt/tak."""
+    if not argv or os.path.basename(argv[0]) != 'java':
+        return False
+    return any(a.startswith('-Dspring.profiles.active=') or '/opt/tak/' in a for a in argv[1:])
+
+
+def _tak_native_java_procs(proc='/proc'):
+    """[{pid, start, java}] for TAK Server's JVMs on this host ([] on a Docker install or when
+    /proc cannot be read). `java` is the first word of the command line."""
+    try:
+        if _tak_is_container():
+            return []
+        btime = None
+        with open(f'{proc}/stat') as f:
+            for ln in f:
+                if ln.startswith('btime '):
+                    btime = float(ln.split()[1])
+                    break
+        hz = os.sysconf('SC_CLK_TCK')
+        names = [n for n in os.listdir(proc) if n.isdigit()]
+    except Exception:
+        return []
+    out = []
+    for n in names:
+        try:
+            with open(f'{proc}/{n}/cmdline', 'rb') as f:
+                argv = [a.decode('utf-8', 'replace') for a in f.read().split(b'\0') if a]
+            if not _java_is_tak_cmdline(argv):
+                continue
+            with open(f'{proc}/{n}/stat') as f:
+                start = _java_proc_start_epoch(f.read(), btime, hz)
+        except Exception:
+            continue          # the process ended, or is hidden from this user
+        if start is not None:
+            out.append({'pid': int(n), 'start': start, 'java': argv[0]})
+    return out
+
+
+def _java_installed_at(java):
+    """(epoch, real path) of when the JDK behind `java` was last written to disk: the newest
+    change time of its bin/java and lib/server/libjvm.so (dpkg and rpm write a new file for
+    each, so the change time is the install time). (None, '') when it cannot be read.
+    A `java` given as a path that no longer exists was removed by an update: (inf, path)."""
+    cands = [java] if os.path.isabs(java) else []
+    w = shutil.which('java')
+    if w:
+        cands.append(w)
+    for c in cands:
+        real = os.path.realpath(c)
+        files = [real, os.path.join(os.path.dirname(os.path.dirname(real)), 'lib', 'server', 'libjvm.so')]
+        times = []
+        for p in files:
+            try:
+                times.append(os.stat(p).st_ctime)
+            except OSError:
+                pass
+        if times:
+            return max(times), real
+        if c is java:
+            return float('inf'), real     # the JVM this process started from is gone
+    return None, ''
+
+
+def _java_stale_procs(procs, installed_at):
+    """The `procs` that started BEFORE their JDK was last written (pure). `installed_at` maps
+    a java path to (epoch, real path). Returns (stale procs, newest finite install epoch or
+    0.0, the JDK path)."""
+    cache, stale, real_java, newest = {}, [], '', 0.0
+    for p in procs:
+        if p['java'] not in cache:
+            cache[p['java']] = installed_at(p['java'])
+        when, real = cache[p['java']]
+        if when is not None and p['start'] < when:
+            stale.append(p)
+            real_java = real_java or real
+            if when != float('inf'):
+                newest = max(newest, when)
+    return stale, newest, real_java
+
+
+def _java_restart_state():
+    """What the console needs to say "restart TAK Server to use the new Java". Never raises.
+    {'stale': [pid, ...], 'installed_at': epoch, 'java': JDK path, 'sig': str}; `stale` is
+    empty when TAK Server started after the JDK last changed (or on Docker)."""
+    st = {'stale': [], 'installed_at': 0.0, 'java': '', 'sig': ''}
+    try:
+        stale, newest, real = _java_stale_procs(_tak_native_java_procs(), _java_installed_at)
+    except Exception:
+        return st
+    if stale:
+        st.update({'stale': sorted(p['pid'] for p in stale), 'installed_at': newest, 'java': real,
+                   'sig': ('java@%d' % int(newest)) if newest else 'java@removed'})
+    return st
+
+
+def _java_package_candidates(real_java, pkg_mgr):
+    """JDK package names to ask the package manager about, from the JDK's own path."""
+    m = _JAVA_PKG_MAJOR_RE.search(real_java or '')
+    major = next((g for g in m.groups() if g), '17') if m else '17'
+    if pkg_mgr == 'dnf':
+        return [f'java-{major}-openjdk-headless', f'java-{major}-openjdk', f'java-{major}-openjdk-devel']
+    return [f'openjdk-{major}-jre-headless', f'openjdk-{major}-jdk-headless',
+            f'openjdk-{major}-jre', f'openjdk-{major}-jdk']
+
+
+def _java_update_security(state):
+    """{pkg, version, how_known} when the installed JDK is a VERIFIED security build (Ubuntu's
+    -security pocket for it, or a dnf security advisory that lists the installed version);
+    None when it is not, or it is not a distro package (Temurin by hand). Raises when the
+    package manager could not answer, so the caller can tell "not security" from "could not
+    tell": never a guess either way (same rule as _staged_kernel_security)."""
+    mgr = _pkg_mgr()
+    names = _java_package_candidates(state.get('java'), mgr)
+    have = _installed_pkg_versions(names)
+    for name in names:
+        ver = have.get(name)
+        if not ver:
+            continue
+        if mgr == 'dnf':
+            for a in _dnf_security_advisories(['--installed', name]):
+                if ver.split(':')[-1] in a['nevra']:
+                    return {'pkg': name, 'version': ver,
+                            'how_known': a['id'] + (' (%s)' % a['severity'] if a['severity'] else '')}
+            return None
+        r = subprocess.run([_real_bin('apt-cache'), 'policy', name],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            raise RuntimeError('apt-cache policy failed (rc=%s)' % r.returncode)
+        return ({'pkg': name, 'version': ver, 'how_known': 'Ubuntu security update'}
+                if _apt_policy_installed_from_security(r.stdout) else None)
+    return None
+
+
+_JAVA_RESTART_HOW = ('TAK Server page → Restart TAK Server. Clients reconnect by themselves; '
+                     'pick a quiet moment if you are mid-operation.')
+
+
+def _java_restart_items(unknown):
+    """Update-email item (ops #963): a verified Java SECURITY build is installed and the
+    running TAK Server still uses the old one. One mail per Java install (the identity is the
+    install time), not repeated; gone once TAK Server restarts. A package manager that cannot
+    answer goes into `unknown` so its dedup state is carried, never re-mailed on a guess."""
+    try:
+        st = _java_restart_state()
+        if not st['stale']:
+            return []
+        sec = _java_update_security(st)
+    except Exception as e:
+        unknown.add('java-restart')
+        print(f"[update-notify] Java restart check failed: {e}", flush=True)
+        return []
+    if not sec:
+        return []
+    return [{'key': 'java-restart', 'label': 'Java (TAK Server)',
+             'installed': 'TAK Server is running the old Java',
+             'target': f"{sec['pkg']} {sec['version']}",
+             'summary': 'Java security update installed: restart TAK Server to use it',
+             'identity': st['sig'],
+             'security': ["The new Java is installed on this machine, but TAK Server started before it "
+                          "and keeps running the old one until it restarts.",
+                          f"It fixes Java security flaws, including in the TLS code behind the client "
+                          f"ports ({sec['how_known']}: {sec['pkg']} {sec['version']})."],
+             'how': _JAVA_RESTART_HOW}]
+
+
 # ops #760: TAK Server's database on ANOTHER machine. The host check above only sees PostgreSQL
 # packages on this box, so a split install (database on Server One) and a managed database
 # (Amazon RDS, Azure Database for PostgreSQL) were never told. The version is read from the
@@ -30965,6 +31159,8 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
         print(f"[update-notify] OS security check failed: {e}", flush=True)
     # ops #754: PostgreSQL security update for the host install (TAK Server's own database)
     pending.extend(_postgres_security_items(unknown))
+    # ops #963: a Java security update that is installed but that TAK Server has not restarted onto
+    pending.extend(_java_restart_items(unknown))
     # ops #755: ...and the TAK Server database CONTAINER (built once at install, never refreshed)
     try:
         pending.extend(_tak_db_refresh_items())
@@ -98837,7 +99033,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         _patch_tak_dockerfile_cacerts(new_ctx, _app_df, ulog)   # ops #200 — JDK's own CA roots
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
-        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build --pull -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
             return _fail("TAK Server image build failed.")
         ulog("✓ Images built")
         # The hardened 5.8 images run as tak:0 / postgres:0, not root, and the tree they
@@ -100919,7 +101115,7 @@ def _deploy_takserver_container(config):
         _patch_tak_dockerfile_cacerts(build_ctx, _app_df, log_step)   # ops #200 — JDK's own CA roots
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
-        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
+        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build --pull -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
             log_step("✗ takserver image build failed."); deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ Images built")
 

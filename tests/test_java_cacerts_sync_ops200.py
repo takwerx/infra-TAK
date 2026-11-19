@@ -380,7 +380,7 @@ def test_both_tak_image_builds_apply_the_patch():
     assert APP.count('_patch_tak_dockerfile_cacerts(new_ctx, _app_df') == 1
     for ctx in ('build_ctx', 'new_ctx'):
         at = APP.index(f'_patch_tak_dockerfile_cacerts({ctx}, _app_df')
-        assert at < APP.index('docker build -t {TAK_CONTAINER}', at)
+        assert at < APP.index('docker build --pull -t {TAK_CONTAINER}', at)
 
 
 class _Exec:

@@ -119,6 +119,15 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button onclick="dismissPgRemote()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
 </div>
 </div></div>
+<div id="java-restart-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px"><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; A Java update is installed, but TAK Server is still running the old Java</div>
+<div id="java-restart-body" style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6">The update only takes effect when TAK Server restarts. Clients reconnect on their own, but pick a quiet moment if you are mid-operation.</div>
+<div id="java-restart-msg" style="font-size:11px;margin-top:6px"></div></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button id="java-restart-btn" onclick="javaRestartTak()" style="padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Restart TAK Server</button>
+<button onclick="dismissJavaRestart()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">I'll restart later</button>
+</div></div></div>
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div id="kpatch-idle">
 <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
@@ -1122,6 +1131,52 @@ function renderOsUpdates(d){
     var be=document.getElementById('osupd-details-body');
     if(be)be.innerHTML=body;
 }
+// ops #963: the new Java is on disk but TAK Server still runs the old one (it only changes on a
+// restart). Shown from /api/os-updates `java_restart`; "later" is quiet for 24 h per Java install.
+function _javaRestartDismissed(sig){
+    try{var d=JSON.parse(localStorage.getItem('java-restart-dismissed')||'null');
+        return !!(d&&d.sig===sig&&d.ts>0&&(Date.now()-d.ts)<24*60*60*1000);}catch(e){return false;}
+}
+function _javaRestartRender(ud){
+    var b=document.getElementById('java-restart-banner');if(!b)return;
+    var j=ud&&ud.java_restart;
+    if(!(j&&j.stale&&j.stale.length)||_javaRestartDismissed(j.sig)){b.style.display='none';return;}
+    b.setAttribute('data-java-sig',j.sig||'');
+    b.style.display='block';
+}
+function dismissJavaRestart(){
+    var b=document.getElementById('java-restart-banner');if(!b)return;
+    var sig=b.getAttribute('data-java-sig')||'';
+    if(sig){try{localStorage.setItem('java-restart-dismissed',JSON.stringify({sig:sig,ts:Date.now()}));}catch(e){}}
+    b.style.display='none';
+}
+async function javaRestartTak(){
+    if(!confirm('Restart TAK Server now?\n\nIt is unavailable for about a minute. Clients reconnect on their own.'))return;
+    var btn=document.getElementById('java-restart-btn'),msg=document.getElementById('java-restart-msg');
+    if(btn)btn.disabled=true;
+    if(msg){msg.style.color='var(--cyan)';msg.textContent='Restarting TAK Server\u2026';}
+    try{
+        var r=await fetch('/api/takserver/control',{method:'POST',credentials:'same-origin',
+            headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'restart',target:'core'})});
+        var d=await r.json();
+        if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
+        if(msg){msg.style.color='var(--green)';msg.textContent='TAK Server restarted. Checking the Java it runs\u2026';}
+        setTimeout(async function(){
+            try{
+                var ur=await fetch('/api/os-updates',{credentials:'same-origin',cache:'no-store'});
+                var ud=await ur.json();
+                var j=ud&&ud.java_restart;
+                if(j&&j.stale&&j.stale.length){
+                    if(msg){msg.style.color='var(--yellow)';msg.textContent='TAK Server is still starting. Check again in a minute.';}
+                    if(btn)btn.disabled=false;
+                }else{_javaRestartRender(ud);}
+            }catch(e){if(btn)btn.disabled=false;}
+        },15000);
+    }catch(e){
+        if(msg){msg.style.color='var(--red)';msg.textContent='Restart failed: '+e.message;}
+        if(btn)btn.disabled=false;
+    }
+}
 async function checkKernelPatch(){
     var banner=document.getElementById('kernel-patch-banner');if(!banner)return;
     // First: check if a background patch job is in flight (started in a prior
@@ -1182,6 +1237,7 @@ async function checkKernelPatch(){
     try{
         var ur=await fetch('/api/os-updates',{credentials:'same-origin',cache:'no-store'});
         var ud=await ur.json();
+        try{_javaRestartRender(ud);}catch(e){}
         if(ud&&ud.error){
             // "Could not check" is NOT "nothing pending" — say so rather than
             // rendering an empty, reassuring screen.
