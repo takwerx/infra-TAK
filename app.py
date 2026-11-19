@@ -8034,7 +8034,23 @@ def _enforce_session_idle_lock():
                 # Don't reset the clock or kill the SSO session on a background poll — just
                 # signal expiry. The true re-prompt fires on the next full-page navigation.
                 return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
+            # ops #815 follow-up: a password sign-in (the form on / and /login posts back
+            # to its own path) that arrives with the expired cookie used to be sent to
+            # /login with its password unread, so the first sign-in after a lock did
+            # nothing and only the second one worked (10.4.2 T&E: a test tool that signs
+            # in again on a 401 looked as if the lock was 10 s late). The session is
+            # ended here either way; the sign-in route then checks the password itself.
+            # NOT when W-IDLE is armed and Authentik had a part in the expired session or
+            # in this request: there the sign-out below must run, or a wrong password
+            # would leave the Authentik session alive to sign the browser in again
+            # without a prompt.
+            signin_post = request.method == 'POST' and request.path in ('/login', '/')
+            sso_side = (session.get('auth_via') != 'password'
+                        or bool(session.get('authentik_username'))
+                        or bool(request.headers.get('X-Authentik-Username')))
             session.clear()  # local lock always holds, regardless of what follows
+            if signin_post and not (sso_side and _widle_sso_logout_active(h)):
+                return None
             if _widle_sso_logout_active(h):
                 # Sign out of the forward_auth outpost so the next request re-prompts. Must be an
                 # ABSOLUTE URL on the SSO vhost — request.host/host_url are the loopback upstream
@@ -8060,6 +8076,10 @@ def _enforce_session_idle_lock():
             session.clear()
         except Exception:
             pass
+        if request.method == 'POST' and request.path in ('/login', '/'):
+            # The session is ended; the sign-in route checks the password in this request.
+            # This path never signed out of Authentik, so nothing is given up here.
+            return None
         return redirect(url_for('login'))
 
 # v0.9.58: the auto-reload "Session expired — signing you back in…" band-aid was REMOVED.
