@@ -443,7 +443,9 @@ def _versions_from_server(infos):
 
     ns = {'re': re, 'VERSION': '10.4.2-alpha', 'update_cache': {}, 'mod_registry': _Registry,
           'detect_modules': lambda: {k: {'installed': True} for k in list(infos) + ['guarddog']},
-          '_node_card_gaps': lambda: {'nodered': 'gap'}, '_node_card_flag': lambda gap: 'Node.js is out of date'}
+          '_node_card_gaps': lambda: {'nodered': 'gap'}, '_node_card_flag': lambda gap: 'Node.js is out of date',
+          # ops #972: the Guard Dog card reads the stamped deploy version (Guard Dog is current here)
+          'load_settings': lambda: {'guarddog_deployed_version': '10.4.2-alpha'}}
     for key in infos:
         ns['_get_%s_version_info' % key] = (lambda k: lambda: infos[k])(key)
     exec(compile(_version_code(), 'app.py', 'exec'), ns)

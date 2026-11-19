@@ -20380,17 +20380,7 @@ def guarddog_page():
     notifications_configured = bool((settings.get('guarddog_alert_email') or '').strip())
     # Detect if Guard Dog config is current or needs re-deploy
     _gd_dep_ver = settings.get('guarddog_deployed_version', '')
-    _gd_dep_email = settings.get('guarddog_deployed_email', '')
-    _gd_dep_nick = settings.get('guarddog_deployed_nickname', '')
-    _gd_cur_email = (settings.get('guarddog_alert_email') or '').strip()
-    _gd_cur_nick = (settings.get('guarddog_server_nickname') or '').strip()
-    gd_needs_update = (
-        gd.get('installed') and (
-            _gd_dep_ver != VERSION or
-            _gd_dep_email != _gd_cur_email or
-            _gd_dep_nick != _gd_cur_nick
-        )
-    )
+    gd_needs_update = _guarddog_needs_update(settings, gd.get('installed'))
     # Last-run timestamps for scheduled maintenance timers
     def _timer_last_run(stamp_file):
         """Read last-run UTC timestamp written by the script itself, or fall back to systemd."""
@@ -45406,6 +45396,25 @@ def _safe_module_version_info(key, info):
     return out
 
 
+def _guarddog_needs_update(settings, installed):
+    """True when the Guard Dog page offers "Update Guard Dog" (ops #972, infra-TAK #590).
+
+    One answer for both screens: the page banner and the main-page card badge. The
+    deployed scripts differ from the running console, or the alert email / server
+    nickname changed since the last deploy. A newer console RELEASE is not a Guard
+    Dog update: the scripts follow the console on its startup, and the console has
+    its own Update Available banner. Showing it on the card too left a blue "update"
+    with no button on the Guard Dog page.
+    """
+    if not installed:
+        return False
+    return bool(
+        (settings.get('guarddog_deployed_version', '') != VERSION)
+        or (settings.get('guarddog_deployed_email', '') != (settings.get('guarddog_alert_email') or '').strip())
+        or (settings.get('guarddog_deployed_nickname', '') != (settings.get('guarddog_server_nickname') or '').strip())
+    )
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards.
 
@@ -45467,17 +45476,12 @@ def get_all_module_versions():
         _set('netbird', _get_netbird_version_info)
     if modules.get('remote_assist', {}).get('installed'):
         _set('remote_assist', _get_remote_assist_version_info)
-    # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
+    # Guard Dog: the card shows an update only when the Guard Dog page offers one
+    # (ops #972): same helper as the page. A newer console release is the console's
+    # own banner; the scripts follow it on startup.
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
-        gd_update = False
-        if gd_latest and (update_cache.get('checked') or 0) > 0:
-            try:
-                def _tv(v):
-                    return tuple(int(p) for p in (v or '').replace('-alpha', '').replace('-beta', '').split('.')[:3])
-                gd_update = _tv(gd_latest) > _tv(VERSION) and gd_latest.strip() != (VERSION or '').strip()
-            except (ValueError, IndexError):
-                pass
+        gd_update = _guarddog_needs_update(load_settings(), True)
         result['guarddog'] = {'version': VERSION, 'update_available': gd_update, 'latest': gd_latest}
     # ops #296: red "Node.js is out of date" flag — same table as the security email.
     try:
