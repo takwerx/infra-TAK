@@ -766,7 +766,8 @@ async function reconfigureAk(){
     }catch(e){alert('Error: '+e.message)}
 }
 
-function escapeHtml(s){var d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
+/* ops #827: escapes & < > " ' so the result is safe in text and in a quoted attribute */
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 async function runDomainAudit(){
     var btn = document.getElementById('domain-audit-btn');
     var res = document.getElementById('domain-audit-result');

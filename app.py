@@ -70,7 +70,8 @@ if __name__ == '__main__':
 
 
 from flask import (Flask, render_template, request, jsonify,
-    redirect, url_for, session, send_from_directory, make_response)
+    redirect, url_for, session, send_from_directory, make_response,
+    g, has_request_context)
 # GH #137: the werkzeug pair is wrapped below (verify_password / hash_password, next to
 # load_auth) and the plain names re-bound to the wrappers, so every existing
 # check_password_hash() call site gets the fail-closed check without being touched.
@@ -214,6 +215,12 @@ app.session_interface = _ConsoleSessionInterface()
 # In-memory rate limiter (per-process). Good baseline protection without extra deps.
 _RATE_LOCK = threading.Lock()
 _RATE_HITS = defaultdict(deque)  # key -> deque[timestamps]
+# ops #815: a key used to stay for the life of the process, one per address that ever
+# posted. _RATE_EXPIRES holds the time each key's newest hit leaves its window; the sweep
+# (at most once a minute, under the lock) drops every key past it.
+_RATE_EXPIRES = {}               # key -> time its newest hit expires
+_RATE_SWEEP = {'next': 0.0}
+_RATE_SWEEP_EVERY = 60
 
 # ops #813: how long a signed console session cookie is accepted after it was last
 # written. Flask checks the cookie's signed timestamp against this value for every
@@ -986,6 +993,23 @@ def _gd_render_older_broker(name, err):
     return name in _GD_OPTIONAL_SCRIPTS and 'not a Guard Dog script name' in err
 
 
+# ops #815: the health endpoint is the one Guard Dog script that is a long-running
+# service, not a timer job. A new copy on disk does nothing until the service restarts,
+# so a fix to it never reached a running box (until its next reboot). Both paths that
+# install the script restart the service when, and only when, the file changed.
+_GD_HEALTH_SCRIPT = 'tak-health-endpoint.py'
+
+
+def _gd_restart_health_endpoint():
+    """Load a changed health endpoint script (try-restart: a stopped or absent service
+    stays as it is). Never raises."""
+    try:
+        subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'tak-health.service']),
+                       capture_output=True, timeout=20)
+    except Exception as e:
+        print(f"[guarddog] tak-health.service not restarted: {str(e)[:120]}", flush=True)
+
+
 def _gd_install_script(name, template, values, perm=0o755):
     """Install /opt/tak-guarddog/<name> from its repo template. Returns True when the
     file changed. A broker on the root-owned layout renders it from ITS copy of the
@@ -1375,17 +1399,40 @@ def _client_ip():
     return (request.remote_addr or 'unknown').strip()
 
 
+def _rate_limit_ip_key(ip):
+    """The rate-limit bucket for a client address (ops #815). One IPv6 customer line is a
+    whole /64, so a caller could take a new address for every request and never reach a
+    per-address limit: IPv6 is counted per /64. IPv4 (also IPv4-mapped IPv6) stays per
+    address. Anything that is not an address is returned unchanged. Only for rate-limit
+    keys: the fail2ban log keeps the real address."""
+    try:
+        addr = ipaddress.ip_address((ip or '').split('%')[0])
+    except ValueError:
+        return ip
+    if addr.version == 6:
+        if addr.ipv4_mapped is not None:
+            return str(addr.ipv4_mapped)
+        return str(ipaddress.ip_network('%s/64' % addr, strict=False))
+    return str(addr)
+
+
 def _is_rate_limited(key, limit, window_seconds):
     """Return True when key exceeded limit within rolling window."""
     now = time.time()
     cutoff = now - window_seconds
     with _RATE_LOCK:
+        if now >= _RATE_SWEEP['next']:
+            _RATE_SWEEP['next'] = now + _RATE_SWEEP_EVERY
+            for stale in [k for k, exp in _RATE_EXPIRES.items() if exp <= now]:
+                _RATE_HITS.pop(stale, None)
+                _RATE_EXPIRES.pop(stale, None)
         q = _RATE_HITS[key]
         while q and q[0] < cutoff:
             q.popleft()
         if len(q) >= limit:
             return True
         q.append(now)
+        _RATE_EXPIRES[key] = now + window_seconds
         return False
 
 
@@ -1551,8 +1598,8 @@ def ensure_session_valid():
     case."""
     _drop_stale_session()
 
-    # Baseline rate limiting
-    ip = _client_ip()
+    # Baseline rate limiting (ops #815: IPv6 is counted per /64)
+    ip = _rate_limit_ip_key(_client_ip())
     if request.method == 'POST' and request.path in ('/login', '/'):
         if _is_rate_limited(f'login:{ip}', limit=12, window_seconds=300):
             return jsonify({'error': 'Too many login attempts. Please wait a few minutes.'}), 429
@@ -1625,7 +1672,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.4.1-alpha"
+VERSION = "10.4.2-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1803,8 +1850,14 @@ REMOTE_ASSIST_LOGO_URL = "/static/eud-remote-assist-banner.png"
 # 0.81.4 distrusts the eMudhra CA keys. No config.yaml schema change; the store only gains
 # columns (peer MAC, cert posture, per-target access); the rollback drill checks 0.80.0 still
 # starts clean on a 0.81-migrated store.
-NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.80.0"      # VETTED (main) — field-validated working pair
-NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.94.0"
+# ops #819: 0.82.1 / v2.96.0 PROMOTED to VETTED (main), so fresh installs and main-channel boxes leave
+# 0.80.0. Evidence: 0.80.0 -> 0.82.1 Update with two peers kept and pinging over the relay (ops #884
+# row 8), 0.82.0 -> 0.82.1 update, rollback, embedded-IdP and Authentik logins, the x509 path and a
+# soak on three platforms (ops #819), and a fresh deploy straight onto this pair (ops #819, PR body).
+# Rollback: re-pin NETBIRD_SERVER_IMAGE / NETBIRD_DASHBOARD_IMAGE to 0.80.0 / v2.94.0; the pin-restore
+# heal converges boxes back on console boot (0.80.0 starts clean on a 0.82-migrated store, ops #819).
+NETBIRD_SERVER_IMAGE = "netbirdio/netbird-server:0.82.1"      # VETTED (main) — field-validated working pair
+NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.96.0"
 # ops #427: 0.82.0 / v2.96.0 UNDER TRIAL on dev (T&E only, not promoted; 0.81.4 passed its 24 h
 # soak, ops #208, but stays unpromoted until the lead moves the vetted pin). 0.82.0: relay
 # negotiates the protocol version, new DB indexes, reverse-proxy access logs move to their own
@@ -1836,8 +1889,8 @@ MEDIAMTX_EDITOR_PATH = "config-editor"  # subdir containing mediamtx_config_edit
 # The tag picks the release; MEDIAMTX_EDITOR_SHA is what every fetch is checked against.
 # Bump both together, only after the editor release is box-tested. tests/test_pinned_third_party_ops637.py
 # fails if either goes back to a branch name.
-MEDIAMTX_EDITOR_REF = "v2.1.14"
-MEDIAMTX_EDITOR_SHA = "8d39e26d81601e107873ca8c81b4a8076bb2e028"  # commit of tag v2.1.14 (was main's tip)
+MEDIAMTX_EDITOR_REF = "v2.1.17"
+MEDIAMTX_EDITOR_SHA = "af22db792889a0c93c24e52d6f69099afd676490"  # COMMIT of tag v2.1.17 (git rev-parse v2.1.17^{commit}; v2.1.17 is an annotated tag, so rev-parse v2.1.17 gives the tag object abf1281 and raw.githubusercontent answers 404 for it). v2.1.17 adds the share-link player start fix (mediamtx-installer PR 54, ops #900/#940); v2.1.15 added hashed passwords + a random first login (ops #877)
 MEDIAMTX_EDITOR_LDAP_BRANCH = None  # LDAP behavior comes from mediamtx_ldap_overlay.py in this repo; use repo default branch
 # The local editor unit's pre-start line that runs the script below (dash: best-effort).
 _MEDIAMTX_EDITOR_PRESTART = 'ExecStartPre=-/usr/bin/python3 /opt/mediamtx-webeditor/ensure_overlay.py'
@@ -2957,6 +3010,15 @@ def _stamp_session_login():
     session[SESSION_TOKEN_KEY] = _session_auth_token()
 
 
+def _stamp_notice_login(fresh):
+    """Per-login id for notice bars that come back on every login (the root-console
+    bar). fresh=True on a password login: a new id, so a dismissal from the last
+    login no longer applies. The SSO path runs on EVERY request, so it only sets the
+    id when the session has none (a new SSO session, or after logout cleared it)."""
+    if fresh or not session.get('notice_login'):
+        session['notice_login'] = secrets.token_hex(6)
+
+
 def _drop_stale_session():
     if not session.get('authenticated'):
         return
@@ -2990,11 +3052,22 @@ def verify_password(pwhash, password):
     if not pwhash:
         return False
     try:
-        return bool(_werkzeug_check_password_hash(pwhash, password or ''))
+        ok = bool(_werkzeug_check_password_hash(pwhash, password or ''))
     except Exception as e:
         print(f"[auth] password check denied: stored hash cannot be checked on this box "
               f"({type(e).__name__}: {str(e)[:120]})", flush=True)
         return False
+    if not ok and password:
+        # ops #815: a wrong console password typed into ANY form is a failed login, not
+        # only on the login page. The "confirm with your password" checks (uninstall,
+        # power, password change, ...) wrote nothing, so a caller holding a session could
+        # guess the password there with no trace and no ban. An empty password is a form
+        # sent without one, not a guess. Never raises, never changes the answer.
+        try:
+            _console_note_failed_password_check(password)
+        except Exception:
+            pass
+    return ok
 
 
 def hash_password(password):
@@ -4894,11 +4967,13 @@ def _apply_authentik_session():
     session['auth_via'] = 'password' if _had_password_session else 'sso'
     session['sso_ok_at'] = int(time.time())
     _stamp_session_login()   # ops #634
+    _stamp_notice_login(False)
     # v10.1.40: stamp the idle clock at the moment SSO authenticates.
     #
     # Only ONE place used to set last_activity — inside _enforce_session_idle_lock()
     # itself. Of the three paths that establish an authenticated session, the password
-    # path at index() POST calls session.clear() first (so a stale value cannot survive),
+    # path at /login POST calls session.clear() first (so a stale value cannot survive;
+    # since ops #815 the one at index() does too, and both stamp the clock),
     # but THIS path and the other did not, leaving whatever the browser's cookie already
     # carried. A returning user whose cookie held a last_activity older than idle_max was
     # therefore re-authenticated by forward_auth and then, on the very next request, had
@@ -5910,6 +5985,34 @@ def _no_retention_bar(settings):
             'bg': '#2b1414', 'border': 'rgba(239,68,68,.45)', 'html': body}
 
 
+def _root_console_bar(settings):
+    """Spec for the "this console runs as root" bar, or None.
+
+    Fresh installs have been born non-root (takwerx @ /opt/infratak) since v10.0.5,
+    but an EXISTING root install stays root on every update — start.sh and Update
+    Now never flip it. The only way off root is the "Switch to non-root" button on
+    the Cyber Controls page, and nothing pointed a root operator at it, so legacy
+    boxes stayed root indefinitely (field report #523 hit a root-only ETL build
+    path). This bar is that pointer.
+
+    Dismissible, but it comes back on every login (operator decision 2026-11-16):
+    the dismissal key carries the per-login id from _stamp_notice_login(). It clears
+    by itself after the switch because the console process is no longer uid 0. No
+    I/O on the render path."""
+    try:
+        if os.getuid() != 0:
+            return None
+        login_id = str(session.get('notice_login') or '')
+    except Exception:
+        return None
+    body = ('⚠ This console runs as root (an older install). Switch to the non-root console '
+            'for least privilege — one click, with automatic rollback. '
+            '<a href="/hardening#console-guard" style="color:inherit;text-decoration:underline">'
+            'Switch to non-root →</a>')
+    return {'cls': 'rootcon-banner', 'key': 'rootconsole:' + login_id, 'fg': '#eab308',
+            'bg': '#2b2411', 'border': 'rgba(234,179,8,.45)', 'html': body}
+
+
 def _tak_cert_names_bar(settings):
     """Spec for the "TAK Server's certificate doesn't include <domain>" bar, or None.
 
@@ -5971,7 +6074,7 @@ def render_notice_bars(settings):
 
 def _render_notice_bars_inner(settings):
     specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings),
-                         _tak_cert_names_bar(settings)) if b]
+                         _tak_cert_names_bar(settings), _root_console_bar(settings)) if b]
     if not specs:
         return ''
     base = _custom_banner_height(settings or {})
@@ -7500,6 +7603,9 @@ def _login_logo_url():
         return url_for('static', filename=LOGIN_LOGO_FILENAME)
     return None
 
+_SAFE_NEXT_PATH_RE = re.compile(r'/[A-Za-z0-9._~/-]*(?:\?[A-Za-z0-9._~/=&%-]*)?')
+
+
 def _safe_next_path():
     """A validated SAME-SITE path from ?next= (or the posted form) for the post-login
     redirect. Used by the setup-AP captive to deep-link straight to the light
@@ -7507,10 +7613,21 @@ def _safe_next_path():
     Local absolute paths only — never an off-site URL (open-redirect guard). Empty if
     absent/unsafe → caller falls back to the normal console page. The login form has no
     action= so it POSTs to the current URL, preserving ?next through the round-trip."""
-    nxt = (request.args.get('next') or request.form.get('next') or '').strip()
-    if nxt.startswith('/') and not nxt.startswith('//') and '://' not in nxt and '\\' not in nxt:
-        return nxt
-    return ''
+    nxt = request.args.get('next') or request.form.get('next') or ''
+    # ops #815: an allow-list of characters, not a list of bad ones. The old check let
+    # through a tab or a newline after the first slash; the URL parsers (Python's and the
+    # browser's) drop those, so the redirect went to another site. Nothing outside plain
+    # path characters is needed here, so nothing else is accepted: no whitespace or
+    # control character, no backslash, no "//" or ".." anywhere, no scheme, no host.
+    if not _SAFE_NEXT_PATH_RE.fullmatch(nxt) or '//' in nxt or '..' in nxt:
+        return ''
+    try:
+        parts = urllib.parse.urlsplit(nxt)
+    except ValueError:
+        return ''
+    if parts.scheme or parts.netloc:
+        return ''
+    return nxt
 
 # ops #638: the console password is the way in to a root service, so it has a floor, and
 # a wrong one leaves a trace. Every failed password login is written (with the real
@@ -7523,11 +7640,53 @@ CONSOLE_LOGIN_FAIL_LOG = os.path.join(CONFIG_DIR, 'console-auth.log')
 CONSOLE_LOGIN_FAIL_LOG_MAX = 2 * 1024 * 1024   # 2 MiB, then roll — one .1 kept
 
 
+# ops #815: one wrong password is one failed login, however often the page sends it. The
+# uninstall dialog checks the typed password when the field loses focus, again when the
+# dialog opens, and once more on submit: three requests for one typo, and 10 lines ban the
+# address. So the same wrong value from the same address inside 10 minutes is recorded
+# once. A new guess is a new line. Only a keyed digest of the last wrong value per address
+# is kept, in memory, never on disk; the key is made new at every console start.
+_PW_FAIL_KEY = secrets.token_bytes(32)
+_PW_FAIL_SEEN = {}            # client address -> (digest of its last wrong password, time)
+_PW_FAIL_SEEN_MAX = 2048
+_PW_FAIL_SAME_WINDOW = 600
+
+
+def _console_note_failed_password_check(password):
+    """A wrong console password was checked during a request (called by verify_password,
+    ops #815). Outside a request (start-up, a script) there is no caller to record. The
+    login routes record their own failures (every one, an empty password too)."""
+    if not has_request_context() or request.path in ('/login', '/'):
+        return
+    ip = _client_ip()
+    digest = hmac.new(_PW_FAIL_KEY, str(password).encode('utf-8', 'surrogatepass'),
+                      hashlib.sha256).digest()
+    now = time.time()
+    with _RATE_LOCK:
+        seen = _PW_FAIL_SEEN.get(ip)
+        if seen and hmac.compare_digest(seen[0], digest) and now - seen[1] < _PW_FAIL_SAME_WINDOW:
+            return
+        if len(_PW_FAIL_SEEN) >= _PW_FAIL_SEEN_MAX:
+            _PW_FAIL_SEEN.clear()
+        _PW_FAIL_SEEN[ip] = (digest, now)
+    _console_log_failed_login('password check on %s' % request.path)
+
+
 def _console_log_failed_login(where):
     """Record one failed console password login. The password is NEVER written. Never raises.
 
+    One line per request at most: verify_password records a wrong password on the
+    "confirm with your password" forms itself (ops #815), and some of those routes also
+    call this. fail2ban counts lines, so a second line would halve the limit.
+
     Rolled at 2 MiB: the login page is public, so whoever sprays it also picks how much
     disk this file takes. fail2ban keeps reading the live file after a roll."""
+    try:
+        if g.get('console_pw_fail_logged'):
+            return
+        g.console_pw_fail_logged = True
+    except Exception:
+        pass
     try:
         ip = _client_ip()
         ipaddress.ip_address(ip)
@@ -7599,8 +7758,9 @@ def login():
             session.clear()
             session['authenticated'] = True
             session['auth_via'] = 'password'   # ops #813
-            session['last_activity'] = int(time.time())
+            session['last_activity'] = int(time.time())   # ops #815: login is activity
             _stamp_session_login()   # ops #634
+            _stamp_notice_login(True)
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
@@ -7612,6 +7772,12 @@ def login():
 
 @app.route('/logout', methods=['POST'])
 def logout():
+    # ops #815: /logout is a POST outside /api/, so the same-origin check in
+    # ensure_session_valid() did not cover it, and a page on another site of the same
+    # domain (the browser sends the console cookie there too) could end every admin
+    # session, over and over. Same rule as the API writes: same origin only.
+    if not _same_origin_ok():
+        return jsonify({'error': 'CSRF validation failed (same-origin required).'}), 403
     audit('auth:logout', '')
     # ops #634: logout ends every console session, not just this browser's, so a
     # copied cookie dies with it. Only a logged-in caller may do that: /logout has no
@@ -7637,13 +7803,16 @@ def index():
         if check_password_hash(auth['password_hash'], request.form.get('password', '')):
             _upgrade_password_hash(auth, request.form.get('password', ''))
             _note_password_length(request.form.get('password', ''))   # ops #638
-            # ops #813: start clean, like /login does, so nothing from an earlier
-            # Authentik-made session (its user name, its marker) carries into this one.
+            # ops #813, #815: start from an empty session, as /login does, so nothing
+            # from an earlier Authentik-made session (its user name, its marker) carries
+            # into this one. Without it an old authentik_username stayed in the cookie
+            # and the audit log named that person for what the password login did.
             session.clear()
             session['authenticated'] = True
             session['auth_via'] = 'password'
             session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
             _stamp_session_login()   # ops #634
+            _stamp_notice_login(True)
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
         _console_log_failed_login('/')   # ops #638
@@ -7831,10 +8000,27 @@ def _enforce_session_idle_lock():
                 if not 0 <= _now - _last < 60:
                     session['last_activity'] = _now
             return
+    except Exception:
+        # The posture could not be read. Standard (no lock) is the default posture, and a
+        # box that is not Hardened must never be locked by this hook.
+        return
+    # ops #815: from here the box IS Hardened, and the lock fails CLOSED. It used to fail
+    # open on any error, and it only fired when the session carried a last_activity stamp,
+    # so a cookie with no stamp (a /login password session never stamped one) replayed
+    # with background GETs alone was never locked. Now: no stamp, or one that cannot be
+    # read, is an expired session; and an unexpected error refuses the request (a page
+    # load ends the session and the operator signs in again) instead of letting it through.
+    try:
         a = (h.get('applied') or {}).get('W2_session') or {}
-        idle_max = int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT))
+        try:
+            idle_max = int(a.get('idle_max_seconds', SESSION_IDLE_MAX_DEFAULT))
+        except (TypeError, ValueError):
+            idle_max = SESSION_IDLE_MAX_DEFAULT
         now = int(time.time())
-        last = session.get('last_activity')
+        try:
+            last = int(session.get('last_activity'))
+        except (TypeError, ValueError):
+            last = None
         # "Activity" must mean a real USER action, not the page's own background polling.
         # The console dashboard auto-refreshes /api/metrics every 5s, module cards every 8s,
         # etc. — if every request reset the clock, last_activity would never age past a few
@@ -7843,7 +8029,7 @@ def _enforce_session_idle_lock():
         # read-only GET to /api/* (a poll/data-fetch) does NOT count as activity; only a page
         # navigation (non-/api GET) or a state-changing call (POST/PUT/PATCH/DELETE) does.
         is_poll = request.path.startswith('/api/') and request.method == 'GET'
-        if last is not None and (now - int(last)) > idle_max:
+        if last is None or (now - last) > idle_max:
             if request.path.startswith('/api/'):
                 # Don't reset the clock or kill the SSO session on a background poll — just
                 # signal expiry. The true re-prompt fires on the next full-page navigation.
@@ -7865,9 +8051,16 @@ def _enforce_session_idle_lock():
             return redirect(url_for('login'))
         if not is_poll:
             session['last_activity'] = now
-    except Exception:
-        # A lock failure must never brick a request — fail open to the normal flow.
-        return
+    except Exception as e:
+        print(f"[auth] idle lock error, request refused: {type(e).__name__}: {str(e)[:120]}", flush=True)
+        if request.path.startswith('/api/'):
+            # As for an expired session above: a background call is only told to sign in.
+            return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
+        try:
+            session.clear()
+        except Exception:
+            pass
+        return redirect(url_for('login'))
 
 # v0.9.58: the auto-reload "Session expired — signing you back in…" band-aid was REMOVED.
 # It masked the real problem (and reload-looped when the Authentik proxy session lapsed
@@ -9471,6 +9664,10 @@ def hardening_apply():
         _hardening_history(h, 'apply', 'hardened')
         save_hardening(h)
         audit('hardening:apply', 'posture=hardened')
+        # ops #815: the idle clock only runs in Hardened posture, so the stamp in this
+        # session can be hours old (it is from the login). Pressing Apply is activity:
+        # without this the lock fired on the operator's very next request.
+        session['last_activity'] = int(time.time())
         return jsonify({'success': True, 'posture': 'hardened', 'log': log_lines})
     except Exception as e:
         for c in reversed(applied_ok):
@@ -10071,7 +10268,9 @@ def _diag_section_box(settings):
 
 
 def _diag_section_console(settings):
-    out = [f"failed units: {_diag_cmd(['systemctl', '--failed', '--no-legend', '--plain'], priv=False) or 'none'}"]
+    _failed = _diag_cmd(['systemctl', '--failed', '--no-legend', '--plain'], priv=False)
+    out = [f"failed units: {_failed or 'none'}"]
+    out.extend(_diag_failed_unit_detail(_failed))
     j = _diag_cmd(['journalctl', '-u', 'takwerx-console', '--since', '2 hours ago', '--no-pager', '-q', '-n', '5000'], timeout=30)
     bad = [l for l in j.splitlines() if re.search(r'Traceback|\bERROR\b|CRITICAL|failed:', l)]
     out.append(f"console journal, last 2 h: {sum('Traceback' in l for l in bad)} traceback(s), {len(bad)} error-class line(s)")
@@ -10332,6 +10531,7 @@ def _diag_section_takserver(settings):
     for el in re.findall(r'<input\b[^>]*>', cc):
         out.append('<input> ' + ' '.join(f'{a}={v}' for a, v in re.findall(r'(\w+)="([^"]*)"', el)
                                          if a in ('_name', 'protocol', 'port', 'auth')))
+    out.extend(_diag_tak_api_ports(cc, _diag_cmd(['systemctl', 'is-active', 'takserver'], priv=False) == 'active'))
     try:
         uaf = _read_own_or_priv('/opt/tak/UserAuthenticationFile.xml') or ''
         in_flat = 'yes' if 'identifier="webadmin"' in uaf else 'no'
@@ -10389,6 +10589,48 @@ def _diag_section_takserver(settings):
         except Exception as e:
             out.append(f"cot schema_version: ({type(e).__name__}: {str(e)[:120]})")
     out.extend(_diag_tak_update_history())
+    return out
+
+
+def _diag_tak_api_ports(core_config_text, service_active, ss_text=None, holder=None):
+    """ops #902: is TAK Server's web API actually listening, and if not, who holds its ports?
+    The report used to show the connectors from CoreConfig and `service: active`, which read as
+    healthy on a box whose API had died on a port clash (field report, 2026-11-17)."""
+    required = _tak_api_required_ports(core_config_text)
+    up = _tak_listening_ports(ss_text if ss_text is not None else _diag_cmd(['ss', '-tlnH'], priv=False))
+    missing = [p for p in required if p not in up]
+    names = ', '.join(str(p) for p in required)
+    if not service_active:
+        return [f"TAK API web ports ({names}): not checked, the takserver service is not active"]
+    if not missing:
+        return [f"TAK API web ports ({names}): all listening"]
+    holder = holder or _tak_port_holder_now
+    out = [f"TAK API web ports ({names}): NOT listening on {', '.join(str(p) for p in missing)} "
+           "although the takserver service is active. The console, TAK Portal and CloudTAK cannot reach "
+           "TAK Server's API."]
+    for p in required:
+        if p in up:
+            out.append(f"  port {p} is held by: {holder(p) or '(could not tell)'}"
+                       "   <-- TAK's API opens its web ports together, so a listener here while another port is "
+                       "closed is not TAK's API")
+    return out
+
+
+def _diag_failed_unit_detail(failed_text, tail=6):
+    """Why each failed systemd unit failed: its result, exit status and last journal lines.
+    `systemctl --failed` alone names the unit and nothing else (ops #902: takrestartwatch.service)."""
+    units = []
+    for ln in (failed_text or '').splitlines():
+        parts = ln.replace('●', ' ').split()
+        if parts and re.fullmatch(r'[\w@.:\\-]+\.(service|timer|socket|mount|path)', parts[0]):
+            units.append(parts[0])
+    out = []
+    for u in units[:8]:
+        show = _diag_cmd(['systemctl', 'show', u, '-p', 'Result', '-p', 'ExecMainStatus',
+                          '-p', 'InactiveEnterTimestamp'], priv=False)
+        out.append(f"  {u}: " + '  '.join(l.strip() for l in show.splitlines() if l.strip()))
+        j = _diag_cmd(['journalctl', '-u', u, '-n', str(tail), '--no-pager', '-q', '-o', 'short-iso'], timeout=15)
+        out.extend('    ' + l[:220] for l in j.splitlines()[-tail:])
     return out
 
 
@@ -12105,7 +12347,10 @@ def console_restart_safe():
     browser driven (mirrors the localhost-only Guard Dog script endpoints), so
     it carries no @login_required — but it is restricted to loopback callers.
     """
-    if (request.remote_addr or '') not in ('127.0.0.1', '::1', 'localhost'):
+    # ops #815: a request that came through a proxy on this box also arrives from loopback,
+    # but carries X-Forwarded-For. The timer script calls 127.0.0.1 directly and sends none.
+    if ((request.remote_addr or '') not in ('127.0.0.1', '::1', 'localhost')
+            or request.headers.get('X-Forwarded-For')):
         return jsonify({'error': 'forbidden'}), 403
 
     busy = _console_busy_reason()
@@ -12535,6 +12780,17 @@ def console_rollback_api():
             cwd=console_dir, capture_output=True, text=True, timeout=60,
             env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
         )
+        # ops #917: a release that pins a web editor older than password hashing (2.1.15) would,
+        # on its "Patch web editor", put back an editor that cannot read hashed passwords. Give
+        # the accounts plain-text passwords first (the editor's own rollback does the same).
+        # Done before the checkout so a failure here leaves the console as it was.
+        editor_reset = {'state': 'none', 'count': 0}
+        if _mediamtx_editor_ref_lacks_hashing(_console_release_editor_ref(console_dir, prev_tag)):
+            editor_reset = _mediamtx_editor_unhash_for_rollback(s)
+            if editor_reset['state'] == 'fail':
+                return jsonify({'ok': False, 'error': (
+                    'Rollback stopped: the MediaMTX web editor passwords could not be changed '
+                    'for the older version. Nothing was changed.')}), 500
         checkout_r = subprocess.run(
             git_cfg + ['checkout', '--force', prev_tag],
             cwd=console_dir, capture_output=True, text=True, timeout=30,
@@ -12547,9 +12803,16 @@ def console_rollback_api():
         s['console_rollback'] = {'available': False}
         save_settings(s)
         _detached_console_restart()
+        message = f'Rolled back to {prev_tag}. Console is restarting.'
+        if editor_reset['state'] == 'reset':
+            message += (' The MediaMTX web editor in that version cannot read the new password '
+                        'format, so its accounts got new passwords. The admin password is on '
+                        'the MediaMTX page. All of them are in '
+                        '/opt/mediamtx-webeditor/initial_admin_password.txt on the editor box.')
         return jsonify({
             'ok': True, 'tag': prev_tag,
-            'message': f'Rolled back to {prev_tag}. Console is restarting.'
+            'message': message,
+            'editor_passwords_reset': editor_reset['count'],
         })
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)[:200]}), 500
@@ -14609,11 +14872,16 @@ def _heal_nodered_cert_read_access(plog=None):
     for fname in ('admin.pem', 'admin.key'):
         path = f'/opt/tak/certs/files/{fname}'
         try:
-            r = subprocess.run(_sudo_wrap(['stat', '-c', '%a', path]),
+            # ops #839: `stat` without -L describes a link itself, and %F says so. chmod
+            # follows links, so only a regular file is changed; a link is left alone and said.
+            r = subprocess.run(_sudo_wrap(['stat', '-c', '%F|%a', path]),
                                capture_output=True, text=True, timeout=15)
-            cur = (r.stdout or '').strip()
+            kind, _, cur = (r.stdout or '').strip().partition('|')
             if not cur or r.returncode != 0:
                 continue                      # TAK not installed / file absent
+            if not kind.startswith('regular'):
+                _say(f'⚠ {path} is a {kind}, not a regular file: left as it is')
+                continue
             if int(cur, 8) & 0o044 == 0o044:
                 continue                      # group+other read already present
             c = subprocess.run(_sudo_wrap(['chmod', '644', path]),
@@ -17347,6 +17615,32 @@ def _conn_wifi_netplan_file():
     return ''
 
 
+def _nmcli_terse_split(line):
+    """The fields of one `nmcli -t` line, as nmcli meant them.
+
+    Terse mode puts ':' between fields and writes a ':' or a '\\' INSIDE a value with a
+    backslash before it (nmcli(1), --escape, default yes; it does so for one field too).
+    A plain split(':') cut a name with a colon in two, and rsplit kept the backslashes, so
+    a network named `Ops: Truck 5` showed as `Ops\\: Truck 5`, was missing from the saved
+    list, and could not be picked or joined (ops #897).
+    https://networkmanager.dev/docs/api/latest/nmcli.html"""
+    fields, cur, i, n = [], [], 0, len(line)
+    while i < n:
+        c = line[i]
+        if c == '\\' and i + 1 < n:
+            cur.append(line[i + 1])
+            i += 2
+            continue
+        if c == ':':
+            fields.append(''.join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    fields.append(''.join(cur))
+    return fields
+
+
 def _conn_wifi_saved():
     """SSIDs the box already knows (from nmcli or the netplan file)."""
     out = []
@@ -17355,7 +17649,7 @@ def _conn_wifi_saved():
             r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show']),
                                capture_output=True, text=True, timeout=10)
             for line in (r.stdout or '').splitlines():
-                p = line.split(':')
+                p = _nmcli_terse_split(line)
                 if len(p) >= 2 and 'wireless' in p[1]:
                     out.append(p[0])
         except Exception:
@@ -17398,7 +17692,7 @@ def _conn_wifi_scan():
             r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'SSID,SIGNAL', 'dev', 'wifi', 'list']),
                                capture_output=True, text=True, timeout=20)
             for line in (r.stdout or '').splitlines():
-                p = line.rsplit(':', 1)
+                p = _nmcli_terse_split(line)
                 _add(p[0], p[1] if len(p) > 1 else '')
         except Exception:
             pass
@@ -17430,7 +17724,7 @@ def _conn_wifi_visible():
             r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'SSID', 'dev', 'wifi', 'list']),
                                capture_output=True, text=True, timeout=8)
             for ln in (r.stdout or '').splitlines():
-                s = ln.strip()
+                s = _nmcli_terse_split(ln)[0].strip()
                 if s:
                     seen.add(s)
         except Exception:
@@ -17683,7 +17977,7 @@ def _conn_wifi_current():
             r = subprocess.run(_sudo_wrap(['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device', 'status']),
                                capture_output=True, text=True, timeout=8)
             for ln in (r.stdout or '').splitlines():
-                p = ln.split(':')
+                p = _nmcli_terse_split(ln)
                 if len(p) >= 4 and p[0] == iface and p[1] == 'wifi' and p[2] == 'connected':
                     name = ':'.join(p[3:]).strip()
                     if name and name != '--':
@@ -18217,7 +18511,7 @@ def _conn_join_best_saved():
                            capture_output=True, text=True, timeout=10)
         saved = []
         for ln in (r.stdout or '').splitlines():
-            parts = ln.rsplit(':', 1)
+            parts = _nmcli_terse_split(ln)
             if len(parts) == 2 and 'wireless' in parts[1] and parts[0] != 'takwerx-hotspot':
                 saved.append(parts[0])
     except Exception:
@@ -29636,6 +29930,9 @@ def _postgres_compose_converge(log, stacks=POSTGRES_COMPOSE_STACKS):
                         out[key] = 'waiting'
                         continue
                     r = _pg_run(argv, timeout=240, cwd=stack_dir)
+                # GH #549: a new database restarts authentik-server and the LDAP outpost (~90 s
+                # later) under a running TAK Server, so TAK's clients need the LDAP heal too.
+                _tak_ldap_recycle_request('Authentik database recreated (PostgreSQL security update)')
             else:
                 r = _pg_run(argv, timeout=240, cwd=stack_dir)
             if r.returncode != 0:
@@ -31090,8 +31387,10 @@ def _guarddog_alert_recipient_warning(settings=None):
 
 @app.route('/api/guarddog/send-alert-email', methods=['POST'])
 def guarddog_send_alert_email():
-    """Called by Guard Dog scripts (localhost only) to send alerts via Email Relay (same path as test email)."""
-    if request.remote_addr not in ('127.0.0.1', '::1'):
+    """Called by Guard Dog scripts (localhost only) to send alerts via Email Relay (same path as test email).
+    A request through a proxy on this box also arrives from loopback but carries
+    X-Forwarded-For: refused (ops #815, same rule as /api/guarddog/cloudtak-repair)."""
+    if request.remote_addr not in ('127.0.0.1', '::1') or request.headers.get('X-Forwarded-For'):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
     # settings.json is the SOURCE OF TRUTH for the recipient; the caller's `to` is a
@@ -31516,8 +31815,10 @@ def guarddog_test_sms():
 
 @app.route('/api/guarddog/send-sms', methods=['POST'])
 def guarddog_send_sms():
-    """Called by Guard Dog scripts (localhost only) to send SMS via Twilio or Brevo."""
-    if request.remote_addr not in ('127.0.0.1', '::1'):
+    """Called by Guard Dog scripts (localhost only) to send SMS via Twilio or Brevo.
+    A request through a proxy on this box also arrives from loopback but carries
+    X-Forwarded-For: refused (ops #815, same rule as /api/guarddog/cloudtak-repair)."""
+    if request.remote_addr not in ('127.0.0.1', '::1') or request.headers.get('X-Forwarded-For'):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
     subj = (data.get('subject') or '')[:100]
@@ -32021,6 +32322,8 @@ def run_guarddog_deploy(alert_email):
             guarddog_deploy_status.update({'running': False, 'error': True})
             return
         subprocess.run(_sudo_wrap(['systemctl', 'start', 'tak-health.service']), capture_output=True, timeout=5)
+        if _GD_HEALTH_SCRIPT in changed:
+            _gd_restart_health_endpoint()   # ops #815: `start` leaves a running one on the old code
         # v0.9.47: network/fanout metrics collector (always-on, like tak-health). Best-effort
         # start — a collector failure must never block the rest of the Guard Dog deploy.
         rmc = subprocess.run(_sudo_wrap(['systemctl', 'enable', 'tak-metrics-collector.service']), capture_output=True, text=True, timeout=5)
@@ -32858,6 +33161,10 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         # --- chown + systemd ---
         plog('━━━ Start Federation Hub services ━━━')
         _module_run(cfg, f'sudo chown -R tak:tak {fh_dir}', timeout=30)
+        try:
+            _fedhub_ca_lockdown(cfg, fh_dir, plog)          # ops #839 (also heals an install made before)
+        except Exception as _lk_e:
+            plog(f'⚠ CA key lockdown skipped: {str(_lk_e)[:120]}')
         _module_run(cfg, 'sudo systemctl daemon-reload', timeout=90)
         _module_run(cfg, 'sudo systemctl enable federation-hub 2>/dev/null; true', timeout=90)
         _module_run(cfg, f'sudo touch {fh_dir}/logs/federation-hub-ui.log && sudo chown tak:tak {fh_dir}/logs/federation-hub-ui.log', timeout=15)
@@ -33158,6 +33465,44 @@ def fedhub_update_log_api():
     })
 
 
+def _fedhub_ca_lockdown(cfg, fh_dir, plog=None):
+    """ops #839 — the CA signing keystores and CA keys of a Federation Hub (on this box or a
+    remote host) are for the Federation Hub account only.
+
+    TAK's makeRootCa.sh / makeCert.sh write <CA>-signing.jks and .p12 with mode 0644 on the
+    host that runs them, the same as on a TAK Server (ops #831). The console runs them on the
+    Federation Hub host, so it closes the files there: group and other lose every right,
+    owner `tak` keeps its own. Only regular files (a link is never followed), found by name
+    (_ca_private_names_only), and only tightened. Returns the names it changed."""
+    say = plog or (lambda m: print(f"Federation Hub CA lockdown: {m}", flush=True))
+    d = f'{fh_dir}/certs/files'
+    ok, out = _module_run(cfg, f'sudo ls -1A {shlex.quote(d)} 2>/dev/null', timeout=30)
+    if not ok:
+        say(f'⚠ could not list {d}: CA key files not checked')
+        return []
+    names = _ca_private_names_only([n for n in (out or '').splitlines() if n])
+    odd = [n for n in names if not re.match(r'^[A-Za-z0-9._-]+$', n)]
+    names = [n for n in names if n not in odd]
+    if odd:
+        say(f'⚠ not touched (odd file name): {", ".join(odd[:5])}')
+    if not names:
+        return []
+    chains = []
+    for n in names:
+        q = shlex.quote('./' + n)           # ./ so a name that starts with - is never an option
+        chains.append(f'[ -f {q} ] && [ ! -L {q} ] && m=$(sudo stat -c %a {q}) && [ "${{m#?}}" != 00 ] '
+                      f'&& sudo chmod go-rwx {q} && echo "FIXED {n} $m"')
+    ok, out = _module_run(cfg, f'cd {shlex.quote(d)} || exit 0; ' + '; '.join(chains) + '; true', timeout=60)
+    fixed = [ln.split(None, 1)[1] for ln in (out or '').splitlines() if ln.startswith('FIXED ')]
+    if fixed:
+        say(f'✓ {len(fixed)} CA key file(s) set to the Federation Hub account only: ' + '; '.join(fixed[:8]))
+        try:
+            audit('ca_private_lockdown', f'fedhub dir={d} files={len(fixed)}')
+        except Exception:
+            pass
+    return fixed
+
+
 def _fedhub_next_numbered_ca_name(current_name, default_stem):
     """Next PKI name for Fed Hub rotation: …-01, …-02 (two-digit). Unnumbered stem gets -01 first."""
     name = (current_name or '').strip() or default_stem
@@ -33325,6 +33670,10 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
             fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
             return
         plog('✓ New CA + server + webadmin-fed cert generated')
+        try:
+            _fedhub_ca_lockdown(cfg, fh_dir, plog)          # ops #839
+        except Exception as _lk_e:
+            plog(f'⚠ CA key lockdown skipped: {str(_lk_e)[:120]}')
 
         patch_cfg_cmd = (
             f'cd {fh_dir}/configs && '
@@ -36896,6 +37245,29 @@ def _module_run(deploy_cfg, cmd, timeout=120, log_fn=None):
             return False, str(e)[:200]
 
 
+def _as_root_sh(cmd):
+    """Shell text that runs `cmd` as root on a remote SSH target (ops #890).
+
+    `_module_run` runs `cmd` as the SSH user. A cloud image's sudo user (azureuser, ubuntu, rocky)
+    is not root, so a bare `apt-get`, `mv /usr/local/bin/...`, `mkdir /opt/...` or `systemctl` dies
+    with "Permission denied". Root runs it as it is; any other user runs the WHOLE string under
+    `sudo -n sh -c`, so a `a && b && c` chain is root all the way through (a `$S a && b` prefix
+    would leave `b` and `c` unprivileged). `-n`: never sit at a password prompt.
+    NON-ROOT-COMMANDS: apt-get, systemctl, mv, mkdir, pip3, useradd."""
+    q = shlex.quote(cmd)
+    return f'if [ "$(id -u)" = 0 ]; then sh -c {q}; else sudo -n sh -c {q}; fi'
+
+
+def _module_run_root(deploy_cfg, cmd, timeout=120, log_fn=None):
+    """Like `_module_run`, but a remote target runs `cmd` as root (see `_as_root_sh`). A local
+    target is unchanged: the console's own shim/broker path already handles its privilege."""
+    if deploy_cfg.get('target_mode') != 'remote':
+        return _module_run(deploy_cfg, cmd, timeout=timeout, log_fn=log_fn)
+    if log_fn:
+        log_fn(f"  [remote] {cmd[:80]}...")
+    return _module_run(deploy_cfg, _as_root_sh(cmd), timeout=timeout)
+
+
 _MODULE_FW_BACKEND_KEY = '_infratak_fw_backend'
 
 
@@ -37369,7 +37741,14 @@ def _get_cloudtak_upstreams(settings):
 
 
 def _mediamtx_editor_endpoint_patch(src):
-    """Patch duplicate Flask endpoints so infra-TAK overlay + core don't conflict. Returns modified source."""
+    """Patch duplicate Flask endpoints so infra-TAK overlay + core don't conflict. Returns modified source.
+
+    Safe to run twice on the same file (ops #877). "Patch web editor" runs this on the editor file
+    already on the box when the fresh download fails; the old window-based version then stamped an
+    UNRELATED route next to the share-links ones (v2.1.x puts /api/playback-mode inside the window)
+    with a duplicate endpoint, and Flask refused the app: the editor crash-looped. Same two rules
+    as MEDIAMTX_ENSURE_OVERLAY_SCRIPT step 4: skip an endpoint that is already stamped anywhere, and
+    look only at the def's own decorator block (a miss is safe, a wrong stamp is not)."""
     import re
     lines = src.splitlines(keepends=True)
     changed = False
@@ -37380,32 +37759,27 @@ def _mediamtx_editor_endpoint_patch(src):
             (r'\bdef api_share_links_generate\s*\(', ('/api/share-links/generate', 'share-links/generate'), 'api_share_links_generate_core'),
             (r'\bdef api_share_links_revoke\s*\(', ('/api/share-links/revoke', 'share-links/revoke'), 'api_share_links_revoke_core'),
     ):
+        if ("endpoint='" + endpoint_val + "'") in ''.join(lines):
+            continue
         for i in range(len(lines) - 1, -1, -1):
             if not re.search(def_pat, lines[i]):
                 continue
+            block = []
             j = i - 1
-            while j >= 0 and j >= i - 20:
-                line = lines[j]
-                if '@app.route' in line and 'endpoint=' not in line and any(h in line for h in route_hints):
-                    if line.rstrip().endswith(')'):
-                        lines[j] = line.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
-                    else:
-                        lines[j] = line.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
-                    changed = True
-                    break
+            while j >= 0 and lines[j].lstrip().startswith('@'):
+                block.append(j)
                 j -= 1
-            else:
-                j = i - 1
-                while j >= 0 and j >= i - 20:
-                    if '@app.route' in lines[j] and 'endpoint=' not in lines[j]:
-                        l = lines[j]
-                        if l.rstrip().endswith(')'):
-                            lines[j] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
-                        else:
-                            lines[j] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
-                        changed = True
-                        break
-                    j -= 1
+            route_js = [k for k in block if '@app.route' in lines[k] and 'endpoint=' not in lines[k]]
+            hinted = [k for k in route_js if any(h in lines[k] for h in route_hints)]
+            pick = hinted or route_js
+            if pick:
+                k = pick[0]
+                l = lines[k]
+                if l.rstrip().endswith(')'):
+                    lines[k] = l.rstrip()[:-1] + ", endpoint='" + endpoint_val + "')\n"
+                else:
+                    lines[k] = l.rstrip().rstrip(')') + ", endpoint='" + endpoint_val + "')\n"
+                changed = True
             break
     return ''.join(lines) if changed else src
 
@@ -38048,6 +38422,149 @@ def _mediamtx_editor_secure_login(settings, log_fn=None):
     _log(f"  ✗ Web editor login could not be checked ({res or 'no answer'}). The web console")
     _log("    stays closed (503) until it is. Deploy MediaMTX again to retry.")
     return 'fail'
+
+
+# ops #917: web editor 2.1.15 and later keep passwords as hashes; 2.1.14 and earlier compare
+# what was typed with the stored text, so a hash locks every account out. Rolling the CONSOLE
+# back to a release that pins an older editor leaves the newer editor file in place, and the
+# older console's "Patch web editor" then downloads the old one. That older console cannot be
+# changed, so the rollback (this code, still the newer release) does what the editor's own
+# rollback does (mediamtx-installer ops #646): every hashed account gets a new random
+# password first. Plain text works in every editor version; the newer one hashes it again at
+# the next sign-in. Run as `python3 -I - <users.json path>` like the login script above.
+_MEDIAMTX_EDITOR_HASHING_SINCE = (2, 1, 15)
+_MEDIAMTX_EDITOR_UNHASH_SCRIPT = r'''
+import json, os, re, secrets, sys
+F = sys.argv[1]
+HASH = re.compile(r'^(scrypt|pbkdf2):[^$]+\$[^$]+\$[0-9a-f]+$')
+PWF = os.path.join(os.path.dirname(F), 'initial_admin_password.txt')
+try:
+    try:
+        with open(F) as f:
+            users = json.load(f)
+        st = os.stat(F)
+    except FileNotFoundError:
+        print('MTXRESET none')
+        sys.exit(0)
+    if not isinstance(users, list):
+        raise ValueError('users.json is not a list')
+    hit = []
+    for u in users:
+        if isinstance(u, dict) and isinstance(u.get('password'), str) and HASH.match(u['password']):
+            new = secrets.token_urlsafe(12)
+            u['password'] = new
+            hit.append((str(u.get('username', '')), new))
+    if not hit:
+        print('MTXRESET none')
+        sys.exit(0)
+    # The new passwords are saved FIRST (root/account only); users.json changes only after.
+    fd = os.open(PWF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write('# MediaMTX web editor: new passwords after a console rollback to an older version. '
+                'Sign in, then change this password (Account tab).\n')
+        f.write('# This file is deleted when the password is changed.\n')
+        for name, pw in hit:
+            f.write(name + ': ' + pw + '\n')
+    if os.geteuid() == 0:
+        os.chown(PWF, st.st_uid, st.st_gid)
+    tmp = F + '.infratak-tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(users, f, indent=2)
+    if os.geteuid() == 0:
+        os.chown(tmp, st.st_uid, st.st_gid)
+    os.replace(tmp, F)
+    print('MTXRESET reset ' + json.dumps([n for n, _p in hit]))
+    for n, p in hit:
+        if n == 'admin':
+            print('MTXRESET admin ' + p)
+except SystemExit:
+    raise
+except Exception as e:
+    print('MTXRESET fail ' + type(e).__name__)
+'''
+
+
+def _mediamtx_editor_ref_lacks_hashing(ref):
+    """True when a pinned editor ref (`v2.1.14`) is older than password hashing (2.1.15).
+    A ref that is not a plain version (a branch name, empty) says nothing: False."""
+    m = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', (ref or '').strip())
+    return bool(m) and tuple(int(x) for x in m.groups()) < _MEDIAMTX_EDITOR_HASHING_SINCE
+
+
+def _console_release_editor_ref(console_dir, tag):
+    """The MEDIAMTX_EDITOR_REF that console release `tag` pins, read from that release's own
+    app.py ('' when the release has none or git cannot read it)."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', str(tag or '')):
+        return ''   # never let a stored value reach git as an option
+    try:
+        r = subprocess.run(
+            ['git', '-c', f'safe.directory={console_dir}', 'grep', '-h', '-E',
+             r'^MEDIAMTX_EDITOR_REF[[:space:]]*=', tag, '--', 'app.py'],
+            cwd=console_dir, capture_output=True, text=True, timeout=30,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    except Exception:
+        return ''
+    m = re.search(r'''MEDIAMTX_EDITOR_REF\s*=\s*["']([^"']+)["']''', r.stdout or '')
+    return m.group(1) if m else ''
+
+
+def _mediamtx_editor_run_users_script(settings, script):
+    """Run `script` where the editor runs, on its users.json, as the account that owns it.
+    Same routing as _mediamtx_editor_run_login_script. Returns the script's stdout ('' when it
+    could not run)."""
+    cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    path = _MEDIAMTX_EDITOR_USERS_FILE
+    if _mediamtx_editor_login_target(settings) != 'local':
+        b64 = _b64.b64encode(script.encode()).decode()
+        ok, out = _module_run(cfg, _REMOTE_SUDO_SH + f'echo {b64} | base64 -d | $S python3 -I - {path}',
+                              timeout=45)
+        return out or ''
+    argv = ['python3', '-I', '-', path]
+    if _mediamtx_owner() == _MEDIAMTX_RUN_USER:
+        argv = _sudo_wrap(['runuser', '-u', _MEDIAMTX_RUN_USER, '--'] + argv)
+    elif not os.access(os.path.dirname(path), os.W_OK):
+        argv = ['sudo', '-n'] + argv
+    try:
+        r = subprocess.run(argv, input=script, capture_output=True, text=True, timeout=45)
+        return r.stdout or ''
+    except Exception:
+        return ''
+
+
+def _mediamtx_editor_unhash_for_rollback(settings):
+    """ops #917: give every hashed web editor account a new random password, so an older
+    editor build can read them. Returns {'state': 'none'|'reset'|'fail', 'count': N}.
+    'none': no editor accounts, or none hashed (nothing to do). 'fail': could not tell or could
+    not save: the caller must stop, since going on would lock the accounts out. For `admin`,
+    the new password is kept for the MediaMTX page to show once (same place as the first one)."""
+    # No MediaMTX on this box (most boxes): no editor, nothing to reset, and no reason to
+    # refuse the rollback because a script that has nothing to run on could not run.
+    if not detect_modules().get('mediamtx', {}).get('installed'):
+        return {'state': 'none', 'count': 0}
+    out = _mediamtx_editor_run_users_script(settings, _MEDIAMTX_EDITOR_UNHASH_SCRIPT)
+    lines = [ln.strip() for ln in out.splitlines() if ln.startswith('MTXRESET ')]
+    if 'MTXRESET none' in lines:
+        return {'state': 'none', 'count': 0}
+    reset = next((ln for ln in lines if ln.startswith('MTXRESET reset ')), '')
+    if not reset:
+        return {'state': 'fail', 'count': 0}
+    try:
+        count = len(json.loads(reset[len('MTXRESET reset '):]))
+    except Exception:
+        count = 0
+    admin_pw = next((ln[len('MTXRESET admin '):] for ln in lines if ln.startswith('MTXRESET admin ')), '')
+    if admin_pw:
+        try:
+            st = _mediamtx_editor_login_load()
+            target = _mediamtx_editor_login_target(settings)
+            if st.get('target') != target:
+                st = {'target': target}
+            st.update({'ok': True, 'user': 'admin', 'reveal': admin_pw, 'set': int(time.time())})
+            _mediamtx_editor_login_save(st)
+        except Exception:
+            pass   # the password is also in initial_admin_password.txt on the editor's box
+    return {'state': 'reset', 'count': count}
 
 
 def _mediamtx_vhost_is_safe(generated):
@@ -42552,27 +43069,53 @@ def _stage_le_cert_local(cert_crt, cert_key, wait_for_cert, log_fn, label='LE'):
 
 
 def _tak_container_ids():
-    """(uid, gid) the TAK container actually runs as, as strings.
+    """(uid, gid) the TAK container actually runs as, as strings; (None, None) if it cannot be told.
 
     v10.1.67. The stock takserver image runs as uid 1000; the HARDENED image runs as
     1001 (tak:0). Hardcoding 1000 left takserver-le.p12 owned by a uid the container is
     not, so keytool could not read it — and combined with an import that deleted the live
     keystore first, that destroyed TAK's 8446 keystore and stopped its API from starting.
-    Falls back to the historical 1000:0 only if the container cannot be asked.
+
+    ops #839: the old answer for "cannot ask" was a made-up 1000:0. A restore asks while the
+    container is stopped (`docker exec` fails on a stopped container), so it chowned the
+    whole certificate folder, CA keys included, to uid 1000, which on most servers is a login
+    account. Now: (1) ask the running container; (2) if it is stopped, take the user the
+    container was created with (`docker inspect` works on a stopped container) and ask the
+    image what ids that user has (`docker run --network none ... id`); (3) if neither works,
+    return (None, None). A caller that gets None leaves ownership as it is. Never a guess.
     """
-    uid, gid = '1000', '0'
+    def _digits(args):
+        try:
+            r = subprocess.run(_sudo_wrap(args), capture_output=True, text=True, timeout=60)
+        except Exception:
+            return None
+        out = (r.stdout or '').strip()
+        return out if r.returncode == 0 and out.isdigit() else None
+
+    uid = _digits(['docker', 'exec', TAK_CONTAINER, 'id', '-u'])
+    gid = _digits(['docker', 'exec', TAK_CONTAINER, 'id', '-g'])
+    if uid is not None and gid is not None:
+        return uid, gid
+    image, user = TAK_CONTAINER, ''
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'id', '-u']),
-                           capture_output=True, text=True, timeout=20)
-        if r.returncode == 0 and (r.stdout or '').strip().isdigit():
-            uid = r.stdout.strip()
-        r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'id', '-g']),
-                           capture_output=True, text=True, timeout=20)
-        if r.returncode == 0 and (r.stdout or '').strip().isdigit():
-            gid = r.stdout.strip()
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.Config.Image}}|{{.Config.User}}', TAK_CONTAINER]),
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0 and '|' in (r.stdout or ''):
+            _img, _usr = (r.stdout or '').strip().split('|', 1)
+            if _img and re.match(r'^[A-Za-z0-9][A-Za-z0-9_.:/@-]*$', _img):
+                image = _img
+            if re.match(r'^[A-Za-z0-9_.:-]*$', _usr or ''):
+                user = _usr
     except Exception:
         pass
-    return uid, gid
+    base = ['docker', 'run', '--rm', '--network', 'none', '--pull', 'never', '--entrypoint', 'id']
+    if user:
+        base += ['--user', user]
+    uid = _digits(base + [image, '-u'])
+    gid = _digits(base + [image, '-g'])
+    if uid is not None and gid is not None:
+        return uid, gid
+    return None, None
 
 
 # The 8446 connector as CoreConfig.xml has it. Attribute values hold slashes
@@ -42653,7 +43196,11 @@ def _install_le_cert_on_8446_container(takserver_host, log_fn, wait_for_cert=Tru
     # The container must be able to READ the p12, so set ownership from the container's real
     # uid FIRST — 1000 is only correct for the stock image; the hardened one runs as 1001.
     _tuid, _tgid = _tak_container_ids()
-    subprocess.run(_sudo_wrap(['chown', f'{_tuid}:{_tgid}', p12]), capture_output=True)
+    if _tuid is None:
+        # ops #839: not told the container's ids, so no guess: the file keeps its owner.
+        log_fn("  ⚠ Could not read the TAK container's user id: leaving the owner of takserver-le.p12 as it is")
+    else:
+        subprocess.run(_sudo_wrap(['chown', f'{_tuid}:{_tgid}', p12]), capture_output=True)
     subprocess.run(_sudo_wrap(['chmod', '0640', p12]), capture_output=True)
     # Import into a TEMP keystore and swap it in only on success. Never delete the live one
     # first: CoreConfig's 8446 connector references it, so a failed import used to leave TAK
@@ -44826,6 +45373,39 @@ def _get_netbird_version_info():
     return out
 
 
+# ops #827: a version string is read from a container's package.json, a remote host's package
+# database or a module's own files, so whoever controls that module chooses it. The console cards
+# show it, so only text that can be a version goes out: letters, digits and . _ + ~ : -, 128 at most.
+# A space and the middle dot are allowed too, because two cards join two versions into one label
+# ("MediaMTX v1.15.3 \u00b7 editor v2.4.0", "0.80.0 \u00b7 dash v2.14.0"). No character of HTML or script fits.
+_MODULE_VERSION_RE = re.compile('[0-9A-Za-z][0-9A-Za-z._+~: \u00b7-]{0,127}')
+_MODULE_VERSION_FIELDS = ('version', 'editor_version', 'beta_version', 'latest', 'editor_latest', 'latest_tag',
+                          'upstream_latest', 'running', 'vetted', 'vetted_release', 'dev_release', 'final_target')
+
+
+def _safe_module_version(value):
+    """value when it can be a version (see _MODULE_VERSION_RE), else ''. Other types pass through."""
+    if not isinstance(value, str):
+        return value
+    v = value.strip()
+    return v if _MODULE_VERSION_RE.fullmatch(v) else ''
+
+
+def _safe_module_version_info(key, info):
+    """A copy of one module's version info with every version field checked (the helpers may cache
+    their dict, so the original is left alone). A refused value is logged once per poll."""
+    if not isinstance(info, dict):
+        return info
+    out = dict(info)
+    for field in _MODULE_VERSION_FIELDS:
+        if field in out and isinstance(out[field], str) and out[field].strip():
+            clean = _safe_module_version(out[field])
+            if not clean:
+                print(f"version-info: {key} {field} is not a version string, not shown", flush=True)
+            out[field] = clean
+    return out
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards.
 
@@ -44906,7 +45486,8 @@ def get_all_module_versions():
                 result[key] = {**result[key], 'node_security': _node_card_flag(gap)}  # copy: helpers may cache
     except Exception as e:
         print(f"version-info: node security flag failed (non-fatal): {e}", flush=True)
-    return result
+    # ops #827: last step, so every module and every field goes through the same check.
+    return {key: _safe_module_version_info(key, info) for key, info in result.items()}
 
 
 @app.route('/api/modules/version')
@@ -46186,6 +46767,63 @@ def _takportal_install_caddy_validate_shim(log_fn=None):
         return 'error'
 
 
+# ops #879: TAK Portal's Marketplace "Deploy To Caddy" runs `bash -lc 'set -euo pipefail; ...;
+# exit 0'` over SSH. A login shell reads ~/.bash_logout when it exits, and errexit (set -e) is
+# still on there. Ubuntu's stock file ends with `[ -x /usr/bin/clear_console ] && clear_console -q`;
+# with no terminal clear_console exits 1, errexit fires, and the whole command exits 1 even though
+# the helper had already written and reloaded Caddy, so the Portal says it failed. Appending
+# `true` does not help (errexit stops the file at the failing line); `set +e` before it does.
+# Verified on Ubuntu 22.04 with a real sshd: stock file rc 1, `set +e` first rc 0.
+TAKPORTAL_LOGOUT_MARKER = 'infratak-portal-logout'
+TAKPORTAL_LOGOUT_BLOCK = (
+    '# ' + TAKPORTAL_LOGOUT_MARKER + ': TAK Portal runs its commands over SSH as\n'
+    "# `bash -lc 'set -e; ...'`, and errexit also applies to this file. Without this line a\n"
+    '# failing command below (clear_console with no terminal) makes the whole command exit 1.\n'
+    'set +e\n'
+)
+
+
+def _takportal_harden_logout_file(log_fn=None):
+    """ops #879: put `set +e` at the top of the console user's existing ~/.bash_logout.
+
+    Only an existing regular file is touched (no file, nothing to fail; Rocky 9's stock file is
+    one comment line and does not fail, it gets the same harmless line), and only once (marker). The rest of the file is kept byte for byte, with its mode.
+    Idempotent. Returns 'changed' | 'current' | 'absent' | 'skipped' | 'error'; never raises."""
+    def _say(m):
+        if log_fn:
+            log_fn(m)
+    try:
+        dest = os.path.expanduser('~/.bash_logout')
+        if os.path.islink(dest) or not os.path.exists(dest):
+            return 'absent'
+        if not os.path.isfile(dest):
+            return 'skipped'
+        with open(dest, 'r', encoding='utf-8', errors='surrogateescape') as f:
+            have = f.read()
+        if TAKPORTAL_LOGOUT_MARKER in have:
+            return 'current'
+        mode = _stat.S_IMODE(os.stat(dest).st_mode)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest), prefix='.bash_logout-')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8', errors='surrogateescape') as f:
+                f.write(TAKPORTAL_LOGOUT_BLOCK + have)
+            os.chmod(tmp, mode)
+            os.replace(tmp, dest)
+            tmp = None
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        _say(f"  \u2713 {dest}: added `set +e` so a failing logout line cannot make TAK Portal's "
+             "SSH commands exit 1 (Marketplace Deploy To Caddy said failed after it worked)")
+        return 'changed'
+    except Exception as e:
+        _say(f"  \u26a0 {os.path.expanduser('~/.bash_logout')} not changed (non-fatal): {e}")
+        return 'error'
+
+
 # ops #644: the portal key's line in the console user's authorized_keys is limited to what
 # TAK Portal needs. `restrict` turns off
 # port/agent/X11 forwarding, pty and ~/.ssh/rc; `from=` admits only the TAK Portal containers'
@@ -46457,6 +47095,9 @@ def _takportal_setup_ssh(log_fn=None):
 
         # ops #298: Marketplace Deploy To Caddy validates as this user.
         _takportal_install_caddy_validate_shim(log_fn=log_fn)
+
+        # ops #879: a failing ~/.bash_logout line must not turn the portal's SSH commands into exit 1.
+        _takportal_harden_logout_file(log_fn=log_fn)
 
         # GH #142: containerized TAK. Whatever the probe says (a root console
         # probes 'root'), TAK Portal's cert/restart/plugin commands target a host
@@ -47798,9 +48439,10 @@ def certs_page():
     cert_dir = '/opt/tak/certs/files'
     files = []
     if os.path.isdir(cert_dir):
+        _held = _ca_private_verdict_or_refuse_all(cert_dir)    # ops #831: one look per page
         for fn in sorted(os.listdir(cert_dir)):
             fp = os.path.join(cert_dir, fn)
-            if os.path.isfile(fp) and not _is_ca_private_material(fn):  # v10.2.26 W6
+            if os.path.isfile(fp) and not _is_ca_private_file(fn, cert_dir, _held):  # v10.2.26 W6, ops #831
                 sz = os.path.getsize(fp)
                 if sz < 1024: sz_d = f"{sz} B"
                 elif sz < 1048576: sz_d = f"{round(sz/1024,1)} KB"
@@ -47874,7 +48516,7 @@ def mediamtx_control():
         if not (remote.get('host') or '').strip():
             return jsonify({'error': 'Remote host not configured'}), 400
         cmd = f'systemctl {action} mediamtx mediamtx-webeditor 2>&1'
-        ok, _ = _ssh_probe(remote, cmd, timeout=30)
+        ok, _ = _ssh_probe(remote, _as_root_sh(cmd), timeout=30)   # ops #890: root, `sudo -n` if not root
         time.sleep(2)
         ok2, out = _ssh_probe(remote, 'systemctl is-active mediamtx 2>/dev/null', timeout=10)
         running = bool(ok2 and out and out.strip() == 'active')
@@ -47924,14 +48566,15 @@ def mediamtx_recovery():
             _restart_after = _mediamtx_editor_reclaim() or []
         # 1) Refresh editor from upstream so we fix corruption / duplicate UI from old or patched copies
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
-            _module_run(
+            _mediamtx_remote_clear_staging(deploy_cfg)   # ops #890: before any scp into /tmp
+            _module_run_root(
                 deploy_cfg,
                 "mkdir -p /opt/mediamtx-webeditor && curl -sL '" + MEDIAMTX_EDITOR_RAW_URL + "' -o /opt/mediamtx-webeditor/mediamtx_config_editor.py",
                 timeout=90,
             )
             # v0.9.12: also bind webedit Flask app to 127.0.0.1 (Tier 3 — Caddy
             # is the only legitimate consumer; upstream defaults to 0.0.0.0).
-            _module_run(
+            _module_run_root(
                 deploy_cfg,
                 "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; "
                 "sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; "
@@ -47965,7 +48608,7 @@ def mediamtx_recovery():
                 except Exception:
                     pass
                 if copy_ok:
-                    _module_run(deploy_cfg, f'python3 /tmp/{name}.py && rm -f /tmp/{name}.py', timeout=15)
+                    _module_run_root(deploy_cfg, f'python3 /tmp/{name}.py && rm -f /tmp/{name}.py', timeout=15)
         else:
             try:
                 src = _read_priv(editor_path)   # v10.0.5 non-root: broker (root-owned dir)
@@ -47984,13 +48627,12 @@ def mediamtx_recovery():
                 with open(overlay_src) as _of:
                     _write_priv('/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', _of.read())
             elif os.path.exists(overlay_src):
-                _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
-                _module_copy(
-                    deploy_cfg,
-                    overlay_src,
-                    '/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py',
-                    timeout=20
-                )
+                # ops #890: scp runs as the SSH user and cannot write into root's /opt: stage in
+                # /tmp, then move into place as root (same two steps as the deploy).
+                _module_run_root(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
+                _ov_ok, _ = _module_copy(deploy_cfg, overlay_src, '/tmp/mediamtx_ldap_overlay.py', timeout=20)
+                if _ov_ok:
+                    _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
         except Exception:
             pass
         if _is_remote:
@@ -48049,7 +48691,7 @@ def mediamtx_recovery():
             f"else sed -i '/^\\[Service\\]/a {_tp_line}' {_tp_unit} 2>/dev/null; fi; "
             'systemctl daemon-reload 2>/dev/null; systemctl restart mediamtx-webeditor 2>/dev/null; true'
         )
-        ok_run, out = _module_run(deploy_cfg, cmd, timeout=25)
+        ok_run, out = _module_run_root(deploy_cfg, cmd, timeout=25)   # ops #890: mv/sed/systemctl need root
         if not ok_run:
             return jsonify({'error': 'Failed to install or restart web editor', 'detail': (out or '')[:500]}), 500
         # Check if web editor actually came up
@@ -48096,7 +48738,8 @@ def mediamtx_logs():
     settings = load_settings()
     deploy_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
     if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
-        ok, out = _ssh_probe(deploy_cfg['remote'], f'journalctl -u {unit} --no-pager -n {lines} 2>&1', timeout=15)
+        # ops #890: a non-root SSH user outside the adm/systemd-journal group reads no system journal.
+        ok, out = _ssh_probe(deploy_cfg['remote'], _as_root_sh(f'journalctl -u {unit} --no-pager -n {lines} 2>&1'), timeout=15)
         entries = [l for l in (out.strip().split('\n') if out and out.strip() else []) if l.strip()] if ok else []
         return jsonify({'entries': entries})
     r = subprocess.run(['journalctl', '-u', unit, '--no-pager', '-n', str(lines)], capture_output=True, text=True, timeout=10)
@@ -48117,10 +48760,11 @@ def mediamtx_uninstall():
     if deploy_cfg.get('target_mode') == 'remote':
         remote = deploy_cfg.get('remote', {})
         if (remote.get('host') or '').strip():
-            ok, out = _ssh_probe(remote, 'systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true', timeout=15)
-            _ssh_probe(remote, 'rm -f /etc/systemd/system/mediamtx.service /etc/systemd/system/mediamtx-webeditor.service /usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml', timeout=10)
-            _ssh_probe(remote, 'rm -rf /opt/mediamtx-webeditor', timeout=10)
-            _ssh_probe(remote, 'systemctl daemon-reload 2>/dev/null; true', timeout=10)
+            # ops #890: every step needs root; `sudo -n` when the SSH user is not root.
+            ok, out = _ssh_probe(remote, _as_root_sh('systemctl stop mediamtx mediamtx-webeditor 2>/dev/null; systemctl disable mediamtx mediamtx-webeditor 2>/dev/null; true'), timeout=15)
+            _ssh_probe(remote, _as_root_sh('rm -f /etc/systemd/system/mediamtx.service /etc/systemd/system/mediamtx-webeditor.service /usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml'), timeout=10)
+            _ssh_probe(remote, _as_root_sh('rm -rf /opt/mediamtx-webeditor'), timeout=10)
+            _ssh_probe(remote, _as_root_sh('systemctl daemon-reload 2>/dev/null; true'), timeout=10)
             steps.append('Stopped and removed MediaMTX on remote host')
         settings['mediamtx_deployment'] = dict(deploy_cfg)
         settings['mediamtx_deployment']['deployed'] = False
@@ -48302,6 +48946,62 @@ _MEDIAMTX_REMOTE_CERT_PERMS = (
 )
 
 
+# ops #891: the remote web editor runs as takwerx. At import it makes
+# /usr/local/etc/mediamtx_backups, and its saves run `sed -i` in /usr/local/etc, which is
+# root:root 755 on a fresh host. The remote deploy skipped the setup the local deploy does
+# (_mediamtx_grant_config_dir_write), so the editor died with PermissionError and crash-looped
+# on every remote host. Same shape as the local step, as one script for the SSH user
+# (root, or sudo -n). Prints EDITOR_PATHS_RC=0 when every step worked.
+_MEDIAMTX_REMOTE_EDITOR_PATHS_SH = (
+    _REMOTE_SUDO_SH +
+    'RC=0; '
+    '$S mkdir -p /usr/local/etc/mediamtx_backups || RC=1; '
+    '$S chown -R takwerx:takwerx /usr/local/etc/mediamtx_backups /opt/mediamtx-webeditor || RC=1; '
+    '$S chown root:takwerx /usr/local/etc || RC=1; '
+    '$S chmod 775 /usr/local/etc || RC=1; '
+    'if [ -f /usr/local/etc/mediamtx.yml ]; then '
+    '$S chown -h takwerx:takwerx /usr/local/etc/mediamtx.yml || RC=1; fi; '
+    'echo "EDITOR_PATHS_RC=$RC"'
+)
+
+# After the start: the editor must stay up, not just be started once. A crash loop
+# (RestartSec=5) shows `activating` between runs, so look three times, 4 s apart, and
+# also ask for the listener on 5080. Prints EDITOR_OK=1 or EDITOR_OK=0 and the last journal
+# lines when it is down.
+_MEDIAMTX_REMOTE_EDITOR_CHECK_SH = (
+    _REMOTE_SUDO_SH +
+    'OK=1; for I in 1 2 3; do sleep 4; '
+    '[ "$(systemctl is-active mediamtx-webeditor 2>/dev/null)" = active ] || OK=0; done; '
+    '(ss -ltn 2>/dev/null | grep -q ":5080 ") || OK=0; '
+    'echo "EDITOR_OK=$OK"; '
+    '[ "$OK" = 1 ] || $S journalctl -u mediamtx-webeditor -n 4 --no-pager -o cat 2>/dev/null'
+)
+
+
+def _mediamtx_remote_editor_prepare(deploy_cfg, plog):
+    """Make the remote editor's paths writable for takwerx before it starts. ops #891."""
+    ok, out = _module_run(deploy_cfg, _MEDIAMTX_REMOTE_EDITOR_PATHS_SH, timeout=60)
+    if ok and 'EDITOR_PATHS_RC=0' in (out or ''):
+        plog("  ✓ Web editor writable paths ready on remote host (backups + editor folder + config folder)")
+        return True
+    plog(f"  ⚠ Could not set up the web editor's folders on the remote host: {(out or '')[-160:]}")
+    return False
+
+
+def _mediamtx_remote_editor_check(deploy_cfg, plog):
+    """Say whether the remote web editor is really up, never just that it was started."""
+    ok, out = _module_run(deploy_cfg, _MEDIAMTX_REMOTE_EDITOR_CHECK_SH, timeout=60)
+    if ok and 'EDITOR_OK=1' in (out or ''):
+        plog("✓ Web editor is running on the remote host (port 5080)")
+        return True
+    plog("✗ Web editor is NOT running on the remote host (port 5080 is not listening).")
+    plog("  Streaming still works. The MediaMTX web page will not load until this is fixed.")
+    tail = (out or '').replace('EDITOR_OK=0', '').strip()
+    if tail:
+        plog(f"  Last log lines: {tail[-300:]}")
+    return False
+
+
 # Remote MediaMTX firewall. Tier 1 (public streaming) only: rtsp 8554, rtsps 8322, srt 8890
 # (UDP; this opened 8890/tcp until v10.1.10). The API (9898) is loopback-only and denied
 # outright. The web editor (5080) and HLS (8888) bind 0.0.0.0 so Caddy on the CONSOLE can
@@ -48379,6 +49079,75 @@ def _mediamtx_remote_firewall(settings, deploy_cfg, plog):
     return 'on', failed
 
 
+# ops #892: Step 1 of the remote deploy ran a bare `apt-get`, so a Rocky/RHEL 9 remote host stopped
+# there ("apt install failed"). The same package set, branched on the REMOTE host's own package
+# manager (the console's distro says nothing about the target). Mirrors the local deploy:
+# EPEL + CRB for the general set (GH #56: genuine RHEL has no `epel-release` package, so fall
+# back to the Fedora EPEL rpm), core packages strictly, then ffmpeg from RPM Fusion
+# (EPEL/RHEL only ship `ffmpeg-free`, no libx264/libx265) with `ffmpeg-free` as the fallback.
+# `git` is in both lists: the web editor is cloned on the remote host, and a stock Rocky/RHEL 9 server
+# image has none (the same trap as ops #792, remote WebODM). A missing ffmpeg warns and does not fail: MediaMTX streams without it. `sudo -n` for a
+# non-root SSH user. NON-ROOT-COMMANDS: dnf, apt-get, rpm.
+_MEDIAMTX_REMOTE_DEPS_SH = (
+    'S=; [ "$(id -u)" = 0 ] || S="sudo -n"; '
+    'if command -v dnf >/dev/null 2>&1; then '
+    'EL=$(rpm -E %rhel 2>/dev/null); case "$EL" in ""|*[!0-9]*) EL=9;; esac; '
+    '$S dnf install -y epel-release dnf-plugins-core >/dev/null 2>&1; '
+    'if ! rpm -q epel-release >/dev/null 2>&1; then '
+    '$S dnf install -y "https://dl.fedoraproject.org/pub/epel/epel-release-latest-$EL.noarch.rpm" >/dev/null 2>&1; '
+    '$S dnf install -y dnf-plugins-core >/dev/null 2>&1; fi; '
+    '$S dnf config-manager --set-enabled crb >/dev/null 2>&1 || '
+    '$S dnf config-manager --set-enabled powertools >/dev/null 2>&1; '
+    '$S dnf install -y wget tar curl openssl python3 python3-pip git 2>&1 || exit 1; '
+    '$S dnf install -y "https://download1.rpmfusion.org/free/el/rpmfusion-free-release-$EL.noarch.rpm" >/dev/null 2>&1; '
+    '$S dnf install -y ffmpeg >/dev/null 2>&1 || $S dnf install -y ffmpeg-free >/dev/null 2>&1 || '
+    'echo "INFRATAK-FFMPEG-MISSING"; '
+    'elif command -v apt-get >/dev/null 2>&1; then '
+    '$S apt-get update -qq && '
+    '$S env DEBIAN_FRONTEND=noninteractive apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip git 2>&1; '
+    'else echo "no dnf or apt-get on this host"; false; fi'
+)
+
+
+# ops #892 (second cause, found on a Rocky 9 host with SELinux enforcing): the config, the two unit
+# files and the editor folder arrive by `mv` from /tmp and keep SELinux's tmp label, so systemd
+# answers "Failed to open /etc/systemd/system/mediamtx.service: Permission denied" and neither
+# service starts, while the deploy said "Services started". restorecon gives them their real
+# labels; a host without restorecon (Ubuntu) does nothing. NON-ROOT-COMMANDS: restorecon.
+_MEDIAMTX_REMOTE_RELABEL_SH = (
+    _REMOTE_SUDO_SH +
+    '$S restorecon -R /usr/local/bin/mediamtx /usr/local/etc/mediamtx.yml /usr/local/etc/mediamtx-webeditor.env '
+    '/etc/systemd/system/mediamtx.service /etc/systemd/system/mediamtx-webeditor.service '
+    '/opt/mediamtx-webeditor >/dev/null 2>&1; true'
+)
+
+# MediaMTX itself must be running after the start (it gets a few seconds); prints systemd's own reason if not.
+_MEDIAMTX_REMOTE_ACTIVE_SH = (
+    'for i in 1 2 3 4 5 6 7 8; do systemctl is-active --quiet mediamtx && exit 0; sleep 1; done; '
+    'systemctl is-active mediamtx 2>&1; journalctl -u mediamtx -n 5 --no-pager 2>&1; exit 1'
+)
+
+
+# Files the console scp's into the remote /tmp as the SSH user, then moves into place as root
+# (ops #890). A root-owned file with the same name (a deploy that ran as root and stopped
+# part way) makes the next scp, as a non-root SSH user, die with "Permission denied": the
+# deploy and the recovery remove them first, as root.
+_MEDIAMTX_REMOTE_STAGING = (
+    '/tmp/mediamtx.yml', '/tmp/mediamtx.service', '/tmp/mediamtx-webeditor.service',
+    '/tmp/mediamtx-webeditor.env', '/tmp/mtx_hls_patcher.py', '/tmp/mtx_ldap_patcher.py',
+    '/tmp/mtx_endpoint_patch.py', '/tmp/mediamtx_ldap_overlay.py', '/tmp/mediamtx_stream.crt',
+    '/tmp/mediamtx_stream.key', '/tmp/ensure_overlay.py',
+)
+
+
+def _mediamtx_remote_clear_staging(deploy_cfg):
+    """Remove the fixed /tmp staging names (above) on the remote host, as root. Never raises."""
+    try:
+        _module_run_root(deploy_cfg, 'rm -f ' + ' '.join(_MEDIAMTX_REMOTE_STAGING), timeout=15)
+    except Exception:
+        pass
+
+
 def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     """Run MediaMTX deploy on a remote host via SSH."""
     import re as _re
@@ -48393,12 +49162,19 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
 
     # Step 1: Dependencies
     plog("━━━ Step 1/7: Installing Dependencies (remote) ━━━")
-    ok, out = _module_run(deploy_cfg, 'apt-get update -qq && apt-get install -y wget tar curl ffmpeg openssl python3 python3-pip 2>&1', timeout=300, log_fn=plog)
+    # ops #892: branches on the remote host's own package manager (Rocky/RHEL or Ubuntu).
+    # ops #890: as root (`sudo -n` for a non-root SSH user), or the package manager dies on "Permission denied".
+    ok, out = _module_run_root(deploy_cfg, _MEDIAMTX_REMOTE_DEPS_SH, timeout=900, log_fn=plog)
     if not ok:
-        plog(f"✗ apt install failed: {(out or '')[-300:]}")
+        plog(f"✗ Installing packages on the remote host failed: {(out or '')[-300:]}")
+        if 'password is required' in (out or '') or 'sudo:' in (out or ''):
+            plog("  The SSH user needs passwordless sudo (sudo -n) on the remote host, or use root.")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Dependencies installed")
+    if 'INFRATAK-FFMPEG-MISSING' in (out or ''):
+        plog("⚠ ffmpeg unavailable on the remote host — MediaMTX streaming OK, but recording / "
+             "MP4 download / test stream need ffmpeg (RPM Fusion repo unreachable?)")
 
     # v0.9.31: ensure `takwerx` system user exists on the remote host before
     # any chown / unit install happens. See `_ensure_takwerx_system_user`
@@ -48450,11 +49226,14 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
         # Upstream writes binary-mode lines (`<hash> *<file>`): match either separator, or
         # the grep finds nothing and EVERY remote deploy refuses (shipped v10.1.34 → row 5).
         f'grep -E "^[0-9a-f]{{64}} [ *]{re.escape(tarball)}$" checksums.sha256 | sha256sum --check --status && '
-        f'tar -xzf {tarball} && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && '
+        # ops #890: extract ONLY the binary. The tarball also holds mediamtx.yml and LICENSE; run as
+        # root they were left behind in /tmp, root-owned, and the next scp of our own mediamtx.yml
+        # (as a non-root SSH user) died with "Permission denied" at Step 4.
+        f'tar -xzf {tarball} mediamtx && mv -f mediamtx /usr/local/bin/ && chmod +x /usr/local/bin/mediamtx && '
         f'(restorecon /usr/local/bin/mediamtx 2>/dev/null || chcon -t bin_t /usr/local/bin/mediamtx 2>/dev/null || true) && '
         f'rm -f {tarball} checksums.sha256'
     )
-    ok, out = _module_run(deploy_cfg, cmd, timeout=120, log_fn=plog)
+    ok, out = _module_run_root(deploy_cfg, cmd, timeout=120, log_fn=plog)
     if not ok:
         plog(f"✗ Download/verify/install failed (checksum mismatch aborts the install): {(out or '')[-200:]}")
         mediamtx_deploy_status.update({'running': False, 'error': True})
@@ -48464,6 +49243,7 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     # Step 4: Config
     plog("")
     plog("━━━ Step 4/7: Writing Configuration (remote) ━━━")
+    _mediamtx_remote_clear_staging(deploy_cfg)   # ops #890: before the first scp into /tmp
     hls_pass = _sec.token_hex(8)
     # apiAddress stays on 127.0.0.1 (webedit Flask calls it locally on the remote host).
     # hlsAddress is 0.0.0.0 so Caddy on the console can reverse-proxy HLS streams;
@@ -48565,9 +49345,12 @@ paths:
         plog("✗ Failed to copy config to remote")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
-    ok, _ = _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml', timeout=10)
+    # ops #890: root:root in place, whoever the SSH user is (a plain `mv` kept the SSH user as owner).
+    ok, out = _module_run_root(deploy_cfg, 'install -D -m 644 -o root -g root /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml && rm -f /tmp/mediamtx.yml', timeout=10)
     if not ok:
-        _module_run(deploy_cfg, 'mv /tmp/mediamtx.yml /usr/local/etc/mediamtx.yml', timeout=10)
+        plog(f"✗ Could not write /usr/local/etc/mediamtx.yml on the remote host: {(out or '')[-200:]}")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
     plog("✓ Configuration written")
     plog(f"  HLS viewer password: {'*' * max(0, len(hls_pass) - 4) + hls_pass[-4:]}")
 
@@ -48587,15 +49370,16 @@ paths:
         plog("✗ Failed to copy systemd unit")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
-    _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service || mv /tmp/mediamtx.service /etc/systemd/system/mediamtx.service', timeout=10)
-    # Web editor: clone on remote and install
-    _module_run(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
-    ok, _ = _module_run(deploy_cfg, 'rm -rf /tmp/mediamtx_editor_clone && ' + _mediamtx_editor_clone_cmd('/tmp/mediamtx_editor_clone'), timeout=90)
+    _module_run_root(deploy_cfg, 'install -m 644 -o root -g root /tmp/mediamtx.service /etc/systemd/system/mediamtx.service && rm -f /tmp/mediamtx.service', timeout=10)
+    # Web editor: clone on remote and install (ops #890: every step below that writes under /opt,
+    # /etc, /usr or starts a unit runs as root, `sudo -n` for a non-root SSH user)
+    _module_run_root(deploy_cfg, 'mkdir -p /opt/mediamtx-webeditor', timeout=10)
+    ok, _clone_out = _module_run_root(deploy_cfg, 'rm -rf /tmp/mediamtx_editor_clone && ' + _mediamtx_editor_clone_cmd('/tmp/mediamtx_editor_clone'), timeout=90)
     if ok:
-        _module_run(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
+        _module_run_root(deploy_cfg, 'cp /tmp/mediamtx_editor_clone/config-editor/mediamtx_config_editor.py /opt/mediamtx-webeditor/ 2>/dev/null; rm -rf /tmp/mediamtx_editor_clone', timeout=15)
         # Remote: bind Flask webedit to 0.0.0.0 so Caddy on the console can reach it.
         # Port 5080 will be UFW source-scoped to the console IP only (Step 6/7).
-        _module_run(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
+        _module_run_root(deploy_cfg, "sed -i 's/port=5000/port=5080/' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null; sed -i 's/9997/9898/g' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null", timeout=10)
         # Patch HLS URLs to go through Caddy /hls-proxy/ instead of direct port 8888 (avoids mixed content)
         hls_patch_script = (
             "import re, sys\n"
@@ -48619,12 +49403,16 @@ paths:
         with open('/tmp/mtx_hls_patcher.py', 'w') as pf:
             pf.write(hls_patch_script)
         _module_copy(deploy_cfg, '/tmp/mtx_hls_patcher.py', '/tmp/mtx_hls_patcher.py', log_fn=plog)
-        _module_run(deploy_cfg, 'python3 /tmp/mtx_hls_patcher.py && rm -f /tmp/mtx_hls_patcher.py', timeout=15)
+        _module_run_root(deploy_cfg, 'python3 /tmp/mtx_hls_patcher.py && rm -f /tmp/mtx_hls_patcher.py', timeout=15)
         try:
             os.remove('/tmp/mtx_hls_patcher.py')
         except Exception:
             pass
         plog("✓ HLS URLs patched for HTTPS proxy")
+    else:
+        # ops #892: this branch did not exist, so a failed download left no editor file and the deploy still ended in success.
+        plog(f"⚠ The web editor could not be downloaded to the remote host (git clone failed): {(_clone_out or '')[-200:]}")
+        plog("  MediaMTX itself still works. Run Patch web editor on the MediaMTX page once the host can reach GitHub.")
     # LDAP overlay: when Authentik is present locally, patch remote editor for header auth
     ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
     ldap_env_lines = ''
@@ -48634,7 +49422,7 @@ paths:
         if os.path.exists(overlay_src):
             ok_ov, _ = _module_copy(deploy_cfg, overlay_src, '/tmp/mediamtx_ldap_overlay.py', log_fn=plog)
             if ok_ov:
-                _module_run(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
+                _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
                 patcher = (
                     "import sys\n"
                     "EDITOR = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
@@ -48667,7 +49455,7 @@ paths:
                 with open('/tmp/mtx_ldap_patcher.py', 'w') as pf:
                     pf.write(patcher)
                 _module_copy(deploy_cfg, '/tmp/mtx_ldap_patcher.py', '/tmp/mtx_ldap_patcher.py', log_fn=plog)
-                _module_run(deploy_cfg, 'python3 /tmp/mtx_ldap_patcher.py && rm -f /tmp/mtx_ldap_patcher.py', timeout=15)
+                _module_run_root(deploy_cfg, 'python3 /tmp/mtx_ldap_patcher.py && rm -f /tmp/mtx_ldap_patcher.py', timeout=15)
                 try:
                     os.remove('/tmp/mtx_ldap_patcher.py')
                 except Exception:
@@ -48677,7 +49465,7 @@ paths:
                 with open('/tmp/mtx_endpoint_patch.py', 'w') as pf:
                     pf.write(MEDIAMTX_REMOTE_EP_PATCH_SCRIPT)
                 _module_copy(deploy_cfg, '/tmp/mtx_endpoint_patch.py', '/tmp/mtx_endpoint_patch.py', log_fn=plog)
-                _module_run(deploy_cfg, 'python3 /tmp/mtx_endpoint_patch.py && rm -f /tmp/mtx_endpoint_patch.py', timeout=15)
+                _module_run_root(deploy_cfg, 'python3 /tmp/mtx_endpoint_patch.py && rm -f /tmp/mtx_endpoint_patch.py', timeout=15)
                 try:
                     os.remove('/tmp/mtx_endpoint_patch.py')
                 except Exception:
@@ -48722,19 +49510,20 @@ paths:
             except OSError:
                 pass
         _dst = _MEDIAMTX_EDITOR_SECRET_ENV
-        _module_run(deploy_cfg,
-                    f'sudo install -m 600 -o root -g root /tmp/mediamtx-webeditor.env {_dst} 2>/dev/null'
-                    f' || install -m 600 /tmp/mediamtx-webeditor.env {_dst}; rm -f /tmp/mediamtx-webeditor.env',
-                    timeout=10)
+        _module_run_root(deploy_cfg,
+                         f'install -m 600 -o root -g root /tmp/mediamtx-webeditor.env {_dst}; rm -f /tmp/mediamtx-webeditor.env',
+                         timeout=10)
     with open('/tmp/mediamtx_webeditor_remote.service', 'w') as f:
         f.write(editor_svc)
     _module_copy(deploy_cfg, '/tmp/mediamtx_webeditor_remote.service', '/tmp/mediamtx-webeditor.service', log_fn=plog)
-    _module_run(deploy_cfg, 'sudo mv /tmp/mediamtx-webeditor.service /etc/systemd/system/ 2>/dev/null || mv /tmp/mediamtx-webeditor.service /etc/systemd/system/', timeout=10)
+    _module_run_root(deploy_cfg, 'install -m 644 -o root -g root /tmp/mediamtx-webeditor.service /etc/systemd/system/mediamtx-webeditor.service && rm -f /tmp/mediamtx-webeditor.service', timeout=10)
     try:
         os.remove('/tmp/mediamtx_webeditor_remote.service')
     except Exception:
         pass
     plog("✓ Services created")
+    # ops #891: the editor runs as takwerx and dies at import without these. Before the start.
+    _mediamtx_remote_editor_prepare(deploy_cfg, plog)
 
     # Step 6: Firewall, BEFORE the services start (ops #630). The editor binds 0.0.0.0:5080
     # and is meant for the console only. This step used to come after the
@@ -48750,13 +49539,24 @@ paths:
         plog("  user passwordless sudo, then deploy again.")
         mediamtx_deploy_status.update({'running': False, 'error': True})
         return
-    _module_run(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=90)
+    # ops #892: relabel what was moved in from /tmp (SELinux hosts), then start.
+    _module_run_root(deploy_cfg, _MEDIAMTX_REMOTE_RELABEL_SH, timeout=60)
+    _module_run_root(deploy_cfg, 'systemctl daemon-reload && systemctl enable mediamtx && systemctl enable mediamtx-webeditor 2>/dev/null; systemctl start mediamtx && systemctl start mediamtx-webeditor 2>/dev/null', timeout=90)
+    # ops #892: "Services started" used to print whatever systemd said. Check MediaMTX itself
+    # (as root: a non-root SSH user cannot read the journal).
+    _mtx_up, _mtx_out = _module_run_root(deploy_cfg, _MEDIAMTX_REMOTE_ACTIVE_SH, timeout=40)
+    if not _mtx_up:
+        plog(f"✗ MediaMTX did not start on the remote host: {(_mtx_out or '')[-300:]}")
+        mediamtx_deploy_status.update({'running': False, 'error': True})
+        return
     plog("✓ Services started")
+    # ops #891: "started" is not "up". The editor crash-looped here and the log still said ok.
+    _mediamtx_remote_editor_check(deploy_cfg, plog)
 
     # Step 5b: Test video
     test_video_url = MEDIAMTX_EDITOR_TEST_VIDEO_URL
     plog("  Downloading test video (truck_60.ts)...")
-    ok_tv, _ = _module_run(deploy_cfg, f'mkdir -p /opt/mediamtx-webeditor/test_videos && wget -q -O /opt/mediamtx-webeditor/test_videos/truck_60.ts "{test_video_url}"', timeout=60)
+    ok_tv, _ = _module_run_root(deploy_cfg, f'mkdir -p /opt/mediamtx-webeditor/test_videos && wget -q -O /opt/mediamtx-webeditor/test_videos/truck_60.ts "{test_video_url}"', timeout=60)
     if ok_tv:
         plog("✓ Test video installed")
     else:
@@ -48802,7 +49602,7 @@ paths:
                 plog(f"  ⏳ {i * 2}s...")
             time.sleep(2)
         if _caddy_cert_pair_ready(cert_file, key_file):
-            _module_run(deploy_cfg, 'mkdir -p /etc/mediamtx/certs', timeout=10)
+            _module_run_root(deploy_cfg, 'mkdir -p /etc/mediamtx/certs', timeout=10)
             # Stage both files somewhere the console can read before copying: scp/copy2
             # open the SOURCE as takwerx and would fail on 0600 caddy:caddy.
             ok_cert = ok_key = False
@@ -48821,7 +49621,7 @@ paths:
             if ok_cert and ok_key:
                 # The unit runs User=takwerx: root:root 0600 made MediaMTX crash-loop on
                 # "open /etc/mediamtx/certs/stream.crt: permission denied" (TEST-MATRIX row 5).
-                _module_run(deploy_cfg, 'mv /tmp/mediamtx_stream.crt /etc/mediamtx/certs/stream.crt && mv /tmp/mediamtx_stream.key /etc/mediamtx/certs/stream.key && ' + _MEDIAMTX_REMOTE_CERT_PERMS, timeout=10)
+                _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_stream.crt /etc/mediamtx/certs/stream.crt && mv /tmp/mediamtx_stream.key /etc/mediamtx/certs/stream.key && ' + _MEDIAMTX_REMOTE_CERT_PERMS, timeout=10)
                 remote_cert = '/etc/mediamtx/certs/stream.crt'
                 remote_key  = '/etc/mediamtx/certs/stream.key'
                 yml_cmd = (
@@ -48834,8 +49634,8 @@ paths:
                     f"sed -i 's|^rtspEncryption:.*|rtspEncryption: \"optional\"|' /usr/local/etc/mediamtx.yml; "
                     f"sed -i 's|^hlsEncryption:.*|hlsEncryption: yes|' /usr/local/etc/mediamtx.yml"
                 )
-                _module_run(deploy_cfg, yml_cmd, timeout=15)
-                _module_run(deploy_cfg, 'systemctl restart mediamtx', timeout=15)
+                _module_run_root(deploy_cfg, yml_cmd, timeout=15)
+                _module_run_root(deploy_cfg, 'systemctl restart mediamtx', timeout=15)
                 plog(f"✓ SSL certificates synced — RTSPS and HTTPS HLS enabled")
                 ssl_ok = True
                 # The Caddyfile's /hls-proxy reverse_proxy only switches to https when
@@ -52041,7 +52841,14 @@ MEDIA_PORT_SRT=18890
 # v10.2.21: security update — v9.12.1 (2026-10-15) embeds MediaMTX 1.21.2 (was 1.20.0).
 # Upstream diff from v9.11.0 is the MediaMTX + Go builder bump only; mediamtx.yml and the
 # lease code we patch (persist/payload) are unchanged. Still multi-arch (checked 2026-10-19).
-MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.12.1'
+# ops #821: security update — v9.13.0 (2026-11-06) moves the image's Node base to node:26-alpine
+# (Node 26.13+), which closes the Brotli decoder CVE-2026-111497 that v9.12.1 (node:24) carried.
+# v9.14.0 adds lib/eip.ts, an AWS Elastic IP reconciler that starts ONLY when the container has
+# EIP_ALLOCATION_ID (the CloudTAK override never sets it, so it is inert on our boxes). Upstream
+# diff from v9.12.1 touches no mediamtx.yml, persist.ts or payload.ts. MediaMTX is 1.21.4 in v9.15.x.
+# NOT v9.13.0 to v9.15.0: those images lack libatomic, so Node 26 will not start and cloudtak-media-1
+# restarts with exit 127 (dfpc-coe/media-infra#63). v9.15.1 (2026-11-17) installs it. Still an amd64 + arm64 index.
+MEDIA_INFRA_IMAGE = 'ghcr.io/dfpc-coe/media-infra:v9.15.1'
 MEDIA_INFRA_MULTIARCH = True
 
 # ops #110: the postgis image the CloudTAK override pins (wins over CloudTAK's own pin).
@@ -54836,9 +55643,13 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
                     changed.append(os.path.relpath(overlay, ct_dir))
         # The api's own lint covers plugin server routes, and the marketplace files it marked
         # @ts-nocheck (those marks are in untracked files, so they survive the checkout).
+        # CloudTAK up to 13.123.x lints the api with ESLint (api/eslint.config.js); 13.124.0
+        # moved it to OXLint (api/.oxlintrc.json), which never reads eslint.config.js, so
+        # the ESLint skip alone no longer protects the build (GH #563, #565).
         api = os.path.join(ct_dir, 'api')
         cfg = os.path.join(api, 'eslint.config.js')
-        if os.path.isfile(cfg):
+        oxc = os.path.join(api, '.oxlintrc.json')
+        if os.path.isfile(cfg) or os.path.isfile(oxc):
             extras = set()
             routes = os.path.join(api, 'stateless', 'routes')
             if os.path.isdir(routes):
@@ -54854,6 +55665,7 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
                         if n.endswith('.ts') and _cloudtak_has_ts_nocheck(p):
                             extras.add(os.path.relpath(p, api).replace(os.sep, '/'))
             patterns = ['stateless/routes/plugin-*.ts'] + sorted(extras)
+        if os.path.isfile(cfg):
             block = ('    /* cloudtak-marketplace-routes */\n    { ignores: ['
                      + ', '.join("'" + p.replace("'", '') + "'" for p in patterns) + '] },')
             with open(cfg, encoding='utf-8') as f:
@@ -54869,6 +55681,26 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
             if new != text:
                 _cloudtak_rewrite_in_place(cfg, new)
                 changed.append(os.path.relpath(cfg, ct_dir))
+        if os.path.isfile(oxc):
+            # OXLint's own skip list: ignorePatterns, relative to the config file. Upstream's
+            # entries stay; ours are added once each, so a second run changes nothing.
+            with open(oxc, encoding='utf-8') as f:
+                text = f.read()
+            try:
+                data = json.loads(text)
+                have = data.get('ignorePatterns')
+                have = list(have) if isinstance(have, list) else []
+                want = have + [p for p in patterns if p not in have]
+                if want != have or not isinstance(data.get('ignorePatterns'), list):
+                    data['ignorePatterns'] = want
+                    m = re.search(r'\n([ \t]+)"', text)
+                    new = (json.dumps(data, indent=m.group(1) if m else 4, ensure_ascii=False)
+                           + ('\n' if text.endswith('\n') else ''))
+                    _cloudtak_rewrite_in_place(oxc, new)
+                    changed.append(os.path.relpath(oxc, ct_dir))
+            except ValueError:
+                plog("  ⚠ api/.oxlintrc.json is not plain JSON, so the build was not set to skip "
+                     "non-infra-TAK plugins for OXLint (non-fatal)")
         if changed:
             plog(f"  Plugins not installed by infra-TAK ({', '.join(foreign)}): the image build skips "
                  f"lint/typecheck for them, as TAK Portal's marketplace set it ({', '.join(changed)})")
@@ -66115,7 +66947,7 @@ window.ctCopyPluginLog = function(btn) {
 
 window.ctGenBootstrapCert = function(btn) {
   var out = document.getElementById('ct-bootstrap-cert-result');
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   var orig = btn.textContent;
   btn.disabled = true; btn.textContent = 'Generating…';
   if (out) { out.style.display = 'block'; out.innerHTML = '<span style="color:var(--text-dim)">Generating certificate + applying ROLE_ADMIN (this takes a few seconds)…</span>'; }
@@ -66153,7 +66985,7 @@ window.ctLoadConnectState = function(retries) {
   if (!st) return;
   var btn = document.getElementById('ct-connect-btn');
   var creds = document.getElementById('ct-connect-creds');
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   fetch('/api/cloudtak/connect-tak', { credentials: 'same-origin' })
     .then(function(r) { return r.json(); })
     .then(function(d) {
@@ -66202,7 +67034,7 @@ window.ctLoadConnectState = function(retries) {
 
 window.ctConnectTak = function(btn) {
   var out = document.getElementById('ct-connect-result');
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   var body = {};
   if (window._ctConnectNeedsCreds) {
     body.username = (document.getElementById('ct-connect-user').value || '').trim();
@@ -66233,7 +67065,7 @@ window.ctConnectTak = function(btn) {
 };
 window.ctMakeAdmin = function(btn) {
   var out = document.getElementById('ct-connect-result');
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   var sel = document.getElementById('ct-make-admin-user');
   if (!sel || !sel.value) return;
   btn.disabled = true;
@@ -66263,7 +67095,7 @@ document.addEventListener('DOMContentLoaded', function() { window.ctLoadConnectS
 window.ctLoadCoreEventsIdentity = function() {
   var host = document.getElementById('ct-coreevents-identity');
   if (!host) return;
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   fetch('/api/cloudtak/coreevents-identity', { credentials: 'same-origin' })
     .then(function(r) { return r.json(); })
     .then(function(d) {
@@ -66300,7 +67132,7 @@ document.addEventListener('DOMContentLoaded', function() { window.ctLoadCoreEven
 window.ctLoadBootstrapChannels = function() {
   var host = document.getElementById('ct-bootstrap-channels');
   if (!host) return;
-  var esc = function(s) { var d = document.createElement('div'); d.textContent = String(s == null ? '' : s); return d.innerHTML; };
+  var esc = function(s) { return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
   fetch('/api/cloudtak/bootstrap-channels', { credentials: 'same-origin' })
     .then(function(r) { return r.json(); })
     .then(function(d) {
@@ -71967,7 +72799,7 @@ def _ensure_takwerx_system_user_remote(deploy_cfg, plog=None):
             'getent passwd takwerx >/dev/null || useradd  --system -g takwerx '
             '-d /nonexistent -s /usr/sbin/nologin takwerx'
         )
-        _module_run(deploy_cfg, cmd, timeout=15)
+        _module_run_root(deploy_cfg, cmd, timeout=15)   # ops #890: groupadd/useradd need root
         ok2, out2 = _module_run(deploy_cfg, 'getent passwd takwerx 2>/dev/null', timeout=10)
         if ok2 and (out2 or '').strip():
             _log("✓ takwerx system user created on remote host")
@@ -75242,6 +76074,22 @@ def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label, tag='p
 _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S = 300
 _TAK_RECYCLE_8089_TIMEOUT_S = 900       # Guard Dog's MAX_WAIT_TAK
 _TAK_RECYCLE_API_TIMEOUT_S = 300        # Guard Dog's api wait (_MAX_API)
+# GH #549: TAK's HTTPS side (groups/all, so ATAK Data Sync and CloudTAK) can stay without
+# groups after an LDAP outage while every 8089 client keeps its groups. ops #316 saw it come
+# back by itself in 75-204 s; the field (v10.4.0 Update Now) saw it stay broken 2.5 h, with
+# Data Sync feeds "removed" on every ATAK, until a TAK restart. So with clients connected the
+# heal keeps re-checking on every monitor tick, and restarts TAK once it has been broken this
+# long: broken Data Sync for everyone is worse than one reconnect.
+_TAK_HTTPS_BROKEN_RESTART_S = 900
+# GH #549: at box boot TAK and the outpost start together, so the outpost-start test above
+# never fires, and a TAK that came up while Authentik answered 502 was never checked. Once
+# per TAK start, this long after it, the HTTPS side is checked once (one login, quiet if OK).
+_TAK_BOOT_HTTPS_CHECK_AFTER_S = 600
+# GH #549: before the update's final heal, Authentik's database, server and LDAP outpost must
+# all be running, healthy and not restarted for this long. Field: a database recreate restarted
+# server and outpost 97 s later, after the final heal had already looked and found nothing.
+_AK_SETTLE_STABLE_S = 180
+_AK_SETTLE_TIMEOUT_S = 900
 _tak_ldap_recycle_lock = threading.Lock()
 
 
@@ -76076,6 +76924,36 @@ def _console_update_in_progress():
         return False
 
 
+def _tak_https_broken_alert(plog, outcome, detail):
+    """GH #549: Guard Dog says that the console restarted TAK Server because its HTTPS side
+    (ATAK Data Sync, CloudTAK) kept giving users no groups. Activity log line always, email
+    when a recipient is set. Never raises."""
+    when = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        line = ' '.join(f"{when} | tak-ldap-heal | {outcome} | {detail}".split())
+        _write_priv('/var/log/takguard/restarts.log', line + '\n', mode='a')
+    except Exception as e:
+        plog(f"  TAK LDAP recycle: Guard Dog activity line not written: {str(e)[:120]}")
+    try:
+        settings = load_settings()
+        to_addr = (settings.get('guarddog_alert_email') or '').strip()
+        if not to_addr:
+            plog("  TAK LDAP recycle: Guard Dog alert email SUPPRESSED (no recipient configured)")
+            return
+        ident = _guarddog_server_identifier(settings) or socket.gethostname()
+        subj = f"⚠ TAK Server restarted: Data Sync had no groups ({ident})"
+        body = (f"TAK Server's HTTPS side gave users no groups for over "
+                f"{_TAK_HTTPS_BROKEN_RESTART_S // 60} minutes after Authentik's LDAP was restarted. "
+                f"While that lasts, ATAK shows Data Sync feeds as removed and CloudTAK shows empty "
+                f"mission lists.\n\nThe console restarted TAK Server to fix it. Connected clients "
+                f"reconnected by themselves.\n\nResult: {outcome}\nDetail: {detail}\n\n"
+                f"If Data Sync still shows no feeds, open the TAK Server page and restart TAK Server."
+                f"\n\nConsole: {ident}\n\n— Guard Dog")
+        _guarddog_send_alert_email_via_relay(to_addr, subj, body)
+    except Exception as e:
+        plog(f"  TAK LDAP recycle: Guard Dog alert email failed: {str(e)[:120]}")
+
+
 def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=False):
     """Once LDAP is healthy again after TAK Server ran through an LDAP outage (see above),
     give its client connections their groups back without a restart
@@ -76099,7 +76977,7 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         need_groups = bool(st.get('need_groups', True)) if pending else True
         must_restart = False
 
-        def _finish(outcome, keep=None, healed_ldap_start=None, healed_gd_restart=None):
+        def _finish(outcome, keep=None, healed_ldap_start=None, healed_gd_restart=None, https_broken_since=None):
             try:
                 s = load_settings()
                 cur = dict(s.get('tak_ldap_recycle') or {})
@@ -76108,10 +76986,14 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                     cur['requested_epoch'] = max(float(cur.get('requested_epoch') or 0), time.time())
                     cur.setdefault('need_groups', need_groups)
                     cur['restart'] = bool(cur.get('restart') or must_restart)
-                elif float(cur.get('requested_epoch') or 0) <= req_at:
-                    # a request made while we worked stays pending for the next caller
-                    for k in ('pending', 'requested_epoch', 'need_groups', 'restart'):
-                        cur.pop(k, None)
+                    if https_broken_since is not None:
+                        cur['https_broken_since'] = https_broken_since
+                else:
+                    cur.pop('https_broken_since', None)   # GH #549: settled one way or the other
+                    if float(cur.get('requested_epoch') or 0) <= req_at:
+                        # a request made while we worked stays pending for the next caller
+                        for k in ('pending', 'requested_epoch', 'need_groups', 'restart'):
+                            cur.pop(k, None)
                 if healed_ldap_start is not None:
                     cur['healed_ldap_start'] = healed_ldap_start
                 if healed_gd_restart is not None:
@@ -76156,6 +77038,31 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                     and gd_restart > float(st.get('healed_gd_restart') or 0) + 1):
                 up = int(gd_restart - tak_start)
                 reasons.append(f"Guard Dog restarted Authentik while TAK Server was running (TAK up {up // 3600}h{up % 3600 // 60:02d}m at the time)")
+        # GH #549 (box boot): TAK and the local outpost started within the window above, so
+        # neither start counts as an outage, and a TAK that came up while Authentik answered
+        # 502 was never looked at. Once per TAK start, after it has settled: one HTTPS login.
+        if (check_outpost and not reasons and ldap_start is not None
+                and abs(ldap_start - tak_start) < _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S
+                and time.time() - tak_start >= _TAK_BOOT_HTTPS_CHECK_AFTER_S
+                and abs(float(st.get('boot_checked_tak_start') or 0) - tak_start) > 1
+                and (final or not _console_update_in_progress())):
+            try:
+                s = load_settings()
+                cur = dict(s.get('tak_ldap_recycle') or {})
+                cur['boot_checked_tak_start'] = tak_start
+                s['tak_ldap_recycle'] = cur
+                save_settings(s)
+            except Exception:
+                pass
+            boot_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+            if boot_pass and _ensure_ldapsearch():
+                try:
+                    boot_verdict, _boot_summary = _tak_api_user_check(plog, tag, boot_pass, wait_s=0)
+                except Exception:
+                    boot_verdict = 'unknown'
+                if boot_verdict == 'broken':
+                    reasons.append("TAK Server started together with Authentik (box boot) and its HTTPS "
+                                   "side gives users no groups")
         reasons = list(dict.fromkeys(reasons))   # a kept reason is also found again above
         if not reasons:
             if pending:
@@ -76211,6 +77118,15 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 verdict, summary = _tak_heal_ldap_sessions(plog, tag, ldap_pass)
             except Exception as e:
                 verdict, summary = 'unknown', f"client heal error: {str(e)[:120]}"
+        escalated = False
+
+        def _alert(result):
+            if escalated:
+                try:
+                    _tak_https_broken_alert(plog, result, summary)
+                except Exception:
+                    pass
+
         if verdict in ('ok', 'healed'):
             # ops #316: a restart drops every connected client to fix the HTTPS side alone, and
             # on test6 that side came back by itself 75-204 s after an outpost restart (the
@@ -76236,16 +77152,28 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             if grouped != 0:
                 who = (f"{grouped} connected client(s) have their groups" if grouped
                        else "TAK's client list can't be read")
-                plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side still gives users no groups: {api_summary}. "
-                     f"TAK Server NOT restarted: {who}, and a restart would drop them all. ATAK Data Sync and "
-                     f"CloudTAK may show empty mission lists until it recovers; if they still do, restart TAK "
-                     f"Server at a quiet moment")
-                _finish(outcome + ' (HTTPS still broken, clients kept)',
-                        healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
-                return False
-            plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side is broken: {api_summary}. ATAK Data Sync and "
-                 f"CloudTAK get no groups (empty mission lists, 403 on create) until TAK Server restarts")
-            summary = f"HTTPS/API side gives users no groups ({api_summary}); no connected clients to drop"
+                # GH #549: never marked healed while broken. Kept pending, so every monitor tick
+                # checks again; once broken this long, TAK is restarted after all.
+                since = float(st.get('https_broken_since') or 0) or time.time()
+                broken_for = time.time() - since
+                if broken_for < _TAK_HTTPS_BROKEN_RESTART_S:
+                    plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side still gives users no groups: {api_summary}. "
+                         f"TAK Server NOT restarted yet: {who}, and a restart would drop them all. ATAK Data "
+                         f"Sync and CloudTAK may show empty mission lists until it recovers. Checked again every "
+                         f"10 min; TAK Server is restarted if it is still broken "
+                         f"{_TAK_HTTPS_BROKEN_RESTART_S // 60} min after it was first seen")
+                    _finish(outcome + ' (HTTPS still broken, clients kept, re-checking)', keep=reasons,
+                            https_broken_since=since)
+                    return False
+                escalated = True
+                plog(f"  ✗ {tag}: TAK's HTTPS/API side still gives users no groups after "
+                     f"{int(broken_for // 60)} min: {api_summary}. ATAK Data Sync and CloudTAK are broken for "
+                     f"everyone, which is worse than one reconnect — restarting TAK Server ({who})")
+                summary = f"HTTPS/API side gave users no groups for {int(broken_for // 60)} min ({api_summary})"
+            else:
+                plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side is broken: {api_summary}. ATAK Data Sync and "
+                     f"CloudTAK get no groups (empty mission lists, 403 on create) until TAK Server restarts")
+                summary = f"HTTPS/API side gives users no groups ({api_summary}); no connected clients to drop"
 
         native = not _tak_is_container()
         plog(f"  {tag}: {summary} — {'restarting' if must_restart else 'falling back to restarting'} TAK Server "
@@ -76257,12 +77185,14 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             r = subprocess.run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=240)
             if r.returncode != 0:
                 plog(f"  ✗ {tag}: TAK Server restart failed: {((r.stderr or '') + (r.stdout or '')).strip()[-300:]}")
+                _alert('TAK Server restart FAILED, restart it by hand')
                 _finish('restart failed', keep=reasons)
                 return False
         except subprocess.TimeoutExpired:
             plog(f"  {tag}: restart command still running after 240s — waiting for the ports")
         ready = _tak_wait_ready(plog, tag)
         if not ready:
+            _alert('TAK Server restarted, but its ports were not up in time')
             _finish('restarted, ports not up in time')
             return True
         plog(f"  ✓ {tag}: TAK Server restarted after LDAP settled; clients reconnect and get their groups back")
@@ -76272,13 +77202,16 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
         if api_verdict == 'ok':
             plog(f"  ✓ {tag}: after the restart: {api_summary}")
+            _alert('TAK Server restarted; users have their groups again')
             _finish('restarted')
         elif api_verdict == 'unknown':
             plog(f"  {tag}: after the restart, HTTPS/API side NOT checked: {api_summary}")
+            _alert('TAK Server restarted; the HTTPS side could not be checked after it')
             _finish('restarted (HTTPS not checked)')
         else:
             plog(f"  ✗ {tag}: STILL BROKEN after the TAK Server restart: {api_summary}. Not restarting again — "
                  f"check CoreConfig's <ldap> settings and the LDAP outpost, then restart TAK Server by hand")
+            _alert(f'TAK Server restarted, but users STILL get no groups: {api_summary}')
             _finish('restarted, HTTPS still broken')
         return True
 
@@ -76286,6 +77219,55 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
 def _ak_ldap_path_starts():
     """Start times of the containers TAK's LDAP lookups go through (outpost, server)."""
     return tuple(_docker_started_epoch(c) for c in ('authentik-ldap-1', 'authentik-server-1'))
+
+
+def _ak_ldap_path_wait_settled(plog):
+    """GH #549: wait until Authentik's database, server and LDAP outpost all run, are healthy
+    (when they have a healthcheck) and none restarted in the last `_AK_SETTLE_STABLE_S`, at
+    most `_AK_SETTLE_TIMEOUT_S`. Field (v10.4.0 Update Now): a database recreate restarted the
+    server and the outpost 97 s later, after the update's final heal had looked and found
+    nothing. No local outpost (remote Authentik, not installed): returns at once.
+    True when settled, False on the time limit."""
+    names = ('authentik-postgresql-1', 'authentik-server-1', 'authentik-ldap-1')
+    fmt = '{{.State.Running}} {{.State.StartedAt}} {{if .State.Health}}{{.State.Health.Status}}{{end}}'
+    t0, said = time.time(), False
+    while True:
+        states = {}
+        for c in names:
+            try:
+                r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', fmt, c]),
+                                   capture_output=True, text=True, timeout=10)
+                states[c] = (r.stdout or '').split() if r.returncode == 0 else None
+            except Exception:
+                states[c] = None
+        if not states['authentik-ldap-1']:
+            return True
+        now = time.time()
+        waiting = []
+        for c, parts in states.items():
+            if not parts:
+                continue                     # not on this box (e.g. an external database)
+            if parts[0] != 'true':
+                waiting.append(f'{c} not running')
+                continue
+            started = _epoch_from_rfc3339(parts[1]) if len(parts) > 1 else None
+            health = parts[2] if len(parts) > 2 else ''
+            if health and health != 'healthy':
+                waiting.append(f'{c} {health}')
+            elif started is None or now - started < _AK_SETTLE_STABLE_S:
+                waiting.append(f"{c} started {int(now - started) if started else '?'}s ago")
+        if not waiting:
+            if said:
+                plog(f"  Authentik settled after {int(now - t0)}s — checking TAK Server's clients now")
+            return True
+        if now - t0 >= _AK_SETTLE_TIMEOUT_S:
+            plog(f"  ✗ Authentik not settled after {int(now - t0)}s ({'; '.join(waiting)}) — checking "
+                 f"TAK Server's clients anyway")
+            return False
+        if not said:
+            plog(f"  waiting for Authentik to settle before checking TAK Server's clients: {'; '.join(waiting)}")
+            said = True
+        time.sleep(10)
 
 
 def _authentik_reconfigure_heal_tak_clients(plog, before=None):
@@ -89378,9 +90360,15 @@ def _rotate_client_cert_names(cert_dir, skip=()):
     -signing keystores. Matching only the old/new CA names re-issued all of those as client
     certs, which appends a non-CA private key to the live enrollment signing keystore that
     CoreConfig's TAKServerCAConfig points at (ops #82, seen on test8 after nine rotations).
+
+    `takserver-le` is never a client either: it is the keystore behind the 8446 connector, built
+    from the box's public (Let's Encrypt or custom) certificate. On Docker TAK Server its
+    .p12/.jks sit in this folder, and `makeCert.sh client takserver-le` overwrote them with a
+    certificate from the TAK CA, so 8446 stopped serving the public certificate and CloudTAK
+    sign-in failed with INVALID_PURPOSE (ops #883). Native boxes keep it in a temp folder.
     """
     files = os.listdir(cert_dir)
-    cas = {'takserver', 'root-ca', 'ca'} | {s.lower() for s in skip if s}
+    cas = {'takserver', 'root-ca', 'ca', 'takserver-le'} | {s.lower() for s in skip if s}
     for f in files:
         if f.endswith('.crl'):
             cas.add(f[:-4].lower())
@@ -90147,6 +91135,11 @@ def takserver_rotate_intca():
             if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh ca "{new_ca_name}" 2>&1'):
                 raise Exception('Failed to create new intermediate CA')
             log(f"✓ Intermediate CA {new_ca_name} created")
+            # ops #831: the new CA's key files are for the TAK Server account only.
+            try:
+                _tak_ca_private_lockdown(lambda m: log(f"  {m}"), cert_dir=cert_dir)
+            except Exception as _lk_e:
+                log(f"  ⚠ CA key lockdown skipped: {str(_lk_e)[:120]}")
 
             log("")
             log("Step 3/7: Creating new server certificate...")
@@ -90726,7 +91719,7 @@ def takserver_rotate_rootca():
                     run(f'mv {_le_keep}/{_f} /opt/tak/certs/files/{_f}')
                 if _le_files:
                     run(f'rm -rf {_le_keep}', check=False)
-                run('chown -R tak:tak /opt/tak/certs/')
+                run('chown -R -h tak:tak /opt/tak/certs/')
             log("✓ Old cert files cleared")
             if _tak_8446_connector_has_le(_read_priv('/opt/tak/CoreConfig.xml')):
                 log("  Kept the Let's Encrypt cert TAK serves on 8446")
@@ -90746,6 +91739,11 @@ def takserver_rotate_rootca():
             if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh ca "{new_int_name}" 2>&1'):
                 raise Exception('Failed to create new Intermediate CA')
             log(f"✓ Intermediate CA {new_int_name} created")
+            # ops #831: the new CA's key files are for the TAK Server account only.
+            try:
+                _tak_ca_private_lockdown(lambda m: log(f"  {m}"), cert_dir=cert_dir)
+            except Exception as _lk_e:
+                log(f"  ⚠ CA key lockdown skipped: {str(_lk_e)[:120]}")
 
             log("")
             log("Step 4/8: Creating new server certificate...")
@@ -91295,12 +92293,26 @@ _NOT_CLIENT_CERT_NAMES = {'takserver', 'ca', 'root-ca'}
 
 def _cert_file_bytes(path):
     """A file from the TAK cert dir. Client .p12/.key are 0600 tak:tak, so a non-root console
-    takes the privileged read when the plain one is refused (same as the .p12 download)."""
+    takes the privileged read when the plain one is refused (same as the .p12 download).
+
+    ops #839: regular files only. The folder is writable by the `tak` account, and the
+    privileged read runs as root by path, so a link there would make root read its target.
+    A link is refused (OSError); a missing file still raises FileNotFoundError."""
+    import stat as _stat_mod
+    st = os.lstat(path)
+    if not _stat_mod.S_ISREG(st.st_mode):
+        raise OSError(f'{path} is not a regular file')
     try:
-        with open(path, 'rb') as f:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(fd, 'rb') as f:
             return f.read()
     except PermissionError:
-        return _read_priv_bytes(path)
+        data = _read_priv_bytes(path)
+        # Read as root by path: if the name was swapped for something else meanwhile, drop it.
+        st2 = os.lstat(path)
+        if not _stat_mod.S_ISREG(st2.st_mode) or (st2.st_dev, st2.st_ino) != (st.st_dev, st.st_ino):
+            raise OSError(f'{path} changed while it was read')
+        return data
 
 
 def _is_int_truststore(f, ext='.p12'):
@@ -93981,6 +94993,124 @@ def _tak58_run_upgrade_db(timeout_sec=6 * 3600, log=None):
     return proc.returncode if proc.returncode is not None else 1
 
 
+# ── ops #902: "service active" and "PostgreSQL 18 serving" do not say the web API came up ──
+# Field (customer report, 2026-11-17): the 5.8 migration ended "ok", but TAK Server's API never
+# opened 8443. Its log said it could not bind 8446, and the thing answering on 8446 was a
+# Federation Hub certificate. TAK Portal then got "connection refused" on 8443 for hours. The
+# migration only read the PostgreSQL major, so nothing said any of it. TAK's API (Tomcat) opens
+# all its web ports together: if one cannot bind, none of them listen.
+def _tak_api_required_ports(core_config_text):
+    """Ports TAK Server's API opens for the console, TAK Portal and CloudTAK: the CoreConfig.xml
+    connectors named `https` (8443), `cert_https` (8446) and `LetsEncrypt` (the one infra-TAK
+    writes itself). 8446 is in the list so that a program sitting on it is named: that was the
+    field fault and the box-test fault (the API dies when it cannot bind 8446). Falls back to
+    8443 when CoreConfig has no such connector. The fed_https connector is left out on purpose:
+    it is not up on a box that does not federate (8444 is closed on a healthy fresh install)."""
+    ports = []
+    for el in re.findall(r'<connector\b[^>]*>', core_config_text or ''):
+        nm = re.search(r'\b_name="([^"]*)"', el)
+        pt = re.search(r'\bport="(\d+)"', el)
+        if nm and pt and nm.group(1) in ('https', 'cert_https', 'LetsEncrypt') and int(pt.group(1)) not in ports:
+            ports.append(int(pt.group(1)))
+    return ports or [8443]
+
+
+def _tak_listening_ports(ss_text):
+    """TCP ports in `ss -tlnH` output (any address, IPv4 or IPv6)."""
+    ports = set()
+    for ln in (ss_text or '').splitlines():
+        parts = ln.split()
+        if len(parts) > 3 and parts[3].rsplit(':', 1)[-1].isdigit():
+            ports.add(int(parts[3].rsplit(':', 1)[-1]))
+    return ports
+
+
+def _tak_port_holder(ss_p_text, cmdline=''):
+    """Who listens on a port, from `ss -tlnpH sport = :N` output, as one line: the process name
+    and pid, and a plain name when the command line says it is Federation Hub. '' when `ss`
+    named nobody (not root, or nothing listening)."""
+    m = re.search(r'users:\(\("([^"]+)",pid=(\d+)', ss_p_text or '')
+    if not m:
+        return ''
+    what = '%s (pid %s)' % (m.group(1), m.group(2))
+    cl = (cmdline or '').replace('\0', ' ')
+    if 'federation-hub' in cl.lower() or 'federationhub' in cl.lower():
+        what += ' = Federation Hub'
+    elif 'spring.profiles.active=api' in cl:
+        what += " = a TAK Server API process (an older copy that did not stop?)"
+    return what
+
+
+def _tak_port_holder_now(port):
+    """_tak_port_holder() for a live port. Read-only (`ss` is on the broker allow-list)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['ss', '-tlnpH', 'sport = :%d' % port]),
+                           capture_output=True, text=True, timeout=15)
+        out = r.stdout or ''
+        m = re.search(r'pid=(\d+)', out)
+        cmdline = ''
+        if m:
+            try:
+                with open('/proc/%s/cmdline' % m.group(1), 'rb') as f:
+                    cmdline = f.read().decode('utf-8', 'replace')
+            except OSError:
+                pass
+        return _tak_port_holder(out, cmdline)
+    except Exception:
+        return ''
+
+
+def _tak_api_wait_serving(required, timeout_s=600, poll_s=10, listening=None,
+                          holder=None, sleep=None, clock=None, stable_s=60):
+    """Wait until every port in `required` has a listener (TAK's API takes a few minutes on its
+    first start after a migration), and keeps it for `stable_s` seconds. The stable wait is real:
+    on a test box with 8446 held by another program, 8443 was seen listening once, a moment
+    before the API gave up and closed it (ops #902, box test). Returns {'ok', 'missing',
+    'listening', 'holders'}. On a timeout, `holders` names who listens on the required ports that
+    ARE up: TAK's API opens its web ports together, so a listener there while another port stays
+    closed is not TAK's API."""
+    listening = listening or (lambda: _tak_listening_ports(subprocess.run(
+        ['ss', '-tlnH'], capture_output=True, text=True, timeout=15).stdout))
+    holder = holder or _tak_port_holder_now
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    end = clock() + timeout_s
+    up_since = None
+    while True:
+        try:
+            up = listening()
+        except Exception:
+            up = set()
+        missing = [p for p in required if p not in up]
+        if not missing:
+            if up_since is None:
+                up_since = clock()
+            if clock() - up_since >= stable_s:
+                return {'ok': True, 'missing': [], 'listening': list(required), 'holders': {}}
+        else:
+            up_since = None           # it opened and closed again: start the stable wait over
+            if clock() >= end:
+                up_req = [p for p in required if p in up]
+                return {'ok': False, 'missing': missing, 'listening': up_req,
+                        'holders': {p: holder(p) for p in up_req}}
+        sleep(poll_s)
+
+
+def _tak_api_not_serving_lines(res):
+    """Plain-words lines for a failed _tak_api_wait_serving() result."""
+    out = ["TAK Server's web API is NOT listening on port %s. The console, TAK Portal and "
+           'CloudTAK cannot reach TAK Server until it does.' % ', '.join(str(p) for p in res['missing'])]
+    for p, who in sorted((res.get('holders') or {}).items()):
+        out.append('  Port %d is already in use by something else%s. TAK Server\'s API cannot start '
+                   'while that is so.' % (p, (': ' + who) if who else ' (could not tell what)'))
+    if res.get('listening'):
+        out.append('  Stop or move that program, then restart TAK Server (Guard Dog or the TAK '
+                   'Server page) and check port %s opens.' % ', '.join(str(p) for p in res['missing']))
+    else:
+        out.append('  Look at /opt/tak/logs/takserver-api.log for the reason it did not start.')
+    return out
+
+
 def run_takserver_58_migration(pkg_path, log=None, status=None):
     """Worker: the whole 5.8 + PG18 migration as one indivisible operation.
 
@@ -94309,6 +95439,20 @@ def run_takserver_58_migration(pkg_path, log=None, status=None):
             return fail('The migration finished but PostgreSQL %s is still serving, not %d.'
                         % (running, TAK_PG_MAJOR), wedged=True)
         _say('  PostgreSQL %d confirmed serving.' % TAK_PG_MAJOR)
+        # ops #902: the database is only half of "TAK Server is back". Wait for the web API to
+        # open its ports; otherwise say so and say who is in the way, instead of ending "ok".
+        _say('Waiting for the TAK Server web API to start (this can take a few minutes)…')
+        _api_ports = _tak_api_required_ports(_read_own_or_priv('/opt/tak/CoreConfig.xml') or '')
+        _api = _tak_api_wait_serving(_api_ports)
+        if not _api['ok']:
+            for _l in _tak_api_not_serving_lines(_api):
+                _say(_l)
+            _say('The database migration itself finished; your data is on PostgreSQL %d.' % TAK_PG_MAJOR)
+            _say('Backup kept at %s' % bk.get('snapshot_path'))
+            _status.update({'running': False, 'complete': False, 'error': True})
+            return
+        _say('  TAK Server web API is listening on port%s %s.'
+             % ('s' if len(_api_ports) > 1 else '', ', '.join(str(p) for p in _api_ports)))
         _say('')
         # Name the right rollback. On a managed database there IS no local PostgreSQL 15
         # cluster holding their data — the only local cluster is the vestigial one TAK's
@@ -95523,6 +96667,12 @@ def _tak_snapshot(label, plog=None):
             subprocess.run(_sudo_wrap(['rm','-rf',certs_dst]), capture_output=True)
             subprocess.run(_sudo_wrap(['cp','-rp',certs_src,certs_dst]), capture_output=True, check=True)
             plog("  snapshot: certs/ copied")
+            # ops #831: same file modes for the CA key files in the copy as in the live
+            # folder (a restore copies the modes back).
+            try:
+                _tak_ca_private_lockdown(lambda m: plog(f"  snapshot: {m}"), cert_dir=certs_dst, live=False)
+            except Exception as _lk_e:
+                plog(f"  snapshot: CA key lockdown skipped: {str(_lk_e)[:120]}")
         except Exception as e:
             plog(f"  snapshot: certs copy failed: {e}")
     else:
@@ -95657,6 +96807,11 @@ def _tak_rollback(label, plog=None):
         if not _via_broker:
             return False, f"Snapshot '{label}' has no cot.pgdump — cannot restore database"
 
+    # ops #839: the container's user ids are read while it is still running. A stopped
+    # container cannot be asked with `docker exec`; the restore used to chown the whole
+    # certificate folder to a made-up uid 1000 then.
+    _rb_ids = _tak_container_ids() if _tak_is_container() else ('tak', 'tak')
+
     # 2. Stop TAK Server
     plog("  rollback: stopping takserver…")
     # v10.2.30: the unit's own TimeoutStopSec is 90 s, so the old 60 s cap raised TimeoutExpired
@@ -95690,10 +96845,11 @@ def _tak_rollback(label, plog=None):
             subprocess.run(_sudo_wrap(['cp','-p',uaf_src,uaf_dst]), capture_output=True, check=True)
             # Match the ownership convention used elsewhere for /opt/tak files.
             # v10.1.67: ask the container for its uid — the hardened image is 1001, not 1000.
-            _ru, _rg = _tak_container_ids() if _tak_is_container() else ('tak', 'tak')
-            subprocess.run(
-                _sudo_wrap(['chown', f'{_ru}:{_rg}', '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
-            )
+            _ru, _rg = _rb_ids
+            if _ru is not None:
+                subprocess.run(
+                    _sudo_wrap(['chown', '-h', f'{_ru}:{_rg}', '/opt/tak/UserAuthenticationFile.xml']), capture_output=True, timeout=10
+                )
             if _tak_is_container():
                 subprocess.run(_sudo_wrap(['chmod', '640', '/opt/tak/UserAuthenticationFile.xml']),
                                capture_output=True, timeout=10)
@@ -95722,14 +96878,25 @@ def _tak_rollback(label, plog=None):
             # Restore ownership (tak:tak) on certs
             # v10.1.67: same — a recursive chown to a hardcoded 1000 would leave the LE p12
             # (mode 0640) unreadable by a hardened container and break the next renewal.
-            _cu, _cg = _tak_container_ids() if _tak_is_container() else ('tak', 'tak')
-            subprocess.run(
-                _sudo_wrap(['chown', '-R', f'{_cu}:{_cg}', '/opt/tak/certs/files']), capture_output=True, timeout=15
-            )
+            # ops #839: ids not known = owners stay as `cp -rp` copied them from the snapshot.
+            # `-h`: a link in the folder is re-owned itself, never what it points at.
+            _cu, _cg = _rb_ids
+            if _cu is not None:
+                subprocess.run(
+                    _sudo_wrap(['chown', '-R', '-h', f'{_cu}:{_cg}', '/opt/tak/certs/files']), capture_output=True, timeout=15
+                )
+            else:
+                plog("  rollback: the TAK container's user id could not be read: certificate owners left as copied")
             if _tak_is_container():
                 subprocess.run(_sudo_wrap(['chmod', '-R', 'g+rwX', '/opt/tak/certs/files']),
                                capture_output=True, timeout=15)
             plog("  rollback: certs/ restored")
+            # ops #831: a snapshot can carry older file modes. Set the CA key files of the
+            # restored folder again.
+            try:
+                _tak_ca_private_lockdown(lambda m: plog(f"  rollback: {m}"))
+            except Exception as _lk_e:
+                plog(f"  rollback: CA key lockdown skipped: {str(_lk_e)[:120]}")
         except Exception as e:
             plog(f"  rollback: certs restore failed: {e}")
 
@@ -96348,6 +97515,8 @@ def console_stack_backup_download_api(label):
     try:
         subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
         subprocess.run(_sudo_wrap(['mkdir', '-p', staging]), capture_output=True, check=True, timeout=30)
+        # ops #831: owner-only before the copy goes in (it becomes console-owned below).
+        subprocess.run(_sudo_wrap(['chmod', '700', staging]), capture_output=True, check=True, timeout=30)
         # A multi-GB bundle copy outlives the broker's 600 s default (ops #160): tell it.
         subprocess.run(_sudo_wrap(['cp', '-rp', src, os.path.join(staging, label)]),
                        capture_output=True, check=True, timeout=1800, env=_tak58_long_env())
@@ -97007,17 +98176,29 @@ def takserver_snapshot_status_api():
     })
 
 
-@app.route('/api/takserver/snapshot/<label>/download')
+@app.route('/api/takserver/snapshot/<label>/download', methods=['POST'])
 @login_required
 def takserver_snapshot_download_api(label):
-    """Stream a .tar.gz of the snapshot directory directly to the client."""
+    """Stream a .tar.gz of the snapshot directory directly to the client.
+
+    ops #831: POST + console password, the same contract as the full-stack backup download.
+    A snapshot is a full backup of the server, certificate files included, and it has to
+    stay one (a restore needs every file)."""
     import subprocess
     ok, safe_label = _validate_snapshot_label(label)
     if not ok:
         return jsonify({'error': safe_label}), 400
+    denied = _require_admin_password({'password': request.form.get('admin_password') or ''})
+    if denied:
+        audit('tak_snapshot_download_refused', f'label={safe_label}')
+        return denied
     snap_path = os.path.join(SNAPSHOT_DIR, safe_label)
     if not os.path.isdir(snap_path):
         return jsonify({'error': 'Snapshot not found'}), 404
+    if request.form.get('check') == '1':
+        # The page asks this first, so a wrong password shows in its dialog and the real
+        # form post (which the browser turns into the file download) never navigates away.
+        return jsonify({'ok': True})
 
     # v10.0.5 non-root: the snapshot tree under /opt/tak/snapshots is root-owned
     # (config/keystores often 0600). tar run as takwerx would SILENTLY skip the
@@ -97032,6 +98213,9 @@ def takserver_snapshot_download_api(label):
         try:
             subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
             subprocess.run(_sudo_wrap(['mkdir', '-p', staging]), capture_output=True, check=True, timeout=30)
+            # ops #831: the staging folder is owner-only before the copy goes in (the copy
+            # becomes console-owned below).
+            subprocess.run(_sudo_wrap(['chmod', '700', staging]), capture_output=True, check=True, timeout=30)
             subprocess.run(_sudo_wrap(['cp', '-rp', snap_path, os.path.join(staging, safe_label)]),
                            capture_output=True, check=True, timeout=300)
             subprocess.run(_sudo_wrap(['chown', '-R', f'{os.getuid()}:{os.getgid()}', staging]),
@@ -97062,6 +98246,10 @@ def takserver_snapshot_download_api(label):
                 try: subprocess.run(_sudo_wrap(['rm', '-rf', staging]), capture_output=True, timeout=60)
                 except Exception: pass
 
+    try:
+        audit('tak_snapshot_download', f'label={safe_label}')
+    except Exception:
+        pass
     from flask import Response
     return Response(
         _stream(),
@@ -97202,6 +98390,12 @@ def takserver_snapshot_upload_api():
         snaps.sort(key=lambda x: x.get('taken_at', ''), reverse=True)
         s['tak_snapshots'] = snaps[:50]
         save_settings(s)
+
+        # ops #831: an uploaded archive can carry older file modes for the CA key files.
+        try:
+            _tak_ca_private_lockdown(cert_dir=os.path.join(extracted_path, 'certs'), live=False)
+        except Exception:
+            pass
 
         return jsonify({'ok': True, 'label': extracted_label, 'size_mb': size_mb})
     except Exception as e:
@@ -99852,7 +101046,10 @@ def _deploy_takserver_container(config):
         # that is only true of the stock image; the hardened one runs as 1001. Falls back to
         # 1000 when the container cannot be asked, which is the historical behaviour.
         _mu, _mg = _tak_container_ids()
-        run_cmd(f'chown -R {_mu}:{_mg} /opt/tak/certs 2>/dev/null; true', check=False)
+        if _mu is not None:
+            run_cmd(f'chown -R -h {_mu}:{_mg} /opt/tak/certs 2>/dev/null; true', check=False)
+        else:
+            log_step("  ⚠ Could not read the TAK container's user id: certificate folder owner left as it is")
         # v10.0.1/v10.0.5 (ARM container): generate certs in a ONE-SHOT `docker run` container
         # that mounts the shared bundle — NOT `docker exec` into the init-pass service container.
         # The init container crash-loops until certs exist (TAK's entrypoint exits with no
@@ -99914,6 +101111,11 @@ def _deploy_takserver_container(config):
         if not _tak_truststore_drop_roots(f'/opt/tak/certs/files/truststore-{int_ca}.jks', cert_pass,
                                           _certsh, log_step)[0]:
             log_step("  ⚠ Root CA left in TAK Server's trust list. TAK works; Revoke Old CA removes it later.")
+        # ops #831: the CA key files are for the TAK Server account only.
+        try:
+            _tak_ca_private_lockdown(lambda m: log_step(f"  {m}"))
+        except Exception as _lk_e:
+            log_step(f"  ⚠ CA key lockdown skipped: {str(_lk_e)[:120]}")
         log_step("✓ Certificates created and truststore built")
 
         # ── Step 7/9: CoreConfig.xml (host-side sed on symlinked /opt/tak) ──
@@ -100720,7 +101922,7 @@ def run_takserver_deploy(config):
 
         _patch_openssl_string_mask(log_step)
 
-        run_cmd('chown -R tak:tak /opt/tak/certs/')
+        run_cmd('chown -R -h tak:tak /opt/tak/certs/')
         # v10.0.5 non-root: cert gen runs AS the `tak` service user. Pre-non-root
         # this was `sudo -u tak ./makeCert.sh` (a shell pipe). The non-root console
         # has no sudo, so route `runuser -u tak -- <script>` through the broker
@@ -100778,6 +101980,11 @@ def run_takserver_deploy(config):
             run_cmd('systemctl stop takserver', check=False)
             deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ All certificates created")
+        # ops #831: the CA key files are for the TAK Server account only.
+        try:
+            _tak_ca_private_lockdown(lambda m: log_step(f"  {m}"))
+        except Exception as _lk_e:
+            log_step(f"  ⚠ CA key lockdown skipped: {str(_lk_e)[:120]}")
         # v10.3.5 W6: TAK Server's own trust list holds the intermediate only (a root in it
         # accepts any root-signed intermediate a client sends). makeCert.sh `ca` put the root
         # there; the truststore-<INT>.p12 it built for clients keeps it. The old "enrolled
@@ -101301,19 +102508,32 @@ def _send_cert_file_priv(cert_dir, filename):
     from flask import send_file
     import io
     fp = os.path.join(cert_dir, filename)
-    if not os.path.isfile(fp):
-        return jsonify({'error': f'{filename} not found'}), 404
+    # ops #839: regular files only. `tak` can write this folder and the privileged read below
+    # runs as root by path, so a link here would serve its target (any file on the box).
     try:
-        with open(fp, 'rb') as f:
+        _st = os.lstat(fp)
+    except OSError:
+        return jsonify({'error': f'{filename} not found'}), 404
+    if not _stat.S_ISREG(_st.st_mode):
+        audit('cert_download_refused', f'file={filename} not a regular file')
+        return jsonify({'error': f'{filename} is not a regular file, so the console does not serve it'}), 403
+    try:
+        fd = os.open(fp, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(fd, 'rb') as f:
             data = f.read()
     except PermissionError:
         try:
             r = subprocess.run(_sudo_wrap(['cat', fp]), capture_output=True, timeout=15)
             data = r.stdout if r.returncode == 0 else b''
+            _st2 = os.lstat(fp)     # swapped for a link or another file while root read it: drop it
+            if not _stat.S_ISREG(_st2.st_mode) or (_st2.st_dev, _st2.st_ino) != (_st.st_dev, _st.st_ino):
+                data = b''
         except Exception:
             data = b''
         if not data:
             return jsonify({'error': f'Could not read {filename}: permission denied for the console user and the privileged read failed'}), 500
+    except OSError:
+        return jsonify({'error': f'Could not read {filename}'}), 500
     return send_file(io.BytesIO(data), as_attachment=True, download_name=filename)
 
 @app.route('/api/download/admin-cert')
@@ -101341,8 +102561,8 @@ def download_truststore():
 @login_required
 def download_ca_pem():
     p = '/opt/tak/certs/files'
-    if os.path.exists(os.path.join(p, 'ca.pem')):
-        return send_from_directory(p, 'ca.pem', as_attachment=True)
+    if os.path.lexists(os.path.join(p, 'ca.pem')):
+        return _send_cert_file_priv(p, 'ca.pem')       # ops #839: not through a link
     return jsonify({'error': 'ca.pem not found'}), 404
 
 
@@ -102133,11 +103353,16 @@ def list_cert_files():
     if not os.path.exists(cert_path):
         return jsonify({'files': []})
     files = []
+    _held = _ca_private_verdict_or_refuse_all(cert_path)    # ops #831: one look per listing
     for f in sorted(os.listdir(cert_path)):
         fp = os.path.join(cert_path, f)
-        if os.path.isfile(fp) and not _is_ca_private_material(f):
-            files.append({'name': f, 'size': os.path.getsize(fp),
-                'size_display': f"{os.path.getsize(fp)/1024:.1f} KB" if os.path.getsize(fp) < 1024*1024 else f"{os.path.getsize(fp)/(1024*1024):.1f} MB"})
+        try:
+            _lst = os.lstat(fp)
+        except OSError:
+            continue
+        if _stat.S_ISREG(_lst.st_mode) and not _is_ca_private_file(f, cert_path, _held):   # ops #839: a link is not listed
+            files.append({'name': f, 'size': _lst.st_size,
+                'size_display': f"{_lst.st_size/1024:.1f} KB" if _lst.st_size < 1024*1024 else f"{_lst.st_size/(1024*1024):.1f} MB"})
     return jsonify({'files': files})
 
 @app.route('/api/certs/download/<filename>')
@@ -102146,9 +103371,13 @@ def download_cert_file(filename):
     import re
     if not re.match(r'^[a-zA-Z0-9._-]+$', filename):
         return jsonify({'error': 'Invalid filename'}), 400
-    if _is_ca_private_material(filename):
+    # ops #831: judged by what the file is (_ca_private_files), not only by its name. A
+    # private key that matches no certificate is refused as well.
+    if _is_ca_private_file(filename, '/opt/tak/certs/files'):
         audit('cert_download_refused', f'file={filename}')
-        return jsonify({'error': 'CA private keys are never downloaded from the console'}), 403
+        return jsonify({'error': 'CA private keys are never downloaded from the console. A file with '
+                                 'a private key that matches no certificate in this folder is treated '
+                                 'the same.'}), 403
     return _send_cert_file_priv('/opt/tak/certs/files', filename)
 
 
@@ -102159,6 +103388,513 @@ def _is_ca_private_material(filename):
     hand them to a browser, and whoever holds them can mint certs this server trusts."""
     f = (filename or '').lower()
     return 'do-not-share' in f or re.search(r'-signing\.(jks|p12|pem|key)$', f) is not None
+
+
+# ── ops #831: CA private material, judged by what the file is and not only by its name ───────
+# TAK's makeCert.sh keeps a CA's key under more than one file name, and each Rotate CA adds
+# files. The name rule above stays the first test; this adds the content of the folder.
+#
+# _ca_private_files() reads the folder and answers for every file:
+#   'ca'     — CA private material: the name rule above; a key or keystore named after a CA
+#              this server has made; or any file (whatever its extension) that holds a private
+#              key whose public half is the public key of a CA certificate in the folder.
+#   'orphan' — a file that holds a private key which belongs to no leaf certificate in the
+#              folder, a keystore that cannot be opened, or a file that could not be read. It
+#              cannot be shown to be a client's, so it is not handed out either (fail closed).
+# Client files (admin.key, admin.p12, a created client's files) and takserver.* hold the key of
+# a leaf certificate in the folder, so they are neither. Certificates, truststores, CRLs and
+# CSRs hold no private key.
+_CA_SCAN_LOCK = threading.Lock()
+_CA_SCAN_FACTS = {}      # (path, file signature, password hash) -> fact about the content
+_CA_SCAN_DIRS = {}       # (cert_dir, deep) -> (signature, {name: 'ca' | 'orphan'})
+_CA_CERT_EXTS = ('.pem', '.crt', '.cer')
+_CA_KEYSTORE_EXTS = ('.p12', '.pfx', '.jks', '.pkcs12', '.keystore', '.ks', '.bcfks', '.jceks')
+_CA_NAME_LEFTOVER_RE = re.compile(r'^(.+)-(?:signing\.(?:jks|p12|pem|key)|do-not-share\.key)$')
+_CA_SCAN_MAX_BYTES = 4 * 1024 * 1024
+_CA_PEM_KEY_RE = re.compile(rb'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----', re.S)
+_CA_OID_P7_DATA = bytes.fromhex('2a864886f70d010701')     # the first OID inside every PKCS#12
+_CA_OID_PBE = (bytes.fromhex('2a864886f70d0105'), bytes.fromhex('2a864886f70d010c01'))   # an encrypted PKCS#8 key
+
+
+def _ca_cert_fact(data, der=False):
+    """(is_ca, public key, CN lower-case) of the first certificate in `data`; None when openssl
+    could not be run; (False, b'', '') when `data` holds no certificate."""
+    try:
+        r = subprocess.run(['openssl', 'x509'] + (['-inform', 'DER'] if der else [])
+                           + ['-noout', '-subject', '-nameopt', 'RFC2253', '-pubkey', '-text'],
+                           input=data, capture_output=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return (False, b'', '')
+    out = r.stdout
+    m = re.search(rb'-----BEGIN PUBLIC KEY-----.*?-----END PUBLIC KEY-----', out, re.S)
+    pub = m.group(0).strip() if m else b''
+    m = re.search(rb'^subject=.*?CN=([^,\n]+)', out, re.M)
+    cn = m.group(1).decode(errors='replace').strip().lower() if m else ''
+    return (b'CA:TRUE' in out, pub, cn)
+
+
+def _ca_pem_key_pubs(data, password):
+    """Public halves of the PEM private keys in `data` (b'' for one the password does not open)."""
+    env = dict(os.environ, ITK_P12_PASS=password or '')
+    pubs = []
+    for block in _CA_PEM_KEY_RE.findall(data):
+        try:
+            r = subprocess.run(['openssl', 'pkey', '-passin', 'env:ITK_P12_PASS', '-pubout'],
+                               input=block, capture_output=True, env=env, timeout=10)
+        except Exception:
+            return None
+        pubs.append(r.stdout.strip() if r.returncode == 0 else b'')
+    return pubs
+
+
+def _ca_der_key_pub(data, password):
+    """Public half of a DER private key; b'' when `data` is not one the password opens."""
+    env = dict(os.environ, ITK_P12_PASS=password or '')
+    try:
+        r = subprocess.run(['openssl', 'pkey', '-inform', 'DER', '-passin', 'env:ITK_P12_PASS', '-pubout'],
+                           input=data, capture_output=True, env=env, timeout=10)
+    except Exception:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else b''
+
+
+def _ca_p12_key_pubs(data, password):
+    """Public halves of the private keys in a PKCS#12: [] for a truststore, '' when the
+    password does not open it, None when openssl could not be run. The password travels in
+    the environment, the bytes in a private temp file."""
+    import tempfile as _tf
+    env = dict(os.environ, ITK_P12_PASS=password or '')
+    try:
+        with _tf.TemporaryDirectory(prefix='itk-cascan-') as td:
+            os.chmod(td, 0o700)
+            path = os.path.join(td, 'in')
+            with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as f:
+                f.write(data)
+            for extra in ([], ['-legacy']):       # makeCert.sh's RC2-40 .p12 needs -legacy on OpenSSL 3
+                r = subprocess.run(['openssl', 'pkcs12', '-in', path, '-nocerts', '-nodes',
+                                    '-passin', 'env:ITK_P12_PASS'] + extra,
+                                   capture_output=True, env=env, timeout=20)
+                if r.returncode == 0:
+                    break
+            else:
+                return ''
+            return _ca_pem_key_pubs(r.stdout, '')
+    except Exception:
+        return None
+
+
+def _ca_jks_key_certs(data):
+    """The first chain certificate (DER) of every private-key entry in a JKS keystore; [] for a
+    truststore; None when `data` is not a JKS this reads. A JKS key is sealed with Java's own
+    scheme, but its certificate chain is stored in the clear beside it."""
+    import struct as _st
+    try:
+        if data[:4] != b'\xfe\xed\xfe\xed':
+            return None
+        version, count = _st.unpack('>II', data[4:12])
+        pos, out = 12, []
+        for _ in range(count):
+            tag = _st.unpack('>I', data[pos:pos + 4])[0]
+            pos += 4
+            pos += 2 + _st.unpack('>H', data[pos:pos + 2])[0] + 8      # alias, timestamp
+            chain = 1
+            if tag == 1:
+                pos += 4 + _st.unpack('>I', data[pos:pos + 4])[0]       # the sealed key
+                chain = _st.unpack('>I', data[pos:pos + 4])[0]
+                pos += 4
+            elif tag != 2:
+                return None
+            first = b''
+            for i in range(chain):
+                if version == 2:
+                    pos += 2 + _st.unpack('>H', data[pos:pos + 2])[0]   # certificate type
+                clen = _st.unpack('>I', data[pos:pos + 4])[0]
+                pos += 4
+                if i == 0:
+                    first = data[pos:pos + clen]
+                pos += clen
+            if pos > len(data):
+                return None
+            if tag == 1:
+                out.append(first)
+        return out
+    except Exception:
+        return None
+
+
+def _ca_file_fact(path, sig, password, low):
+    """What a file in the certificate folder holds: {'cert': (is_ca, pub, cn) or None,
+    'keys': [public halves of its private keys, b'' for one that could not be opened],
+    'sealed': True for a keystore or key that cannot be looked into, 'ca_chain': True for a
+    JKS key entry whose certificate is a CA}. None when the file could not be read or openssl
+    could not be run (the caller refuses the file and does not keep the answer)."""
+    ck = (path, sig, hashlib.sha256((password or '').encode()).hexdigest()[:16])
+    hit = _CA_SCAN_FACTS.get(ck)
+    if hit is not None:
+        return hit
+    if sig[0] > _CA_SCAN_MAX_BYTES:
+        return None
+    try:
+        data = _cert_file_bytes(path)
+    except Exception:
+        return None
+    fact = {'cert': None, 'keys': [], 'sealed': False, 'ca_chain': False}
+    if b'-----BEGIN' in data:
+        if b'CERTIFICATE-----' in data:
+            fact['cert'] = _ca_cert_fact(data)
+            if fact['cert'] is None:
+                return None
+        fact['keys'] = _ca_pem_key_pubs(data, password)
+        if fact['keys'] is None:
+            return None
+    elif data[:4] == b'\xfe\xed\xfe\xed':
+        certs = _ca_jks_key_certs(data)
+        if certs is None:
+            fact['sealed'] = True
+        for der in certs or []:
+            cf = _ca_cert_fact(der, der=True)
+            if cf is None:
+                return None
+            if cf[0] or not cf[1]:
+                fact['ca_chain'] = fact['ca_chain'] or cf[0]
+                fact['sealed'] = fact['sealed'] or not cf[1]
+            fact['keys'].append(cf[1])      # the public key the sealed key belongs to
+    elif data[:1] == b'\x30' and _CA_OID_P7_DATA in data[:64]:
+        pubs = _ca_p12_key_pubs(data, password)
+        if pubs is None:
+            return None
+        if pubs == '':
+            fact['sealed'] = True
+        else:
+            fact['keys'] = pubs
+    elif data[:1] == b'\x30':
+        pub = _ca_der_key_pub(data, password)
+        if pub is None:
+            return None
+        if pub:
+            fact['keys'] = [pub]
+        elif any(oid in data[:48] for oid in _CA_OID_PBE):
+            fact['keys'] = [b'']            # an encrypted key the password does not open
+        else:
+            fact['cert'] = _ca_cert_fact(data, der=True)
+            if fact['cert'] is None:
+                return None
+            if not fact['cert'][1]:
+                fact['cert'] = None
+                fact['sealed'] = low.endswith(_CA_KEYSTORE_EXTS) or bool(_ca_key_stem(low))
+    else:
+        # not PEM, not DER, not JKS: only a keystore or key by its name is held back
+        fact['sealed'] = (low.endswith(_CA_KEYSTORE_EXTS) or bool(_ca_key_stem(low))) and len(data) > 0
+    _CA_SCAN_FACTS[ck] = fact
+    return fact
+
+
+def _ca_key_stem(low):
+    """'int-ca-01' for int-ca-01.key, int-ca-01.key.pk8 and int-ca-01.pk8; '' for anything else."""
+    for ext in ('.key.pk8', '.key', '.pk8'):
+        if low.endswith(ext):
+            return low[:-len(ext)]
+    return ''
+
+
+def _ca_file_stem(low):
+    """The name a key, keystore or certificate file is filed under: 'admin' for admin.key,
+    admin.p12, admin.jks, admin.pem and admin.key.pk8."""
+    return _ca_key_stem(low) or low.rsplit('.', 1)[0]
+
+
+def _ca_names_from_listing(names):
+    """CA names from a folder listing: makeCert.sh `ca NAME` leaves NAME.crl, truststore-NAME.*
+    and NAME-signing.*; the working slot and the root are `ca` and `root-ca`."""
+    ca_names = {'ca', 'root-ca'}
+    for f in names:
+        low = f.lower()
+        if low.endswith('.crl'):
+            ca_names.add(low[:-4])
+        elif low.startswith('truststore-') and low.endswith(('.jks', '.p12')):
+            ca_names.add(low[len('truststore-'):-4])
+        m = _CA_NAME_LEFTOVER_RE.match(low)
+        if m:
+            ca_names.add(m.group(1))
+    return ca_names
+
+
+def _ca_private_names_only(names):
+    """The CA private files among `names` (a folder listing), by file name alone: the same
+    first two tests _ca_private_files makes. For a folder the console cannot open itself (a
+    Federation Hub on another host, ops #839)."""
+    ca_names = _ca_names_from_listing(names)
+    out = []
+    for f in names:
+        low = f.lower()
+        if _is_ca_private_material(f) or (
+                (_ca_key_stem(low) or low.endswith(_CA_KEYSTORE_EXTS)) and not low.startswith('truststore-')
+                and _ca_file_stem(low) in ca_names):
+            out.append(f)
+    return sorted(out)
+
+
+def _ca_private_files(cert_dir=None, deep=True):
+    """{file name: 'ca' | 'orphan'} for the TAK certificate folder (see the block comment above).
+    One listdir and one stat per file when nothing changed since the last call.
+
+    deep=False judges by file names alone (the name rule and the CA names makeCert.sh leaves
+    behind): no file is opened and there is no 'orphan' answer. That is what the file-mode
+    step uses, so a console start never reads a private key."""
+    d = cert_dir or _CERT_FILES_DIR
+    try:
+        entries = sorted(os.listdir(d))
+    except OSError:
+        return {}
+    files = {}
+    for f in entries:
+        try:
+            st = os.stat(os.path.join(d, f))
+        except OSError:
+            continue
+        if _stat.S_ISREG(st.st_mode):
+            files[f] = (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
+    password = ''
+    if deep:
+        try:
+            password = _get_tak_cert_password(load_settings()) or ''
+        except Exception:
+            password = ''
+    signature = (tuple(sorted(files.items())), hashlib.sha256(password.encode()).hexdigest()[:16])
+    with _CA_SCAN_LOCK:
+        hit = _CA_SCAN_DIRS.get((d, deep))
+        if hit and hit[0] == signature:
+            return hit[1]
+        if len(_CA_SCAN_DIRS) > 500:
+            _CA_SCAN_DIRS.clear()
+        if len(_CA_SCAN_FACTS) > 20000:         # snapshots come and go; do not grow without end
+            _CA_SCAN_FACTS.clear()
+        ca_names = _ca_names_from_listing(files)
+        verdict, facts, complete = {}, {}, True
+        ca_pubs, leaf_pubs, leaf_stems = set(), set(), set()
+        for f, sig in files.items():
+            low = f.lower()
+            if _is_ca_private_material(f):
+                verdict[f] = 'ca'
+            elif (_ca_key_stem(low) or low.endswith(_CA_KEYSTORE_EXTS)) and not low.startswith('truststore-') \
+                    and _ca_file_stem(low) in ca_names:
+                verdict[f] = 'ca'               # INTERMEDIATE-CA-01.key: by its name, never opened
+            elif deep:
+                fact = _ca_file_fact(os.path.join(d, f), sig, password, low)
+                if fact is None:
+                    verdict[f] = 'orphan'       # could not be judged: held back, and asked again next time
+                    complete = False
+                    continue
+                facts[f] = fact
+                if fact['cert'] and fact['cert'][1]:
+                    is_ca, pub, cn = fact['cert']
+                    # NAME-trusted.pem of a client holds the CA's certificate, not the client's
+                    # (makeCert.sh appends ca-trusted.pem to an empty file): it names nothing.
+                    named = low.endswith(_CA_CERT_EXTS) and not low.rsplit('.', 1)[0].endswith('-trusted')
+                    if is_ca:
+                        ca_pubs.add(pub)
+                        if cn:
+                            ca_names.add(cn)
+                    else:
+                        leaf_pubs.add(pub)
+                        if named:
+                            leaf_stems.add(low.rsplit('.', 1)[0])
+        for f, fact in facts.items():
+            low = f.lower()
+            stem = _ca_file_stem(low)
+            if (_ca_key_stem(low) or low.endswith(_CA_KEYSTORE_EXTS)) and not low.startswith('truststore-') \
+                    and stem in ca_names:
+                verdict[f] = 'ca'               # named after a CA only its certificate's CN shows
+            elif fact['ca_chain'] or any(k and k in ca_pubs for k in fact['keys']):
+                verdict[f] = 'ca'
+            elif fact['sealed'] or any(not k for k in fact['keys']):
+                if stem not in leaf_stems:      # cannot be looked into: only a known client's name passes
+                    verdict[f] = 'orphan'
+            elif any(k not in leaf_pubs for k in fact['keys']):
+                verdict[f] = 'orphan'
+        if complete:
+            _CA_SCAN_DIRS[(d, deep)] = (signature, verdict)
+        return verdict
+
+
+def _is_ca_private_file(filename, cert_dir=None, verdict=None):
+    """True when the console must not hand `filename` (in the TAK certificate folder) to a
+    browser: CA private material, or a file with a private key that matches no leaf certificate
+    there. `verdict` is a _ca_private_files() answer the caller already has (a listing asks
+    once, not once per file). If the folder cannot be judged, every file is refused (fail
+    closed)."""
+    if _is_ca_private_material(filename):
+        return True
+    if verdict is None:
+        try:
+            verdict = _ca_private_files(cert_dir)
+        except Exception:
+            return True
+    return filename in verdict
+
+
+def _ca_private_verdict_or_refuse_all(cert_dir):
+    """_ca_private_files(cert_dir) for a listing; a set-like that holds every name when the
+    folder cannot be judged (fail closed)."""
+    try:
+        return _ca_private_files(cert_dir)
+    except Exception:
+        class _All(dict):
+            def __contains__(self, _name):
+                return True
+        return _All()
+
+
+def _tak_ca_private_lockdown(plog=None, cert_dir=None, live=True):
+    """ops #831 — CA private key files are for the TAK Server account only.
+
+    Sets the file modes of the CA signing keystores (<CA>-signing.jks / .p12) and of every
+    CA .key in the TAK certificate folder, whatever mode TAK's own scripts gave them.
+
+    Only CA private material is touched, found by file name alone (_ca_private_files(deep=False):
+    the signing keystores and every CA .key), so no file is opened. Client files keep their
+    modes: Node-RED reads admin.pem/admin.key as uid 1000 through its bind mount (see
+    _heal_nodered_cert_read_access), and the folder stays 0755. Only regular files are changed.
+
+    Native TAK Server reads the keystore as `tak` (the owner makeCert.sh gives it): owner tak,
+    mode 0600. A TAK container reads the bundle as its own uid or through group 0
+    (_container_own_tree): the group bits stay, the "other" bits go. Modes only ever get
+    tighter. `live=False` is for a snapshot's copy of the folder: same modes, no owner change
+    (a restore copies them back with `cp -rp`).
+
+    Returns (fixed, still_open): what changed, and what could not be set."""
+    d = cert_dir or _CERT_FILES_DIR
+
+    def _say(m):
+        (plog or (lambda x: print(f"CA key lockdown: {x}", flush=True)))(m)
+
+    container = _tak_is_container()
+    keep = 0o770 if container else 0o700
+
+    def _open_mode(path):
+        """The file's mode when it grants more than `keep`, else None (also when it is gone
+        or is not a regular file)."""
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return None
+        if not _stat.S_ISREG(st.st_mode):
+            return None
+        cur = _stat.S_IMODE(st.st_mode)
+        return cur if cur & ~keep & 0o777 else None
+
+    try:
+        names = sorted(n for n, kind in _ca_private_files(d, deep=False).items() if kind == 'ca')
+    except Exception as e:
+        _say(f"⚠ could not read {d}: {str(e)[:120]}")
+        return [], []
+    names = [n for n in names if _open_mode(os.path.join(d, n)) is not None]
+    if not names:
+        return [], []
+    # A name with a character outside this set is not passed to a command: it is reported.
+    odd = [n for n in names if not re.match(r'^[A-Za-z0-9._-]+$', n)]
+    names = [n for n in names if n not in odd]
+    tak_uid = cuid = cgid = None
+    if container and live:
+        try:
+            cuid, cgid = (int(x) for x in _tak_container_ids())
+        except Exception:
+            cuid = cgid = None              # ops #839: not told, no guess
+    elif live:
+        try:
+            import pwd as _pwd831
+            tak_uid = _pwd831.getpwnam('tak').pw_uid
+        except Exception:
+            tak_uid = None
+
+    fixed = []
+    unknown_owner = []
+    for n in names:
+        path = os.path.join(d, n)
+        cur = _open_mode(path)
+        if cur is None:
+            continue
+        try:
+            st = os.lstat(path)
+            if live and not container and st.st_uid != tak_uid:
+                # TAK Server (user tak) read this one through the group/other bits we remove.
+                # Give it to tak first; if that does not take, the mode stays as it is.
+                if tak_uid is None:
+                    continue
+                subprocess.run(_sudo_wrap(['chown', '-h', 'tak:tak', path]), capture_output=True, timeout=20)
+                if os.lstat(path).st_uid != tak_uid:
+                    continue
+            elif live and container and cuid is None:
+                unknown_owner.append(n)     # the container's ids are unknown: leave this file as it is
+                continue
+            elif live and container and not ((st.st_uid == cuid and cur & 0o400)
+                                             or (st.st_gid == cgid and cur & 0o040)):
+                # The container read it through the "other" bits: make it the container's own.
+                subprocess.run(_sudo_wrap(['chown', '-h', f'{cuid}:{cgid}', path]),
+                               capture_output=True, timeout=20)
+                st = os.lstat(path)
+                if not (st.st_uid == cuid or st.st_gid == cgid):
+                    continue
+            if _open_mode(path) is None:        # replaced by something else meanwhile: leave it
+                continue
+            subprocess.run(_sudo_wrap(['chmod', oct(cur & keep)[2:].zfill(3), path]),
+                           capture_output=True, timeout=20)
+        except Exception:
+            pass
+        if _open_mode(path) is None:
+            fixed.append(f'{n} {oct(cur)[2:]}->{oct(cur & keep)[2:].zfill(3)}')
+    left = [n for n in names if _open_mode(os.path.join(d, n)) is not None]
+    if left and container and not unknown_owner:
+        # A host chmod on the bundle tree can report success and change nothing
+        # (_container_own_tree): do it as root inside the image, on the mounted folder.
+        try:
+            subprocess.run(_sudo_wrap(['docker', 'run', '--rm', '--user', '0',
+                                       '-v', f'{os.path.realpath(d)}:/mnt/cakeys',
+                                       '--entrypoint', 'sh', TAK_CONTAINER, '-c',
+                                       'cd /mnt/cakeys && chmod o-rwx -- ' + shlex.join(left)]),
+                           capture_output=True, text=True, timeout=120)
+        except Exception:
+            pass
+        for n in list(left):
+            if _open_mode(os.path.join(d, n)) is None:
+                left.remove(n)
+                fixed.append(f'{n} o-rwx')
+    if fixed:
+        _say(f"{len(fixed)} CA private key file(s) in {d} set to the TAK Server account only: "
+             + '; '.join(fixed[:8]) + (f' (+{len(fixed) - 8} more)' if len(fixed) > 8 else ''))
+        try:
+            audit('ca_private_lockdown', f'dir={d} files={len(fixed)}')
+        except Exception:
+            pass
+    left += odd
+    if left:
+        _say(f"⚠ {len(left)} CA private key file(s) in {d} could not be set to the TAK Server "
+             f"account only: {', '.join(left[:8])}")
+    return fixed, left
+
+
+def _tak_ca_private_lockdown_all(plog=None):
+    """The live certificate folder and every snapshot's copy of it (startup converge)."""
+    fixed, left = [], []
+    if os.path.isdir(_CERT_FILES_DIR):
+        f, l = _tak_ca_private_lockdown(plog)
+        fixed += f
+        left += l
+    try:
+        labels = sorted(os.listdir(SNAPSHOT_DIR))
+    except OSError:
+        labels = []
+    for label in labels:
+        snap_certs = os.path.join(SNAPSHOT_DIR, label, 'certs')
+        if label.startswith('.dl-') or not os.path.isdir(snap_certs):     # .dl-*: a download in progress
+            continue
+        f, l = _tak_ca_private_lockdown(plog, cert_dir=snap_certs, live=False)
+        fixed += f
+        left += l
+    return fixed, left
+
 
 @app.route('/api/deploy/log')
 @login_required
@@ -107848,6 +109584,8 @@ def _auto_update_guarddog():
             # ops #645 W2 part 2a: root renders it from its own copy (gd_render)
             if _gd_install_script(name, template, vals):
                 updated += 1
+                if name == _GD_HEALTH_SCRIPT:
+                    _gd_restart_health_endpoint()   # ops #815
         # ops #845: the SMS scripts are optional (installed when SMS is saved), so the loop
         # above skips them. A box that already had SMS set up then kept the old sms_send.py
         # (plain HTTP to a console that answers HTTPS only, so no alert text was ever sent)
@@ -110837,24 +112575,40 @@ def _cloudtak_write_override_file(ct_dir):
         return False
 
 
-def _cloudtak_recreate_and_heal(ct_dir, log, pull=False):
+def _cloudtak_recreate_and_heal(ct_dir, log, pull=False, wait_s=0):
     """Force-recreate the whole CloudTAK stack, then re-apply the media patches the recreate
     wiped. A bare `docker compose` in the stack dir, so COMPOSE_FILE in .env decides the files:
     base + infra-TAK's override + TAK Portal's marketplace file + the operator's
     docker-compose.custom.yml (GH #261). The console-start hardening and Guard Dog's
     auto-repair (ops #197) both recreate through here. `pull` downloads the pinned postgis
     first, so `up` doesn't spend its 240 s on it. Returns 'ok', 'recreate' (the up failed)
-    or 'heal' (the media heal did not confirm)."""
+    or 'heal' (the media heal did not confirm).
+    wait_s (ops #889): the console gives up on `up` after 240 s, but the broker keeps running it,
+    and on a loaded box (test6: docker at 250 percent CPU, images still unpacking) it finishes
+    minutes later. With wait_s > 0 a timeout is not a failure: wait up to that long for the
+    running compose to end, then carry on to the heals, and let the caller's fresh drift check
+    judge. 0 (the console-start path, which runs before the web server is up) keeps the old
+    behaviour: the timeout is raised."""
     if pull:
         # ops #110: an override change can carry a new postgis pin (POSTGIS_IMAGE).
         # Download it before the recreate so `up -d` doesn't spend its 240 s budget
         # on the pull — the stack keeps running meanwhile.
         _docker_compose_pull(None, ct_dir, log,
                              timeout=600, label='CloudTAK postgis', services=['postgis'])
-    r = subprocess.run(
-        _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
-    )
-    if r.returncode != 0:
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate']), cwd=ct_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=240
+        )
+    except subprocess.TimeoutExpired:
+        if wait_s <= 0:
+            raise
+        log(f"CloudTAK recreate is still running after 240s (a loaded box) — waiting up to {int(wait_s // 60)} min for it")
+        if not _ct_wait_compose_idle(timeout=wait_s, log=log):
+            log(f"CloudTAK recreate warning: still running after {int(wait_s // 60)} min")
+            return 'recreate'
+        log("CloudTAK recreate finished after the wait")
+        r = None
+    if r is not None and r.returncode != 0:
         log(f"CloudTAK recreate warning: {(r.stdout or '')[:200]}")
         return 'recreate'
     log("CloudTAK recreated with hardened port bindings")
@@ -111015,6 +112769,7 @@ _startup_heal_cloudtak_media_hls()
 CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR = 3
 CLOUDTAK_AUTOREPAIR_SETTLE_S = 90       # api up this long: TAK Portal waits for it, then prunes
 CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S = 900   # a failed repair is reported, not retried straight away
+CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S = 900  # ops #889: the recreate outlasted the console's 240 s: wait for it this long
 _CLOUDTAK_AUTOREPAIR_RECORD = os.path.join(CONFIG_DIR, 'cloudtak-autorepair.json')
 # Any compose step that changes the stack, or an image build (TAK Portal builds --no-cache first).
 _CLOUDTAK_COMPOSE_BUSY_RE = re.compile(
@@ -111171,7 +112926,11 @@ def _cloudtak_autorepair_request(settle_s=None):
     ct_dir = os.path.expanduser('~/CloudTAK')
     with _cloudtak_autorepair_lock:
         if cloudtak_autorepair_status.get('running'):
-            return {'state': 'repairing', 'detail': cloudtak_autorepair_status.get('detail') or ''}
+            # ops #889: "still repairing" with how long, so a slow box reads as slow, not as failed.
+            _since = cloudtak_autorepair_status.get('started')
+            _mins = f" (running {max(int(time.time() - _since) // 60, 0)} min)" if _since else ''
+            return {'state': 'repairing',
+                    'detail': f"still repairing{_mins}: {cloudtak_autorepair_status.get('detail') or ''}".rstrip(': ')}
         settings = load_settings()
         try:
             if _get_cloudtak_deployment_config(settings).get('target_mode') == 'remote':
@@ -111233,7 +112992,7 @@ def _cloudtak_autorepair_run(ct_dir, drift):
             _cloudtak_ensure_custom_compose(ct_dir, _log)
             _patch_cloudtak_minio_registry(ct_dir)
             _patch_cloudtak_compose_ports(ct_dir)
-            stage = _cloudtak_recreate_and_heal(ct_dir, _log, pull=True)
+            stage = _cloudtak_recreate_and_heal(ct_dir, _log, pull=True, wait_s=CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S)
             why = {'recreate': 'docker compose up --force-recreate failed',
                    'heal': 'the HLS profile did not re-apply'}.get(stage, '')
         elif drift['kind'] == 'media' or drift.get('hls') is False:
@@ -113882,10 +115641,11 @@ def _mediamtx_editor_remote_py_deps(deploy_cfg):
                 f'then pip3 install "$@" {flag} --ignore-installed 2>&1; rc=$?; fi; return $rc; }}; '
                 f'_pi {_pkgs} && _pi -U {_MEDIAMTX_EDITOR_CERTIFI}')
 
-    ok, out = _module_run(deploy_cfg, _pip('--break-system-packages'), timeout=240)
+    # ops #890: pip installs system-wide and `runuser` both need root (`sudo -n` for a non-root SSH user)
+    ok, out = _module_run_root(deploy_cfg, _pip('--break-system-packages'), timeout=240)
     if not ok and 'no such option' in (out or ''):
-        ok, out = _module_run(deploy_cfg, _pip(''), timeout=240)
-    chk, chk_out = _module_run(deploy_cfg, _MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK, timeout=30)
+        ok, out = _module_run_root(deploy_cfg, _pip(''), timeout=240)
+    chk, chk_out = _module_run_root(deploy_cfg, _MEDIAMTX_EDITOR_REMOTE_IMPORT_CHECK, timeout=30)
     if chk:
         return True, out
     tail = ((chk_out or '') if ok else (out or '')).strip().splitlines()[-1:] or ['no output']
@@ -114460,6 +116220,15 @@ def _startup_migrations():
             _heal_nodered_cert_read_access(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _nrh_e:
             print(f"Startup migration: Node-RED cert heal error (non-fatal): {_nrh_e}", flush=True)
+
+        # ops #831 — existing boxes: the CA key files (and each snapshot's copy of them) get
+        # the file modes a new deploy sets. Only CA private material; client files and the
+        # folder keep their modes (Node-RED reads admin.pem/admin.key through its bind
+        # mount). Idempotent: a stat per file when nothing needs a change.
+        try:
+            _tak_ca_private_lockdown_all(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _cal_e:
+            print(f"Startup migration: CA key lockdown error (non-fatal): {_cal_e}", flush=True)
 
         # v10.1.9 W1 — retrofit: encrypt an existing split-box core↔DB link (TLS + SCRAM).
         # One-shot per box; involves a takserver restart + live verification (minutes), so it
@@ -115604,6 +117373,17 @@ def _startup_migrations():
                 )
         except Exception as tp_shim_err:
             print(f"Startup migration: takportal caddy validate helper error (non-fatal): {tp_shim_err}")
+
+        # ops #879 — same for the console user's ~/.bash_logout: boxes that already run TAK Portal
+        # get `set +e` on the next console start, so Marketplace "Deploy To Caddy" stops saying
+        # failed after it worked. Idempotent; touches only an existing file.
+        try:
+            if os.path.isdir(os.path.expanduser('~/TAK-Portal')):
+                _takportal_harden_logout_file(
+                    lambda m: print(f"Startup migration: {m}", flush=True)
+                )
+        except Exception as tp_logout_err:
+            print(f"Startup migration: takportal logout file error (non-fatal): {tp_logout_err}")
 
         # ops #644 — restrict TAK Portal's SSH key line (written with no options before this
         # release) and keep its from= in step with the portal's Docker networks. Never adds trust.
@@ -117665,6 +119445,19 @@ def _post_update_auto_deploy():
             except Exception as _mtx_f2b_err:
                 print(f"Post-update: MediaMTX Fail2ban setup skipped: {_mtx_f2b_err}")
 
+            # GH #549: Authentik's database first, before the Reconfigure. Recreating it restarts
+            # authentik-server and the LDAP outpost ~90 s later; run last (as before) those
+            # restarts landed after the final TAK client heal had looked. The later converge
+            # below then finds Authentik's database fixed and leaves it alone.
+            try:
+                _ak_pg_log = lambda m: print(f"Post-update: {m}", flush=True)
+                _ak_pg = _postgres_compose_converge(
+                    _ak_pg_log, stacks=[(k, l, d, sv) for k, l, d, sv in POSTGRES_COMPOSE_STACKS if k == 'authentik'])
+                if (_ak_pg or {}).get('authentik') in ('fixed', 'failed'):
+                    _ak_ldap_path_wait_settled(_ak_pg_log)
+            except Exception as _akpge:
+                print(f"Post-update: Authentik database security update error (non-fatal): {_akpge}", flush=True)
+
             # CloudTAK is independent (talks to TAK Server, not Authentik) — start it early
             cloudtak_t = threading.Thread(target=_auto_cloudtak, daemon=True)
             cloudtak_t.start()
@@ -118231,6 +120024,12 @@ def _post_update_auto_deploy():
             # update, the one-time catch-up for boxes already on v10.2.23), heal TAK's clients
             # once LDAP is settled: clients that connected during the outage hold empty groups
             # until they are looked up again. TAK restart only as the fallback.
+            # GH #549: first let Authentik settle, so a late knock-on restart (a database
+            # recreate restarts server and outpost ~90 s later) is seen by this check.
+            try:
+                _ak_ldap_path_wait_settled(lambda m: print(f"Post-update:{m}", flush=True))
+            except Exception as _ase:
+                print(f"Post-update: Authentik settle wait error (non-fatal): {_ase}", flush=True)
             try:
                 _tak_recycle_after_ldap_outage(lambda m: print(f"Post-update:{m}", flush=True),
                                                'end of console update', check_outpost=True, final=True)

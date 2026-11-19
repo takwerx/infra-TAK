@@ -1160,7 +1160,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
   window._takBanJail = {};
   window._takSortAsc = true;
   function _takIpToNum(ip){var p=ip.split('.');return p.length===4?((+p[0]<<24)|(+p[1]<<16)|(+p[2]<<8)|+p[3])>>>0:0;}
-  function _takEsc(s){var d=document.createElement('div');d.textContent=(s===undefined||s===null)?'':String(s);return d.innerHTML;}
+  function _takEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
   window.renderTakBanList = function(ips){
     var c=document.getElementById('tak-ban-list-container');if(!c)return;
     if(!ips.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>';return;}
@@ -1242,7 +1242,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     var banner = document.getElementById('ssh-safety-banner');
     if (!list) return;
     if (!info || !info.groups) { list.innerHTML = '<div style="color:var(--text-dim);font-size:12px">Unavailable.</div>'; return; }
-    var esc = function(s){ var d=document.createElement('div'); d.textContent=(s===undefined||s===null)?'':String(s); return d.innerHTML; };
+    var esc = function(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
     var html = '';
     info.groups.forEach(function(g){
       var chips = g.cidrs.map(function(c){

@@ -95,6 +95,7 @@ def login_app(tmp_path):
     app.secret_key = 'test'
     g = {
         'os': os, 'json': json, 'datetime': datetime.datetime, 'ipaddress': ipaddress, 'time': __import__('time'),
+        're': re, 'urllib': __import__('urllib.parse'), 'g': flask.g,   # ops #815: _safe_next_path, one line per request
         'CONFIG_DIR': str(cfg),
         'request': flask.request, 'session': flask.session, 'redirect': flask.redirect,
         'url_for': flask.url_for, 'jsonify': flask.jsonify,
@@ -107,6 +108,7 @@ def login_app(tmp_path):
         '_apply_authentik_session': lambda: False,
         '_login_logo_url': lambda: None,
         '_stamp_session_login': lambda: None,   # session stamp from a parallel login change, if present
+        '_stamp_notice_login': lambda fresh: None,   # per-login id for the root-console bar (PR 525)
         'audit': lambda ev, detail='': audits.append((ev, detail)),
         'VERSION': 'test',
         'print': lambda *a, **kw: printed.append(' '.join(str(x) for x in a)),
@@ -114,7 +116,8 @@ def login_app(tmp_path):
     exec(_src({'_client_ip', '_safe_next_path', '_console_log_failed_login', '_note_password_length',
                '_console_password_needs_change', '_console_password_length_state',
                'console_password_confirm_length', 'login', 'index'},
-              {'CONSOLE_PASSWORD_MIN_LEN', 'CONSOLE_LOGIN_FAIL_LOG', 'CONSOLE_LOGIN_FAIL_LOG_MAX'}), g)
+              {'CONSOLE_PASSWORD_MIN_LEN', 'CONSOLE_LOGIN_FAIL_LOG', 'CONSOLE_LOGIN_FAIL_LOG_MAX',
+               '_SAFE_NEXT_PATH_RE'}), g)
     app.add_url_rule('/login', 'login', g['login'], methods=['GET', 'POST'])
     app.add_url_rule('/', 'index', g['index'], methods=['GET', 'POST'])
     app.add_url_rule('/console', 'console_page', lambda: 'console')

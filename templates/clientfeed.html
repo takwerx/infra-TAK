@@ -173,7 +173,7 @@
 <script>
 const FEED_HOST = {{ pub_host(feed_host)|tojson }};
 function closeModal(id){ document.getElementById(id).classList.remove('open'); }
-function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function ago(iso){
   if(!iso) return 'never';
   const secs = Math.max(0, (Date.now() - Date.parse(iso))/1000);
