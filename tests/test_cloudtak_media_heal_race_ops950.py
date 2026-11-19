@@ -190,10 +190,54 @@ def test_heal_reports_failure_and_does_not_restart_when_apply_fails():
     assert any('apply failed' in l for l in logs)
 
 
-def test_remote_heal_command_skips_the_second_restart():
-    """The remote one-liner must treat UNCHANGED as already healed, like the local path."""
+def _remote_cmd(tmp_path, apply_mode):
+    """Run the one-line shell the REMOTE heal sends over ssh, with a fake `docker` first on PATH.
+    apply_mode: CHANGED, UNCHANGED or FAIL (what the apply script inside the container does)."""
     tree = ast.parse(APP)
-    fn = ast.get_source_segment(APP, next(
+    src = ast.get_source_segment(APP, next(
         n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_cloudtak_media_hls_heal'))
-    assert '*UNCHANGED*) echo OK' in fn
-    assert 'docker restart' in fn
+    sent = []
+    import base64 as _b
+    ns = {'_b64': _b, '_CT_MEDIA_CHECK_SH': 'echo check', '_CT_MEDIA_APPLY_SH': 'echo apply',
+          '_ssh_probe': lambda cfg, cmd, timeout=0: sent.append(cmd) or (True, ''),
+          '_ct_media_converged': lambda o: False, 'time': types.SimpleNamespace(sleep=lambda s: None)}
+    exec(compile(src, 'app.py', 'exec'), ns)
+    ns['_cloudtak_media_hls_heal'](plog=lambda m: None, remote_cfg={'host': 'x'})
+    cmd = sent[0]
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    log = tmp_path / 'docker.log'
+    (bindir / 'docker').write_text(f"""#!/bin/sh
+echo "$@" >> {log}
+case "$1" in
+  ps) echo cloudtak-media-1 ;;
+  restart) ;;
+  exec) body=$(cat)
+        case "$body" in
+          *"echo apply"*) case "{apply_mode}" in CHANGED) echo CHANGED ;; UNCHANGED) echo UNCHANGED ;; *) exit 1 ;; esac ;;
+          *) echo "drift ok na" ;;
+        esac ;;
+esac
+""")
+    (bindir / 'docker').chmod(0o755)
+    env = dict(os.environ, PATH=f'{bindir}:{os.environ["PATH"]}')
+    r = subprocess.run(['sh', '-c', cmd], capture_output=True, text=True, env=env, timeout=30)
+    return r.stdout.strip(), (log.read_text() if log.exists() else '')
+
+
+def test_remote_heal_restarts_once_after_a_change(tmp_path):
+    out, calls = _remote_cmd(tmp_path, 'CHANGED')
+    assert out == 'HEALED', out
+    assert calls.count('restart') == 1
+
+
+def test_remote_heal_skips_the_restart_when_another_heal_got_there_first(tmp_path):
+    out, calls = _remote_cmd(tmp_path, 'UNCHANGED')
+    assert out == 'OK', out
+    assert 'restart' not in calls
+
+
+def test_remote_heal_reports_fail_and_does_not_restart_when_apply_fails(tmp_path):
+    out, calls = _remote_cmd(tmp_path, 'FAIL')
+    assert out == 'FAIL', out
+    assert 'restart' not in calls
