@@ -313,7 +313,10 @@ def test_os_updates_answer_carries_the_java_state():
          '_os_updates_summary': lambda force=False: {'total': 0},
          '_kernel_reboot_state': lambda: {'pending': False, 'kernel': False, 'running': 'k'},
          '_kernel_cve_banner': lambda r: None,
-         '_java_restart_state': lambda: {'stale': [7], 'sig': 'java@9'}}
+         '_java_restart_state': lambda: {'stale': [7], 'sig': 'java@9'},
+         '_tak_container_java_facts_cached': lambda: {'applicable': False, 'stale': False, 'running': '',
+                                                      'newest': '', 'sig': ''},   # ops #968
+         '_JAVA_IMAGE_HOW': ''}
     exec(compile(_cut('os_updates_api'), 'app.py', 'exec'), n)
     assert n['os_updates_api']()['java_restart'] == {'stale': [7], 'sig': 'java@9'}
 
