@@ -65,6 +65,7 @@ from . import register_module, job_log, job_state, get_ctx
 from . import atlas_backup
 from . import atlas_instances
 from . import atlas_renewal
+from . import atlas_roster
 from . import atlas_tak_cas
 from .atlas_instances import MODE_DYNAMIC, MODE_FIXED
 
@@ -4031,6 +4032,8 @@ def deploy(ctx, job, params):
             # the group, and said nothing when it did. Idempotent: on the
             # ordinary path this only confirms what was just made.
             _reconcile_agency_group(ctx, _inst, plog)
+            # ATLAS W495: after the agency group, which its role is scoped to.
+            _reconcile_roster(ctx, _inst, plog)
             # Re-emit now that the application exists: the console vhost only
             # grows its forward_auth block once Authentik is in the picture.
             ctx['generate_caddyfile'](ctx['load_settings']())
@@ -4938,6 +4941,22 @@ def _reconcile_agency_group(ctx, inst, plog):
     return _record_agency_group_state(ctx, inst, outcome, plog=plog)
 
 
+def _reconcile_roster(ctx, inst, plog):
+    """The standard-admin group and the read-only roster account (ATLAS W495).
+
+    ⚠️ **After `_reconcile_agency_group`**, because the roster role is scoped
+    to the agency admin group and must never be scoped to one that is missing.
+    Restarts `api` when `.env` changed, so ATLAS starts with the current token.
+    Never raises; see `atlas_roster`.
+    """
+    try:
+        dirpath = instance_paths(ctx, inst)['dir']
+        if atlas_roster.ensure(ctx, inst, dirpath, write_env_value, plog)['env_changed']:
+            _compose(ctx, 'up -d api', timeout=300, inst=inst)
+    except Exception as exc:
+        plog('  ⚠ Could not reconcile the standard admins: %s' % str(exc)[:80])
+
+
 def _reconcile_access(ctx, inst, plog):
     """Every Authentik check an update owes a deployment, in one place.
 
@@ -4954,6 +4973,8 @@ def _reconcile_access(ctx, inst, plog):
     # ⚠️ Idempotent, and the only route by which a deployment made before
     # W221 gets its group and its binding at all.
     _reconcile_agency_group(ctx, inst, plog)
+    # ⚠️ Idempotent, and after the agency group (its role is scoped to it).
+    _reconcile_roster(ctx, inst, plog)
     # ⚠️ Idempotent, and the only route by which a provider created with the
     # wrong hostname is ever corrected — see the function.
     _reconcile_provider_host(ctx, inst, plog)
@@ -5800,6 +5821,12 @@ def remove_instance(ctx, inst, plog=None):
     renewal_note = atlas_renewal.remove(ctx, inst)
     if renewal_note:
         note(f'{label}: {renewal_note}')
+
+    # ⚠️ And the standard-admin group and its roster account (ATLAS W495), or
+    # a reused slug inherits the old deployment's standard admins.
+    roster_note = atlas_roster.remove(ctx, inst)
+    if roster_note:
+        note(f'{label}: {roster_note}')
 
     # ⚠️ Only the keys this deployment owns. `atlas_` is a prefix of
     # `atlas_corona_`, so a `startswith` sweep while removing the *plain*

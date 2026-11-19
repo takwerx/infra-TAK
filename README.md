@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.4.1-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.1-alpha)**
+**Current release: [v10.4.2-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.2-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -458,6 +458,22 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.4.2-alpha — 2026-11-19 — Security hardening: console sign-in, page text and CA keys; CloudTAK 13.124.0 Update works
+
+**Headline: console sign-in is safer, names shown on console pages can no longer run as script, and the CA private key is no longer downloadable. CloudTAK Update to 13.124.0 works on servers with Marketplace plugins, Update Now keeps ATAK users' groups and Data Sync, and ATLAS gets a second admin level. Update from the Console page.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.2-alpha))
+
+**Security.**
+- Console sign-in returns you only to a page on this console, locks when idle, and slows down repeated wrong passwords. Internal-only pages refuse callers from outside the box.
+- WiFi, TAK group, Authentik user and module version names show as plain text on the console pages, the stream site and the Node-RED configurator.
+- The console no longer offers the CA private key as a download. Rotate Intermediate CA on a Docker TAK Server keeps the public certificate on port 8446.
+- CloudTAK media image on Node 26 (Brotli fix), NetBird 0.82.1 on the main channel, MediaMTX web editor 2.1.17 with hashed passwords.
+
+**ATLAS.**
+- Each agency gets a standard admin group and a read-only roster account.
+
+**Fixes.**
+- CloudTAK Update to 13.124.0 with Marketplace plugins, CloudTAK repair on a slow server, Update Now keeps ATAK users' groups and Data Sync, remote MediaMTX for a non-root sudo user and on Rocky 9, TAK Portal "Deploy To Caddy" on Ubuntu, stream site video for slow viewers, Node-RED feeds with a deleted mission, TAK Server web API messages, WiFi names with a colon or backslash, the ArcGIS ETL pin, and a notice bar on a root console.
 
 ### v10.4.1-alpha — 2026-11-17 — Security hardening: Caddy and console sign-in; ATLAS backs up before Update
 
