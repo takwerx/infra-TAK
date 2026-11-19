@@ -1,19 +1,19 @@
 {
   "schema": 1,
-  "serial": 202611160342,
+  "serial": 202611190517,
   "entries": [
     {
       "prefix": "etl-active911",
       "name": "Active 911",
       "description": "Active 911 is a service that provides real-time emergency dispatch information to first responders. Alerts are written to CloudTAK Events with the responders of each alert as Assignments.",
       "source": "dfpc-coe/etl-active911",
-      "ref": "v4.11.0",
-      "sha": "27c4b2053562966bd206de6a6e3a09b26d85a55d",
-      "version": "4.11.0",
+      "ref": "v4.13.0",
+      "sha": "68b546bd992e80e980657c71e2d9acc13fa52923",
+      "version": "4.13.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-active911/27c4b2053562966bd206de6a6e3a09b26d85a55d/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-active911/27c4b2053562966bd206de6a6e3a09b26d85a55d/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-active911/68b546bd992e80e980657c71e2d9acc13fa52923/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-active911/68b546bd992e80e980657c71e2d9acc13fa52923/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-active911",
       "compute": {
         "memory": 256,
@@ -27,20 +27,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-adsbx",
       "name": "ADS-B Exchange",
       "description": "Ingests real-time ADS-B aircraft position data from ADS-B Exchange and posts aircraft tracks to the map.",
       "source": "dfpc-coe/etl-adsbx",
-      "ref": "v5.17.0",
-      "sha": "ad7cf38ba0a37184f2fbc9142235bbed4e73b5d4",
-      "version": "5.17.0",
+      "ref": "v5.19.0",
+      "sha": "037125b214373c6c122651ed04f3f67dfe10e9e2",
+      "version": "5.19.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-adsbx/ad7cf38ba0a37184f2fbc9142235bbed4e73b5d4/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-adsbx/ad7cf38ba0a37184f2fbc9142235bbed4e73b5d4/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-adsbx/037125b214373c6c122651ed04f3f67dfe10e9e2/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-adsbx/037125b214373c6c122651ed04f3f67dfe10e9e2/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-adsbx",
       "compute": {
         "memory": 1024,
@@ -54,20 +54,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-air-data",
       "name": "AirData",
       "description": "Ingests drone flight telemetry from AirData and posts aircraft positions to the map.",
       "source": "dfpc-coe/etl-air-data",
-      "ref": "v2.14.0",
-      "sha": "7d5af48a690191cd0fb0bb798e80dd9b27878ff5",
-      "version": "2.14.0",
+      "ref": "v2.16.0",
+      "sha": "73169bd65ce591c62433789f095e62cb85142cc5",
+      "version": "2.16.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-air-data/7d5af48a690191cd0fb0bb798e80dd9b27878ff5/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-air-data/7d5af48a690191cd0fb0bb798e80dd9b27878ff5/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-air-data/73169bd65ce591c62433789f095e62cb85142cc5/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-air-data/73169bd65ce591c62433789f095e62cb85142cc5/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-air-data",
       "compute": {
         "memory": 512,
@@ -81,20 +81,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-AlertWest",
       "name": "ALERTWest",
       "description": "Ingests ALERTWest camera locations, orientation and latest imagery from the public ALERTWest camera API and registers each camera site as a Core Device.",
       "source": "dfpc-coe/etl-AlertWest",
-      "ref": "v2.3.0",
-      "sha": "56f20667bfd532ca68eb659a543108812528845c",
-      "version": "2.3.0",
+      "ref": "v2.5.0",
+      "sha": "8ad42a8c3a10416f810ec3e1dfb0f8aec17a0818",
+      "version": "2.5.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-AlertWest/56f20667bfd532ca68eb659a543108812528845c/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-AlertWest/8ad42a8c3a10416f810ec3e1dfb0f8aec17a0818/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-AlertWest",
       "compute": {
         "memory": 512,
@@ -108,20 +108,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-axon",
       "name": "Axon",
       "description": "Ingests device and unit locations from the Axon platform and posts them to the map.",
       "source": "dfpc-coe/etl-axon",
-      "ref": "v1.18.0",
-      "sha": "74df25acec0b021a8244fa3dd8b3e5efb81d35ed",
-      "version": "1.18.0",
+      "ref": "v1.20.0",
+      "sha": "dadda43de514128e831d4cc7f01026bdd4aa41be",
+      "version": "1.20.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-axon/74df25acec0b021a8244fa3dd8b3e5efb81d35ed/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-axon/74df25acec0b021a8244fa3dd8b3e5efb81d35ed/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-axon/dadda43de514128e831d4cc7f01026bdd4aa41be/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-axon/dadda43de514128e831d4cc7f01026bdd4aa41be/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-axon",
       "compute": {
         "memory": 512,
@@ -135,20 +135,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-brinc",
       "name": "BRINC",
       "description": "Pulls BRINC UAS drone telemetry into the TAK system and posts drone positions to the map.",
       "source": "dfpc-coe/etl-brinc",
-      "ref": "v1.8.0",
-      "sha": "7b8efe6daeba2d22e0a7d8d02e582a47248e3f68",
-      "version": "1.8.0",
+      "ref": "v1.10.0",
+      "sha": "b88e318a06a36856922f1d9ca33a31b513036050",
+      "version": "1.10.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-brinc/7b8efe6daeba2d22e0a7d8d02e582a47248e3f68/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-brinc/7b8efe6daeba2d22e0a7d8d02e582a47248e3f68/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-brinc/b88e318a06a36856922f1d9ca33a31b513036050/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-brinc/b88e318a06a36856922f1d9ca33a31b513036050/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-brinc",
       "compute": {
         "memory": 512,
@@ -162,20 +162,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-buddi",
       "name": "BUDDI",
       "description": "Ingests BUDDI GPS tracker locations and posts them to the map.",
       "source": "dfpc-coe/etl-buddi",
-      "ref": "v1.14.0",
-      "sha": "dc970adafbb4f07097dc32b61239cfce6d0b7f5b",
-      "version": "1.14.0",
+      "ref": "v1.16.0",
+      "sha": "7cf935f6af3d48c212a4ae036637cf6412e8a789",
+      "version": "1.16.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-buddi/dc970adafbb4f07097dc32b61239cfce6d0b7f5b/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-buddi/dc970adafbb4f07097dc32b61239cfce6d0b7f5b/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-buddi/7cf935f6af3d48c212a4ae036637cf6412e8a789/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-buddi/7cf935f6af3d48c212a4ae036637cf6412e8a789/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-buddi",
       "compute": {
         "memory": 512,
@@ -189,20 +189,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-caltopo",
       "name": "CalTopo",
       "description": "Ingests map objects from a shared CalTopo map, or the live Shared Locations of a CalTopo Team Account, and posts them to the map. Optionally creates a CalTopo Map in a Team Account for every CoreEvent created.",
       "source": "dfpc-coe/etl-caltopo",
-      "ref": "v5.19.0",
-      "sha": "87d8bf72ebb158b3a9be6b5e7913501e53984ac1",
-      "version": "5.19.0",
+      "ref": "v5.21.0",
+      "sha": "22e3083b3ac4b847727b455b40dc2a557cc59ef2",
+      "version": "5.21.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-caltopo/87d8bf72ebb158b3a9be6b5e7913501e53984ac1/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-caltopo/87d8bf72ebb158b3a9be6b5e7913501e53984ac1/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-caltopo/22e3083b3ac4b847727b455b40dc2a557cc59ef2/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-caltopo/22e3083b3ac4b847727b455b40dc2a557cc59ef2/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-caltopo",
       "compute": {
         "memory": 512,
@@ -216,20 +216,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-cellping",
       "name": "Cell Ping",
       "description": "Receives the cell phone location emails that carriers send in response to an exigent location request and posts the location & its uncertainty to the map as Cursor-on-Target.",
       "source": "dfpc-coe/etl-cellping",
-      "ref": "v1.3.0",
-      "sha": "e63c5c913f1b08f3de653b5dd05ef4dab9870153",
-      "version": "1.3.0",
+      "ref": "v1.5.0",
+      "sha": "06929a1825759a0d4da566a92262c4cb992e10d6",
+      "version": "1.5.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cellping/e63c5c913f1b08f3de653b5dd05ef4dab9870153/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cellping/06929a1825759a0d4da566a92262c4cb992e10d6/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-cellping",
       "compute": {
         "memory": 256,
@@ -243,20 +243,20 @@
         "installable": false
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-central-square",
       "name": "CentralSquare",
       "description": "Ingests CentralSquare Public Safety Suite Professional CAD data from the Pro Suite REST API - active calls for service are written to CloudTAK Events with their dispatched units as Assignments and their command log on the Event Timeline, AVL unit locations are posted to the map.",
       "source": "dfpc-coe/etl-central-square",
-      "ref": "v1.12.0",
-      "sha": "7f272ef98fc20814645d54e135577e933abed190",
-      "version": "1.12.0",
+      "ref": "v1.14.0",
+      "sha": "9fb475fd7b5ae20999d6f9efc6a10670b71de47d",
+      "version": "1.14.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-central-square/7f272ef98fc20814645d54e135577e933abed190/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-central-square/7f272ef98fc20814645d54e135577e933abed190/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-central-square/9fb475fd7b5ae20999d6f9efc6a10670b71de47d/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-central-square/9fb475fd7b5ae20999d6f9efc6a10670b71de47d/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-central-square",
       "compute": {
         "memory": 512,
@@ -270,20 +270,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-13 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-caic",
       "name": "Colorado Avalanche Information Center",
       "description": "Ingests avalanche forecast zones and observations from the Colorado Avalanche Information Center (CAIC) and posts them to the map.",
       "source": "dfpc-coe/etl-caic",
-      "ref": "v3.18.1",
-      "sha": "070fc4da97cc7a7918daf972396be7c3e771545c",
-      "version": "3.18.1",
+      "ref": "v3.20.0",
+      "sha": "43137e8b1e243834ebac44fc278cccb665b1d521",
+      "version": "3.20.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-caic/070fc4da97cc7a7918daf972396be7c3e771545c/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-caic/070fc4da97cc7a7918daf972396be7c3e771545c/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-caic/43137e8b1e243834ebac44fc278cccb665b1d521/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-caic/43137e8b1e243834ebac44fc278cccb665b1d521/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-caic",
       "compute": {
         "memory": 512,
@@ -297,7 +297,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-13 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-cotrip-signs",
@@ -331,13 +331,13 @@
       "name": "COtrip Incidents",
       "description": "Ingests road incident and closure data from the Colorado COtrip system and posts them to the map.",
       "source": "dfpc-coe/etl-cotrip-incidents",
-      "ref": "v5.14.0",
-      "sha": "d3876fa3ec757172d9d890afa7bffb1daf6359d9",
-      "version": "5.14.0",
+      "ref": "v5.16.0",
+      "sha": "484793886100b592b9468b48200a8249d50fa632",
+      "version": "5.16.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-incidents/d3876fa3ec757172d9d890afa7bffb1daf6359d9/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-incidents/d3876fa3ec757172d9d890afa7bffb1daf6359d9/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-incidents/484793886100b592b9468b48200a8249d50fa632/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-incidents/484793886100b592b9468b48200a8249d50fa632/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-cotrip-incidents",
       "compute": {
         "memory": 512,
@@ -351,20 +351,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-cotrip-plows",
       "name": "COtrip Snowplows",
       "description": "Ingests snowplow locations from the Colorado COtrip system and posts them to the map.",
       "source": "dfpc-coe/etl-cotrip-plows",
-      "ref": "v4.14.0",
-      "sha": "c097c3571bdd1735d2a7fe96a54ed235bbeb14aa",
-      "version": "4.14.0",
+      "ref": "v4.16.0",
+      "sha": "604add5ef167707c5a11b102242a7ebe379579d1",
+      "version": "4.16.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-plows/c097c3571bdd1735d2a7fe96a54ed235bbeb14aa/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-plows/c097c3571bdd1735d2a7fe96a54ed235bbeb14aa/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-plows/604add5ef167707c5a11b102242a7ebe379579d1/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-plows/604add5ef167707c5a11b102242a7ebe379579d1/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-cotrip-plows",
       "compute": {
         "memory": 512,
@@ -378,20 +378,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-cotrip-cameras",
       "name": "COtrip Traffic Cameras",
       "description": "Ingests traffic camera locations and imagery metadata from the Colorado COtrip system and posts them to the map.",
       "source": "dfpc-coe/etl-cotrip-cameras",
-      "ref": "v2.15.0",
-      "sha": "a82bdab159b5dc3a81b94dad19aba3de377bf35f",
-      "version": "2.15.0",
+      "ref": "v2.17.0",
+      "sha": "1cacdb7d5e87025cea5e4a83b7f8b791fc2918ba",
+      "version": "2.17.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-cameras/a82bdab159b5dc3a81b94dad19aba3de377bf35f/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-cameras/a82bdab159b5dc3a81b94dad19aba3de377bf35f/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-cameras/1cacdb7d5e87025cea5e4a83b7f8b791fc2918ba/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cotrip-cameras/1cacdb7d5e87025cea5e4a83b7f8b791fc2918ba/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-cotrip-cameras",
       "compute": {
         "memory": 512,
@@ -405,7 +405,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-cotrip-weather",
@@ -439,13 +439,13 @@
       "name": "Cursor-on-Target Webhook",
       "description": "Webhook endpoint that receives Cursor-on-Target events as GeoJSON or XML and posts them to the map.",
       "source": "dfpc-coe/etl-cot",
-      "ref": "v1.4.0",
-      "sha": "5f298a8063ce578f96b6ebad3523fd7d8f2f6b91",
-      "version": "1.4.0",
+      "ref": "v1.6.0",
+      "sha": "4d730d985c89e79682b069d47ba392e3bc722abf",
+      "version": "1.6.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cot/5f298a8063ce578f96b6ebad3523fd7d8f2f6b91/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-cot/4d730d985c89e79682b069d47ba392e3bc722abf/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-cot",
       "compute": {
         "memory": 512,
@@ -459,20 +459,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-09 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-dji-flight-hub",
       "name": "DJI FlightHub 2",
       "description": "Polls the DJI FlightHub 2 OpenAPI for aircraft, dock, and remote controller locations and posts them to the map as Cursor-on-Target.",
       "source": "dfpc-coe/etl-dji-flight-hub",
-      "ref": "v1.8.1",
-      "sha": "58334205007379a8fd139d170deae33a13522d3a",
-      "version": "1.8.1",
+      "ref": "v1.10.0",
+      "sha": "a713bb336c52aaf5614aadb36014c99c440bb9ce",
+      "version": "1.10.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-dji-flight-hub/58334205007379a8fd139d170deae33a13522d3a/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-dji-flight-hub/a713bb336c52aaf5614aadb36014c99c440bb9ce/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-dji-flight-hub",
       "compute": {
         "memory": 512,
@@ -486,20 +486,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-drone-sense",
       "name": "DroneSense",
       "description": "Ingests drone telemetry from DroneSense and posts aircraft positions to the map.",
       "source": "dfpc-coe/etl-drone-sense",
-      "ref": "v2.15.0",
-      "sha": "55ab4093430b62cd1eeb97c40fd89346ca8ad122",
-      "version": "2.15.0",
+      "ref": "v2.17.0",
+      "sha": "54ffa3510d5ad5d73124c333a4d280196ea3473f",
+      "version": "2.17.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-drone-sense/55ab4093430b62cd1eeb97c40fd89346ca8ad122/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-drone-sense/55ab4093430b62cd1eeb97c40fd89346ca8ad122/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-drone-sense/54ffa3510d5ad5d73124c333a4d280196ea3473f/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-drone-sense/54ffa3510d5ad5d73124c333a4d280196ea3473f/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-drone-sense",
       "compute": {
         "memory": 512,
@@ -513,20 +513,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-ensurity",
       "name": "Ensurity Mobile",
       "description": "Receives Ensurity Mobile vehicle telemetry via webhook and on a schedule and posts vehicle positions to the map.",
       "source": "dfpc-coe/etl-ensurity",
-      "ref": "v1.9.0",
-      "sha": "14eecece15c762488a690cd9b8a5c0607466705e",
-      "version": "1.9.0",
+      "ref": "v1.10.0",
+      "sha": "6b8642a37ea0f0f2d328887b66ae98277b70bce7",
+      "version": "1.10.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-ensurity/14eecece15c762488a690cd9b8a5c0607466705e/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-ensurity/6b8642a37ea0f0f2d328887b66ae98277b70bce7/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-ensurity",
       "compute": {
         "memory": 512,
@@ -540,20 +540,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-arcgis",
       "name": "Esri ArcGIS",
       "description": "Synchronizes features with Esri ArcGIS: ingests ArcGIS Feature and Map Server layers to the map on a schedule and optionally pushes map features back out to ArcGIS.",
       "source": "dfpc-coe/etl-arcgis",
-      "ref": "v7.35.1",
-      "sha": "7c99969125671cef4256e98100a614fc841a3c59",
-      "version": "7.35.1",
+      "ref": "v7.36.0",
+      "sha": "910fc609a3f6e60735351e3c83d76870a14e1400",
+      "version": "7.36.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/7c99969125671cef4256e98100a614fc841a3c59/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/7c99969125671cef4256e98100a614fc841a3c59/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/910fc609a3f6e60735351e3c83d76870a14e1400/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-arcgis/910fc609a3f6e60735351e3c83d76870a14e1400/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-arcgis",
       "compute": {
         "memory": 1024,
@@ -567,20 +567,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-17 /module-scan"
+      "reviewed": "2026-11-18 /module-scan"
     },
     {
       "prefix": "etl-everywhere-hub",
       "name": "Everywhere Hub",
       "description": "Ingests device and team tracking data from Everywhere Hub via webhook and scheduled cache refresh and posts positions to the map.",
       "source": "dfpc-coe/etl-everywhere-hub",
-      "ref": "v1.15.0",
-      "sha": "b9cfb5af8ca317620a9a6706fbc52bbd2a367c67",
-      "version": "1.15.0",
+      "ref": "v1.16.0",
+      "sha": "725254f0342a5cc7eb3dfd95a38f123fa933d88f",
+      "version": "1.16.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-everywhere-hub/b9cfb5af8ca317620a9a6706fbc52bbd2a367c67/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-everywhere-hub/b9cfb5af8ca317620a9a6706fbc52bbd2a367c67/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-everywhere-hub/725254f0342a5cc7eb3dfd95a38f123fa933d88f/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-everywhere-hub/725254f0342a5cc7eb3dfd95a38f123fa933d88f/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-everywhere-hub",
       "compute": {
         "memory": 512,
@@ -594,20 +594,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-first-due",
       "name": "First Due",
-      "description": "Ingests active CAD dispatches or AVL device locations from the First Due REST API and posts each call - location, address, assigned units, dispatch message and call notes - or device to the map.",
+      "description": "Ingests active CAD dispatches or AVL device locations from the First Due REST API - active dispatches are written to CloudTAK Events with their dispatched units as Assignments, AVL device locations are posted to the map.",
       "source": "dfpc-coe/etl-first-due",
-      "ref": "v1.3.0",
-      "sha": "943c232c7d4d1f57f329173e66ab3dc2cb03dd7e",
-      "version": "1.3.0",
+      "ref": "v1.5.0",
+      "sha": "70d42918384c69aa7c5b29aba714889ddabd4ce7",
+      "version": "1.5.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-first-due/943c232c7d4d1f57f329173e66ab3dc2cb03dd7e/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-first-due/70d42918384c69aa7c5b29aba714889ddabd4ce7/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-first-due",
       "compute": {
         "memory": 512,
@@ -621,20 +621,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-inreach",
       "name": "Garmin inReach",
       "description": "Ingests satellite tracking positions from Garmin inReach and posts them to the map.",
       "source": "dfpc-coe/etl-inreach",
-      "ref": "v6.3.0",
-      "sha": "f7eb367b7a369b777fb9d5940281c98d27ba4094",
-      "version": "6.3.0",
+      "ref": "v6.5.0",
+      "sha": "07b7fbf78daf8eaa2d696f926808960f895739d6",
+      "version": "6.5.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-inreach/f7eb367b7a369b777fb9d5940281c98d27ba4094/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-inreach/f7eb367b7a369b777fb9d5940281c98d27ba4094/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-inreach/07b7fbf78daf8eaa2d696f926808960f895739d6/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-inreach/07b7fbf78daf8eaa2d696f926808960f895739d6/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-inreach",
       "compute": {
         "memory": 512,
@@ -648,20 +648,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-geojson",
       "name": "GeoJSON",
       "description": "Fetches GeoJSON from a configurable HTTP endpoint and posts the features to the map.",
       "source": "dfpc-coe/etl-geojson",
-      "ref": "v2.14.0",
-      "sha": "8ccca24c3967d0c12d40a79620a67b137186a718",
-      "version": "2.14.0",
+      "ref": "v2.16.0",
+      "sha": "4cebe08b1ad2b500ba12bbc4fc030349747a40bc",
+      "version": "2.16.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-geojson/8ccca24c3967d0c12d40a79620a67b137186a718/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-geojson/4cebe08b1ad2b500ba12bbc4fc030349747a40bc/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-geojson",
       "compute": {
         "memory": 512,
@@ -675,20 +675,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-geotab",
       "name": "Geotab",
       "description": "Ingests fleet vehicle telematics from Geotab and posts vehicle positions to the map.",
       "source": "dfpc-coe/etl-geotab",
-      "ref": "v3.12.0",
-      "sha": "5a02d1b568e9f6c0625a38b992adb48c1dd4f467",
-      "version": "3.12.0",
+      "ref": "v3.14.0",
+      "sha": "5cd08fc1e21c8e2e5b3276052d79974037c67c3a",
+      "version": "3.14.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-geotab/5a02d1b568e9f6c0625a38b992adb48c1dd4f467/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-geotab/5a02d1b568e9f6c0625a38b992adb48c1dd4f467/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-geotab/5cd08fc1e21c8e2e5b3276052d79974037c67c3a/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-geotab/5cd08fc1e21c8e2e5b3276052d79974037c67c3a/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-geotab",
       "compute": {
         "memory": 1024,
@@ -702,20 +702,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-jeffcom",
       "name": "JeffCom 911",
       "description": "Ingests computer-aided dispatch (CAD) incidents and unit locations from JeffCom 911 via schedule and webhook and posts them to the map.",
       "source": "dfpc-coe/etl-jeffcom",
-      "ref": "v1.20.0",
-      "sha": "2058a72f7c2c7f1570649b53ffd92aa7111c51ab",
-      "version": "1.20.0",
+      "ref": "v1.22.0",
+      "sha": "8f8ac489408a73f5c36b2192f04d0f708ff3dde4",
+      "version": "1.22.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-jeffcom/2058a72f7c2c7f1570649b53ffd92aa7111c51ab/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-jeffcom/8f8ac489408a73f5c36b2192f04d0f708ff3dde4/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-jeffcom",
       "compute": {
         "memory": 512,
@@ -729,20 +729,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-nasa-acero",
       "name": "NASA ACERO",
       "description": "Receives NASA ACERO aircraft and mission data via webhook and posts it to the map.",
       "source": "dfpc-coe/etl-nasa-acero",
-      "ref": "v1.10.0",
-      "sha": "1af7110924bbf72baed2cc2bd2b8e48d5a5c9104",
-      "version": "1.10.0",
+      "ref": "v1.12.0",
+      "sha": "e8977853631aba0fc6fd3cee81b16885cb0c26d4",
+      "version": "1.12.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-nasa-acero/1af7110924bbf72baed2cc2bd2b8e48d5a5c9104/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-nasa-acero/1af7110924bbf72baed2cc2bd2b8e48d5a5c9104/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-nasa-acero/e8977853631aba0fc6fd3cee81b16885cb0c26d4/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-nasa-acero/e8977853631aba0fc6fd3cee81b16885cb0c26d4/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-nasa-acero",
       "compute": {
         "memory": 512,
@@ -756,20 +756,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-13 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-optimus",
       "name": "Optimus",
       "description": "Ingests tracker positions from Optimus (Optimus Pro) and posts them to the map.",
       "source": "dfpc-coe/etl-optimus",
-      "ref": "v1.19.0",
-      "sha": "c16dc35923ed1ec7df84a5359a7db6c604418751",
-      "version": "1.19.0",
+      "ref": "v1.21.0",
+      "sha": "450dd991401df479f6a71facfa685c124aab1471",
+      "version": "1.21.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-optimus/c16dc35923ed1ec7df84a5359a7db6c604418751/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-optimus/450dd991401df479f6a71facfa685c124aab1471/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-optimus",
       "compute": {
         "memory": 512,
@@ -783,20 +783,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-santa",
       "name": "Santa Tracker",
       "description": "Posts Santa's simulated position to the map as a seasonal tracking feature.",
       "source": "dfpc-coe/etl-santa",
-      "ref": "v2.12.0",
-      "sha": "e7473c675361e14e982c83f7924b93b4eca3537a",
-      "version": "2.12.0",
+      "ref": "v2.14.0",
+      "sha": "f5218580dcf529e640d6e3a93cfda8fe3f15bfdc",
+      "version": "2.14.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-santa/e7473c675361e14e982c83f7924b93b4eca3537a/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-santa/f5218580dcf529e640d6e3a93cfda8fe3f15bfdc/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-santa",
       "compute": {
         "memory": 512,
@@ -810,20 +810,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-shotover",
       "name": "Shotover",
       "description": "Rotates CloudTAK video lease credentials and maintains server video injectors so Shotover camera feeds stay available in TAK.",
       "source": "dfpc-coe/etl-shotover",
-      "ref": "v2.13.0",
-      "sha": "5dbd15136b58e8eaa5501aefda975b303fc4afe8",
-      "version": "2.13.0",
+      "ref": "v2.15.0",
+      "sha": "281a07bddf186dc83ad8d43dabbf513e7230f90f",
+      "version": "2.15.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-shotover/5dbd15136b58e8eaa5501aefda975b303fc4afe8/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-shotover/281a07bddf186dc83ad8d43dabbf513e7230f90f/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-shotover",
       "compute": {
         "memory": 512,
@@ -837,20 +837,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-skydio",
       "name": "Skydio",
       "description": "Streams live Skydio Cloud drone telemetry into TAK as Cursor-on-Target and receives Skydio webhook events for flight state, device alerts, and live stream status.",
       "source": "dfpc-coe/etl-skydio",
-      "ref": "v1.3.0",
-      "sha": "1e353be93827ce199c4d6343a4d5a5610e193b4c",
-      "version": "1.3.0",
+      "ref": "v1.5.0",
+      "sha": "81a1d77bb5af9be4ac5639499b1ffd18572c85bc",
+      "version": "1.5.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-skydio/1e353be93827ce199c4d6343a4d5a5610e193b4c/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-skydio/1e353be93827ce199c4d6343a4d5a5610e193b4c/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-skydio/81a1d77bb5af9be4ac5639499b1ffd18572c85bc/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-skydio/81a1d77bb5af9be4ac5639499b1ffd18572c85bc/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-skydio",
       "compute": {
         "memory": 1024,
@@ -864,20 +864,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-skymira",
       "name": "SkyMira",
       "description": "Ingests satellite vehicle tracking messages from SkyMira and posts vehicle positions to the map.",
       "source": "dfpc-coe/etl-skymira",
-      "ref": "v2.12.0",
-      "sha": "4557747258a5e963af6122e09b1c517e9d8db5ec",
-      "version": "2.12.0",
+      "ref": "v2.14.0",
+      "sha": "dd26df4ebf4843c79ae051bdc62186637303d03e",
+      "version": "2.14.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-skymira/4557747258a5e963af6122e09b1c517e9d8db5ec/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-skymira/4557747258a5e963af6122e09b1c517e9d8db5ec/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-skymira/dd26df4ebf4843c79ae051bdc62186637303d03e/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-skymira/dd26df4ebf4843c79ae051bdc62186637303d03e/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-skymira",
       "compute": {
         "memory": 512,
@@ -891,20 +891,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-slack-bsar",
       "name": "Slack BSAR",
       "description": "Creates a Slack channel for every SAR CoreEvent placed on a CoreEvent Board or created in a TAK Server Channel, with a pinned card whose controls assign, close & prioritise the Event from Slack.",
       "source": "dfpc-coe/etl-slack-bsar",
-      "ref": "v1.14.0",
-      "sha": "b0e7852752874b0dd025a48c991b2b75cd6e0719",
-      "version": "1.14.0",
+      "ref": "v1.16.0",
+      "sha": "f8ffa0a948ab87db5324f21a684edf76bbb61605",
+      "version": "1.16.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-slack-bsar/b0e7852752874b0dd025a48c991b2b75cd6e0719/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-slack-bsar/f8ffa0a948ab87db5324f21a684edf76bbb61605/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-slack-bsar",
       "compute": {
         "memory": 256,
@@ -918,20 +918,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-spider-tracks",
       "name": "Spidertracks",
       "description": "Ingests aircraft tracking positions from Spidertracks and posts them to the map.",
       "source": "dfpc-coe/etl-spider-tracks",
-      "ref": "v2.12.0",
-      "sha": "4c77a4cef78e241681aed7fb809ae3b86c95ef5a",
-      "version": "2.12.0",
+      "ref": "v2.14.0",
+      "sha": "6b962ade07d9407fff64c7b6b12eb92fe869185f",
+      "version": "2.14.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-spider-tracks/4c77a4cef78e241681aed7fb809ae3b86c95ef5a/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-spider-tracks/4c77a4cef78e241681aed7fb809ae3b86c95ef5a/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-spider-tracks/6b962ade07d9407fff64c7b6b12eb92fe869185f/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-spider-tracks/6b962ade07d9407fff64c7b6b12eb92fe869185f/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-spider-tracks",
       "compute": {
         "memory": 512,
@@ -945,20 +945,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-spot",
       "name": "SPOT",
       "description": "Ingests satellite GPS messenger positions from SPOT and posts them to the map.",
       "source": "dfpc-coe/etl-spot",
-      "ref": "v3.11.0",
-      "sha": "1a7e84acc67a8448fd2361a2278428cff2711595",
-      "version": "3.11.0",
+      "ref": "v3.13.0",
+      "sha": "1d623bfc3163343ecde33bf5b8f0a9e9ceb9698e",
+      "version": "3.13.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-spot/1a7e84acc67a8448fd2361a2278428cff2711595/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-spot/1a7e84acc67a8448fd2361a2278428cff2711595/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-spot/1d623bfc3163343ecde33bf5b8f0a9e9ceb9698e/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-spot/1d623bfc3163343ecde33bf5b8f0a9e9ceb9698e/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-spot",
       "compute": {
         "memory": 512,
@@ -972,7 +972,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-strato",
@@ -1006,13 +1006,13 @@
       "name": "USGS Stream Gauges",
       "description": "Ingests stream gauge water level and flow observations from the USGS and posts them to the map.",
       "source": "dfpc-coe/etl-usgs-gauges",
-      "ref": "v1.5.0",
-      "sha": "f969271abe00280e393655b9406d97c14269646b",
-      "version": "1.5.0",
+      "ref": "v1.7.0",
+      "sha": "b96ff6dcdc6a222ebf11cea3da01ea6d8fd07ecd",
+      "version": "1.7.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-usgs-gauges/f969271abe00280e393655b9406d97c14269646b/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-usgs-gauges/f969271abe00280e393655b9406d97c14269646b/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-usgs-gauges/b96ff6dcdc6a222ebf11cea3da01ea6d8fd07ecd/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-usgs-gauges/b96ff6dcdc6a222ebf11cea3da01ea6d8fd07ecd/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-usgs-gauges",
       "compute": {
         "memory": 512,
@@ -1026,20 +1026,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-verkada",
       "name": "Verkada",
       "description": "Ingests Verkada camera locations and manages CloudTAK video leases so camera streams are available in TAK.",
       "source": "dfpc-coe/etl-verkada",
-      "ref": "v1.20.0",
-      "sha": "488eca8ecc4acab9fcb4ec1bfd4ad8fded52b027",
-      "version": "1.20.0",
+      "ref": "v1.22.0",
+      "sha": "14c11fd608cb8cb1bf3c09630d833c96daf07b3f",
+      "version": "1.22.0",
       "author": "COE",
       "community": false,
-      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-verkada/488eca8ecc4acab9fcb4ec1bfd4ad8fded52b027/logo.png",
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-verkada/488eca8ecc4acab9fcb4ec1bfd4ad8fded52b027/README.md",
+      "logo": "https://raw.githubusercontent.com/dfpc-coe/etl-verkada/14c11fd608cb8cb1bf3c09630d833c96daf07b3f/logo.png",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-verkada/14c11fd608cb8cb1bf3c09630d833c96daf07b3f/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-verkada",
       "compute": {
         "memory": 512,
@@ -1053,20 +1053,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-waze",
       "name": "Waze",
       "description": "Ingests one collection of the Waze for Cities partner feed - user reported alerts, traffic jams or unusual traffic - and posts it to the map.",
       "source": "dfpc-coe/etl-waze",
-      "ref": "v1.2.0",
-      "sha": "f8deeea3bd009776c18bcdc06d046710e31104e7",
-      "version": "1.2.0",
+      "ref": "v1.4.0",
+      "sha": "cc6cf82c76b3f5c36339b3cd5352919a0099b096",
+      "version": "1.4.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-waze/f8deeea3bd009776c18bcdc06d046710e31104e7/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-waze/cc6cf82c76b3f5c36339b3cd5352919a0099b096/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-waze",
       "compute": {
         "memory": 512,
@@ -1080,20 +1080,20 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-wildweb",
       "name": "WildWeb CAD",
       "description": "Ingests wildland fire incident dispatch data from WildWeb CAD and posts incidents to the map.",
       "source": "dfpc-coe/etl-wildweb",
-      "ref": "v4.14.0",
-      "sha": "edb037bfd9c72aa342bec53a49efe9bae96ca986",
-      "version": "4.14.0",
+      "ref": "v4.16.0",
+      "sha": "acec1934aa5b31fc040eb9be5993bc9903549634",
+      "version": "4.16.0",
       "author": "COE",
       "community": false,
       "logo": null,
-      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-wildweb/edb037bfd9c72aa342bec53a49efe9bae96ca986/README.md",
+      "readme": "https://raw.githubusercontent.com/dfpc-coe/etl-wildweb/acec1934aa5b31fc040eb9be5993bc9903549634/README.md",
       "repo_url": "https://github.com/dfpc-coe/etl-wildweb",
       "compute": {
         "memory": 512,
@@ -1107,7 +1107,7 @@
         "installable": true
       },
       "has_capabilities": true,
-      "reviewed": "2026-11-08 /module-scan"
+      "reviewed": "2026-11-17 /module-scan"
     },
     {
       "prefix": "etl-caltopo-clptak",
