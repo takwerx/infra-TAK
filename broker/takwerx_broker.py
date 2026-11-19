@@ -1756,17 +1756,83 @@ def _check_docker_exec_flags(args, what):
             raise Denied(f'{what} {k} denied: makes root read a host file')
 
 
+# ops #933: the ONE driver-option volume the console may create. A new ATLAS
+# deployment backs its Postgres named volume with a bind into its own store
+# (`modules/atlas.py::_bind_pg_volume`); without this every new deploy stopped at
+# "Reserved store". The shape is exact, the device is checked, nothing else widens.
+_ATLAS_VOLUME_ROOTS = tuple(d for d in HOME_MODULE_DIRS + ROOT_MODULE_DIRS
+                            if d.rstrip('/').endswith('/atlas'))
+_ATLAS_VOLUME_NAME = re.compile(r'^takmdm(-[a-z0-9]+)*_pgdata$')
+_ATLAS_VOLUME_OPTS = ('type=none', 'o=bind')
+
+
+def _check_atlas_pg_volume(rest):
+    """`rest` = the words after `docker volume create`. Allow exactly
+    `--driver local -o type=none -o device=<ATLAS store>/pgdata -o o=bind <name>`
+    (the -o options in any order, `--opt` for `-o`), and refuse everything else.
+
+    The device is the dangerous part: it makes root's docker daemon bind that host
+    directory into a volume. It must be `<atlas root>/<deployment>/store/pgdata`
+    under an ATLAS module dir, pass the normal path allow-list (which resolves
+    symlinks in the console-owned home, so a planted link cannot point it at
+    /etc), and the volume must carry the ATLAS Postgres volume name."""
+    driver, opts, names = None, [], []
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in ('--driver', '-d'):
+            if driver is not None or i + 1 >= len(rest):
+                raise Denied('docker volume create: --driver given twice or without a value')
+            driver = rest[i + 1]
+            i += 2
+        elif tok in ('-o', '--opt'):
+            if i + 1 >= len(rest):
+                raise Denied(f'docker volume create {tok}: missing value')
+            opts.append(rest[i + 1])
+            i += 2
+        elif tok.startswith('-'):
+            raise Denied(f'docker volume create option denied: {tok} '
+                         '(driver options can bind host paths)')
+        else:
+            names.append(tok)
+            i += 1
+    if len(names) != 1:
+        raise Denied('docker volume create: one name only')
+    if driver != 'local':
+        raise Denied(f'docker volume create --driver {driver!r} denied (only local)')
+    devices = [o[len('device='):] for o in opts if o.startswith('device=')]
+    fixed = sorted(o for o in opts if not o.startswith('device='))
+    if len(devices) != 1 or fixed != sorted(_ATLAS_VOLUME_OPTS):
+        raise Denied('docker volume create: driver options denied '
+                     '(only type=none, o=bind and one device= under an ATLAS store)')
+    if not _ATLAS_VOLUME_NAME.fullmatch(names[0]):
+        raise Denied(f'docker volume create: {names[0]!r} is not an ATLAS Postgres volume')
+    device = devices[0]
+    p = _abs(device)
+    if p != device:
+        raise Denied(f'docker volume create: device must be a normalised path: {device}')
+    ok = False
+    for root in _ATLAS_VOLUME_ROOTS:
+        if p.startswith(root):
+            parts = p[len(root):].split('/')
+            ok = len(parts) == 3 and all(parts) and parts[1:] == ['store', 'pgdata']
+            break
+    if not ok:
+        raise Denied(f'docker volume create: device is not an ATLAS store pgdata path: {device}')
+    _path_allowed(p)
+
+
 def _check_docker_volume(argv):
     """`docker volume create` with driver options can bind any host dir (/etc)
     into a named volume, which then passes the bind-mount check as a NAME.
-    Allow only a plain `docker volume create <name>`."""
+    Allow a plain `docker volume create <name>`, and (ops #933) the one ATLAS
+    Postgres bind volume shape, checked by `_check_atlas_pg_volume`."""
     if len(argv) < 3 or argv[2] != 'create':
         return
     rest = argv[3:]
-    for tok in rest:
-        if tok.startswith('-'):
-            raise Denied(f'docker volume create option denied: {tok} '
-                         '(driver options can bind host paths)')
+    if any(tok.startswith('-') for tok in rest):
+        _check_atlas_pg_volume(rest)
+        return
     if len(rest) > 1:
         raise Denied('docker volume create: one name only')
 
