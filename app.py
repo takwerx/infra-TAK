@@ -3649,6 +3649,72 @@ def _patch_tak_dockerfile_cacerts(build_ctx, app_dockerfile, log_fn=None):
     return True
 
 
+# ops #963 — TAK's 5.8 hardened bundle pins its Java in one line of Dockerfile.hardened-takserver:
+#     ARG BASE_DEPLOY_TAG=17.0.19_10-jdk-ubi10-minimal
+# (verified in takserver-docker-hardened-5.8-RELEASE-75.zip, 2026-11-19). `docker build --pull`
+# refreshes a MUTABLE tag, but a pin to one exact Temurin build never moves, so a TAK Server
+# built from this bundle ran Java 17.0.19 after the November 2026 security fix (17.0.21+9,
+# Docker Hub tag published 2026-11-18) with nothing on the box to say so. This is the one fleet
+# constant: bump it when Temurin publishes the next 17 security build, and a test pins it.
+# https://hub.docker.com/_/eclipse-temurin/tags?name=17.0.21_9-jdk-ubi10-minimal
+_TEMURIN17_FIXED_TAG = '17.0.21_9-jdk-ubi10-minimal'
+_TEMURIN_JDK_TAG_RE = re.compile(r'(\d+(?:\.\d+){1,3})_(\d+)-jdk-ubi10-minimal')
+_TEMURIN_PIN_LINE_RE = re.compile(
+    r'(?m)^(?P<pre>ARG[ \t]+BASE_DEPLOY_TAG=)(?P<tag>\d+(?:\.\d+){1,3}_\d+-jdk-ubi10-minimal)[ \t]*$')
+
+
+def _temurin_tag_key(tag):
+    """Sortable (feature, interim, update, patch, build) for a Temurin '17.0.19_10-jdk-ubi10-minimal'
+    style tag, or None when the tag is any other shape."""
+    m = _TEMURIN_JDK_TAG_RE.fullmatch(tag or '')
+    if not m:
+        return None
+    parts = [int(x) for x in m.group(1).split('.')]
+    parts += [0] * (4 - len(parts))
+    return tuple(parts) + (int(m.group(2)),)
+
+
+def _patch_tak_hardened_java_pin(build_ctx, app_dockerfile, log_fn=None):
+    """Move the bundle's pinned Temurin 17 base up to _TEMURIN17_FIXED_TAG. Idempotent.
+
+    Touches only an `ARG BASE_DEPLOY_TAG=<Temurin 17 jdk-ubi10-minimal tag>` line whose build is
+    OLDER than the fixed one. A newer pin, another major, a JRE or non-UBI tag, an ARG we cannot
+    read as a Temurin tag, or a Dockerfile without the line is built exactly as shipped, and so is
+    one we cannot read or write (same contract as the patchers above)."""
+    _log = log_fn or (lambda m: print(m, flush=True))
+    if not app_dockerfile:
+        return False
+    df = os.path.join(build_ctx, app_dockerfile)
+    try:
+        with open(df) as f:
+            src = f.read()
+    except Exception as e:
+        _log(f"  (could not read {os.path.basename(app_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    fixed = _temurin_tag_key(_TEMURIN17_FIXED_TAG)
+    old_tags = []
+
+    def _bump(m):
+        key = _temurin_tag_key(m.group('tag'))
+        if key is None or key[0] != fixed[0] or key >= fixed:
+            return m.group(0)
+        old_tags.append(m.group('tag'))
+        return m.group('pre') + _TEMURIN17_FIXED_TAG
+
+    new = _TEMURIN_PIN_LINE_RE.sub(_bump, src)
+    if new == src:
+        return False
+    try:
+        with open(df, 'w') as f:
+            f.write(new)
+    except Exception as e:
+        _log(f"  (could not patch {os.path.basename(app_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    _log(f"  Patched {os.path.basename(app_dockerfile)}: Java base {old_tags[0]} → {_TEMURIN17_FIXED_TAG} "
+         "(TAK pins an exact Temurin build, so the security fix would never arrive).")
+    return True
+
+
 def _tak_container_drop_distrusted_cas(log_fn=None):
     """Same roots, out of the RUNNING TAK container's JDK, for installs whose image was built
     before the patch above. Returns the aliases removed (empty when already clean), or None
@@ -99031,6 +99097,7 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         # which is exactly right for a hardened bundle: that one is UBI-based and needs no patch.
         _patch_tak_db_dockerfile(new_ctx, ulog)
         _patch_tak_hardened_dockerfile(new_ctx, (_app_df, _db_df), ulog)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_hardened_java_pin(new_ctx, _app_df, ulog)   # ops #963 — pinned Temurin build never moves
         _patch_tak_db_pgdg_releasever(new_ctx, _db_df, ulog)   # ops #686 — PGDG lags new RHEL minors
         _patch_tak_dockerfile_cacerts(new_ctx, _app_df, ulog)   # ops #200 — JDK's own CA roots
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
@@ -101113,6 +101180,7 @@ def _deploy_takserver_container(config):
         log_step(f'  bundle layout: {_app_df} / {_db_df}')
         _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
         _patch_tak_hardened_dockerfile(build_ctx, (_app_df, _db_df), log_step)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_hardened_java_pin(build_ctx, _app_df, log_step)   # ops #963 — pinned Temurin build never moves
         _patch_tak_db_pgdg_releasever(build_ctx, _db_df, log_step)   # ops #686 — PGDG lags new RHEL minors
         _patch_tak_dockerfile_cacerts(build_ctx, _app_df, log_step)   # ops #200 — JDK's own CA roots
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
