@@ -34,6 +34,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import types
 import urllib.parse
@@ -94,7 +95,8 @@ class Box:
                  settings=None, coreconfig=True, update_in_progress=False, restart_rc=0, tak_running=True,
                  subs=None, ldap_users=None, tak_ldap_ok=True, dead_pool=0, online=True, api_ok=True,
                  history=None, https='ok', https_after_restart='ok', https_flaky=0, api_busy=0,
-                 gd_restart=None, ghosts=(), ghosts_leave=False, outpost='user', api_back_after=None):
+                 gd_restart=None, ghosts=(), ghosts_leave=False, outpost='user', api_back_after=None,
+                 https_partial=False):
         self.t = T0
         # What the local outpost's log shows of TAK's lookups during HTTPS logins (ops #158):
         # 'user' = each login is looked up; 'others' = TAK looks the console's admin cert up on
@@ -140,6 +142,9 @@ class Box:
         # answer). `https_flaky` = that many logins give no groups first (dead pooled connections
         # in the API's own LDAP pool, each dropped after its failure; ops #158).
         self.https, self.https_after_restart, self.https_flaky = https, https_after_restart, https_flaky
+        # v10.4.3 W1: `https_partial` = only the FIRST user the check logs in as gets the `https`
+        # state; every other user is fine (the "some users fine" case that keeps the hold).
+        self.https_partial, self.partial_cn = https_partial, None
         self.leaf_certs, self.user_api, self.workdirs, self.missions = [], [], [], set()
         self.alerts = []               # GH #549: Guard Dog alerts (at, args, kwargs)
 
@@ -154,6 +159,10 @@ class Box:
         assert url.startswith(f'{API}/') and cert.endswith('user.pem')
         path = url[len(API) + 1:]
         state = self.https
+        if self.https_partial:
+            self.partial_cn = self.partial_cn or self.leaf_cn
+            if self.leaf_cn != self.partial_cn:
+                state = 'ok'
         if path == 'groups/all':
             if self.first_login is None:
                 self.first_login = self.t
@@ -392,7 +401,8 @@ class Box:
                   '_TAK_API_CHECK_WAIT_S', '_TAK_API_CHECK_RETRY_S', '_TAK_API_CHECK_RETRY_MAX_S',
                   '_TAK_MARTI_READ_WAIT_S', '_TAK_MARTI_READ_RETRY_MAX_S', '_TAK_API_CHECK_STUCK_S'):
             ns[c] = _const(c)
-        for c in ('_TAK_HTTPS_BROKEN_RESTART_S', '_TAK_BOOT_HTTPS_CHECK_AFTER_S'):   # GH #549
+        for c in ('_TAK_HTTPS_BROKEN_RESTART_S', '_TAK_BOOT_HTTPS_CHECK_AFTER_S',   # GH #549
+                  '_TAK_HTTPS_STUCK_AFTER_OUTPOST_S'):                         # v10.4.3 W1
             if re.search(r'^%s = \d+' % c, APP, re.M):
                 ns[c] = _const(c)
         ns['_tak_https_broken_alert'] = lambda *a, **k: box.alerts.append((box.t, a, k))
@@ -852,21 +862,73 @@ def test_test8_streaming_fine_but_https_gives_no_groups_restarts_tak_once():
     assert box.workdirs == []
 
 
-def test_ops316_https_broken_with_grouped_clients_connected_does_not_restart_tak_at_once():
-    # test6 2026-10-30: all 8 clients had their groups, TAK's API gave the check user none
-    # for 182 s, and the heal restarted TAK (dropping all 8). Now TAK is left running on the
-    # first finding: the full wait, then a ✗ line, and no restart. GH #549: but it stays
-    # pending and is checked again (see the gh549 tests below).
+def test_w1_every_user_broken_with_grouped_clients_restarts_tak_without_the_hold():
+    # v10.4.3 W1 (#549, akres E3c): grouped 8089 clients, LDAP good, but TAK's HTTPS side gives
+    # the check user AND a second user no groups, the outpost up well past the ops #316
+    # self-recovery window. That is the stuck state (every user, until TAK restarts): restart
+    # now, not after 15 min. ops #316 (test6, 182 s) is still covered: the normal rounds run
+    # first, and nothing restarts inside _TAK_HTTPS_STUCK_AFTER_OUTPOST_S of the outpost start.
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others')
+    assert box.recycle() is True
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']] and box.drops() == []
+    assert box.t - box.first_login >= _const('_TAK_API_CHECK_WAIT_S')       # the normal rounds ran
+    assert not any('TAK Server NOT restarted yet' in l for l in box.log)
+    assert any('min after the LDAP outpost started' in l and 'restarting TAK Server now' in l for l in box.log)
+    assert len({u for u, m, url in box.user_api if url.endswith('groups/all')}) >= 2   # a second user was asked
+    st = box.settings['tak_ldap_recycle']
+    assert st['last_outcome'] == 'restarted' and 'https_broken_since' not in st
+    [(at, args, kw)] = box.alerts                          # clients were dropped: Guard Dog says so
+    assert 'restarted' in args[1]
+
+
+def test_w1_partial_case_keeps_the_hold():
+    # Another user gets its groups: not the all-users stuck state. With grouped clients
+    # connected, the GH #549 hold stays (checked every tick, restart after 15 min).
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others',
+                      https_partial=True)
     assert box.recycle() is False
     assert box.restarts() == [] and box.drops() == []
-    assert box.t - box.first_login >= _const('_TAK_API_CHECK_WAIT_S')       # no stuck shortcut
-    assert not any('not waiting the rest of the' in l or 'falling back to restarting' in l for l in box.log)
     [line] = [l for l in box.log if l.startswith('  ✗ TAK LDAP recycle:')]
+    assert 'another user is fine' in line
     assert re.search(r'TAK Server NOT restarted yet: \d+ connected client\(s\) have their groups', line)
     st = box.settings['tak_ldap_recycle']
     assert st['last_outcome'] == 'clients fine, no restart (HTTPS still broken, clients kept, re-checking)'
     assert box.alerts == []
+
+
+@pytest.fixture
+def long_window(monkeypatch):
+    # The ops #158 stuck shortcut is the only path that finds TAK broken before the full
+    # _TAK_API_CHECK_WAIT_S, and it already holds off while the outpost is new. To reach the
+    # W1 window from it, stretch the window past that shortcut (fake clock, no real wait).
+    real = _const
+    win = 2 * HOUR
+    monkeypatch.setattr(sys.modules[__name__], '_const',
+                        lambda c: win if c == '_TAK_HTTPS_STUCK_AFTER_OUTPOST_S' else real(c))
+    return win
+
+
+def test_w1_nothing_restarts_inside_the_window_after_the_outpost_start(long_window):
+    # TAK found broken before the outpost has been up the window: wait it out, check once
+    # more, and restart only if it is still broken then.
+    box = idle_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others')
+    assert box.recycle() is True
+    assert any('checking once more in' in l for l in box.log)
+    assert box.tak_start - (T0 - HOUR) >= long_window
+
+
+def test_w1_tak_that_recovers_inside_the_window_is_not_restarted(long_window):
+    box = idle_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others')
+    real_sleep = box.sleep
+
+    def sleep(sec):
+        if any('checking once more in' in l for l in box.log[-1:]):
+            box.https = 'ok'                  # ops #316: TAK came back by itself
+        real_sleep(sec)
+    box.sleep = sleep
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert any('no TAK Server restart needed' in l for l in box.log)
 
 
 # ── GH #549: TAK's HTTPS side that stays broken with clients connected ───────────────
@@ -884,7 +946,9 @@ def _ticks_until_restart(box, most=4):
 
 
 def test_gh549_https_still_broken_is_rechecked_every_tick_and_tak_restarts_after_15_min():
-    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others')
+    # v10.4.3 W1: the hold is kept only for the partial case (another user is fine).
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others',
+                      https_partial=True)
     assert box.recycle() is False and box.restarts() == []
     st = box.settings['tak_ldap_recycle']
     assert 'healed_ldap_start' not in st                  # the outage is NOT marked healed
@@ -910,7 +974,9 @@ def test_gh549_https_still_broken_is_rechecked_every_tick_and_tak_restarts_after
 
 
 def test_gh549_https_that_recovers_by_itself_before_15_min_never_restarts_tak():
-    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others')
+    # v10.4.3 W1: partial case (another user is fine) — the only one that still holds.
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others',
+                      https_partial=True)
     box.recycle()
     box.https = 'ok'
     box.t += 600
@@ -945,12 +1011,12 @@ def test_gh549_tak_that_booted_with_authentik_and_has_no_https_groups_is_found()
     for gap in (-60, 0, 90):
         box = healthy_box(tak_start=T0 - 20 * 60, ldap_start=T0 - 20 * 60 + gap, https='no_groups',
                           outpost='others')
-        assert box.recycle(trigger='periodic LDAP outage check', final=False) is False, gap
-        assert box.restarts() == []                    # clients connected: not at once
+        # v10.4.3 W1: every user broken, outpost up 20 min (akres E2b/E2f): restart at once,
+        # clients connected or not.
+        assert box.recycle(trigger='periodic LDAP outage check', final=False) is True, gap
+        assert box.restarts() == [['systemctl', 'restart', 'takserver']], gap
         assert any('started together with Authentik' in l for l in box.log), gap
-        st = box.settings['tak_ldap_recycle']
-        assert st['pending'] and st['https_broken_since'] and st['boot_checked_tak_start'] == T0 - 20 * 60
-        assert _ticks_until_restart(box) is not None, gap
+        assert box.settings['tak_ldap_recycle']['boot_checked_tak_start'] == T0 - 20 * 60
     box = idle_box(tak_start=T0 - 20 * 60, ldap_start=T0 - 20 * 60 + 30, https='no_groups')
     assert box.recycle(trigger='periodic LDAP outage check', final=False) is True   # nobody to drop
 
@@ -974,7 +1040,8 @@ def test_gh549_healthy_boot_is_checked_once_per_tak_start_and_quietly():
 
 def test_ops316_https_broken_after_an_8089_heal_never_restarts_tak():
     # The 8089 heal gave the empty client its groups back: it counts as a client to keep.
-    box = outage_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups')
+    # v10.4.3 W1: so long as another user is fine (partial); every user broken restarts.
+    box = outage_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', https_partial=True)
     assert box.recycle() is False
     assert box.restarts() == [] and box.drops() == ['tls:16']
     assert box.settings['tak_ldap_recycle']['last_outcome'] == \
@@ -1127,8 +1194,8 @@ def test_https_check_backs_off_and_is_bounded():
     real_sleep = box.sleep
 
     def sleep(s):
-        if any('HTTPS check round' in l for l in box.log[-1:]):
-            waits.append(s)
+        if not box.restarts() and any('HTTPS check round' in l for l in box.log[-1:]):
+            waits.append(s)                   # the rounds before the restart (W1 restarts after them)
         real_sleep(s)
     box.sleep = sleep
     box.recycle()
