@@ -53733,6 +53733,12 @@ _CT_MEDIA_APPLY_SH = r'''
 exec 8>/tmp/.ct-media-heal.lock
 command -v flock >/dev/null 2>&1 && flock 8
 F=/mediamtx.yml
+# ops #950 (ARM fresh install, 10.4.3 candidate): right after a recreate the image's /start is still
+# running `node /dist/configure.js`, which reads this file and writes it back before it starts MediaMTX.
+# An edit that lands in that window is undone by the write, or leaves the file torn, and MediaMTX then
+# starts from a file with no api and no playback. Wait (20 s at most) until that script has ended.
+w=0
+while [ $w -lt 40 ] && ps 2>/dev/null | grep -q '[c]onfigure\.js'; do sleep 0.5; w=$((w+1)); done
 state() {
 if [ "$(grep -cE '^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):' $F 2>/dev/null)" = 5 ] \
  && grep -q "^hlsVariant: mpegts" $F 2>/dev/null \
@@ -53759,8 +53765,7 @@ if [ "$1" != ok ]; then
   grep -vE '^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):' "$F" > "$F.ops950.tmp"
   [ $? -le 1 ] || { rm -f "$F.ops950.tmp"; echo "cannot read $F" >&2; exit 1; }
   printf 'hlsVariant: mpegts\nhlsAlwaysRemux: no\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n' >> "$F.ops950.tmp"
-  cat "$F.ops950.tmp" > "$F"
-  rm -f "$F.ops950.tmp"
+  mv -f "$F.ops950.tmp" "$F" || { rm -f "$F.ops950.tmp"; echo "cannot replace $F" >&2; exit 1; }
 fi
 for f in /lib/persist.ts /dist/lib/persist.js; do
   [ -f "$f" ] && sed -i "s/'ephemeral', 'false'/'ephemeral', 'all'/g" "$f"
@@ -54235,33 +54240,42 @@ def _cloudtak_upload_limit_heal(plog=None, remote_cfg=None, wait=False):
 
 
 # ops #969 (infra-TAK #589): CloudTAK refuses to save the schedule or the login (environment) of a
-# server-wide ETL layer. Every ETL layer infra-TAK makes is server-wide (connection 0). The UI saves
-# it with PATCH /api/connection/0/layer/ID/incoming (and /outgoing), and CloudTAK's two routes declare
-# `connectionid: Type.Integer({ minimum: 1 })` and have no connection-0 branch (Create, Delete, Update
-# Layer and Get Layer have one), so the save is refused with "Validation Error" (400, then 404 once the
-# limit is relaxed). Reported upstream as dfpc-coe/CloudTAK#2042. Until a CloudTAK release carries the
-# fix, this gives both routes the branch the sibling routes use: connection 0 is allowed for an admin
-# only, and the layer must have no connection. It edits the compiled route inside the api container
-# (a recreate brings back the original, so it runs wherever the upload-limit heal runs) and restarts
-# the api once, because node has already loaded the route. A route that already declares minimum 0 is
-# left alone (upstream fixed it), and so is any file whose shape differs from what this expects: that
-# is never counted as drift. A restart rewrites nginx.conf, so the upload-limit heal runs again
-# straight after. The script prints OK <mtime> for a patched file: the console compares that time
-# with the container's start, so a patched file that the api never reloaded (a failed restart, a
-# console stopped between the edit and the restart) is drift too, and the restart is only done while
-# the api answers (never in the middle of first-boot migrations).
+# server-wide ETL layer, and an ETL on such a layer cannot keep its session. Every ETL layer infra-TAK
+# makes is server-wide (connection 0). Two parts, both edits of compiled routes inside the api container:
+#  1. The UI saves a layer with PATCH /api/connection/0/layer/ID/incoming (and /outgoing). CloudTAK's two
+#     routes (connection-layer.js) declare `connectionid: Type.Integer({ minimum: 1 })` and have no
+#     connection-0 branch (Create, Delete, Update Layer and Get Layer have one), so the save is refused
+#     with "Validation Error" (400, then 404 once the limit is relaxed). dfpc-coe/CloudTAK#2042.
+#  2. A running ETL stores its cached session with PUT /api/connection/null/layer/ID/incoming/ephemeral:
+#     the ETL library builds the URL from the layer's connection, which is null for a server-wide layer.
+#     The two ephemeral routes (connection-layer-ephemeral.js) take only an integer of 1 or more and call
+#     Auth.is_connection, so every run fails right after the login ("Failed to put ephemeral values to
+#     ETL") and the login repeats every run. dfpc-coe/CloudTAK#2047.
+# Until a CloudTAK release carries the fixes, this gives the routes the branch their siblings use:
+# connection 0 (and, for ephemeral only, the word null the ETL library sends) is allowed for an admin
+# only, plus, for ephemeral, that layer's own ETL token; the layer must have no connection. A connection
+# token never reaches it (its id of 0 would match any connection token). The edit goes into the compiled
+# route inside the api container (a recreate brings back the original, so it runs wherever the
+# upload-limit heal runs) and the api is restarted once, because node has already loaded the routes. A
+# route that already declares minimum 0 is left alone (upstream fixed it), and so is any file whose
+# shape differs from what this expects: that is never counted as drift. A restart rewrites nginx.conf, so
+# the upload-limit heal runs again straight after. The script prints one line: OK <mtime> for a patched
+# file: the console compares that time with the container's start, so a patched file that the api never
+# reloaded (a failed restart, a console stopped between the edit and the restart) is drift too, and the
+# restart is only done while the api answers (never in the middle of first-boot migrations).
 _CT_ETL_LAYER_SH = r'''cd /home/etl/api 2>/dev/null || { echo NOCONF; exit 0; }
 F=dist/stateless/routes/connection-layer.js
 [ -f "$F" ] || { echo NOCONF; exit 0; }
 command -v node >/dev/null 2>&1 || { echo NOCONF; exit 0; }
-MODE=__MODE__ F="$F" node - <<'JS'
+MODE=__MODE__ F="$F" E=dist/stateless/routes/connection-layer-ephemeral.js node - <<'JS'
 const fs = require('fs');
 const cp = require('child_process');
-const F = process.env.F;
 const MODE = process.env.MODE;
-const t = fs.readFileSync(F, 'utf8');
 const MIN1 = 'connectionid: Type.Integer({ minimum: 1 })';
 const MIN0 = 'connectionid: Type.Integer({ minimum: 0 })';
+const SHAPE = {};
+const shape = () => { throw SHAPE; };
+// ---- connection-layer.js: PATCH incoming and outgoing (ops #969, CloudTAK#2042)
 const OLDAUTH = [
   '            const { connection } = await Auth.is_connection(config, req, {',
   '                resources: [',
@@ -54295,51 +54309,141 @@ const NEWAUTH = [
   ''].join('\n');
 const OLDCMP = 'if (layer.connection !== connection.id) {';
 const NEWCMP = 'if (connection && layer.connection !== connection.id) {';
-const shape = () => { console.log('SHAPE'); process.exit(0); };
-let out = t;
-let need = 0;
-for (const d of ['Update an incoming layer configuration', 'Update an outgoing layer configuration']) {
-  const i = out.indexOf(d);
-  if (i < 0) shape();
-  const j = out.indexOf(MIN1, i);
-  if (j < 0 || j - i > 200) {
-    const z = out.indexOf(MIN0, i);
-    if (z >= 0 && z - i <= 200) continue;   // this route already takes connection 0: upstream fixed it
-    shape();
+const DONE1 = 'connection 0 is a server-wide layer, admin only';
+function planLayer(t) {
+  let out = t;
+  let need = 0;
+  for (const d of ['Update an incoming layer configuration', 'Update an outgoing layer configuration']) {
+    const i = out.indexOf(d);
+    if (i < 0) shape();
+    const j = out.indexOf(MIN1, i);
+    if (j < 0 || j - i > 200) {
+      const z = out.indexOf(MIN0, i);
+      if (z >= 0 && z - i <= 200) continue;   // this route already takes connection 0: upstream fixed it
+      shape();
+    }
+    const k = out.indexOf(OLDAUTH, j);
+    if (k < 0 || k - j > 1500) shape();
+    out = out.slice(0, j) + MIN0 + out.slice(j + MIN1.length, k) + NEWAUTH + out.slice(k + OLDAUTH.length);
+    if (d.indexOf('incoming') >= 0) {
+      // only inside this route: the check that the layer belongs to the connection must cope with no connection
+      const c = out.indexOf(OLDCMP, j);
+      if (c < 0 || c - j > 4000) shape();
+      out = out.slice(0, c) + NEWCMP + out.slice(c + OLDCMP.length);
+    }
+    need++;
   }
-  const k = out.indexOf(OLDAUTH, j);
-  if (k < 0 || k - j > 1500) shape();
-  out = out.slice(0, j) + MIN0 + out.slice(j + MIN1.length, k) + NEWAUTH + out.slice(k + OLDAUTH.length);
-  if (d.indexOf('incoming') >= 0) {
-    // only inside this route: the check that the layer belongs to the connection must cope with no connection
-    const c = out.indexOf(OLDCMP, j);
-    if (c < 0 || c - j > 4000) shape();
-    out = out.slice(0, c) + NEWCMP + out.slice(c + OLDCMP.length);
+  return { out, need, done: t.indexOf(DONE1) >= 0 };
+}
+// ---- connection-layer-ephemeral.js: PUT incoming and outgoing ephemeral (ops #969, CloudTAK#2047)
+const UNION = "connectionid: Type.Union([Type.Integer({ minimum: 0 }), Type.Literal('null')])";
+const DONE2 = 'a server-wide layer stores its own ephemeral values';
+function oldEphAuth(kind) {
+  return [
+  '            const { connection } = await Auth.is_connection(config, req, {',
+  '                resources: [',
+  '                    { access: AuthResourceAccess.CONNECTION, id: req.params.connectionid },',
+  '                    { access: AuthResourceAccess.LAYER, id: req.params.layerid },',
+  '                ],',
+  '            }, req.params.connectionid);',
+  '            if (connection.readonly)',
+  "                throw new Err(400, null, 'Connection is Read-Only mode');",
+  '            const layer = await config.models.Layer.augmented_from(req.params.layerid);',
+  '            if (layer.connection !== connection.id) {',
+  "                throw new Err(400, null, 'Layer does not belong to this connection');",
+  '            }',
+  '            else if (!layer.' + kind + ') {',
+  ''].join('\n');
+}
+function newEphAuth(kind) {
+  return [
+  '            // ops #969 (infra-TAK #589): ' + DONE2 + '. The ETL library puts null in the URL for it',
+  '            // (0 once CloudTAK sends that): this layer\'s own ETL token or an admin, and the layer must have no connection',
+  '            let connection = null;',
+  '            let layer;',
+  "            if (req.params.connectionid === 0 || req.params.connectionid === 'null') {",
+  '                const auth = await Auth.is_auth(config, req, {',
+  '                    resources: [{ access: AuthResourceAccess.LAYER, id: req.params.layerid }],',
+  '                });',
+  '                if (auth.access !== AuthResourceAccess.LAYER) {',
+  '                    await Auth.as_user(config, req, { admin: true });',
+  '                }',
+  '                layer = await config.models.Layer.augmented_from(req.params.layerid);',
+  '                if (layer.connection !== null) {',
+  "                    throw new Err(400, null, 'Layer is not an admin layer');",
+  '                }',
+  '            }',
+  '            else {',
+  '                const auth = await Auth.is_connection(config, req, {',
+  '                    resources: [',
+  '                        { access: AuthResourceAccess.CONNECTION, id: req.params.connectionid },',
+  '                        { access: AuthResourceAccess.LAYER, id: req.params.layerid },',
+  '                    ],',
+  '                }, req.params.connectionid);',
+  '                connection = auth.connection;',
+  '                if (connection.readonly)',
+  "                    throw new Err(400, null, 'Connection is Read-Only mode');",
+  '                layer = await config.models.Layer.augmented_from(req.params.layerid);',
+  '                if (layer.connection !== connection.id) {',
+  "                    throw new Err(400, null, 'Layer does not belong to this connection');",
+  '                }',
+  '            }',
+  '            if (!layer.' + kind + ') {',
+  ''].join('\n');
+}
+function planEphemeral(t) {
+  let out = t;
+  let need = 0;
+  for (const kind of ['incoming', 'outgoing']) {
+    const i = out.indexOf("name: '" + (kind === 'incoming' ? 'Incoming' : 'Outgoing') + " Ephemeral'");
+    if (i < 0) shape();
+    const j = out.indexOf(MIN1, i);
+    if (j < 0 || j - i > 300) {
+      const z = out.indexOf(MIN0, i);
+      const u = out.indexOf(UNION, i);
+      if ((z >= 0 && z - i <= 300) || (u >= 0 && u - i <= 300)) continue;   // ours already, or upstream fixed it
+      shape();
+    }
+    const o = oldEphAuth(kind);
+    const k = out.indexOf(o, j);
+    if (k < 0 || k - j > 1500) shape();
+    out = out.slice(0, j) + UNION + out.slice(j + MIN1.length, k) + newEphAuth(kind) + out.slice(k + o.length);
+    need++;
   }
-  need++;
+  return { out, need, done: t.indexOf(DONE2) >= 0 };
 }
-if (need === 0) {
-  console.log(t.indexOf('connection 0 is a server-wide layer, admin only') >= 0
-    ? 'OK ' + Math.floor(fs.statSync(F).mtimeMs / 1000) : 'UPSTREAM');
-  process.exit(0);
-}
-if (MODE !== 'apply') { console.log('MISSING'); process.exit(0); }
-const tmp = F.replace(/\.js$/, '.ops969.' + process.pid + '.tmp.js');
-try {
-  fs.writeFileSync(tmp, out);
-  const chk = cp.spawnSync(process.execPath, ['--check', tmp]);
-  if (chk.status !== 0) {
-    console.log('FAIL');
-  } else {
+// ---- one file: SHAPE, OK <mtime>, UPSTREAM, MISSING (check), HEALED or FAIL (apply), NOCONF (not there)
+function handle(F, plan) {
+  if (!fs.existsSync(F)) return 'NOCONF';
+  const t = fs.readFileSync(F, 'utf8');
+  let p;
+  try { p = plan(t); } catch (e) { if (e === SHAPE) return 'SHAPE'; throw e; }
+  if (p.need === 0) {
+    return p.done ? 'OK ' + Math.floor(fs.statSync(F).mtimeMs / 1000) : 'UPSTREAM';
+  }
+  if (MODE !== 'apply') return 'MISSING';
+  const tmp = F.replace(/\.js$/, '.ops969.' + process.pid + '.tmp.js');
+  try {
+    fs.writeFileSync(tmp, p.out);
+    const chk = cp.spawnSync(process.execPath, ['--check', tmp]);
+    if (chk.status !== 0) return 'FAIL';
     if (!fs.existsSync(F + '.ops969.bak')) fs.copyFileSync(F, F + '.ops969.bak');
     fs.renameSync(tmp, F);
-    console.log('HEALED');
+    return 'HEALED';
+  } catch (e) {
+    return 'FAIL';
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (e) { /* already renamed or never written */ }
   }
-} catch (e) {
-  console.log('FAIL');
-} finally {
-  try { fs.unlinkSync(tmp); } catch (e) { /* already renamed or never written */ }
 }
+const r = [handle(process.env.F, planLayer), handle(process.env.E, planEphemeral)].filter((x) => x !== 'NOCONF');
+const times = r.filter((x) => x.indexOf('OK ') === 0).map((x) => Number(x.split(' ')[1]));
+console.log(r.length === 0 ? 'NOCONF'
+  : r.indexOf('HEALED') >= 0 ? 'HEALED'      // an edit is on disk: the api must restart to load it; a failure on the other file shows on the next check
+  : r.indexOf('FAIL') >= 0 ? 'FAIL'
+  : r.indexOf('MISSING') >= 0 ? 'MISSING'
+  : times.length ? 'OK ' + Math.max.apply(null, times)
+  : r.indexOf('UPSTREAM') >= 0 ? 'UPSTREAM' : 'SHAPE');
 JS
 '''
 _cloudtak_etl_heal_lock = threading.Lock()
@@ -54360,8 +54464,8 @@ def _ct_etl_stale(script_out, started):
 
 
 def _cloudtak_etl_layer_heal(plog=None, remote_cfg=None, wait=False):
-    """ops #969: let an admin save the schedule and login of a server-wide ETL layer (see the block
-    comment above). Convergence like _cloudtak_upload_limit_heal: it reads the live route first and
+    """ops #969: let an admin save the schedule and login of a server-wide ETL layer, and let an ETL
+    on it store its session (see the block comment above). Convergence like _cloudtak_upload_limit_heal: it reads the live route first and
     edits it only when it still has the minimum-1 connection id, so a converged box, or a CloudTAK
     that already carries the upstream fix, is a no-op with no restart. After an edit (or when an
     earlier edit was never reloaded) it restarts the api container once, but only while the api
@@ -54444,7 +54548,7 @@ def _cloudtak_etl_layer_heal(plog=None, remote_cfg=None, wait=False):
                                         capture_output=True, text=True, timeout=120)
                     out = 'HEALED' if rs.returncode == 0 and _answers(name, 40) else 'NOAPI'
         if out == 'HEALED':
-            _log("  ✓ CloudTAK ETL layers: an admin can now save the schedule and login of a server-wide layer (api restarted once)")
+            _log("  ✓ CloudTAK ETL layers: an admin can now save the schedule and login of a server-wide layer, and its ETL keeps its session between runs (api restarted once)")
             _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # the restart rewrote nginx.conf
             return True
         if out in ('OK', 'UPSTREAM'):
@@ -54453,7 +54557,7 @@ def _cloudtak_etl_layer_heal(plog=None, remote_cfg=None, wait=False):
             _log("  ℹ CloudTAK ETL layer fix not applied: the api's layer routes differ from what it expects (left unchanged)")
             return True  # never counted as drift
         if wait or out in ('FAIL', 'NOAPI'):
-            _log(f"  ⚠ CloudTAK ETL layer fix not applied ({out or 'no answer'}); saving the schedule or login of a server-wide ETL layer may fail")
+            _log(f"  ⚠ CloudTAK ETL layer fix not applied ({out or 'no answer'}); saving the schedule or login of a server-wide ETL layer, or its ETL keeping a session, may fail")
         return False
     except Exception as e:
         _log(f"  ⚠ CloudTAK ETL layer fix error (non-fatal): {e}")
@@ -59726,6 +59830,98 @@ def _cloudtak_drop_build_data(cloudtak_dir):
         pass
 
 
+# ops #983 (infra-TAK #601): a CloudTAK Update on a nearly full disk ran the 3-minute build, died
+# with "no space left on device" (tippecanoe make, npm install), and the revert of the checkout
+# failed for the same reason. The floor is MEASURED, not guessed (ops #983, Ubuntu 22.04 x86_64,
+# CloudTAK 13.124.0, Docker 29.10): a no-cache build of the four CloudTAK images with every layer
+# new wrote 11.3 GB (images 6.6 GB + build cache); the ready-made images `up -d` can pull (media,
+# postgis, garage) add 1.7 GB; the TAK Portal print image on test12 is 2.1 GB. 11.3 + 1.7 + 2.1 =
+# 15.1 GB, rounded up to 16. The old images and old build cache stay until pruned, so none of it
+# is given back during the update. One number for every box (fleet constant, no per-box tiers).
+_CLOUDTAK_UPDATE_MEASURED_GB = 16
+_CLOUDTAK_UPDATE_MIN_FREE = _CLOUDTAK_UPDATE_MEASURED_GB * 1024 ** 3
+_CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT = 1024 ** 3   # the checkout itself: the new tag's files, ~0.3 GB
+
+
+def _cloudtak_fs_free_local(path):
+    """(filesystem id, free bytes a non-root process may use) for the filesystem holding `path`,
+    or (None, None) when it cannot be read. Walks up to the nearest ancestor that can be read:
+    /var/lib/docker is root-only (mode 710), so a non-root console asks about /var/lib instead."""
+    probe = path
+    while probe:
+        try:
+            st = os.statvfs(probe)
+            return os.stat(probe).st_dev, st.f_bavail * st.f_frsize
+        except OSError:
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+    return None, None
+
+
+def _cloudtak_fs_free_remote(remote_cfg, path):
+    """The same (filesystem id, free bytes) for `path` on the remote CloudTAK host, over SSH."""
+    q = f'"{path}"' if re.fullmatch(r'\$HOME/[A-Za-z0-9._-]+', path) else shlex.quote(path)
+    ok, out = _ssh_probe(
+        remote_cfg,
+        f"p={q}; while [ ! -e \"$p\" ] && [ \"$p\" != / ]; do p=$(dirname \"$p\"); done; "
+        "df -P -B1 \"$p\" | awk 'NR==2{print $1, $4}'", timeout=30)
+    try:
+        fsid, free = (out or '').strip().splitlines()[-1].split()
+        return fsid, int(free)
+    except Exception:
+        return None, None
+
+
+def _cloudtak_update_space_problem(cloudtak_dir, remote_cfg=None):
+    """None when there is room for a CloudTAK Update, or a dict describing what is short.
+
+    Two places fill up: the Docker data folder (the rebuilt images and the build cache) and the
+    CloudTAK checkout. They are usually one disk; when they are, the bigger need applies to it.
+    A number that cannot be read never blocks an Update (the old behaviour stays)."""
+    try:
+        rc, out, _err = _cloudtak_docker(['docker', 'info', '--format', '{{.DockerRootDir}}'],
+                                         remote_cfg=remote_cfg, timeout=30)
+        docker_root = (out or '').strip().splitlines()[-1] if rc == 0 and (out or '').strip() else ''
+    except Exception:
+        docker_root = ''
+    if not docker_root.startswith('/'):
+        docker_root = '/var/lib/docker'
+    ct_path = '~/CloudTAK' if remote_cfg is not None else cloudtak_dir
+    if remote_cfg is not None:
+        d_id, d_free = _cloudtak_fs_free_remote(remote_cfg, docker_root)
+        c_id, c_free = _cloudtak_fs_free_remote(remote_cfg, '$HOME/CloudTAK')
+    else:
+        d_id, d_free = _cloudtak_fs_free_local(docker_root)
+        c_id, c_free = _cloudtak_fs_free_local(ct_path)
+    checks = []   # (what, where, free, need)
+    if d_free is not None:
+        need = _CLOUDTAK_UPDATE_MIN_FREE
+        if c_free is not None and c_id == d_id:
+            need += _CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT
+        checks.append(('the CloudTAK images and build cache', docker_root, d_free, need))
+    if c_free is not None and not (d_free is not None and c_id == d_id):
+        checks.append(('the CloudTAK files', ct_path, c_free, _CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT))
+    for what, where, free, need in checks:
+        if free < need:
+            return {'what': what, 'where': where, 'free': free, 'need': need}
+    return None
+
+
+def _cloudtak_update_space_lines(problem):
+    """The log lines for a refused Update: what is short, that nothing changed, what to do."""
+    gb = 1024 ** 3
+    return [
+        f"✗ Not enough free disk space to update CloudTAK: {problem['free'] / gb:.1f} GB free for "
+        f"{problem['what']} ({problem['where']}); the update needs about {problem['need'] / gb:.0f} GB.",
+        "  Nothing was changed. CloudTAK is still running as before.",
+        "  Free some space, then press Update again. Safe ways: run `docker builder prune -f` and",
+        "  `docker image prune -f` on this server (old build cache and unused image layers), and",
+        "  delete old logs or backups. Do not delete Docker volumes: they hold your data.",
+    ]
+
+
 def run_cloudtak_update():
     """Fetch latest stable release tag, checkout, rebuild images, restart. Preserves DB and config."""
     def plog(msg):
@@ -59791,6 +59987,15 @@ def run_cloudtak_update():
                 plog(f"✗ {release_tag} is older than the {from_ver} already running; not downgrading. Nothing was changed.")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+        # ops #983: refuse BEFORE anything is checked out or built when the disk cannot hold the
+        # rebuild. A full disk used to fail the build after minutes and leave the checkout unwritable.
+        _space = _cloudtak_update_space_problem(None if is_remote else os.path.expanduser('~/CloudTAK'),
+                                                remote_cfg=(remote_cfg if is_remote else None))
+        if _space:
+            for _l in _cloudtak_update_space_lines(_space):
+                plog(_l)
+            cloudtak_deploy_status.update({'running': False, 'error': True})
+            return
         _mod_result_versions('cloudtak', frm=from_ver, to=(release_tag or '').lstrip('vV'))
 
         plog("")
@@ -92384,6 +92589,58 @@ def _rotate_coreconfig_truststore(cc_text):
     return path, html.unescape(p.group(1)) if p else ''
 
 
+def _coreconfig_signing_ca(cc_text):
+    """Name of the CA whose signing keystore CoreConfig's <TAKServerCAConfig> names, from
+    keystoreFile="certs/files/NAME-signing.jks" ('' when the element or the pattern is absent)."""
+    m = re.search(r'<TAKServerCAConfig\b[^>]*\bkeystoreFile="([^"]*)"', cc_text or '')
+    base = (m.group(1) if m else '').rsplit('/', 1)[-1]
+    return base[:-len('-signing.jks')] if base.endswith('-signing.jks') and len(base) > len('-signing.jks') else ''
+
+
+def _coreconfig_truststore_ca(cc_text):
+    """NAME from the truststore-NAME.jks that the <tls> under <security> enforces ('' otherwise)."""
+    path, _pw = _rotate_coreconfig_truststore(cc_text)
+    base = os.path.basename(path or '')
+    return base[len('truststore-'):-len('.jks')] if re.match(r'^truststore-.+\.jks$', base) else ''
+
+
+def _coreconfig_point_at_ca(cc_text, old_ca_name, new_ca_name):
+    """CoreConfig.xml with its CA references moved to new_ca_name (ops #986).
+
+    The names to replace are the ones the FILE holds: the signing keystore of
+    <TAKServerCAConfig> and the truststore of <security><tls>. They used to be taken from
+    ca.pem, which runs ahead of CoreConfig.xml after a rotation that stopped half-way (ca.pem is
+    the new CA from Step 2 on, CoreConfig.xml is written only at Step 6). The replace then found
+    nothing, the step still logged success, and TAK Server kept signing with the old CA."""
+    text = cc_text or ''
+    sign_old = _coreconfig_signing_ca(text)
+    if sign_old and sign_old != new_ca_name:
+        text = re.sub(r'(<TAKServerCAConfig\b[^>]*\bkeystoreFile="(?:[^"]*/)?)' + re.escape(sign_old)
+                      + r'(-signing\.jks")', lambda m: m.group(1) + new_ca_name + m.group(2), text, count=1)
+    trust_old = _coreconfig_truststore_ca(text)
+    if trust_old and trust_old != new_ca_name:
+        sec = re.search(r'<security\b.*?</security>', text, re.S)
+        if sec:
+            fixed = re.sub(r'(<tls\b[^>]*\btruststoreFile="(?:[^"]*/)?truststore-)' + re.escape(trust_old)
+                           + r'(\.jks")', lambda m: m.group(1) + new_ca_name + m.group(2), sec.group(0), count=1)
+            text = text[:sec.start()] + fixed + text[sec.end():]
+    if old_ca_name and old_ca_name in text:
+        text = text.replace(old_ca_name, new_ca_name)
+    return text
+
+
+def _coreconfig_ca_mismatch(cc_text, new_ca_name):
+    """What CoreConfig.xml still names that is not new_ca_name: [] when it is all on the new CA."""
+    left = []
+    sign = _coreconfig_signing_ca(cc_text)
+    if sign and sign != new_ca_name:
+        left.append(f'signing keystore {sign}-signing.jks')
+    trust = _coreconfig_truststore_ca(cc_text)
+    if trust and trust != new_ca_name:
+        left.append(f'truststore truststore-{trust}.jks')
+    return left
+
+
 def _pem_key(pem):
     """The base64 body of a PEM cert, whitespace-free: equal for the same cert in any store."""
     m = re.search(r'-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----', pem or '', re.S)
@@ -92766,13 +93023,26 @@ def takserver_rotate_intca():
             log("Step 6/7: Updating CoreConfig.xml...")
             # v10.0.5 non-root: sed isn't broker-routed + /opt/tak is tak:tak — rewrite
             # CoreConfig via broker read-modify-write.
-            for _cc in ('/opt/tak/CoreConfig.xml', '/opt/tak/CoreConfig.example.xml'):
-                try:
-                    _t = _read_priv(_cc)
-                    if old_ca_name in _t:
-                        _write_priv(_cc, _t.replace(old_ca_name, new_ca_name))
-                except Exception:
-                    pass
+            # ops #986: the live CoreConfig.xml is moved by the names IT holds (ca.pem can be
+            # ahead of it after a half-failed rotation), and the step fails if it still names
+            # another CA afterwards. The example file is only a template: old name only.
+            try:
+                _t = _read_priv('/opt/tak/CoreConfig.xml')
+                _t2 = _coreconfig_point_at_ca(_t, old_ca_name, new_ca_name)
+                if _t2 != _t:
+                    _write_priv('/opt/tak/CoreConfig.xml', _t2)
+                _left = _coreconfig_ca_mismatch(_read_priv('/opt/tak/CoreConfig.xml'), new_ca_name)
+            except Exception as _cc_e:
+                raise Exception(f'CoreConfig.xml could not be updated or read back: {str(_cc_e)[:160]}')
+            if _left:
+                raise Exception(f'CoreConfig.xml still names {" and ".join(_left)} after the update, '
+                                f'not {new_ca_name}. TAK Server was not restarted')
+            try:
+                _t = _read_priv('/opt/tak/CoreConfig.example.xml')
+                if old_ca_name in _t:
+                    _write_priv('/opt/tak/CoreConfig.example.xml', _t.replace(old_ca_name, new_ca_name))
+            except Exception:
+                pass
             # v10.3.5 W9: issued certs can't outlive the new intermediate.
             try:
                 _t, _cl = _coreconfig_clamp_issued_validity(_read_priv('/opt/tak/CoreConfig.xml'), cert_dir)
@@ -122568,6 +122838,7 @@ _MODULE_CTX = {
     '_get_authentik_env_value': _get_authentik_env_value,
     '_ensure_authentik_tvr_app': _ensure_authentik_tvr_app,
     '_deregister_authentik_proxy_app': _deregister_authentik_proxy_app,
+    '_w1_reassert_app_mfa': _w1_reassert_app_mfa,   # ATLAS (ops #985): a new app gets the MFA gate on a Hardened box
     # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION;
     # W10: the shared infratak network + the CloudTAK override refresh (api recreate)
     '_get_tak_deployment_config': _get_tak_deployment_config,

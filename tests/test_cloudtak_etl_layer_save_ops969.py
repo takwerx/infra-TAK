@@ -14,7 +14,8 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""ops #969 / infra-TAK #589 — saving the schedule or login of an ETL layer fails in CloudTAK.
+"""ops #969 / infra-TAK #589 — saving the schedule or login of an ETL layer fails in CloudTAK, and an
+ETL on a server-wide layer cannot keep its session (second half of this file, dfpc-coe/CloudTAK#2047).
 
 Every ETL layer infra-TAK makes is server-wide (connection 0). CloudTAK's UI saves it with
 PATCH /api/connection/0/layer/ID/incoming (and /outgoing). Those two routes declare
@@ -50,6 +51,8 @@ APP = (REPO / 'app.py').read_text(encoding='utf-8')
 FIXTURES = REPO / 'tests' / 'fixtures'
 ROUTES = FIXTURES / 'cloudtak-13.124.0-connection-layer-routes.mjs'
 HARNESS = FIXTURES / 'etl-layer-routes-harness.mjs'
+EPH_ROUTES = FIXTURES / 'cloudtak-13.124.0-connection-layer-ephemeral-routes.mjs'
+EPH_HARNESS = FIXTURES / 'etl-ephemeral-routes-harness.mjs'
 
 
 def _sh():
@@ -58,14 +61,18 @@ def _sh():
     return m.group(1)
 
 
-def _api_dir(tmp_path, text=None):
-    """A stand-in for /home/etl/api in the container: package.json says ESM, like the real one."""
+def _api_dir(tmp_path, text=None, ephemeral=None):
+    """A stand-in for /home/etl/api in the container: package.json says ESM, like the real one.
+    ephemeral=True also puts CloudTAK 13.124.0's ephemeral route file there (a text puts that text)."""
     api = tmp_path / 'etl' / 'api'
     route_dir = api / 'dist' / 'stateless' / 'routes'
     route_dir.mkdir(parents=True)
     (api / 'package.json').write_text('{"type": "module"}')
     route = route_dir / 'connection-layer.js'
     route.write_text(ROUTES.read_text() if text is None else text)
+    if ephemeral:
+        (route_dir / 'connection-layer-ephemeral.js').write_text(
+            EPH_ROUTES.read_text() if ephemeral is True else ephemeral)
     return api, route
 
 
@@ -78,6 +85,16 @@ def _run(api, mode):
 
 def _calls(route):
     r = subprocess.run(['node', str(HARNESS), str(route)], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    return json.loads(r.stdout)
+
+
+def _eph(api):
+    return api / 'dist' / 'stateless' / 'routes' / 'connection-layer-ephemeral.js'
+
+
+def _eph_calls(route):
+    r = subprocess.run(['node', str(EPH_HARNESS), str(route)], capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     return json.loads(r.stdout)
 
@@ -221,6 +238,173 @@ def test_a_patch_that_does_not_parse_is_never_installed(tmp_path):
     r = subprocess.run(['sh', '-c', script], capture_output=True, text=True, timeout=60)
     assert r.stdout.strip() == 'FAIL'
     assert route.read_text() == before
+    assert not list(route.parent.glob('*.tmp.js'))
+
+
+# ══ part 2 (CloudTAK#2047): an ETL on a server-wide layer stores its session ══════════════════════════
+# The ETL library builds /api/connection/<layer.connection>/layer/ID/incoming/ephemeral; for a
+# server-wide layer that is the word null. The two ephemeral routes take an integer of 1 or more.
+
+KINDS = ('incoming', 'outgoing')
+
+
+def test_cloudtak_13_124_0_cannot_store_an_etl_session_on_a_server_wide_layer(tmp_path):
+    api, _ = _api_dir(tmp_path, ephemeral=True)
+    got = _eph_calls(_eph(api))
+    for kind in KINDS:
+        assert got[kind]['connectionid_schema'] == {'kind': 'integer', 'minimum': 1}
+        # "Failed to put ephemeral values to ETL": the check refuses the URL before the route runs
+        assert got[kind]['etl_token_null']['code'] == 400
+        assert got[kind]['etl_token_zero']['code'] == 400
+        assert got[kind]['admin_null']['code'] == 400
+        assert got[kind]['conn_etl_token']['code'] == 200          # a connection's layer works, as the issue says
+
+
+def test_heal_lets_the_layers_own_etl_token_and_an_admin_store_a_session_with_null_or_0(tmp_path):
+    api, _ = _api_dir(tmp_path, ephemeral=True)
+    assert _run(api, 'apply') == 'HEALED'
+    got = _eph_calls(_eph(api))
+    for kind in KINDS:
+        assert got[kind]['etl_token_null']['code'] == 200
+        assert got[kind]['etl_token_zero']['code'] == 200
+        assert got[kind]['admin_null']['code'] == 200
+        assert got[kind]['stored_after_etl_token_null'] == [f'{kind}:1']     # on that layer, not another
+
+
+def test_heal_keeps_everyone_else_out_of_a_server_wide_layers_session(tmp_path):
+    api, _ = _api_dir(tmp_path, ephemeral=True)
+    _run(api, 'apply')
+    got = _eph_calls(_eph(api))
+    for kind in KINDS:
+        g = got[kind]
+        assert g['anonymous_null']['code'] == 401
+        assert g['user_null']['code'] == 401                  # signed in, not a system admin
+        assert g['agency_admin_null']['code'] == 401          # agency admins are not system admins
+        assert g['other_layer_token_null']['code'] == 403     # another layer's ETL token
+        # a connection token never gets in: the route's resource list has id 0, and CloudTAK's check
+        # lets any token of that kind through when the id is 0
+        assert g['connection_token_null']['code'] == 403
+        assert g['connection_token_zero']['code'] == 403
+        # connection 0 / null never reaches a connection's own layer, not even for an admin or its own token
+        assert g['admin_connection_layer_null']['code'] == 400
+        assert g['etl_token_connection_layer_null']['code'] == 400
+        assert g['no_config_null']['code'] == 400             # the layer has no incoming/outgoing config
+        # only integers and the word null in lower case: anything else is refused by the params check
+        assert [b['code'] for b in g['bad_words']] == [400, 400, 400, 400]
+
+
+def test_heal_leaves_a_connections_own_layer_session_as_it_was(tmp_path):
+    before = _eph_calls(_eph(_api_dir(tmp_path / 'base', ephemeral=True)[0]))
+    api, _ = _api_dir(tmp_path, ephemeral=True)
+    _run(api, 'apply')
+    after = _eph_calls(_eph(api))
+    for kind in KINDS:
+        for case in ('conn_etl_token', 'conn_owner', 'conn_other_user', 'conn_wrong_layer',
+                     'conn_etl_token_other_connection', 'conn_readonly', 'conn_connection_token'):
+            assert after[kind][case] == before[kind][case], case
+    assert after['incoming']['conn_etl_token']['code'] == 200
+    assert after['incoming']['conn_owner']['code'] == 200
+    assert after['incoming']['conn_other_user']['code'] == 401
+    assert after['incoming']['conn_wrong_layer']['code'] == 400       # the route's own owner check still runs
+    assert after['incoming']['conn_readonly']['code'] == 400          # read-only connections stay read-only
+
+
+def test_heal_edits_both_files_in_one_run_and_keeps_a_backup_of_each(tmp_path):
+    api, route = _api_dir(tmp_path, ephemeral=True)
+    orig_eph = _eph(api).read_text()
+    assert _run(api, 'check') == 'MISSING'
+    assert _eph(api).read_text() == orig_eph                          # check never edits
+    assert _run(api, 'apply') == 'HEALED'
+    assert (route.parent / 'connection-layer.js.ops969.bak').read_text() == ROUTES.read_text()
+    assert (route.parent / 'connection-layer-ephemeral.js.ops969.bak').read_text() == orig_eph
+    assert not list(route.parent.glob('*.tmp.js'))
+    again = _run(api, 'apply')
+    assert re.fullmatch(r'OK \d+', again) and re.fullmatch(r'OK \d+', _run(api, 'check'))
+    assert 'Type.Literal' in _eph(api).read_text()
+
+
+def test_a_box_the_first_version_of_the_fix_already_healed_gets_the_ephemeral_part_only(tmp_path):
+    # 10.4.2 boxes carry the layer-save edit and not the ephemeral one: the next heal adds the second
+    api, route = _api_dir(tmp_path)                                    # no ephemeral file yet
+    assert _run(api, 'apply') == 'HEALED'
+    first = route.read_text()
+    _eph(api).write_text(EPH_ROUTES.read_text())                       # CloudTAK has the file: only the first edit is in
+    assert _run(api, 'check') == 'MISSING'
+    assert _run(api, 'apply') == 'HEALED'
+    assert route.read_text() == first                                  # the first file is not touched again
+    assert 'Type.Literal' in _eph(api).read_text()
+    assert re.fullmatch(r'OK \d+', _run(api, 'check'))
+
+
+def test_an_ephemeral_file_cloudtak_fixed_itself_is_left_alone(tmp_path):
+    fixed = EPH_ROUTES.read_text().replace('connectionid: Type.Integer({ minimum: 1 })',
+                                           'connectionid: Type.Integer({ minimum: 0 })')
+    assert fixed != EPH_ROUTES.read_text()
+    api, route = _api_dir(tmp_path, text=ROUTES.read_text().replace(
+        'connectionid: Type.Integer({ minimum: 1 })', 'connectionid: Type.Integer({ minimum: 0 })'), ephemeral=fixed)
+    assert _run(api, 'check') == 'UPSTREAM' and _run(api, 'apply') == 'UPSTREAM'
+    assert _eph(api).read_text() == fixed
+    assert not list(route.parent.glob('*.ops969.*'))
+
+
+def test_the_ephemeral_fix_alone_is_ours_when_the_layer_routes_are_upstream_fixed(tmp_path):
+    api, route = _api_dir(tmp_path, text=ROUTES.read_text().replace(
+        'connectionid: Type.Integer({ minimum: 1 })', 'connectionid: Type.Integer({ minimum: 0 })'), ephemeral=True)
+    assert _run(api, 'check') == 'MISSING'
+    assert _run(api, 'apply') == 'HEALED'
+    assert re.fullmatch(r'OK \d+', _run(api, 'check'))                  # converged, and the mtime is the ephemeral file's
+    assert int(_run(api, 'check').split()[1]) == int(_eph(api).stat().st_mtime)
+
+
+def test_an_ephemeral_file_it_does_not_recognise_is_left_alone_and_is_not_drift(tmp_path):
+    changed = EPH_ROUTES.read_text().replace('config.models.Layer.augmented_from(req.params.layerid)',
+                                             'config.models.Layer.byId(req.params.layerid)')
+    assert changed != EPH_ROUTES.read_text()
+    api, route = _api_dir(tmp_path, text=ROUTES.read_text().replace(
+        'connectionid: Type.Integer({ minimum: 1 })', 'connectionid: Type.Integer({ minimum: 0 })'), ephemeral=changed)
+    assert _run(api, 'check') == 'UPSTREAM'                              # layer routes are CloudTAK's; this file is not ours to say
+    assert _run(api, 'apply') == 'UPSTREAM' and _eph(api).read_text() == changed
+    api2, _ = _api_dir(tmp_path / 'b', text='// nothing we know\n', ephemeral=changed)
+    assert _run(api2, 'apply') == 'SHAPE' and _eph(api2).read_text() == changed
+
+
+def test_one_unrecognised_file_does_not_stop_the_other_from_being_healed(tmp_path):
+    changed = EPH_ROUTES.read_text().replace('config.models.Layer.augmented_from(req.params.layerid)',
+                                             'config.models.Layer.byId(req.params.layerid)')
+    api, route = _api_dir(tmp_path, ephemeral=changed)
+    assert _run(api, 'apply') == 'HEALED'                               # the layer-save edit is in
+    assert _eph(api).read_text() == changed                             # the unknown file is untouched
+    assert re.fullmatch(r'OK \d+', _run(api, 'check'))                  # and the box counts as converged
+
+
+def test_the_check_that_a_route_belongs_to_the_connection_is_edited_only_inside_each_ephemeral_route(tmp_path):
+    # the same line elsewhere in the file (before the routes) must not be the one that is edited
+    cmp_line = 'if (layer.connection !== connection.id) {'
+    text = EPH_ROUTES.read_text()
+    early = text.replace("export default async function router(schema, config) {",
+                         "export default async function router(schema, config) {\n    " + cmp_line.replace('{', '{ /* unrelated */ }'), 1)
+    api, route = _api_dir(tmp_path, ephemeral=early)
+    assert _run(api, 'apply') == 'HEALED'
+    out = _eph(api).read_text()
+    assert out.count(cmp_line + ' /* unrelated */ }') == 1
+    assert out.count("'Layer is not an admin layer'") == 2
+
+
+def test_an_ephemeral_patch_that_does_not_parse_is_never_installed(tmp_path):
+    api, route = _api_dir(tmp_path, ephemeral=True)
+    script = _sh().replace('__MODE__', 'apply').replace('/home/etl/api', str(api))
+    broken = script.replace("'            if (!layer.' + kind + ') {',", "'            if (!layer.' + kind + ') {{{',")
+    assert broken != script
+    before = _eph(api).read_text()
+    r = subprocess.run(['sh', '-c', broken], capture_output=True, text=True, timeout=60)
+    # the layer-save file was edited, so the api has to restart to load it: HEALED. The ephemeral file stays as it was
+    assert r.stdout.strip() == 'HEALED'
+    assert _eph(api).read_text() == before
+    assert not list(route.parent.glob('*.tmp.js'))
+    # the next run has only the ephemeral file left to do, and it fails again: that is shown, not hidden
+    r = subprocess.run(['sh', '-c', broken], capture_output=True, text=True, timeout=60)
+    assert r.stdout.strip() == 'FAIL'
+    assert _eph(api).read_text() == before
     assert not list(route.parent.glob('*.tmp.js'))
 
 
