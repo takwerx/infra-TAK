@@ -246,6 +246,168 @@ def test_update_and_rollback_never_touch_config(box, monkeypatch):
     assert box.files[M.CONFIG_PATH] == M.seed_config_text()
 
 
+# ── Security's four changes (ops #980) ────────────────────────────────────────────────
+
+def _first_write_into_ptt_folder(cmds):
+    """Index of the first command that makes or changes anything in the ptt data folder."""
+    for i, e in enumerate(cmds):
+        if e[0] in ('mkdir', 'cp', 'chown', 'chmod', 'rm') and any(
+                a == M.DATA_DIR or a.startswith(M.DATA_DIR + '/') for a in e[1:]):
+            return i
+    return None
+
+
+def test_deploy_stops_the_service_before_root_touches_the_ptt_folder(box):
+    _run_deploy(box)
+    cmds = box.cmds()
+    stop = next(i for i, e in enumerate(cmds) if e[:3] == ['systemctl', 'stop', M.UNIT])
+    first = _first_write_into_ptt_folder(cmds)
+    assert first is not None and stop < first, cmds[:first + 1]
+
+
+def test_every_recursive_chown_in_the_module_uses_dash_h(box, monkeypatch):
+    _run_deploy(box)
+    box.settings['meshrelay'] = {'tag': 'v4.5.0'}
+    monkeypatch.setattr(M, '_have_backup', lambda: True)
+    monkeypatch.setattr(M, '_have_web_backup', lambda: True)
+    M.rollback(box.ctx(), plog=box.logs.append)
+    chowns = [e for e in box.cmds() if e[0] == 'chown' and '-R' in e]
+    assert chowns, 'expected a recursive chown'
+    for e in chowns:
+        assert '-h' in e, e
+    # ...and the module source has no other recursive chown
+    src = (REPO / 'modules/meshrelay.py').read_text()
+    assert "['chown', '-R'" not in src
+
+
+def test_install_tree_chown_does_not_follow_links(box):
+    M._install_tree(box.ctx(), '/nonexistent-src', '/opt/x', owner='ptt:ptt')
+    assert ['chown', '-h', '-R', 'ptt:ptt', '/opt/x'] in box.cmds()
+
+
+def test_broker_accepts_chown_dash_h_on_the_ptt_folder():
+    assert B._evaluate({'op': 'exec', 'argv': ['chown', '-h', '-R', 'ptt:ptt', M.DATA_DIR]})[0] == 'ALLOW'
+
+
+def test_update_stops_the_service_before_root_reads_the_ptt_web_folder(box, monkeypatch):
+    box.files[M.CONFIG_PATH] = M.seed_config_text()
+    box.settings['meshrelay'] = {'tag': 'v4.5.0'}
+    seen = []
+    real = M._install_tree
+
+    def spy(ctx, src, dst, owner=None):
+        seen.append((src, [e[:3] for e in box.cmds()]))
+        return real(ctx, src, dst, owner)
+    monkeypatch.setattr(M, '_install_tree', spy)
+    assert M.update(box.ctx(), plog=box.logs.append)['success'] is True
+    backup_read = next(h for src, h in seen if src == M.WEB_DIR)
+    assert ['systemctl', 'stop', M.UNIT] in backup_read, 'web files read before the stop'
+
+
+def test_update_that_fails_after_the_stop_but_before_any_swap_starts_the_old_service_again(box, monkeypatch):
+    box.settings['meshrelay'] = {'tag': 'v4.5.0'}
+    real = M._priv
+
+    def failing(ctx, argv, timeout=120, check=True):
+        if argv[:1] == ['cp'] and argv[2:3] == [M.BACKUP_DIR + '/ptt-server']:
+            raise RuntimeError('cp failed: disk full')
+        return real(ctx, argv, timeout, check)
+    monkeypatch.setattr(M, '_priv', failing)
+    res = M.update(box.ctx(), plog=box.logs.append)
+    assert res['success'] is False
+    cmds = box.cmds()
+    assert cmds[-1][:3] == ['systemctl', 'start', M.UNIT], cmds[-3:]
+    assert ['cp', M.BACKUP_DIR + '/ptt-server', M.BIN_PATH] not in cmds     # nothing was swapped
+
+
+class _Pw:
+    def __init__(self, uid=998, gid=997, shell='/usr/sbin/nologin'):
+        self.pw_uid, self.pw_gid, self.pw_shell = uid, gid, shell
+
+
+class _Gr:
+    def __init__(self, name, gid, mem=()):
+        self.gr_name, self.gr_gid, self.gr_mem = name, gid, list(mem)
+
+
+def _account(monkeypatch, pw=None, groups=None):
+    pw = pw or _Pw()
+    groups = groups if groups is not None else [_Gr('ptt', 997)]
+    monkeypatch.setattr(B.pwd, 'getpwnam', lambda n: pw)
+    monkeypatch.setattr(B.grp, 'getgrall', lambda: groups)
+
+    def getgrgid(gid):
+        for g in groups:
+            if g.gr_gid == gid:
+                return g
+        raise KeyError(gid)
+
+    def getgrnam(n):
+        for g in groups:
+            if g.gr_name == n:
+                return g
+        raise KeyError(n)
+    monkeypatch.setattr(B.grp, 'getgrgid', getgrgid)
+    monkeypatch.setattr(B.grp, 'getgrnam', getgrnam)
+
+
+def test_ptt_account_check_passes_the_account_the_op_creates(monkeypatch):
+    _account(monkeypatch)
+    assert B._meshrelay_account_problem() == ''
+    _account(monkeypatch, pw=_Pw(shell='/sbin/nologin'))
+    assert B._meshrelay_account_problem() == ''
+
+
+@pytest.mark.parametrize('group', ['docker', 'sudo', 'wheel', 'disk', 'shadow', 'adm', 'takwerx'])
+def test_ptt_account_check_refuses_any_extra_group(monkeypatch, group):
+    _account(monkeypatch, groups=[_Gr('ptt', 997), _Gr(group, 50, ['ptt'])])
+    assert group in B._meshrelay_account_problem()
+
+
+@pytest.mark.parametrize('shell', ['/bin/bash', '/bin/sh', '/usr/bin/zsh', '', '/tmp/nologin'])
+def test_ptt_account_check_refuses_a_real_shell(monkeypatch, shell):
+    _account(monkeypatch, pw=_Pw(shell=shell))
+    assert 'shell' in B._meshrelay_account_problem()
+
+
+def test_ptt_account_check_refuses_a_primary_group_that_is_not_its_own(monkeypatch):
+    _account(monkeypatch, groups=[_Gr('docker', 997)])
+    assert 'primary group' in B._meshrelay_account_problem()
+    _account(monkeypatch, pw=_Pw(gid=0), groups=[_Gr('root', 0)])
+    assert 'uid/gid 0' in B._meshrelay_account_problem()
+
+
+def test_ptt_account_op_refuses_an_unfit_existing_account_and_creates_nothing(monkeypatch):
+    _account(monkeypatch, groups=[_Gr('ptt', 997), _Gr('docker', 50, ['ptt'])])
+    monkeypatch.setattr(B.subprocess, 'run', lambda *a, **k: (_ for _ in ()).throw(AssertionError('ran a command')))
+    res = B._do_meshrelay_account({'op': 'meshrelay_account'})
+    assert res['ok'] is False and 'docker' in res['error']
+
+
+def test_console_side_account_check_matches_the_broker_rule():
+    body = APP[APP.index('def _meshrelay_account_ready'):APP.index('def _ensure_meshrelay_account')]
+    assert "pw.pw_shell not in (" in body and 'getgrall' in body and 'gr_name != _MESHRELAY_RUN_USER' in body
+
+
+def test_broker_pins_the_ptt_unit_to_user_ptt_and_no_extra_groups():
+    good = M.unit_text()
+    B._check_unit_write(M.UNIT_PATH, good.encode(), 'w')
+    for bad in (good.replace('User=ptt', 'User=mediamtx'),                       # shared list let this through
+                good.replace('[Service]\n', '[Service]\nSupplementaryGroups=caddy\n', 1),
+                good.replace('[Service]\n', '[Service]\nSupplementaryGroups=systemd-journal\n', 1),
+                good.replace('[Service]\n', '[Service]\nGroup=takwerx\n', 1),
+                good.replace('[Service]\n', '[Service]\nGroup=ptt\n', 1)):
+        with pytest.raises(B.Denied):
+            B._check_unit_write(M.UNIT_PATH, bad.encode(), 'w')
+
+
+def test_broker_keeps_user_ptt_out_of_every_other_unit():
+    mtx = ('[Unit]\nDescription=x\n[Service]\nUser=ptt\nExecStart=/opt/mediamtx/mediamtx\n'
+           '[Install]\nWantedBy=multi-user.target\n')
+    with pytest.raises(B.Denied, match='only for'):
+        B._check_unit_write('/etc/systemd/system/mediamtx.service', mtx.encode(), 'w')
+
+
 # ── condition 2: web port closed to the outside ───────────────────────────────────────
 
 def test_deploy_opens_only_the_phone_port_and_closes_the_web_port(box):
@@ -467,7 +629,7 @@ def test_data_files_are_owner_only_and_the_folder_is_700(box):
     assert ['chmod', '700', M.DATA_DIR] in cmds
     assert ['chmod', '600', M.CONFIG_PATH] in cmds
     assert ['chmod', '600', M.DATA_DIR + '/tak_connections.json'] in cmds
-    assert ['chown', '-R', 'ptt:ptt', M.DATA_DIR] in cmds
+    assert ['chown', '-h', '-R', 'ptt:ptt', M.DATA_DIR] in cmds
     assert ['chown', 'root:root', M.BIN_PATH] in cmds
 
 
@@ -581,12 +743,49 @@ def test_phone_login_filter_ignores_success_and_trailing_text(line):
     assert not [r for r in rxs if r.search(line)]
 
 
-def test_phone_login_jail_reads_the_journal_and_bans_only_the_phone_port():
-    body = APP[APP.index('def _f2b_arm_meshrelay_jail'):APP.index('def _f2b_disarm_meshrelay_jail')]
+def _jail_body():
+    return APP[APP.index('def _f2b_arm_meshrelay_jail'):APP.index('def _f2b_disarm_meshrelay_jail')]
+
+
+def test_phone_login_jail_reads_the_journal_and_never_blocks_anyone():
+    """Security (ops #980): a UDP source address can be forged, so one forged packet could get
+    a victim's phone banned. The jail reads the journal and only raises an alert."""
+    body = _jail_body()
     assert 'backend  = systemd' in body and '_SYSTEMD_UNIT=ptt-server.service' in body
-    assert 'protocol=udp' in body and 'port=\\"5000\\"' in body
-    assert 'allports' not in body                    # never cut the TAK stack or the console
     assert "'fail2ban-client', 'status', 'meshrelay-auth'" in body      # proves it loaded
+    # no firewall action of any kind, and no Guard Dog "Banned" mail
+    for banned in ('iptables', 'banaction', 'protocol=udp', 'allports', 'ufw', 'nftables',
+                   'infratak-guarddog\n', 'infratak-guarddog"'):
+        assert banned not in body, banned
+    assert 'action   = {MESHRELAY_F2B_ACTION}' in body
+    m = re.search(r"^MESHRELAY_F2B_ACTION = '([^']+)'", APP, re.M)
+    assert m and m.group(1) == 'infratak-meshrelay-alert'
+
+
+def _alert_action_text():
+    m = re.search(r'_MESHRELAY_ALERT_ACTION = \(\n(.*?)\n\)\n', APP, re.S)
+    assert m, '_MESHRELAY_ALERT_ACTION missing'
+    ns = {}
+    exec('T = (' + m.group(1) + ')', ns)
+    return ns['T']
+
+
+def test_phone_login_alert_action_only_writes_a_log_line():
+    text = _alert_action_text()
+    assert text.startswith('[Definition]')
+    body = [ln for ln in text.splitlines() if ln.startswith('actionban')]
+    assert len(body) == 1
+    ban = body[0]
+    assert '/var/log/takguard/restarts.log' in ban and 'nothing blocked' in ban
+    for bad in ('iptables', 'nft', 'ufw', 'firewall-cmd', 'fail2ban-client', 'infratak-f2b-notify', 'Banned'):
+        assert bad not in ban, bad
+    assert re.search(r'^actionunban\s*=\s*$', text, re.M)
+
+
+def test_disarming_the_jail_removes_the_alert_action_file_too():
+    start = APP.index('def _f2b_disarm_meshrelay_jail')
+    body = APP[start:APP.index('\n\n\n', start)]
+    assert 'MESHRELAY_F2B_ACTION_PATH' in body and "'rm', '-f'" in body
 
 
 def test_deploy_arms_the_jail_and_uninstall_removes_it(box):

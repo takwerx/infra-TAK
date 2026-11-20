@@ -853,6 +853,7 @@ _UNIT_FILE_RE = re.compile(r'^tak[a-z0-9]+guard\.(service|timer)$')   # Guard Do
 # files root runs. ops #643: MediaMTX and its web editor run as their own account.
 # ops #973: the MeshRelay PTT server runs as `ptt` (own account, no shell, not in the console group).
 MESHRELAY_USER = 'ptt'
+MESHRELAY_UNIT = 'ptt-server.service'
 UNIT_USERS = frozenset({BROKER_USER, 'mediamtx', MESHRELAY_USER})
 UNIT_GROUPS = frozenset({BROKER_USER, 'caddy', 'systemd-journal'})
 # These must keep a non-root User= (the plan's rule). So their drop-ins are checked
@@ -1177,10 +1178,18 @@ def _check_unit_write(path, content, mode):
             raise Denied(f'unit: {rel} must keep a non-root User=')
         if not root_ctx and user not in UNIT_USERS:
             raise Denied(f'unit: User={user} not allowed')
+        # ops #973 (Security, ops #980): `ptt` runs one unit and that unit runs as nobody else,
+        # with no extra group. UNIT_USERS / UNIT_GROUPS are shared by every unit, so pin it here.
+        if rel == MESHRELAY_UNIT and user != MESHRELAY_USER:
+            raise Denied(f'unit: {rel} must run as User={MESHRELAY_USER}')
+        if user == MESHRELAY_USER and rel != MESHRELAY_UNIT:
+            raise Denied(f'unit: User={MESHRELAY_USER} is only for {MESHRELAY_UNIT}')
     for sec, k, v in lines:
         if k == 'User' and dropin:
             raise Denied('unit: a drop-in may not set User=')
         elif k in ('Group', 'SupplementaryGroups'):
+            if rel == MESHRELAY_UNIT:
+                raise Denied(f'unit: {rel} may not set {k}=')
             if dropin and k == 'Group':
                 raise Denied('unit: a drop-in may not set Group=')
             for g in v.split():
@@ -7525,27 +7534,40 @@ def _check_meshrelay_account(req):
         raise Denied(f'meshrelay_account takes no arguments: {sorted(extra)}')
 
 
+_NO_LOGIN_SHELLS = frozenset({'/usr/sbin/nologin', '/sbin/nologin', '/bin/false', '/usr/bin/false'})
+
+
 def _meshrelay_account_problem():
-    """Why an existing `ptt` account is unfit to run the MeshRelay server, or ''."""
+    """Why an existing `ptt` account is unfit to run the MeshRelay server, or ''.
+    It faces the internet, so it must be exactly what the op creates: uid/gid not 0, no login
+    shell, its own group as the primary group, and no other group at all (a `ptt` in docker,
+    sudo, wheel, disk, shadow or adm would run the server with that reach; Security, ops #980)."""
     try:
         pw = pwd.getpwnam(MESHRELAY_USER)
     except KeyError:
         return 'missing'
     if pw.pw_uid == 0 or pw.pw_gid == 0:
         return 'ptt account is uid/gid 0'
+    if pw.pw_shell not in _NO_LOGIN_SHELLS:
+        return f'ptt account has a login shell: {pw.pw_shell}'
     try:
-        broker_grp = grp.getgrnam(BROKER_USER)
-        if MESHRELAY_USER in broker_grp.gr_mem or pw.pw_gid == broker_grp.gr_gid:
-            return f'ptt account is in group {BROKER_USER}'
+        primary = grp.getgrgid(pw.pw_gid).gr_name
     except KeyError:
-        pass
+        return 'ptt account has a primary group that does not exist'
+    if primary != MESHRELAY_USER:
+        return f'ptt account has primary group {primary}, not {MESHRELAY_USER}'
+    extra = sorted(g.gr_name for g in grp.getgrall()
+                   if MESHRELAY_USER in g.gr_mem and g.gr_name != MESHRELAY_USER)
+    if extra:
+        return f'ptt account is in other groups: {", ".join(extra)}'
     return ''
 
 
 def _do_meshrelay_account(req):
     """Create the `ptt` system account (own group, no home, no shell) when it is missing.
-    Never adds groups to an existing account, and refuses an existing one that is uid 0 or
-    in the console's group. The MeshRelay unit runs as this account (ops #973)."""
+    Never adds groups to an existing account, and refuses an existing one that is uid 0, has a
+    login shell, or is in any group besides its own (`_meshrelay_account_problem`). The
+    MeshRelay unit runs as this account (ops #973)."""
     created = False
     if _meshrelay_account_problem() == 'missing':
         groupadd = shutil.which('groupadd', path=BROKER_TRUSTED_PATH)

@@ -310,7 +310,8 @@ def _install_tree(ctx, src_root, dst_root, owner=None):
         for f in files:
             _priv(ctx, ['cp', os.path.join(base, f), os.path.join(here, f)])
     if owner:
-        _priv(ctx, ['chown', '-R', owner, dst_root])
+        # -h: never follow a link inside the tree (ops #980); callers stop the service first
+        _priv(ctx, ['chown', '-h', '-R', owner, dst_root])
 
 
 def _active(ctx):
@@ -427,7 +428,10 @@ def _stage_release(ctx, plog, arch):
 
 
 def _fix_perms(ctx):
-    _priv(ctx, ['chown', '-R', f'{RUN_USER}:{RUN_USER}', DATA_DIR])
+    """Root changes owner and mode inside the `ptt` folder. The service must be stopped first
+    (a live `ptt` process could swap a file for a link while root works; Security, ops #980),
+    and `-h` keeps chown from following a link that is already there."""
+    _priv(ctx, ['chown', '-h', '-R', f'{RUN_USER}:{RUN_USER}', DATA_DIR])
     _priv(ctx, ['chmod', '700', DATA_DIR])
     # data files hold users, TAK client keys and recordings: owner only
     _priv(ctx, ['chmod', '600', CONFIG_PATH], check=False)
@@ -453,15 +457,17 @@ def deploy(ctx, job, params):
         plog("📡 Step 1/7 — Account and folders")
         if not ctx['_ensure_meshrelay_account'](plog):
             raise RuntimeError('could not create the ptt account')
+        # Stop a running service BEFORE root writes anywhere near the `ptt` folder (Security,
+        # ops #980: a live `ptt` process could swap a file for a link while root copies or
+        # changes modes). It also frees the binary: `cp` onto a running one fails with "Text
+        # file busy" (seen on a real box). Step 5 starts it again.
+        _priv(ctx, ['systemctl', 'stop', UNIT], check=False)
         for d in (INSTALL_DIR, BACKUP_DIR, DATA_DIR):
             _priv(ctx, ['mkdir', '-p', d])
         _priv(ctx, ['chmod', '755', INSTALL_DIR])
         plog("📡 Step 2/7 — Download the pinned release")
         stage, binpath, web_root = _stage_release(ctx, plog, arch)
         plog("📡 Step 3/7 — Install files")
-        # A second Deploy meets a running binary: `cp` onto it fails with "Text file busy"
-        # (seen on a real box, ops #973). Stop it first; the restart in Step 5 starts it again.
-        _priv(ctx, ['systemctl', 'stop', UNIT], check=False)
         _priv(ctx, ['cp', binpath, BIN_PATH])
         _priv(ctx, ['chmod', '755', BIN_PATH])
         _priv(ctx, ['chown', 'root:root', BIN_PATH])
@@ -535,6 +541,7 @@ def update(ctx, plog=None):
     plog = plog or _plog
     stage = None
     swapped = False
+    stopped = False
     try:
         arch = ctx['_host_arch']()
         prob = pin_problem(arch=arch)
@@ -543,13 +550,16 @@ def update(ctx, plog=None):
         if installed_version(ctx) == RELEASE['tag']:
             return {'success': True, 'message': 'already on the pinned version'}
         stage, binpath, web_root = _stage_release(ctx, plog, arch)
+        old = installed_version(ctx)
+        # Stop first: root reads the web files out of the `ptt` folder for the backup, and a
+        # live `ptt` process could swap one for a link meanwhile (Security, ops #980).
+        _priv(ctx, ['systemctl', 'stop', UNIT])
+        stopped = True
         plog("💾 Backing up the current binary and web files")
         _priv(ctx, ['rm', '-rf', BACKUP_DIR])
         _priv(ctx, ['mkdir', '-p', BACKUP_DIR])
         _priv(ctx, ['cp', BIN_PATH, BACKUP_DIR + '/ptt-server'])
         _install_tree(ctx, WEB_DIR, BACKUP_DIR + '/web')
-        old = installed_version(ctx)
-        _priv(ctx, ['systemctl', 'stop', UNIT])
         swapped = True
         _priv(ctx, ['cp', binpath, BIN_PATH])
         _priv(ctx, ['chmod', '755', BIN_PATH])
@@ -579,6 +589,10 @@ def update(ctx, plog=None):
                 rollback(ctx, plog)
             except Exception as e2:
                 plog(f"✗ Rollback also failed: {str(e2)[:200]}")
+        elif stopped:
+            # stopped for the backup, failed before any file was swapped: the old version is
+            # still in place, so start it again rather than leave phones with no server
+            _priv(ctx, ['systemctl', 'start', UNIT], check=False)
         return {'success': False, 'error': str(e)[:300]}
     finally:
         if stage:

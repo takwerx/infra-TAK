@@ -25792,23 +25792,41 @@ MESHRELAY_F2B_FINDTIME = 600
 MESHRELAY_F2B_BANTIME = 3600
 
 
+# ops #973 (Security, ops #980): phones talk UDP, and a UDP source address can be forged, so a
+# line like "Auth failed ... from <victim ip>" can be made by anyone. The jail therefore never
+# blocks: its only action writes a Guard Dog log line. (A name with a new line can fake a whole
+# journal line too.) Ryan is asked to log names with %q; until then nothing here can cut off a
+# real phone.
+MESHRELAY_F2B_ACTION = 'infratak-meshrelay-alert'
+MESHRELAY_F2B_ACTION_PATH = '/etc/fail2ban/action.d/infratak-meshrelay-alert.conf'
+_MESHRELAY_ALERT_ACTION = (
+    "[Definition]\n"
+    "# Alert only. No iptables, no block: the sender address of a UDP packet can be forged.\n"
+    "actionban  = mkdir -p /var/log/takguard"
+    " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
+    " | fail2ban: Alert only, nothing blocked: many failed MeshRelay phone logins name <ip>"
+    " (the address may be forged)\""
+    " >> /var/log/takguard/restarts.log\n"
+    "actionunban =\n"
+)
+
+
 def _f2b_arm_meshrelay_jail(log_fn=None):
-    """Write the meshrelay-auth filter + jail, reload fail2ban, check it loaded. (ok, message).
+    """Write the meshrelay-auth filter + alert-only jail, reload fail2ban, check it loaded.
+    (ok, message).
 
     Reads the ptt-server journal (no log file to prepare, no Caddy change, so nothing here can
-    stop Caddy). The ban blocks UDP 5000 only: a guesser loses the phone port, never the TAK
-    stack or the console (same reasoning as the MediaMTX jail). fail2ban missing is not an
-    error: MeshRelay works, it is just unthrottled, and the message says so."""
+    stop Caddy). It never blocks anyone: see the note above MESHRELAY_F2B_ACTION. fail2ban
+    missing is not an error: MeshRelay works, it is just unwatched, and the message says so."""
     if not _f2b_is_available():
         return (False, 'fail2ban is not installed — MeshRelay works, but repeated bad phone '
-                       'logins are not throttled. Deploy the fail2ban module to arm it.')
+                       'logins raise no alert. Deploy the fail2ban module to arm it.')
     try:
         _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
         _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+        _makedirs_priv('/etc/fail2ban/action.d', exist_ok=True)
         _write_priv('/etc/fail2ban/filter.d/meshrelay-auth.conf', _F2B_OWNED_FILTERS['meshrelay-auth'])
-        guarddog_action = ""
-        if os.path.exists('/etc/fail2ban/action.d/infratak-guarddog.conf'):
-            guarddog_action = "\n         infratak-guarddog"
+        _write_priv(MESHRELAY_F2B_ACTION_PATH, _MESHRELAY_ALERT_ACTION)
         jail_conf = (
             "[meshrelay-auth]\n"
             "enabled  = true\n"
@@ -25819,8 +25837,7 @@ def _f2b_arm_meshrelay_jail(log_fn=None):
             f"findtime = {MESHRELAY_F2B_FINDTIME}\n"
             f"bantime  = {MESHRELAY_F2B_BANTIME}\n"
             f"ignoreip = {_f2b_trusted_ignoreip()}\n"
-            "action   = iptables-multiport[name=meshrelay-udp, port=\"5000\", protocol=udp]"
-            f"{guarddog_action}\n"
+            f"action   = {MESHRELAY_F2B_ACTION}\n"
         )
         _write_priv('/etc/fail2ban/jail.d/infratak-meshrelay-auth.conf', jail_conf)
         r = subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
@@ -25832,7 +25849,8 @@ def _f2b_arm_meshrelay_jail(log_fn=None):
         if v.returncode != 0:
             return (False, 'jail written and fail2ban reloaded, but the jail did not load: %s'
                     % ((v.stderr or v.stdout or '')[:160]))
-        return (True, 'jail armed and loaded (%d strikes / %ds → %ds ban on UDP 5000)'
+        return (True, 'alert-only jail armed and loaded (%d failures in %ds raise one Guard Dog alert '
+                      'per address per %ds; nobody is blocked)'
                 % (MESHRELAY_F2B_MAXRETRY, MESHRELAY_F2B_FINDTIME, MESHRELAY_F2B_BANTIME))
     except Exception as e:
         return (False, 'jail setup failed: %s' % str(e)[:200])
@@ -25845,10 +25863,12 @@ def _f2b_disarm_meshrelay_jail():
     try:
         removed = _f2b_remove_jail('infratak-meshrelay-auth.conf', 'MeshRelay uninstalled')
         fpath = '/etc/fail2ban/filter.d/meshrelay-auth.conf'
-        if _exists_priv(fpath):
-            subprocess.run(_sudo_wrap(['rm', '-f', fpath]), capture_output=True, timeout=10)
+        for gone in (fpath, MESHRELAY_F2B_ACTION_PATH):
+            if _exists_priv(gone):
+                subprocess.run(_sudo_wrap(['rm', '-f', gone]), capture_output=True, timeout=10)
+                removed = True
+        if removed:
             subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, text=True, timeout=45)
-            removed = True
         return (True, 'jail removed' if removed else 'no jail present')
     except Exception as e:
         return (False, 'jail removal failed: %s' % str(e)[:200])
@@ -64172,7 +64192,9 @@ _MESHRELAY_RUN_USER = 'ptt'
 
 
 def _meshrelay_account_ready():
-    """True when the `ptt` account exists and is fit: not root, in no group of the console's."""
+    """True when the `ptt` account exists and is fit. Same rule as the broker's
+    `_meshrelay_account_problem` (Security, ops #980): not root, no login shell, its own group
+    as the primary group, and no other group at all."""
     try:
         import pwd, grp
         pw = pwd.getpwnam(_MESHRELAY_RUN_USER)
@@ -64180,12 +64202,15 @@ def _meshrelay_account_ready():
         return False
     if pw.pw_uid == 0 or pw.pw_gid == 0:
         return False
+    if pw.pw_shell not in ('/usr/sbin/nologin', '/sbin/nologin', '/bin/false', '/usr/bin/false'):
+        return False
     try:
-        g = grp.getgrnam('takwerx')
-        if _MESHRELAY_RUN_USER in g.gr_mem or pw.pw_gid == g.gr_gid:
+        if grp.getgrgid(pw.pw_gid).gr_name != _MESHRELAY_RUN_USER:
             return False
     except KeyError:
-        pass
+        return False
+    if any(_MESHRELAY_RUN_USER in g.gr_mem and g.gr_name != _MESHRELAY_RUN_USER for g in grp.getgrall()):
+        return False
     return True
 
 
