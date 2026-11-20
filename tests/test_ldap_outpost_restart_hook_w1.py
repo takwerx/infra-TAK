@@ -14,6 +14,7 @@ TAK restarted, 3 times in 5. The heal used to wait for the 10-min monitor tick. 
     and runs again if the outpost restarted while it worked.
 """
 import ast
+import pathlib
 import re
 import threading
 import time
@@ -36,21 +37,25 @@ def _seg(node):
 
 # ── the wrappers ─────────────────────────────────────────────────────────────
 
+def _w1(console):
+    return [h for h in console.hooks if h[0] in ('watch', 'hook')]
+
+
 def test_run_locked_puts_a_start_under_the_watch_inside_the_lock(console):
     console.ns['_ak_compose_run_locked'](['up', '-d', '--force-recreate', 'ldap'], 'h1', console.plog, '/ak')
-    assert console.hooks == [('watch', 'h1', True)]
+    assert _w1(console) == [('watch', 'h1', True)]
 
 
 @pytest.mark.parametrize('args', [['ps'], ['logs', 'ldap'], ['stop', 'ldap'], ['config']])
 def test_run_locked_leaves_non_start_commands_alone(console, args):
     console.ns['_ak_compose_run_locked'](args, 'h', console.plog, '/ak')
-    assert console.hooks == []
+    assert _w1(console) == []
 
 
 def test_subprocess_wrapper_puts_a_start_under_the_watch(console):
     console.ns['_ak_compose_subprocess'](['docker', 'compose', 'restart', 'ldap'], 'h2', cwd='/ak')
     console.ns['_ak_compose_subprocess'](['docker', 'compose', 'ps'], 'h3', cwd='/ak')
-    assert console.hooks == [('watch', 'h2', True)]
+    assert _w1(console) == [('watch', 'h2', True)]
 
 
 def test_module_compose_local_watch_and_remote_hook(console):
@@ -59,7 +64,7 @@ def test_module_compose_local_watch_and_remote_hook(console):
     mc({'target_mode': 'remote'}, 'cd ~/authentik && docker compose up -d --force-recreate ldap', 'rem')
     mc({'target_mode': 'remote'}, 'cd ~/authentik && docker compose up -d server worker', 'rem2')
     mc({'target_mode': 'remote'}, 'cd ~/authentik && docker compose logs ldap', 'rem3')
-    assert console.hooks == [('watch', 'loc', True), ('hook', 'rem (remote Authentik)', None)]
+    assert _w1(console) == [('watch', 'loc', True), ('hook', 'rem (remote Authentik)', None)]
 
 
 # ── whole-file guard: no outpost start without the hook ──────────────────────
@@ -273,3 +278,65 @@ def test_poller_does_not_refire_for_a_restart_the_watch_already_hooked():
 
 def test_poller_ignores_remote_or_absent_outpost():
     assert _run_poller([None, None, None], [None, None, None]) == []
+
+
+# ── v10.4.3 W7: no ldap-only start into a core that is not ready ──────────────
+
+@pytest.mark.parametrize('cmd,only', [
+    (['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap'], True),
+    (['docker', 'compose', 'up', '-d', '--no-deps', '--force-recreate', 'ldap'], True),
+    (['docker', 'compose', 'restart', '-t', '30', 'ldap'], True),
+    (['docker', 'compose', 'up', '-d'], False),                      # whole stack: starts the core
+    (['docker', 'compose', 'up', '-d', 'server', 'worker'], False),
+    (['docker', 'compose', 'up', '-d', 'server', 'ldap'], False),
+    (['docker', 'compose', 'stop', 'ldap'], False),
+    ('cd ~/authentik && docker compose up -d --force-recreate ldap 2>&1', True),
+    ('cd ~/authentik && docker compose stop ldap; docker compose up -d ldap 2>&1', True),
+    ('cd ~/authentik && docker compose up -d 2>&1', False),
+    ('cd ~/authentik && docker compose logs ldap', False),
+])
+def test_ldap_only_start_detection(console, cmd, only):
+    assert console.ns['_compose_starts_only_ldap'](cmd) is only
+
+
+def test_ldap_only_start_does_not_run_while_core_not_ready(console, capsys):
+    console.core_ready = False
+    assert console.ns['_ak_compose_run_locked'](['up', '-d', '--force-recreate', 'ldap'], 'h', console.plog, '/ak') is None
+    r = console.ns['_ak_compose_subprocess'](['docker', 'compose', 'restart', 'ldap'], 'h2', cwd='/ak', text=True)
+    ok, msg = console.ns['_ak_module_compose']({'target_mode': 'local'},
+                                               'cd ~/authentik && docker compose up -d --force-recreate ldap', 'h3')
+    assert console.ran == []                                  # nothing ran
+    assert r.returncode == 75 and 'core not ready' in r.stdout
+    assert ok is False and 'core not ready' in msg
+    said = console.logged + capsys.readouterr().out.splitlines()
+    assert sum('core not ready — outpost not touched' in l for l in said) == 3
+    # waited outside the lock, never inside it
+    assert all(not held for kind, wait, held in console.hooks if kind == 'core_ready' and wait > 0)
+
+
+def test_whole_stack_start_is_never_gated(console):
+    console.core_ready = False
+    console.ns['_ak_compose_run_locked'](['up', '-d'], 'stack', console.plog, '/ak')
+    assert len(console.ran) == 1 and not [h for h in console.hooks if h[0] == 'core_ready']
+
+
+def test_raw_ldap_only_sites_are_gated():
+    # The four raw ldap-only recreates run the gate before the watch.
+    for holder in ('ldap-internal-host', 'pgbouncer-image-restart', 'deploy-ldap-token-recreate',
+                   'post-update-hardening-recreate'):
+        i = APP.index(f"_ldap_outpost_restart_watch('{holder}'")
+        assert '_ldap_core_gate(' in APP[i - 700:i], holder
+
+
+def test_stack_healthy_wait_requires_ready():
+    src = _seg(FUNCS['_wait_for_authentik_stack_healthy'])
+    assert '_authentik_core_ready(0)' in src
+
+
+def test_guard_dog_gates_its_outpost_restarts():
+    sh = (pathlib.Path(__file__).resolve().parent.parent / 'scripts' / 'guarddog' / 'tak-authentik-watch.sh').read_text()
+    assert '"http://127.0.0.1:9090/-/health/ready/"' in sh
+    i = sh.index('_ak_compose_locked "ldap-restart" restart ldap')
+    assert '_ak_core_ready' in sh[i - 200:i]
+    j = sh.index('_ak_compose_locked "ldap-recreate" up -d --force-recreate ldap')
+    assert '! _ak_core_ready' in sh[j - 2500:j]

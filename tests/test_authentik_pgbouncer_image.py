@@ -137,6 +137,7 @@ def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pas
     ns['_ak_compose_subprocess'] = lambda cmd, holder, plog=None, wait=None, **kw: ns['subprocess'].run(cmd, **kw)
     ns['_AK_COMPOSE_LOCK_BUSY_RC'] = 75
     ns['_ldap_outpost_restart_watch'] = lambda reason, plog=None: contextlib.nullcontext()   # v10.4.3 W1
+    ns['_ldap_core_gate'] = lambda *a, **k: True                                              # v10.4.3 W7
     for name in ('_ensure_authentik_pgbouncer_image', '_authentik_ldap_sa_search', '_authentik_ldap_sa_group_probe',
                  '_authentik_ldap_sa_groups_settle', '_compose_set_service_image'):
         exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)

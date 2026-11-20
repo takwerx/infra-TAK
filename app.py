@@ -35833,12 +35833,14 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                     _f.write(comp)
                 _log(f"✓ docker-compose.yml: LDAP AUTHENTIK_HOST → {_ldap_internal} (internal)")
                 with _authentik_compose_lock('ldap-internal-host', plog=_log) as _locked:  # v10.1.55 W3
-                    if _locked:
+                    _ldap_ran = bool(_locked) and _ldap_core_gate(['docker', 'compose', 'up', 'ldap'], 'ldap-internal-host', _log, wait_s=30)   # v10.4.3 W7
+                    if _ldap_ran:
                         with _ldap_outpost_restart_watch('ldap-internal-host', _log):   # v10.4.3 W1
                             subprocess.run(
                                 _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=60
                             )
-                _log("✓ LDAP container recreated with internal host")
+                if _ldap_ran:
+                    _log("✓ LDAP container recreated with internal host")
             else:
                 _log(f"✓ docker-compose.yml: LDAP AUTHENTIK_HOST already internal — no change")
         except Exception as e:
@@ -68368,10 +68370,11 @@ def _wait_for_authentik_stack_healthy(plog, timeout=240):
         # Server reporting healthy? (or up with no healthcheck defined)
         hr = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Health.Status}}', 'authentik-server-1']), capture_output=True, text=True, timeout=10)
         status = (hr.stdout or '').strip()
-        if status == 'healthy':
+        # v10.4.3 W7: healthy AND /-/health/ready/ 200 (E3c: 2026.8.5 sat at ready=503).
+        if (status == 'healthy' or (status in ('', '<no value>') and not stopped)) and _authentik_core_ready(0):
             return True
-        if status in ('', '<no value>') and not stopped:
-            return True  # running, no healthcheck — best signal we have
+        if status == 'healthy':
+            status = 'healthy, but /-/health/ready/ is not 200 yet'
         if time.time() - last_log > 25:
             plog(f"  … waiting for Authentik server to become healthy (status: {status or 'unknown'})")
             last_log = time.time()
@@ -74458,16 +74461,67 @@ def _compose_argv_may_start(argv):
     return any(t in _COMPOSE_START_VERBS for t in toks[toks.index('compose') + 1:])
 
 
+# --- v10.4.3 W7: never (re)start the outpost into a core that is not ready -----------------
+# akres E2b/E2f: an outpost started while the core was down came up not ready and left TAK
+# with no groups, first try. A RUNNING outpost serves from its cache for >= 15 min (E2a), so
+# skipping its restart is the smaller harm; the caller sees "not run" (the lock-busy result)
+# and retries on its own schedule. Only commands whose sole named service is ldap are gated —
+# a whole-stack `up -d` is what starts the core. Covers E2b/E2f only, NOT the E3c window.
+_LDAP_START_CORE_WAIT_S = 90
+
+
+def _compose_starts_only_ldap(cmd):
+    """True for a compose up|restart|start|create (argv list or shell string) whose only
+    named service is ldap."""
+    if isinstance(cmd, str):
+        for m in re.finditer(r'\bdocker compose (?:up|restart|start|create)\b([^;&|\n]*)', cmd):
+            words = [w for w in m.group(1).split()
+                     if not w.startswith('-') and not w.isdigit() and '>' not in w]
+            if words == ['ldap']:
+                return True
+        return False
+    toks = [str(t) for t in (cmd or [])]
+    if 'compose' not in toks:
+        return False
+    rest = toks[toks.index('compose') + 1:]
+    vi = next((i for i, t in enumerate(rest) if t in _COMPOSE_START_VERBS), None)
+    if vi is None:
+        return False
+    return [t for t in rest[vi + 1:] if not t.startswith('-') and not t.isdigit()] == ['ldap']
+
+
+def _ldap_core_gate(cmd, holder, plog=None, wait_s=_LDAP_START_CORE_WAIT_S):
+    """W7: True = go ahead. False (logged) = an ldap-only start while the LOCAL core is not
+    ready after `wait_s`; the command must not run."""
+    if not _compose_starts_only_ldap(cmd):
+        return True
+    if _authentik_core_ready(wait_s):
+        return True
+    (plog or (lambda m: print(m, flush=True)))(
+        f"  ⚠ Authentik core not ready — outpost not touched ({holder}): /-/health/ready/ is not 200. "
+        f"The running outpost keeps serving from its cache; this runs again on the next attempt.")
+    return False
+
+
+def _ldap_core_not_ready_msg(holder):
+    return (f"Authentik core not ready — outpost not touched ({holder}); "
+            f"it runs again on the next attempt")
+
+
 def _ak_compose_run_locked(args, holder, plog, cwd, timeout=120, wait=_AK_COMPOSE_LOCK_WAIT_S):
     """`docker compose <args>` in `cwd` under the compose lock (ops #173). Returns the
     CompletedProcess, or None when the lock was not taken: the command did NOT run, and
     a ⚠ line saying so is logged for the caller's issue list."""
+    argv = ['docker', 'compose'] + list(args)
+    if not _ldap_core_gate(argv, holder, plog):          # v10.4.3 W7 (waits outside the lock)
+        return None
     with _authentik_compose_lock(holder, plog=plog, timeout=wait) as _locked:
         if not _locked:
             plog(f"  ⚠ Skipped `docker compose {' '.join(args)}`: another Authentik operation "
                  f"held the compose lock for {wait}s. Run it again once that finishes.")
             return None
-        argv = ['docker', 'compose'] + list(args)
+        if not _ldap_core_gate(argv, holder, plog, wait_s=0):
+            return None
         with (_ldap_outpost_restart_watch(holder, plog) if _compose_argv_may_start(argv)
               else contextlib.nullcontext()):
             return subprocess.run(_sudo_wrap(argv), cwd=cwd,
@@ -74489,12 +74543,18 @@ def _ak_compose_subprocess(cmd, holder, plog=None, wait=_AK_COMPOSE_LOCK_WAIT_S,
     the command does NOT run and a failed CompletedProcess comes back (returncode 75, the
     reason on stdout and stderr), so the caller's own failure handling reports it. With
     check=True that is a CalledProcessError instead. Never runs unlocked."""
-    with _authentik_compose_lock(holder, plog=plog, timeout=wait) as _locked:
-        if _locked:
-            with (_ldap_outpost_restart_watch(holder, plog) if _compose_argv_may_start(cmd)
-                  else contextlib.nullcontext()):
-                return subprocess.run(cmd, **kw)
-    msg = _ak_compose_lock_busy_msg(holder, wait)
+    msg = None
+    if not _ldap_core_gate(cmd, holder, plog):           # v10.4.3 W7 (waits outside the lock)
+        msg = _ldap_core_not_ready_msg(holder)
+    else:
+        with _authentik_compose_lock(holder, plog=plog, timeout=wait) as _locked:
+            if _locked:
+                if _ldap_core_gate(cmd, holder, plog, wait_s=0):
+                    with (_ldap_outpost_restart_watch(holder, plog) if _compose_argv_may_start(cmd)
+                          else contextlib.nullcontext()):
+                        return subprocess.run(cmd, **kw)
+                msg = _ldap_core_not_ready_msg(holder)
+    msg = msg or _ak_compose_lock_busy_msg(holder, wait)
     out = msg if (kw.get('text') or kw.get('universal_newlines') or kw.get('encoding')) else msg.encode()
     if kw.get('check'):
         raise subprocess.CalledProcessError(_AK_COMPOSE_LOCK_BUSY_RC, cmd, output=out, stderr=out)
@@ -74511,6 +74571,8 @@ def _ak_module_compose(ak_cfg, cmd, holder, plog=None, wait=_AK_COMPOSE_LOCK_WAI
         if _COMPOSE_LDAP_START_RE.search(cmd or ''):
             _after_ldap_outpost_restart(f'{holder} (remote Authentik)', plog)   # v10.4.3 W1
         return res
+    if not _ldap_core_gate(cmd, holder, plog):           # v10.4.3 W7
+        return False, _ldap_core_not_ready_msg(holder)
     with _authentik_compose_lock(holder, plog=plog, timeout=wait) as _locked:
         if _locked:
             with (_ldap_outpost_restart_watch(holder, plog)
@@ -76944,9 +77006,13 @@ def _ensure_authentik_pgbouncer_image(plog):
             rr = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'server', 'worker']),
                                 cwd=ak_dir, capture_output=True, text=True, timeout=300)
             _wait_for_authentik_stack_healthy(plog, timeout=180)
-            with _ldap_outpost_restart_watch('pgbouncer-image-restart', plog):   # v10.4.3 W1
-                rl = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']),
-                                    cwd=ak_dir, capture_output=True, text=True, timeout=120)
+            if _ldap_core_gate(['docker', 'compose', 'up', 'ldap'], 'pgbouncer-image-restart', plog, wait_s=30):   # v10.4.3 W7
+                with _ldap_outpost_restart_watch('pgbouncer-image-restart', plog):   # v10.4.3 W1
+                    rl = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']),
+                                        cwd=ak_dir, capture_output=True, text=True, timeout=120)
+            else:
+                # not run: the running outpost keeps serving; not a failed restart
+                rl = subprocess.CompletedProcess(['docker', 'compose', 'restart', 'ldap'], 0, stdout='', stderr='')
         for res in (rr, rl):
             if res.returncode != 0:
                 plog(f"  ✗ pgbouncer image: restart failed: {((res.stderr or '') + (res.stdout or ''))[-300:]}")
@@ -84315,11 +84381,14 @@ entries:
                                             plog(f"  Recreating LDAP container with new token...")
                                             with _authentik_compose_lock('deploy-ldap-token-recreate', plog=plog,
                                                                          timeout=_AK_COMPOSE_LOCK_WAIT_LONG_S) as _locked:
-                                                if _locked:
+                                                _ldap_gate_ok = bool(_locked) and _ldap_core_gate(['docker', 'compose', 'up', 'ldap'], 'deploy-ldap-token-recreate', plog, wait_s=30)   # v10.4.3 W7
+                                                if _ldap_gate_ok:
                                                     with _ldap_outpost_restart_watch('deploy-ldap-token-recreate', plog):   # v10.4.3 W1
                                                         _run_priv_chain([['docker', 'compose', 'stop', 'ldap'], ['docker', 'compose', 'rm', '-f', 'ldap'], ['docker', 'compose', 'up', '-d', 'ldap']], 'and', timeout=60, cwd=ak_dir)
-                                            if _locked:
+                                            if _locked and _ldap_gate_ok:
                                                 plog(f"  ✓ LDAP container recreated with injected token")
+                                            elif _locked:
+                                                pass   # W7 gate logged it: core not ready, outpost not touched
                                             else:
                                                 plog(f"  ⚠ LDAP recreate skipped: {_ak_compose_lock_busy_msg('deploy-ldap-token-recreate', _AK_COMPOSE_LOCK_WAIT_LONG_S)}")
                                             time.sleep(10)
@@ -120460,10 +120529,12 @@ def _post_update_auto_deploy():
                                         _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'worker', 'server']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=120
                                     )
                                     _wait_for_authentik_stack_healthy(lambda m: print(f"Post-update: {m}"), timeout=180)
-                                    with _ldap_outpost_restart_watch('post-update-hardening-recreate'):   # v10.4.3 W1
-                                        subprocess.run(
-                                            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=90
-                                        )
+                                    if _ldap_core_gate(['docker', 'compose', 'up', 'ldap'], 'post-update-hardening-recreate',
+                                                       lambda m: print(f"Post-update:{m}", flush=True), wait_s=30):   # v10.4.3 W7
+                                        with _ldap_outpost_restart_watch('post-update-hardening-recreate'):   # v10.4.3 W1
+                                            subprocess.run(
+                                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=90
+                                            )
                                 else:
                                     print("Post-update: Authentik hardening recreate skipped — compose lock busy; "
                                           "the hardened compose applies on the next stack recreate", flush=True)
