@@ -45,6 +45,19 @@ from test_atlas_agency_admins import FakeAuthentik  # noqa: E402
 CORONA = ai.make('corona', ai.MODE_DYNAMIC, 50, 8761)
 PLAIN = ai.make(None, ai.MODE_FIXED, 100, 8760)
 
+#: The access policy an agency's application carries (ops #979): global admins
+#: OR the agency's group, in one policy so it means the same under `any`/`all`.
+ACCESS_POLICY = {
+    'pk': 'pol1', 'name': 'ATLAS access: atlas-corona',
+    'expression': 'return ak_is_group_member(request.user, name="authentik Admins") '
+                  'or ak_is_group_member(request.user, name="atlas-corona-admins")'}
+
+
+def access_binding(**fields):
+    return dict({'pk': 'b1', 'policy': 'pol1', 'group': None, 'order': 0,
+                 'enabled': True, 'negate': False,
+                 'policy_obj': {'name': ACCESS_POLICY['name']}}, **fields)
+
 
 def make_ctx(env=None, settings=None):
     """A console context holding settings in memory and an Authentik `.env`."""
@@ -202,7 +215,7 @@ def test_an_existing_group_and_binding_are_recorded_as_present(authentik):
     authentik(FakeAuthentik(
         groups=[{'name': 'atlas-corona-admins', 'is_superuser': False,
                  'pk': 'g9'}],
-        bindings=[{'pk': 'b1', 'group': 'g9', 'order': 10}]))
+        policies=[ACCESS_POLICY], bindings=[access_binding()]))
     ctx = make_ctx()
 
     atlas._reconcile_agency_group(ctx, CORONA, lambda _m: None)
@@ -379,16 +392,17 @@ def test_the_name_returning_wrapper_keeps_its_contract(authentik):
 
 
 @pytest.mark.parametrize('binding', [
-    {'pk': 'b1', 'group': 'g9', 'order': 10, 'enabled': False},
-    {'pk': 'b1', 'group': 'g9', 'order': 10, 'negate': True},
-    {'pk': 'b1', 'group': 'g9', 'order': 10, 'enabled': False, 'negate': True},
+    access_binding(enabled=False),
+    access_binding(negate=True),
+    access_binding(enabled=False, negate=True),
 ])
 def test_a_disabled_or_negated_binding_is_a_problem_not_a_pass(authentik, binding):
     """⚠️ It passed before: any binding naming the group counted, so the tile
-    said OK while every member of the group was turned away."""
+    said OK while every member of the group was turned away. Now the binding that
+    counts is the one of the deployment's access policy (ops #979)."""
     fake = authentik(FakeAuthentik(
         groups=[{'name': 'atlas-corona-admins', 'is_superuser': False, 'pk': 'g9'}],
-        bindings=[binding]))
+        policies=[ACCESS_POLICY], bindings=[binding]))
     ctx = make_ctx()
 
     atlas._reconcile_agency_group(ctx, CORONA, lambda _m: None)
@@ -397,6 +411,7 @@ def test_a_disabled_or_negated_binding_is_a_problem_not_a_pass(authentik, bindin
     assert 'disabled or negated' in recorded(ctx)['detail']
     # ⚠️ Never repaired from here: somebody switched it off in Authentik.
     assert fake.posted == []
+    assert fake.deleted == []
     said = atlas.agency_group_problem(ctx['_store']['s'], CORONA)
     assert said and 'disabled or negated' in said
 
@@ -404,8 +419,9 @@ def test_a_disabled_or_negated_binding_is_a_problem_not_a_pass(authentik, bindin
 def test_one_live_binding_beside_a_disabled_one_is_present(authentik):
     authentik(FakeAuthentik(
         groups=[{'name': 'atlas-corona-admins', 'is_superuser': False, 'pk': 'g9'}],
-        bindings=[{'pk': 'b1', 'group': 'g9', 'order': 10, 'enabled': False},
-                  {'pk': 'b2', 'group': 'g9', 'order': 11, 'enabled': True}]))
+        policies=[ACCESS_POLICY],
+        bindings=[access_binding(pk='b1', enabled=False),
+                  access_binding(pk='b2', order=1)]))
     ctx = make_ctx()
 
     atlas._reconcile_agency_group(ctx, CORONA, lambda _m: None)

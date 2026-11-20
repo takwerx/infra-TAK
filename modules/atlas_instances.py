@@ -71,6 +71,11 @@ RESERVED_SLUGS = frozenset({
     # agency directly on top of it -- same directory, same store, same
     # pki -- while every *name* stayed distinct and nothing complained.
     'default',
+    # ⚠️ ATLAS W495: the plain deployment's standard-admin group is
+    # `atlas-standard-admins`, which is exactly what an agency named
+    # 'standard' would get as its *admin* group. Its members would be super
+    # admins there and standard admins on the plain console.
+    'standard',
 })
 
 #: Internal loopback port for the api container. The plain instance already uses

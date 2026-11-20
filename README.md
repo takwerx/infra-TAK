@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.4.2-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.2-alpha)**
+**Current release: [v10.4.3-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.3-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -459,6 +459,28 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.4.3-alpha — 2026-11-20 — ATLAS agency admins can sign in on Hardened servers
+
+**Headline: ATLAS agency admins can sign in again on Hardened servers, ATLAS Deploy no longer downgrades a running ATLAS, and new ATLAS deploys work on a non-root console. Also security updates for CoTURN and Node-RED, Java update notices for TAK Server, and a set of fixes. Update from the Console page.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.3-alpha))
+
+**ATLAS.**
+- Agency admins can sign in on a Hardened server. Each ATLAS app has one access policy, and Update Now moves existing deployments to it. Removing an agency removes its access.
+- The standard-admin group from ATLAS 2.3.0 is admitted, on the plain deployment too.
+- Deploy on a running ATLAS refuses to downgrade it, and says so when GitHub cannot be read.
+- New ATLAS deploys work on a non-root console.
+
+**Security.**
+- CoTURN 4.19.2 and Node-RED 4.1.18 (Node 22.23.5).
+- The console tells you when TAK Server (also Docker TAK Server) still runs an older Java after a security update.
+
+**Fixes.**
+- Console idle lock: the first password sign-in after a lock works.
+- Rotate Intermediate CA refuses a CA name already in use, and works on a Docker TAK Server after an old restore.
+- Caddy install retries its signing-key download and shows the error.
+- CloudTAK: an admin can save the schedule and login of a server-wide ETL layer; the media container recovers from a restart loop; Update explains lint failures clearly.
+- The Guard Dog card on the main page matches the Guard Dog page.
+- Bundled ETL catalog updated (37 ETL updates, ArcGIS ETL 7.36.0).
 
 ### v10.4.2-alpha — 2026-11-19 — Security hardening: console sign-in, page text and CA keys; CloudTAK 13.124.0 Update works
 
