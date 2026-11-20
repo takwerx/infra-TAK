@@ -43,6 +43,7 @@ testable without Authentik.
 """
 import json
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -112,6 +113,17 @@ def parse_groups(expression):
     return found
 
 
+def is_ours(expression):
+    """True when `expression` is exactly what `build_expression` writes.
+
+    ⚠️ Only then may `ensure` rewrite it. `parse_groups` reads the names out of
+    any text, so "rebuild from what it parsed" would turn a hand-written
+    `return in_group_a and before_5pm` into `return in_group_a`.
+    """
+    expression = expression or ''
+    return expression == build_expression(parse_groups(expression))
+
+
 def is_access_binding(binding):
     """True for an enabled, not-negated binding of one of our policies."""
     name = (binding.get('policy_obj') or {}).get('name') or ''
@@ -154,6 +166,16 @@ def ensure(api, app_slug, add=(), remove=(), plog=None):
     try:
         app = api.call('core/applications/%s/' % app_slug)
         pol = _find(api, 'policies/expression/', 'name', name)
+        if pol is not None and not is_ours(pol.get('expression')):
+            # ⚠️ Security read, ops #978: somebody wrote this expression by
+            # hand (a time check, a second condition). Rewriting it from the
+            # names `parse_groups` finds would silently drop their condition,
+            # and could widen who gets in. Reported and left as it is.
+            detail = ('the access policy "%s" was changed by hand in Authentik '
+                      'and is left as it is; make it a plain list of groups '
+                      'again, or delete it, and run Update' % name)
+            log('  ⚠ ' + detail)
+            return _outcome('failed', detail)
         current = parse_groups(pol.get('expression')) if pol else []
         wanted = [ADMIN_GROUP]
         for group in list(current) + list(add):
@@ -300,9 +322,24 @@ def remove(api, app_slug):
 
     ⚠️ On removal of a deployment, so a later deployment that reuses the slug
     starts from the administrators alone rather than inheriting stale groups.
+
+    ⚠️ **Only once the application is gone** (Security read, ops #978): the
+    lookup must answer 404. Deleting the policy deletes its binding, and an
+    application left with no binding is open to every signed-in user, so an
+    application that is still there (its deregistration failed), or a lookup
+    that failed for another reason, keeps its policy. Raises then; the caller
+    logs it.
     """
     pol = _find(api, 'policies/expression/', 'name', policy_name(app_slug))
     if pol is None:
         return False
+    try:
+        api.call('core/applications/%s/' % app_slug)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            raise
+    else:
+        raise RuntimeError('the application "%s" is still in Authentik; its '
+                           'access policy is kept' % app_slug)
     api.call('policies/expression/%s/' % pol['pk'], method='DELETE')
     return True

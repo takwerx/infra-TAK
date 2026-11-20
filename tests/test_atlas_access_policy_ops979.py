@@ -336,6 +336,7 @@ def test_removing_a_deployment_removes_its_policy(authentik):
     fake = authentik(hardened_box())
     update(fake)
     api = atlas_access.Api('http://ak', {})
+    fake.apps.pop(APP)  # `remove_instance` deregisters the application first
 
     assert atlas_access.remove(api, APP) is True
     assert not [p for p in fake.policies if p['name'].startswith('ATLAS access')]
@@ -349,12 +350,119 @@ def test_removing_an_agency_removes_its_policy_and_group(authentik):
     fake = authentik(hardened_box())
     update(fake)
     assert [p for p in fake.policies if p['name'] == 'ATLAS access: ' + APP]
+    fake.apps.pop(APP)
 
     note = atlas.remove_agency_admin_group(make_ctx(), CORONA)
 
     assert not [p for p in fake.policies if p['name'].startswith('ATLAS access')]
     assert 'removed' in (note or '')
     assert any('core/groups/group-pk/' in url for url in fake.deleted)
+
+
+# --------------------------------------------------------------------------- #
+# Security read of the merged rework (ops #978, follow-up item 3)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_policy_stays_while_its_application_is_still_there(authentik):
+    """⚠️ Deleting the policy deletes its binding. If the application's
+    deregistration failed, it would be left with no binding at all, which
+    Authentik opens to every signed-in user."""
+    from modules import atlas_access
+    fake = authentik(hardened_box())
+    update(fake)
+    api = atlas_access.Api('http://ak', {})
+
+    with pytest.raises(RuntimeError, match='still in Authentik'):
+        atlas_access.remove(api, APP)
+
+    assert [p for p in fake.policies if p['name'] == 'ATLAS access: ' + APP]
+    assert not can_open(fake, 'all', {'nobody'}, mfa=True)
+
+
+def test_the_policy_stays_when_the_application_lookup_fails(authentik):
+    """Only a 404 means "gone". An Authentik that answers 500, or not at all,
+    says nothing about the application."""
+    from modules import atlas_access
+    fake = authentik(hardened_box())
+    update(fake)
+    api = atlas_access.Api('http://ak', {})
+    fake.fail.add('core/applications/')
+
+    with pytest.raises(OSError):
+        atlas_access.remove(api, APP)
+
+    assert [p for p in fake.policies if p['name'] == 'ATLAS access: ' + APP]
+
+
+def test_an_agency_removal_keeps_the_policy_of_an_application_still_there(authentik):
+    from test_atlas_agency_group_reconcile import make_ctx
+    fake = authentik(hardened_box())
+    update(fake)
+    logged = []
+
+    atlas.remove_agency_admin_group(make_ctx(), CORONA, plog=logged.append)
+
+    assert [p for p in fake.policies if p['name'] == 'ATLAS access: ' + APP]
+    assert any('could not be removed' in m and 'still in Authentik' in m
+               for m in logged)
+
+
+HAND_WRITTEN = ('return ak_is_group_member(request.user, name="authentik Admins") '
+                'and request.context.get("geoip", {}).get("country") == "US"')
+
+
+@pytest.mark.parametrize('change', [
+    {'add': ['atlas-corona-standard-admins']},
+    {'remove': ['atlas-corona-standard-admins']},
+    {}])
+def test_a_hand_written_policy_is_reported_and_left_as_it_is(authentik, change):
+    """⚠️ `parse_groups` finds names in any text. Rebuilding from them would
+    drop the operator's extra condition (here: the country check) and could let
+    in a group they never meant to."""
+    from modules import atlas_access
+    fake = authentik(hardened_box())
+    update(fake)
+    [pol] = [p for p in fake.policies if p['name'] == 'ATLAS access: ' + APP]
+    pol['expression'] = HAND_WRITTEN
+    api = atlas_access.Api('http://ak', {})
+    before = [dict(b) for b in fake.bindings]
+    logged = []
+
+    result = atlas_access.ensure(api, APP, plog=logged.append, **change)
+
+    assert result['status'] == 'failed'
+    assert 'changed by hand' in result['detail']
+    assert pol['expression'] == HAND_WRITTEN
+    assert [dict(b) for b in fake.bindings] == before
+    assert not any(m == 'PATCH' for m, _url in fake.calls)
+
+
+def test_our_own_expression_is_still_updated(authentik):
+    """The check must not freeze a policy this module wrote."""
+    from modules import atlas_access
+    fake = authentik(hardened_box())
+    update(fake)
+    api = atlas_access.Api('http://ak', {})
+
+    result = atlas_access.ensure(api, APP, add=['atlas-corona-standard-admins'])
+
+    assert result['status'] == 'created'
+    assert can_open(fake, 'all', {'atlas-corona-standard-admins'}, mfa=True)
+
+
+@pytest.mark.parametrize('expression,ours', [
+    ('return ak_is_group_member(request.user, name="authentik Admins")', True),
+    ('return ak_is_group_member(request.user, name="authentik Admins") or '
+     'ak_is_group_member(request.user, name="atlas-corona-admins")', True),
+    (HAND_WRITTEN, False),
+    ('return True', False),
+    ('', False),
+    ('return ak_is_group_member(request.user, name="authentik Admins")\n', False),
+])
+def test_is_ours_matches_only_what_build_expression_writes(expression, ours):
+    from modules import atlas_access
+    assert atlas_access.is_ours(expression) is ours
 
 
 # --------------------------------------------------------------------------- #
