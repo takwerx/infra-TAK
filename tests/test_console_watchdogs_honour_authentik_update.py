@@ -254,7 +254,7 @@ def ticks(monkeypatch):
     return run
 
 
-def _ldap_loop(reason, calls):
+def _ldap_loop(reason, calls, gate=True):
     def rec(name, ret=None):
         def f(*a, **k):
             calls.append(name)
@@ -277,6 +277,7 @@ def _ldap_loop(reason, calls):
         '_resync_ldap_credential_to_coreconfig': rec('cc_resync', (False, '')),
         '_authentik_webadmin_role_check_and_heal': rec('role_heal', False),
         '_authentik_audit_scrape_recent': rec('audit', 0),
+        '_ldap_drift_gate_ok': rec('drift_gate', gate),           # v10.4.3 W6
     }
     exec(compile(_src('_authentik_ldap_sa_bind_watchdog_loop'), 'app.py', 'exec'), ns)
     return ns['_authentik_ldap_sa_bind_watchdog_loop']
@@ -295,8 +296,18 @@ def test_ldap_sa_watchdog_skips_the_heal_during_an_update(ticks, capsys):
 def test_ldap_sa_watchdog_still_heals_a_real_drift(ticks, capsys):
     calls = []
     ticks(_ldap_loop('', calls), 1)
-    assert calls[:3] == ['bind_probe', 'token_check', 'heal']
+    assert calls[:4] == ['bind_probe', 'token_check', 'drift_gate', 'heal']
     assert 'bind drift DETECTED' in capsys.readouterr().out
+
+
+def test_w6_failed_bind_while_ldap_is_not_ready_is_not_drift(ticks, capsys):
+    # akres E2f / E3: core down or outpost restarting -> the bind fails; resetting the SA
+    # password and recreating the outpost then is wrong (and an E3c risk). Not drift.
+    calls = []
+    ticks(_ldap_loop('', calls, gate=False), 2)
+    assert 'heal' not in calls and 'record_failure' not in calls
+    assert calls.count('drift_gate') == 2
+    assert 'bind drift DETECTED' not in capsys.readouterr().out
 
 
 def _channels_loop(reason, calls):

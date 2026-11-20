@@ -74537,6 +74537,63 @@ def _ak_module_compose(ak_cfg, cmd, holder, plog=None, wait=_AK_COMPOSE_LOCK_WAI
 _GD_AUTHENTIK_UPDATE_MARKER = '/var/lib/takguard/authentik_update_in_progress'
 _GD_AUTHENTIK_UPDATE_MAX_S = 1800        # tak-authentik-watch.sh UPDATE_MAX_SECS
 _AK_LOCAL_HEALTH_URL = 'http://127.0.0.1:9090/-/health/live/'
+# v10.4.3 W6/W7: `ready` (not `live`) — 200 only once the core can serve requests (database
+# reachable, migrations done). akres E2b/E2f: an outpost started while this said no came up
+# not ready and left TAK stuck; E3c: `live` passed while `ready` was 503 on 2026.8.5.
+_AK_LOCAL_READY_URL = 'http://127.0.0.1:9090/-/health/ready/'
+_LDAP_DRIFT_MIN_UP_S = 60
+
+
+def _authentik_core_ready(timeout_s=0):
+    """True once the LOCAL Authentik core answers /-/health/ready/ with 200, polling for
+    up to `timeout_s`. No local ~/authentik (remote Authentik, not installed): True — there
+    is nothing local to gate."""
+    if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+        return True
+    deadline = time.time() + max(0, timeout_s)
+    while True:
+        try:
+            with urllib.request.urlopen(_AK_LOCAL_READY_URL, timeout=5) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        left = deadline - time.time()
+        if left <= 0:
+            return False
+        time.sleep(min(5.0, max(0.5, left)))
+
+
+def _ldap_drift_gate_ok():
+    """v10.4.3 W6: may a failed adm_ldapservice bind be read as PASSWORD drift? Only when
+    the core is ready AND the outpost is running, healthy and up at least
+    _LDAP_DRIFT_MIN_UP_S. Otherwise it is an availability fault, and the drift heal
+    (set_password + outpost recreate — itself an E3c risk) must not run. Logs the reason."""
+    why = None
+    if not _authentik_core_ready(0):
+        why = 'Authentik core not ready (/-/health/ready/ is not 200)'
+    else:
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f',
+                                           '{{.State.Running}} {{.State.StartedAt}} '
+                                           '{{if .State.Health}}{{.State.Health.Status}}{{end}}',
+                                           'authentik-ldap-1']),
+                               capture_output=True, text=True, timeout=10)
+            parts = (r.stdout or '').split()
+        except Exception:
+            parts = []
+        started = _epoch_from_rfc3339(parts[1]) if len(parts) >= 2 else None
+        if not parts or parts[0] != 'true' or started is None:
+            why = 'LDAP outpost not running'
+        elif len(parts) >= 3 and parts[2] != 'healthy':
+            why = f'LDAP outpost {parts[2]}'
+        elif time.time() - started < _LDAP_DRIFT_MIN_UP_S:
+            why = f'LDAP outpost up only {int(time.time() - started)}s'
+    if why:
+        print(f"[ldap-sa-watchdog] adm_ldapservice bind failed, but LDAP not ready — not a "
+              f"password drift ({why}); re-checking next tick", flush=True)
+        return False
+    return True
 _AK_UPDATE_INPROC = {'since': 0.0}       # ops #214: this console's own Update, marker or not
 
 
@@ -81285,6 +81342,8 @@ def _authentik_ldap_sa_bind_watchdog_loop():
                     else:
                         print(f"[ldap-sa-watchdog] LDAP outpost token repair FAILED: {_tok_msg}", flush=True)
                         _record_ldap_sa_heal_failure(f'outpost token repair failed: {_tok_msg}')
+                elif not _ldap_drift_gate_ok():
+                    pass    # v10.4.3 W6: availability fault, not drift — logged by the gate
                 else:
                     print("[ldap-sa-watchdog] adm_ldapservice bind drift DETECTED — auto-resyncing", flush=True)
                     try:
