@@ -10,8 +10,11 @@ Security conditions (Security lead, ops #973, Thu Nov 19 2026), each with a test
 tests/test_meshrelay_ops973.py:
   1. config.json is seeded with auth_enabled true before the first start; the health
      check fails the deploy if it ever reads false. config.json.example is never copied.
-  2. The dashboard port is loopback-only behind Caddy: a firewall deny rule plus the
-     check from outside. (The app has no bind option yet, so it listens on every address.)
+  2. The dashboard port is loopback-only behind Caddy: a firewall deny rule here, proved by
+     a check from a second machine in the box test (a probe of the box's own address goes over
+     loopback and would say "open"; so Deploy cannot prove it from the box). The app has no
+     bind option yet, so it listens on every address and the firewall rule is the only guard:
+     with no active firewall the port is open and only the app's own login remains.
   3. Authentik forward_auth covers the dashboard host. The phones use UDP 5000 only (the
      web router has no route they call), so nothing the phones need sits behind it. They
      never touch Caddy, so their brute-force protection is a fail2ban jail on the app's own
@@ -34,21 +37,28 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 
-from . import register_module, job_log
+from . import register_module, job_log, job_state
 
 KEY = 'meshrelay'
+_BUSY = threading.Lock()        # one update or rollback at a time
 UNIT = 'ptt-server'
 UNIT_PATH = '/etc/systemd/system/ptt-server.service'
 RUN_USER = 'ptt'
 INSTALL_DIR = '/opt/meshrelay'            # root-owned: binary + backup, read-only to `ptt`
 BIN_PATH = INSTALL_DIR + '/ptt-server'
 BACKUP_DIR = INSTALL_DIR + '/backup'
-DATA_DIR = '/var/lib/meshrelay'           # `ptt`-owned: config, users, recordings, web files
-WEB_DIR = DATA_DIR + '/web'
+DATA_DIR = '/var/lib/meshrelay'           # `ptt`-owned: config, users, recordings
+# The dashboard's static files are root-owned, next to the binary, and linked into the data folder
+# (the app serves ./web from its working directory). Root then never copies into the `ptt`
+# tree, and the non-root console can read them for the backup (Security, ops #980; a 700 folder
+# owned by `ptt` made the console's backup walk see nothing).
+WEB_DIR = INSTALL_DIR + '/web'
+WEB_LINK = DATA_DIR + '/web'
 CONFIG_PATH = DATA_DIR + '/config.json'
 PTT_PORT = 5000                           # UDP, public: the phones connect here
 # Not Ryan's default 8080: Guard Dog's health agent and Fed Hub already use 8080 on a
@@ -126,9 +136,13 @@ def config_problem(text):
     # A missing key means the app's own default, which is true. Only an explicit non-true fails.
     if cfg.get('auth_enabled', True) is not True:
         return 'auth_enabled is not true: anyone could join the relay without an account'
-    if (cfg.get('github_token') or '').strip():
+    if str(cfg.get('github_token') or '').strip():
         return 'config.json holds a github_token: infra-TAK keeps tokens out of the app'
-    if int(cfg.get('web_port') or 0) != WEB_PORT:
+    try:
+        web_port = int(cfg.get('web_port') or 0)
+    except (TypeError, ValueError):
+        return 'web_port is not a number'
+    if web_port != WEB_PORT:
         return f'web_port is not {WEB_PORT}: the firewall rule and Caddy point at {WEB_PORT}'
     return ''
 
@@ -314,6 +328,47 @@ def _install_tree(ctx, src_root, dst_root, owner=None):
         _priv(ctx, ['chown', '-h', '-R', owner, dst_root])
 
 
+def _stop_service(ctx):
+    """Stop the service and make sure it is stopped. Root writes into the `ptt` folder only after
+    this returns: a live `ptt` process could swap a file for a link while root works (Security,
+    ops #980). `systemctl stop` on a unit that does not exist yet is fine; a unit that is still
+    running afterwards is not."""
+    _priv(ctx, ['systemctl', 'stop', UNIT], check=False)
+    r = _priv(ctx, ['systemctl', 'is-active', UNIT], check=False)
+    if (r.stdout or '').strip() == 'active':
+        raise RuntimeError(f'{UNIT} did not stop: nothing was changed')
+
+
+def _audit(ctx, event, detail=''):
+    """One console audit line per action (C3/C7). Never raises."""
+    try:
+        fn = (ctx or {}).get('audit')
+        if fn:
+            fn(event, detail, force=True)
+    except Exception:
+        pass
+
+
+def _reassert_mfa(ctx, plog):
+    """A new Authentik app on a Hardened box ships without the require-MFA binding until the
+    console's own sweep runs; a module deploy does not restart the console (ops #985, ATLAS).
+    Does nothing when Hardening is not applied. Never raises."""
+    sweep = (ctx or {}).get('_w1_reassert_app_mfa')
+    if not sweep:
+        return False
+    try:
+        return bool(sweep(plog))
+    except Exception as exc:
+        plog('  \u26a0 Could not check the MFA requirement: %s' % str(exc)[:80])
+        return False
+
+
+def _link_web(ctx):
+    """Point the data folder's `web` at the root-owned files (the app serves ./web). The service
+    is stopped. -n: replace a link, never go into the folder it points at."""
+    _priv(ctx, ['ln', '-sfn', WEB_DIR, WEB_LINK])
+
+
 def _active(ctx):
     r = subprocess.run(ctx['_sudo_wrap'](['systemctl', 'is-active', UNIT]),
                        capture_output=True, text=True, timeout=30)
@@ -461,7 +516,7 @@ def deploy(ctx, job, params):
         # ops #980: a live `ptt` process could swap a file for a link while root copies or
         # changes modes). It also frees the binary: `cp` onto a running one fails with "Text
         # file busy" (seen on a real box). Step 5 starts it again.
-        _priv(ctx, ['systemctl', 'stop', UNIT], check=False)
+        _stop_service(ctx)
         for d in (INSTALL_DIR, BACKUP_DIR, DATA_DIR):
             _priv(ctx, ['mkdir', '-p', d])
         _priv(ctx, ['chmod', '755', INSTALL_DIR])
@@ -477,6 +532,7 @@ def deploy(ctx, job, params):
             ctx['_write_priv'](CONFIG_PATH, seed_config_text(), perm=0o600)
             plog("✓ config.json seeded (login required for every phone)")
         _fix_perms(ctx)
+        _link_web(ctx)
         prob = config_problem(read_config(ctx))
         if prob:
             raise RuntimeError(prob)
@@ -519,9 +575,12 @@ def deploy(ctx, job, params):
             ctx['_ensure_authentik_meshrelay_app'](fqdn, ak_token, plog=plog, settings=s)
         else:
             plog("⚠ Authentik token not found: the dashboard stays closed (Caddy answers 503) until it is set up")
+        if fqdn and ak_token:
+            _reassert_mfa(ctx, plog)
         ok, msg = ctx['_f2b_arm_meshrelay_jail'](plog)
         plog(f"{'✓' if ok else '⚠'} Phone-login jail: {msg}")
         host = (ctx['_get_service_domain'](s, 'meshrelay') or '').strip()
+        _audit(ctx, 'meshrelay_deploy', 'tag=%s arch=%s' % (RELEASE['tag'], arch))
         plog(f"✅ MeshRelay {RELEASE['tag']} is running. Phones connect to UDP {PTT_PORT}.")
         if host:
             plog(f"   Dashboard: https://{host}/  (first admin password: see the MeshRelay page)")
@@ -564,7 +623,7 @@ def update(ctx, plog=None):
         _priv(ctx, ['cp', binpath, BIN_PATH])
         _priv(ctx, ['chmod', '755', BIN_PATH])
         _priv(ctx, ['rm', '-rf', WEB_DIR])
-        _install_tree(ctx, web_root, WEB_DIR, owner=f'{RUN_USER}:{RUN_USER}')
+        _install_tree(ctx, web_root, WEB_DIR)
         _priv(ctx, ['systemctl', 'start', UNIT])
         ok, why = False, ''
         for _ in range(15):
@@ -580,6 +639,7 @@ def update(ctx, plog=None):
         s['meshrelay'] = {'tag': RELEASE['tag'], 'arch': arch, 'sha256': RELEASE['assets'][arch][1],
                           'previous': old}
         ctx['save_settings'](s)
+        _audit(ctx, 'meshrelay_update', 'from=%s to=%s' % (old, RELEASE['tag']))
         plog(f"✅ MeshRelay updated to {RELEASE['tag']}")
         return {'success': True}
     except Exception as e:
@@ -612,12 +672,12 @@ def rollback(ctx, plog=None):
     plog = plog or _plog
     if not _have_backup():
         raise RuntimeError('no backup to roll back to')
-    _priv(ctx, ['systemctl', 'stop', UNIT], check=False)
+    _stop_service(ctx)
     _priv(ctx, ['cp', BACKUP_DIR + '/ptt-server', BIN_PATH])
     _priv(ctx, ['chmod', '755', BIN_PATH])
     if _have_web_backup():
         _priv(ctx, ['rm', '-rf', WEB_DIR])
-        _install_tree(ctx, BACKUP_DIR + '/web', WEB_DIR, owner=f'{RUN_USER}:{RUN_USER}')
+        _install_tree(ctx, BACKUP_DIR + '/web', WEB_DIR)
     _priv(ctx, ['systemctl', 'start', UNIT])
     s = ctx['load_settings']()
     prev = (s.get('meshrelay') or {}).get('previous')
@@ -625,12 +685,13 @@ def rollback(ctx, plog=None):
         # tag back to the old one; the recorded checksum and `previous` belonged to the version we left
         s['meshrelay'] = {'tag': prev, 'arch': (s.get('meshrelay') or {}).get('arch', '')}
         ctx['save_settings'](s)
+    _audit(ctx, 'meshrelay_rollback', 'tag=%s' % (prev or ''))
     plog("↩ Rolled back to the previous version")
 
 
 def uninstall(ctx, job, params):
     steps = []
-    _priv(ctx, ['systemctl', 'stop', UNIT], check=False)
+    _stop_service(ctx)
     _priv(ctx, ['systemctl', 'disable', UNIT], check=False)
     _priv(ctx, ['rm', '-f', UNIT_PATH], check=False)
     _priv(ctx, ['systemctl', 'daemon-reload'], check=False)
@@ -656,22 +717,40 @@ def uninstall(ctx, job, params):
     steps.append('Authentik proxy app deregistered')
     ctx['_f2b_disarm_meshrelay_jail']()
     steps.append('Phone-login jail removed')
+    _audit(ctx, 'meshrelay_uninstall', 'keep_data=%s' % bool((params or {}).get('keep_data')))
     return {'success': True, 'steps': steps}
 
 
 def register(ctx):
     from flask import jsonify
 
+    def _busy():
+        """409 when a deploy job runs or another update/rollback holds the lock; else take the lock."""
+        if job_state(KEY).get('running') or not _BUSY.acquire(blocking=False):
+            return jsonify({'success': False, 'error': 'MeshRelay is busy: wait for the running action'}), 409
+        return None
+
     def update_view():
-        r = update(ctx)
+        refused = _busy()
+        if refused:
+            return refused
+        try:
+            r = update(ctx)
+        finally:
+            _BUSY.release()
         return jsonify(r), (200 if r.get('success') else 500)
 
     def rollback_view():
+        refused = _busy()
+        if refused:
+            return refused
         try:
             rollback(ctx)
             return jsonify({'success': True})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
+        finally:
+            _BUSY.release()
 
     def forget_password_view():
         s = ctx['load_settings']()

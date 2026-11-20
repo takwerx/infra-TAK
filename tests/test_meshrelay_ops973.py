@@ -90,9 +90,14 @@ class Box:
         self.web = web
         self.fw = []
         self.logs = []
+        self.audits = []
+        self.mfa = []
+        self.still_active = False      # make `systemctl is-active` say active (a stop that failed)
 
     def sudo(self, argv):
         self.events.append(list(argv))
+        if self.still_active and list(argv)[:2] == ['systemctl', 'is-active']:
+            return ['echo', 'active']
         return ['true']
 
     def read(self, path):
@@ -129,6 +134,8 @@ class Box:
             'meshrelay_fetch': self.fetch,
             '_f2b_arm_meshrelay_jail': lambda plog=None: (self.fw.append(('jail', 'arm')) or (True, 'armed')),
             '_f2b_disarm_meshrelay_jail': lambda: (self.fw.append(('jail', 'disarm')) or (True, 'removed')),
+            'audit': lambda event, detail='', force=False: self.audits.append((event, detail)),
+            '_w1_reassert_app_mfa': lambda plog=None: (self.mfa.append(1) or True),
         }
 
     def cmds(self):
@@ -291,19 +298,118 @@ def test_broker_accepts_chown_dash_h_on_the_ptt_folder():
     assert B._evaluate({'op': 'exec', 'argv': ['chown', '-h', '-R', 'ptt:ptt', M.DATA_DIR]})[0] == 'ALLOW'
 
 
-def test_update_stops_the_service_before_root_reads_the_ptt_web_folder(box, monkeypatch):
+def test_web_files_are_root_owned_next_to_the_binary_and_linked_into_the_data_folder(box):
+    """Security (ops #980): root never copies into the ptt tree, and the non-root console can read the
+    files for the update backup (a 700 folder owned by ptt made that backup walk see nothing)."""
+    assert M.WEB_DIR.startswith(M.INSTALL_DIR + '/') and not M.WEB_DIR.startswith(M.DATA_DIR)
+    assert M.WEB_LINK == M.DATA_DIR + '/web'
+    _run_deploy(box)
+    cmds = box.cmds()
+    link = [i for i, e in enumerate(cmds) if e == ['ln', '-sfn', M.WEB_DIR, M.WEB_LINK]]
+    perms = [i for i, e in enumerate(cmds) if e[:3] == ['chown', '-h', '-R']]
+    stop = next(i for i, e in enumerate(cmds) if e[:3] == ['systemctl', 'stop', M.UNIT])
+    assert link and perms and stop < perms[0] < link[0]
+    for e in cmds:
+        assert not (e[0] == 'chown' and M.WEB_DIR in e), e        # web files stay root-owned
+
+
+def test_update_and_rollback_never_chown_the_web_files_to_ptt(box, monkeypatch):
     box.files[M.CONFIG_PATH] = M.seed_config_text()
     box.settings['meshrelay'] = {'tag': 'v4.5.0'}
-    seen = []
-    real = M._install_tree
-
-    def spy(ctx, src, dst, owner=None):
-        seen.append((src, [e[:3] for e in box.cmds()]))
-        return real(ctx, src, dst, owner)
-    monkeypatch.setattr(M, '_install_tree', spy)
+    monkeypatch.setattr(M, '_have_backup', lambda: True)
+    monkeypatch.setattr(M, '_have_web_backup', lambda: True)
     assert M.update(box.ctx(), plog=box.logs.append)['success'] is True
-    backup_read = next(h for src, h in seen if src == M.WEB_DIR)
-    assert ['systemctl', 'stop', M.UNIT] in backup_read, 'web files read before the stop'
+    M.rollback(box.ctx(), plog=box.logs.append)
+    assert not [e for e in box.cmds() if e[0] == 'chown']
+    # the backup is read from the root-owned folder, after the stop
+    cmds = box.cmds()
+    stop = next(i for i, e in enumerate(cmds) if e[:3] == ['systemctl', 'stop', M.UNIT])
+    first_cp = next(i for i, e in enumerate(cmds) if e[0] == 'cp')
+    assert stop < first_cp
+
+
+def test_broker_accepts_the_web_link_command_and_still_refuses_links_out_of_the_data_dir():
+    assert B._evaluate({'op': 'exec', 'argv': ['ln', '-sfn', M.WEB_DIR, M.WEB_LINK]})[0] == 'ALLOW'
+    assert B._evaluate({'op': 'exec', 'argv': ['ln', '-sfn', '/etc', M.DATA_DIR + '/evil']})[0] == 'DENY'
+
+
+def test_deploy_stops_before_touching_anything_when_the_service_will_not_stop(box):
+    box.still_active = True
+    job = _run_deploy(box)
+    assert job['error'] is True and job['complete'] is False
+    assert not [e for e in box.cmds() if e[0] in ('cp', 'chown', 'chmod', 'mkdir', 'rm', 'ln')]
+    assert not [e for e in box.events if e[0] == 'WRITE']
+
+
+def test_rollback_and_uninstall_refuse_to_go_on_when_the_service_will_not_stop(box, monkeypatch):
+    box.still_active = True
+    monkeypatch.setattr(M, '_have_backup', lambda: True)
+    with pytest.raises(RuntimeError, match='did not stop'):
+        M.rollback(box.ctx(), plog=box.logs.append)
+    with pytest.raises(RuntimeError, match='did not stop'):
+        M.uninstall(box.ctx(), {}, {})
+    assert not [e for e in box.cmds() if e[0] in ('cp', 'rm', 'chown', 'chmod')]
+
+
+def test_deploy_asks_the_console_to_put_the_mfa_gate_on_the_new_authentik_app(box):
+    _run_deploy(box)
+    assert box.mfa == [1]
+
+
+def test_a_failed_mfa_sweep_never_fails_the_deploy(box):
+    def boom(plog=None):
+        raise RuntimeError('authentik away')
+    c = box.ctx()
+    c['_w1_reassert_app_mfa'] = boom
+    job = {'running': True, 'complete': False, 'error': False, 'log': []}
+    M.deploy(c, job, {})
+    assert job['complete'] is True and job['error'] is False
+
+
+def test_deploy_update_rollback_and_uninstall_each_leave_an_audit_line(box, monkeypatch):
+    box.files[M.CONFIG_PATH] = M.seed_config_text()
+    _run_deploy(box)
+    box.settings['meshrelay'] = {'tag': 'v4.5.0'}
+    monkeypatch.setattr(M, '_have_backup', lambda: True)
+    monkeypatch.setattr(M, '_have_web_backup', lambda: True)
+    M.update(box.ctx(), plog=box.logs.append)
+    M.rollback(box.ctx(), plog=box.logs.append)
+    M.uninstall(box.ctx(), {}, {'keep_data': True})
+    assert [a[0] for a in box.audits] == ['meshrelay_deploy', 'meshrelay_update', 'meshrelay_rollback', 'meshrelay_uninstall']
+    assert not any('token' in a[1].lower() or 'password' in a[1].lower() for a in box.audits)
+
+
+@pytest.mark.parametrize('text', ['{"web_port": "abc"}', '{"web_port": [1]}', '{"github_token": 5, "web_port": 8187}',
+                                  '{"auth_enabled": true, "web_port": null}'])
+def test_config_problem_never_raises_on_a_config_the_ptt_account_wrote(text):
+    assert isinstance(M.config_problem(text), str)
+
+
+def _views(monkeypatch, box):
+    flask = pytest.importorskip('flask')
+    got = {}
+    monkeypatch.setattr(M, 'register_module', lambda d: got.update(d))
+    M.register(box.ctx())
+    routes = {r['endpoint']: r['view'] for r in got['extra_routes']}
+    return flask.Flask('t'), routes
+
+
+def test_update_and_rollback_refuse_to_overlap_a_running_deploy_or_each_other(box, monkeypatch):
+    app, routes = _views(monkeypatch, box)
+    monkeypatch.setattr(M, 'job_state', lambda k: {'running': True})
+    with app.test_request_context():
+        for name in ('meshrelay_update', 'meshrelay_rollback'):
+            resp, code = routes[name]()
+            assert code == 409, name
+    monkeypatch.setattr(M, 'job_state', lambda k: {'running': False})
+    assert M._BUSY.acquire(blocking=False)          # another update holds the lock
+    try:
+        with app.test_request_context():
+            assert routes['meshrelay_update']()[1] == 409
+            assert routes['meshrelay_rollback']()[1] == 409
+    finally:
+        M._BUSY.release()
+    assert not M._BUSY.locked()
 
 
 def test_update_that_fails_after_the_stop_but_before_any_swap_starts_the_old_service_again(box, monkeypatch):
