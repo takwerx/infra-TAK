@@ -222,7 +222,14 @@ def _asset_api_url(tag, name, token):
 
 def fetch(tag, name, dest, token='', limit=_MAX_BIN):
     """Download one release file to `dest` and return its SHA-256. Never logs the token."""
-    url = _asset_api_url(tag, name, token)
+    # SCRATCH ONLY (ops #973): a private test build on a read-only blob link in a throwaway
+    # resource group; the GitHub API / token path is NOT exercised on the box. Never merge.
+    _blob = '/var/tmp/meshrelay-blob-link'
+    if os.path.exists(_blob):
+        _base, _sas = open(_blob).read().strip().split('|', 1)
+        url, token = f'{_base}/{name}?{_sas}', ''
+    else:
+        url = _asset_api_url(tag, name, token)
     h = hashlib.sha256()
     n = 0
     with _open(url, token, 'application/octet-stream', timeout=120) as r, open(dest, 'wb') as f:
