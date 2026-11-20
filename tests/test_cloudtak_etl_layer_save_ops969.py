@@ -397,6 +397,12 @@ def test_an_ephemeral_patch_that_does_not_parse_is_never_installed(tmp_path):
     assert broken != script
     before = _eph(api).read_text()
     r = subprocess.run(['sh', '-c', broken], capture_output=True, text=True, timeout=60)
+    # the layer-save file was edited, so the api has to restart to load it: HEALED. The ephemeral file stays as it was
+    assert r.stdout.strip() == 'HEALED'
+    assert _eph(api).read_text() == before
+    assert not list(route.parent.glob('*.tmp.js'))
+    # the next run has only the ephemeral file left to do, and it fails again: that is shown, not hidden
+    r = subprocess.run(['sh', '-c', broken], capture_output=True, text=True, timeout=60)
     assert r.stdout.strip() == 'FAIL'
     assert _eph(api).read_text() == before
     assert not list(route.parent.glob('*.tmp.js'))

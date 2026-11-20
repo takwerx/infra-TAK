@@ -54429,8 +54429,8 @@ function handle(F, plan) {
 const r = [handle(process.env.F, planLayer), handle(process.env.E, planEphemeral)].filter((x) => x !== 'NOCONF');
 const times = r.filter((x) => x.indexOf('OK ') === 0).map((x) => Number(x.split(' ')[1]));
 console.log(r.length === 0 ? 'NOCONF'
+  : r.indexOf('HEALED') >= 0 ? 'HEALED'      // an edit is on disk: the api must restart to load it; a failure on the other file shows on the next check
   : r.indexOf('FAIL') >= 0 ? 'FAIL'
-  : r.indexOf('HEALED') >= 0 ? 'HEALED'
   : r.indexOf('MISSING') >= 0 ? 'MISSING'
   : times.length ? 'OK ' + Math.max.apply(null, times)
   : r.indexOf('UPSTREAM') >= 0 ? 'UPSTREAM' : 'SHAPE');
