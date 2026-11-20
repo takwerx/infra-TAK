@@ -97,7 +97,7 @@ class Box:
                  subs=None, ldap_users=None, tak_ldap_ok=True, dead_pool=0, online=True, api_ok=True,
                  history=None, https='ok', https_after_restart='ok', https_flaky=0, api_busy=0,
                  gd_restart=None, ghosts=(), ghosts_leave=False, outpost='user', api_back_after=None,
-                 https_partial=False):
+                 https_partial=False, https_after_api_restart='ok', api_restart_rc=0, api_only_restart=False):
         self.t = T0
         # What the local outpost's log shows of TAK's lookups during HTTPS logins (ops #158):
         # 'user' = each login is looked up; 'others' = TAK looks the console's admin cert up on
@@ -146,6 +146,13 @@ class Box:
         # v10.4.3 W1: `https_partial` = only the FIRST user the check logs in as gets the `https`
         # state; every other user is fine (the "some users fine" case that keeps the hold).
         self.https_partial, self.partial_cn = https_partial, None
+        # ops #1000: `systemctl restart takserver-api` (native only): the API JVM is back (8443
+        # listening) 60 s later and the HTTPS side is then in `https_after_api_restart`; 8089 is
+        # never touched. `api_restart_rc` != 0 = the command fails.
+        self.https_after_api_restart, self.api_restart_rc = https_after_api_restart, api_restart_rc
+        # The older tests below exercise the full-restart machinery (still what a container install
+        # runs), so the box leaves the API-only restart off unless a test asks for it.
+        self.api_only_restart = api_only_restart
         self.leaf_certs, self.user_api, self.workdirs, self.missions = [], [], [], set()
         self.alerts = []               # GH #549: Guard Dog alerts (at, args, kwargs)
 
@@ -311,6 +318,14 @@ class Box:
             hits = [l for l in self.msglog if any(re.search(p, l) for p in pats)]
             return subprocess.CompletedProcess(cmd, 0 if hits else 1, stdout=''.join(l + '\n' for l in hits),
                                                stderr='')
+        if cmd == ['systemctl', 'restart', 'takserver-api']:
+            assert not self.container
+            self.t += 5
+            if self.api_restart_rc == 0:
+                self.ports_up_at = self.t + 60
+                self.https = self.https_after_api_restart
+            return subprocess.CompletedProcess(cmd, self.api_restart_rc, stdout='',
+                                               stderr='boom' if self.api_restart_rc else '')
         if cmd in (['systemctl', 'restart', 'takserver'], ['docker', 'restart', 'takserver']):
             self.t += 20
             if self.restart_rc == 0:
@@ -403,9 +418,10 @@ class Box:
                   '_TAK_MARTI_READ_WAIT_S', '_TAK_MARTI_READ_RETRY_MAX_S', '_TAK_API_CHECK_STUCK_S'):
             ns[c] = _const(c)
         for c in ('_TAK_HTTPS_BROKEN_RESTART_S', '_TAK_BOOT_HTTPS_CHECK_AFTER_S',   # GH #549
-                  '_TAK_HTTPS_STUCK_AFTER_OUTPOST_S'):                         # v10.4.3 W1
+                  '_TAK_HTTPS_STUCK_AFTER_OUTPOST_S', '_TAK_API_ONLY_RESTART_PORT_WAIT_S'):   # v10.4.3 W1, ops #1000
             if re.search(r'^%s = \d+' % c, APP, re.M):
                 ns[c] = _const(c)
+        ns['_TAK_API_ONLY_RESTART'] = box.api_only_restart
         ns['_tak_https_broken_alert'] = lambda *a, **k: box.alerts.append((box.t, a, k))
         ns['_tak_ldap_recycle_lock'] = threading.Lock()
         ns['_ldap_pw_file'] = lambda pw: contextlib.nullcontext('/run/fake/ldap-pw')   # L4 (v10.4.3)
@@ -418,8 +434,10 @@ class Box:
                      '_tak_device_usernames', '_tak_client_sessions', '_tak_client_sessions_wait',
                      '_tak_log_removed_subscriptions', '_tak_heal_ldap_sessions',
                      '_tak_api_user_check_once', '_tak_api_user_check',
-                     '_ldap_outpost_tak_searches', '_tak_api_check_stuck'):
-            exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
+                     '_ldap_outpost_tak_searches', '_tak_api_check_stuck',
+                     '_tak_restart_api_only', '_tak_api_only_heal'):
+            if f'def {name}(' in APP:      # the ops #1000 helpers do not exist on the base branch
+                exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
         return ns
 
     def recycle(self, trigger='end of console update', check_outpost=True, final=True):
@@ -2195,3 +2213,91 @@ def test_w3_restarts_tak_at_most_once_per_window():
     box.t += _const('_TAK_GROUPS_WATCH_RESTART_EVERY_S')
     box.settings['tak_ldap_recycle'].pop('pending', None)
     assert _watch(box) is True and len(box.restarts()) == 2
+
+
+# ── ops #1000: native install, HTTPS side stuck after an outpost recreate → restart ONLY the API ──
+# Field/box (Ubuntu 22.04 update leg, 2 of 3 boxes, 2026-11-20): after the update recreated the LDAP
+# outpost, TAK's HTTPS side (8443) gave every LDAP user no groups for 21+ min, 8089 clients kept
+# theirs. `systemctl restart takserver-api` alone fixed it (groups back after ~5 min, messaging and
+# the 8089 clients untouched). So the heal restarts the API at once, not after 5 min of retries and
+# the 240 s outpost window, and keeps the full TAK restart for when that did not help.
+
+API_RESTART = ['systemctl', 'restart', 'takserver-api']
+FULL_RESTART = ['systemctl', 'restart', 'takserver']
+
+
+def _stuck_native(box_fn=healthy_box, **kw):
+    kw.setdefault('tak_start', T0 - 3 * 24 * HOUR)
+    kw.setdefault('ldap_start', T0 - HOUR)
+    return box_fn(https='no_groups', outpost='others', api_only_restart=True, **kw)
+
+
+def test_ops1000_stuck_https_with_grouped_clients_restarts_only_the_api_at_once():
+    box = _stuck_native()
+    clients = [s['subscriptionUid'] for s in box.subs]
+    t0 = box.t
+    assert box.recycle() is True
+    assert box.restarts() == [API_RESTART]                    # no full TAK restart
+    assert box.drops() == []
+    assert [s['subscriptionUid'] for s in box.subs] == clients   # every 8089 client still connected
+    assert box.t - t0 < _const('_TAK_API_CHECK_WAIT_S')       # no 5 min of retries first
+    assert not any('checking once more in' in l for l in box.log)   # no wait for the 240 s window
+    assert any('restarting only TAK\'s API process now, 8089 stays up' in l for l in box.log)
+    assert any('no full TAK Server restart needed' in l for l in box.log)
+    st = box.settings['tak_ldap_recycle']
+    assert st['last_outcome'] == 'API restarted alone' and 'pending' not in st
+    [(at, args, kw)] = box.alerts
+    assert 'API restarted alone' in args[1]
+
+
+def test_ops1000_stuck_https_with_no_clients_restarts_only_the_api_too():
+    box = _stuck_native(idle_box)
+    assert box.recycle() is True
+    assert box.restarts() == [API_RESTART]
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'API restarted alone'
+
+
+def test_ops1000_api_restart_that_does_not_help_falls_back_to_the_full_restart():
+    box = _stuck_native(https_after_api_restart='no_groups', https_after_restart='ok')
+    assert box.recycle() is True
+    assert box.restarts() == [API_RESTART, FULL_RESTART]      # the full restart is the last resort
+    assert any('still' in l and 'after the API-only restart' in l for l in box.log)
+    assert box.settings['tak_ldap_recycle']['last_outcome'] == 'restarted'
+
+
+def test_ops1000_api_restart_command_failing_falls_back_to_the_full_restart():
+    box = _stuck_native(api_restart_rc=1)
+    assert box.recycle() is True
+    assert box.restarts() == [API_RESTART, FULL_RESTART]
+    assert any('API restart failed' in l and 'falling back to restarting TAK Server' in l for l in box.log)
+
+
+def test_ops1000_partial_case_still_holds_and_never_restarts_the_api():
+    # only the check user is broken, another user is fine: not the stuck state
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups',
+                      https_partial=True, api_only_restart=True)
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert any('another user is fine' in l for l in box.log)
+
+
+def test_ops1000_healthy_https_never_restarts_anything():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, api_only_restart=True)
+    assert box.recycle() is False
+    assert box.restarts() == []
+
+
+def test_ops1000_a_container_install_has_no_separate_api_process_and_keeps_the_full_restart():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, container=True, https='no_groups', api_only_restart=True)
+    ok, why = box.ns()['_tak_restart_api_only'](box.log.append, 'TAK LDAP recycle')
+    assert ok is False and 'container' in why
+    assert [c for c in box.calls if c[1:2] == ['restart']] == []   # nothing was run
+
+
+def test_ops1000_api_only_restart_is_a_plain_systemctl_the_broker_allows():
+    src = _src('_tak_restart_api_only')
+    assert "['systemctl', 'restart', 'takserver-api']" in src
+    broker = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               'broker', 'takwerx_broker.py')).read()
+    verbs = re.search(r'^SYSTEMCTL_VERBS = \{(.*?)\}', broker, re.S | re.M).group(1)
+    assert "'restart'" in verbs

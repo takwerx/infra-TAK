@@ -77380,6 +77380,14 @@ _TAK_HTTPS_BROKEN_RESTART_S = 900
 # The 900 s hold above is kept only for the PARTIAL case (another user gets groups, clients
 # connected). Fleet constant.
 _TAK_HTTPS_STUCK_AFTER_OUTPOST_S = 240
+# ops #1000 (AJ's lead, 2026-11-20): on a NATIVE install the stuck state (every user without groups
+# over HTTPS while LDAP and the 8089 clients are fine) is fixed by restarting TAK's API process
+# alone: `systemctl restart takserver-api` (box-verified: groups back 305 s later, the messaging
+# process and the 8089 clients untouched). So the heal does that as soon as the HTTPS check says
+# empty, with no 240 s wait and no 5 min of retries, and keeps the full TAK restart for the case
+# that the API restart did not help. The API JVM needs up to this long to listen on 8443 again.
+_TAK_API_ONLY_RESTART_PORT_WAIT_S = 600
+_TAK_API_ONLY_RESTART = True      # fleet constant: native installs restart the API process alone first
 # GH #549: at box boot TAK and the outpost start together, so the outpost-start test above
 # never fires, and a TAK that came up while Authentik answered 502 was never checked. Once
 # per TAK start, this long after it, the HTTPS side is checked once (one login, quiet if OK).
@@ -78200,6 +78208,61 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
         delay = min(delay * 2, _TAK_API_CHECK_RETRY_MAX_S)
 
 
+def _tak_restart_api_only(plog, tag):
+    """ops #1000: restart only TAK's API process (native install: `takserver-api`), leaving the
+    messaging process and every 8089 client connected. Waits for 8443 to listen again. Returns
+    (ok, detail): ok False = the restart command failed or 8443 did not come back in
+    `_TAK_API_ONLY_RESTART_PORT_WAIT_S`, or 8089 stopped answering (the caller then falls back
+    to the full TAK restart)."""
+    if _tak_is_container():
+        return False, "TAK runs in a container: no separate API process to restart"
+    t0 = time.time()
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver-api']),
+                           capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        plog(f"  {tag}: API restart command still running after 240s — waiting for port 8443")
+    except Exception as e:
+        return False, f"API restart not run: {str(e)[:120]}"
+    else:
+        if r.returncode != 0:
+            return False, f"API restart failed: {((r.stderr or '') + (r.stdout or '')).strip()[-200:]}"
+    # the restart command returns at once; the API JVM listens on 8443 again 1-5 min later
+    while not _tcp_accepts(8443):
+        if time.time() - t0 >= _TAK_API_ONLY_RESTART_PORT_WAIT_S:
+            return False, f"TAK's API (8443) not up {int(time.time() - t0)}s after the API restart"
+        time.sleep(5)
+    if not _tcp_accepts(8089):
+        return False, "8089 stopped answering during the API restart"
+    return True, f"TAK's API restarted alone, 8443 listening again after {int(time.time() - t0)}s, 8089 untouched"
+
+
+def _tak_api_only_heal(plog, tag, ldap_pass, api_summary, who):
+    """ops #1000: the HTTPS side gives users no groups while LDAP does (native install). Restart
+    TAK's API process alone, then check the HTTPS side again. Returns (done, summary): done True
+    = users have their groups again, no full TAK restart needed. done False = the API restart
+    did not help (or could not run); `summary` then says why, for the full-restart fallback."""
+    plog(f"  ✗ {tag}: TAK's HTTPS/API side gives users no groups while LDAP does: {api_summary}. ATAK Data "
+         f"Sync and CloudTAK are broken for everyone until TAK's API restarts — restarting only TAK's API "
+         f"process now, 8089 stays up ({who})")
+    ok, detail = _tak_restart_api_only(plog, tag)
+    if not ok:
+        plog(f"  ✗ {tag}: {detail} — falling back to restarting TAK Server")
+        return False, f"HTTPS/API side gave users no groups ({api_summary}); the API-only restart failed: {detail}"
+    plog(f"  {tag}: {detail}")
+    try:
+        verdict, check = _tak_api_user_check(plog, tag, ldap_pass)   # the API warms up a while
+    except Exception as e:
+        verdict, check = 'unknown', f"HTTPS check error: {str(e)[:120]}"
+    if verdict == 'ok':
+        plog(f"  ✓ {tag}: after the API-only restart: {check} — no full TAK Server restart needed")
+        return True, f"{detail}; {check}"
+    plog(f"  ✗ {tag}: after the API-only restart the HTTPS side is still not fine ({verdict}: {check}) — "
+         f"falling back to restarting TAK Server")
+    return False, (f"HTTPS/API side gave users no groups ({api_summary}); still {verdict} after an "
+                   f"API-only restart ({check})")
+
+
 def _tak_ldap_recycle_request(reason, need_groups=True, restart=False):
     """Ask for one TAK client heal (TAK restart only as the fallback) once LDAP is healthy
     again; `restart` = TAK must restart regardless (CoreConfig's LDAP credential changed).
@@ -78451,13 +78514,18 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             # stuck state (every user, until TAK restarts) — not the 75-204 s self-recovery of
             # ops #316 or the ~54 s API reconnect of ops #158. Those keep the normal rounds.
             api_info = {}
+            # ops #1000: native install = the API process can be restarted alone (cheap for the
+            # 8089 clients), so a round of logins that still gives no groups is enough: no 300 s
+            # of retries and no wait for the outpost to be 240 s old.
+            api_only = _TAK_API_ONLY_RESTART and not _tak_is_container()
             try:
-                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass, early=grouped == 0,
-                                                               info=api_info)
+                api_verdict, api_summary = _tak_api_user_check(
+                    plog, tag, ldap_pass, early=grouped == 0, info=api_info,
+                    wait_s=0 if api_only else _TAK_API_CHECK_WAIT_S)
                 if api_verdict == 'broken':
                     ref = _docker_started_epoch('authentik-ldap-1') or req_at or 0
                     left = _TAK_HTTPS_STUCK_AFTER_OUTPOST_S - (time.time() - ref) if ref else 0
-                    if left > 0:
+                    if left > 0 and not api_only:
                         plog(f"  {tag}: HTTPS check: {api_summary} — the LDAP outpost started "
                              f"{int(time.time() - ref)}s ago and TAK can recover by itself in that window "
                              f"(ops #316); checking once more in {int(left)}s")
@@ -78500,12 +78568,19 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 who = (f"{grouped} connected client(s) will reconnect" if grouped
                        else "TAK's client list can't be read")
                 escalated = True
-                plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side still gives users no groups "
-                     f"{_TAK_HTTPS_STUCK_AFTER_OUTPOST_S // 60}+ min after the LDAP outpost started, while LDAP "
-                     f"gives them groups: {api_summary}. ATAK Data Sync and CloudTAK are broken for everyone "
-                     f"until TAK restarts — restarting TAK Server now ({who})")
-                summary = (f"HTTPS/API side gave users no groups {_TAK_HTTPS_STUCK_AFTER_OUTPOST_S // 60}+ min "
-                           f"after the LDAP outpost started ({api_summary})")
+                if api_only:
+                    done, summary = _tak_api_only_heal(plog, tag, ldap_pass, api_summary, who)
+                    if done:
+                        _alert(f'TAK API restarted alone; users have their groups again ({summary})')
+                        _finish('API restarted alone', healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
+                        return True
+                else:
+                    plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side still gives users no groups "
+                         f"{_TAK_HTTPS_STUCK_AFTER_OUTPOST_S // 60}+ min after the LDAP outpost started, while LDAP "
+                         f"gives them groups: {api_summary}. ATAK Data Sync and CloudTAK are broken for everyone "
+                         f"until TAK restarts — restarting TAK Server now ({who})")
+                    summary = (f"HTTPS/API side gave users no groups {_TAK_HTTPS_STUCK_AFTER_OUTPOST_S // 60}+ min "
+                               f"after the LDAP outpost started ({api_summary})")
             elif grouped != 0:
                 who = (f"{grouped} connected client(s) have their groups" if grouped
                        else "TAK's client list can't be read")
@@ -78528,9 +78603,16 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                      f"everyone, which is worse than one reconnect — restarting TAK Server ({who})")
                 summary = f"HTTPS/API side gave users no groups for {int(broken_for // 60)} min ({api_summary})"
             else:
-                plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side is broken: {api_summary}. ATAK Data Sync and "
-                     f"CloudTAK get no groups (empty mission lists, 403 on create) until TAK Server restarts")
-                summary = f"HTTPS/API side gives users no groups ({api_summary}); no connected clients to drop"
+                if api_only:
+                    done, summary = _tak_api_only_heal(plog, tag, ldap_pass, api_summary, "no connected clients")
+                    if done:
+                        _alert(f'TAK API restarted alone; users have their groups again ({summary})')
+                        _finish('API restarted alone', healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
+                        return True
+                else:
+                    plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side is broken: {api_summary}. ATAK Data Sync and "
+                         f"CloudTAK get no groups (empty mission lists, 403 on create) until TAK Server restarts")
+                    summary = f"HTTPS/API side gives users no groups ({api_summary}); no connected clients to drop"
 
         native = not _tak_is_container()
         plog(f"  {tag}: {summary} — {'restarting' if must_restart else 'falling back to restarting'} TAK Server "
