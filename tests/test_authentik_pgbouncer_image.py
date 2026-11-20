@@ -383,8 +383,9 @@ def test_line_edit_failure_changes_nothing_and_never_redumps(tmp_path):
 def test_harden_step_does_not_recreate_on_a_formatting_only_diff():
     # The post-update harden step re-dumps compose at the default width; v10.2.22's
     # width=200 file differed only in line wrapping and still recreated server/ldap.
-    i = APP.index('print("Post-update: Authentik compose hardened — recreating worker/server, then ldap")')
-    block = APP[i - 1500:i]
+    # v10.4.3 W2: the line now says whether ldap is recreated too (only if its section changed)
+    i = APP.index('print("Post-update: Authentik compose hardened — recreating worker/server"')
+    block = APP[i - 3000:i]
     assert '_ak_recreate = _ak != _ak_orig' in block
     assert 'safe_load(_ak) == _yaml_cmp.safe_load(_ak_orig)' in block
     assert block.rstrip().endswith('if _ak_recreate:')
