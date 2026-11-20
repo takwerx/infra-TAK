@@ -64280,8 +64280,13 @@ def _ensure_authentik_meshrelay_app(fqdn, ak_token, plog=None, flow_pk=None, inv
             results = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
             if results:
                 provider_pk = results[0]['pk']
+                # Authentik 2026.8.5 validates a partial update as if `mode` were its default
+                # (`proxy`) and refuses a body without it: HTTP 400 "Internal host cannot be
+                # empty" (ops #708). Found again on a box by a second MeshRelay Deploy (ops #973).
                 req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
-                    data=json.dumps({'external_host': host, 'cookie_domain': cookie}).encode(),
+                    data=json.dumps({'name': 'MeshRelay Proxy', 'authorization_flow': flow_pk,
+                        'invalidation_flow': inv_flow_pk, 'mode': 'forward_single',
+                        'external_host': host, 'cookie_domain': cookie}).encode(),
                     headers=_ak_headers, method='PATCH')
                 _urlreq.urlopen(req, timeout=10)
                 log("  ✓ Proxy provider already exists (external_host updated)")

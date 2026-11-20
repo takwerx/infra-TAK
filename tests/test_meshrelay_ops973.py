@@ -30,6 +30,8 @@ import pathlib
 import re
 import tarfile
 import types
+import json
+import urllib.error
 import urllib.request
 
 import pytest
@@ -812,3 +814,72 @@ def test_app_lists_meshrelay_for_update_emails_version_cards_and_full_uninstall(
     assert "mod_registry.meshrelay.get_version_info(mod_registry.get_ctx())" in APP
     assert "mod_registry.uninstall_module('meshrelay', log_fn=plog)" in APP
     assert "'meshrelay': ['meshrelay_http']" in APP
+
+
+# ── a second Deploy meets the Authentik provider that the first one made (box test, ops #973) ──
+
+class _AkResp:
+    def __init__(self, payload):
+        self._b = json.dumps(payload).encode()
+
+    def read(self):
+        return self._b
+
+
+class _FakeAuthentik:
+    """Authentik 2026.8.5 as seen on a box: a POST of an existing provider or app is a 400, and a
+    PATCH of a proxy provider without `mode` is a 400 too (ops #708: validated as mode=proxy)."""
+
+    def __init__(self):
+        self.calls = []
+        self.patched = []
+
+    def urlopen(self, req, timeout=None):
+        url, method = req.full_url, (getattr(req, 'method', None) or 'GET')
+        body = json.loads(req.data.decode()) if req.data else {}
+        self.calls.append((method, url))
+
+        def refuse(msg):
+            raise urllib.error.HTTPError(url, 400, 'Bad Request', {}, io.BytesIO(msg.encode()))
+        if 'flows/instances/?designation=authorization' in url:
+            return _AkResp({'results': [{'pk': 'flow-a', 'slug': 'default-provider-authorization-implicit-consent'}]})
+        if 'flows/instances/?designation=invalidation' in url:
+            return _AkResp({'results': [{'pk': 'flow-i', 'slug': 'default-invalidation-flow'}]})
+        if url.endswith('/providers/proxy/') and method == 'POST':
+            refuse('{"name":["provider with this name already exists."]}')
+        if 'providers/proxy/?search=MeshRelay' in url:
+            return _AkResp({'results': [{'pk': 7}]})
+        if '/providers/proxy/7/' in url and method == 'PATCH':
+            if 'mode' not in body:
+                refuse('{"internal_host":["Internal host cannot be empty when forward auth is disabled."]}')
+            self.patched.append(body)
+            return _AkResp({})
+        if url.endswith('/core/applications/') and method == 'POST':
+            refuse('{"slug":["Application with this slug already exists."]}')
+        if '/core/applications/meshrelay/' in url and method == 'PATCH':
+            return _AkResp({})
+        raise AssertionError(f'unexpected Authentik call {method} {url}')
+
+
+def _load_ak_app_func(monkeypatch, fake, logs):
+    tree = ast.parse(APP)
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_ensure_authentik_meshrelay_app')
+    ns = {'json': json, 'time': types.SimpleNamespace(sleep=lambda s: None),
+          '_get_authentik_api_url': lambda s: 'http://ak.test',
+          '_pub_hostport': lambda h: h,
+          '_get_service_domain': lambda s, k: 'meshrelay.example.test',
+          '_outpost_add_providers_safe': lambda *a, **k: logs.append('outpost'),
+          }
+    exec(compile(ast.Module([fn], []), 'app.py', 'exec'), ns)
+    monkeypatch.setattr(urllib.request, 'urlopen', fake.urlopen)
+    return ns['_ensure_authentik_meshrelay_app']
+
+
+def test_second_deploy_updates_the_existing_authentik_provider_with_its_mode(monkeypatch):
+    fake, logs = _FakeAuthentik(), []
+    ensure = _load_ak_app_func(monkeypatch, fake, logs)
+    assert ensure('example.test', 'tok', plog=logs.append, settings={}) is True
+    assert fake.patched and fake.patched[0]['mode'] == 'forward_single'
+    assert fake.patched[0]['external_host'] == 'https://meshrelay.example.test'
+    assert not [m for m in logs if 'error' in str(m).lower()], logs
+    assert 'outpost' in logs         # the provider still reaches the embedded outpost
