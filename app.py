@@ -3972,6 +3972,48 @@ def _pkg_install(pkgs, repo=None, log_fn=None, timeout=1800):
         log_fn(f"  pkg install failed ({pm}): {out.strip()[:300]}")
     return ok, out
 
+def _pkg_ensure_epel(log_fn=None):
+    """Make sure EPEL is enabled on a dnf (RHEL-family) box. Returns True when it is.
+
+    Some packages (fail2ban) are in EPEL only. The TAK Server database step adds EPEL,
+    but a console-only box (no TAK Server yet) has none, so `dnf install fail2ban`
+    said "Unable to find a match" (ops #1006). Genuine RHEL has no `epel-release`
+    package (GH #56), so fall back to the Fedora EPEL rpm for this box's major version.
+    No-op on apt boxes and when EPEL is already there."""
+    if _pkg_mgr() != 'dnf':
+        return True
+
+    def _have():
+        try:
+            return subprocess.run(['rpm', '-q', 'epel-release'], capture_output=True,
+                                  text=True, timeout=60).returncode == 0
+        except Exception:
+            return False
+
+    if _have():
+        return True
+    if log_fn:
+        log_fn("  enabling EPEL (fail2ban is only in EPEL on RHEL/Rocky)")
+    _pkg_install('epel-release', log_fn=log_fn)
+    if _have():
+        return True
+    el = '9'
+    try:
+        with open('/etc/os-release') as f:
+            for line in f:
+                if line.startswith('VERSION_ID='):
+                    major = line.split('=', 1)[1].strip().strip('"').split('.')[0]
+                    if major.isdigit():
+                        el = major
+    except Exception:
+        pass
+    _pkg_install(f'https://dl.fedoraproject.org/pub/epel/epel-release-latest-{el}.noarch.rpm',
+                 log_fn=log_fn)
+    ok = _have()
+    if not ok and log_fn:
+        log_fn("  could not enable EPEL; the next install step may fail")
+    return ok
+
 def _pkg_remove(pkgs, purge=False, timeout=600):
     """Remove package(s). apt remove/purge ↔ dnf remove. Returns (ok, output)."""
     if isinstance(pkgs, str):
@@ -115580,18 +115622,13 @@ def _fail2ban_install_and_configure(plog):
         plog("fail2ban migration: idempotent-noop (already applied)")
         return False
 
-    pkg_mgr = s.get('pkg_mgr', 'apt')
-
-    # Step 1: Install fail2ban
+    # Step 1: Install fail2ban. On RHEL/Rocky it lives in EPEL, which a console-only
+    # box (no TAK Server yet) does not have: enable it first (ops #1006).
     plog("fail2ban migration: installing fail2ban")
-    if pkg_mgr == 'apt':
-        result = subprocess.run(_sudo_wrap(['apt-get', 'install', '-y', 'fail2ban']),
-                                capture_output=True, text=True)
-    else:
-        result = subprocess.run(_sudo_wrap(['yum', 'install', '-y', 'fail2ban']),
-                                capture_output=True, text=True)
-    if result.returncode != 0:
-        plog(f"fail2ban migration: FAILED — package install error: {result.stderr[:300]}")
+    _pkg_ensure_epel(log_fn=plog)
+    pkg_ok, pkg_out = _pkg_install('fail2ban', log_fn=plog)
+    if not pkg_ok:
+        plog(f"fail2ban migration: FAILED — package install error: {pkg_out[-300:]}")
         return False
     plog("fail2ban migration: fail2ban installed")
 
