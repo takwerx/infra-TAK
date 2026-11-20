@@ -4056,6 +4056,10 @@ def deploy(ctx, job, params):
             _reconcile_agency_group(ctx, _inst, plog)
             # ATLAS W495: after the agency group, which its role is scoped to.
             _reconcile_roster(ctx, _inst, plog)
+            # ⚠️ Last of the Authentik steps, after the access policy is bound
+            # (ops #985): on a Hardened box a new application must carry the
+            # require-MFA binding like every other login app.
+            _reassert_mfa(ctx, plog)
             # Re-emit now that the application exists: the console vhost only
             # grows its forward_auth block once Authentik is in the picture.
             ctx['generate_caddyfile'](ctx['load_settings']())
@@ -5086,6 +5090,34 @@ def _reconcile_access(ctx, inst, plog):
     # ⚠️ Idempotent, and the only route by which a provider created with the
     # wrong hostname is ever corrected — see the function.
     _reconcile_provider_host(ctx, inst, plog)
+    # ⚠️ Last, so the application's own bindings are final first (ops #985).
+    _reassert_mfa(ctx, plog)
+
+
+def _reassert_mfa(ctx, plog):
+    """On a Hardened box, put the require-MFA binding on every login app.
+
+    ⚠️ **Reported from a real box (ops #985):** a new agency deployment on a
+    Hardened box came up with policy mode `any` and only its own access
+    binding, so the agency's administrators signed in without the MFA step
+    every other app asks for. Hardening binds MFA to the apps that exist when
+    it runs; an app made afterwards is covered only by the console's boot-time
+    sweep, and a module deploy does not restart the console. Remote Assist and
+    NetBird call the same sweep at the end of their deploy; ATLAS did not.
+
+    The sweep is the console's own (`_w1_reassert_app_mfa`), so the policy,
+    the engine mode and the record that Hardening reverts from stay in one
+    place. It does nothing when Hardening is not applied. Never raises: a
+    deploy or an update must not fail over it.
+    """
+    sweep = (ctx or {}).get('_w1_reassert_app_mfa')
+    if not sweep:
+        return False
+    try:
+        return bool(sweep(plog))
+    except Exception as exc:
+        plog('  ⚠ Could not check the MFA requirement: %s' % str(exc)[:80])
+        return False
 
 
 def _reconcile_provider_host(ctx, inst, plog):
