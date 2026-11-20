@@ -3676,6 +3676,32 @@ def deploy(ctx, job, params):
         tag, expected = _resolve_install_target(ctx, plog)
         signed = not _is_pin_fallback(tag, expected)
 
+        # ⚠️ **Not backwards (ops #982).** Update refuses to move a built
+        # deployment to an older release; Deploy on the same deployment did
+        # not, and took ATLAS down (2.3.0 rebuilt on 2.2.2, database already
+        # migrated). Asked before git touches the checkout, so a refusal leaves
+        # the box as it was. The pin fallback is checked too: it is the older
+        # release most likely to be offered.
+        _built = _installed_version(ctx, _inst)
+        refusal = _downgrade_lines(_built, tag.lstrip('vV'), _channel_of(ctx))
+        if refusal:
+            for line in refusal:
+                plog(line)
+            if _is_pin_fallback(tag, expected):
+                # ⚠️ The cause is GitHub, not the channel. "Switch the channel
+                # back" would send an operator the wrong way, and GitHub's
+                # unauthenticated limit (60 an hour per address) is easy to hit.
+                raise RuntimeError(
+                    'ATLAS could not read the release list from GitHub (it '
+                    'may be rate-limited), and the only release left was the '
+                    'old built-in ' + tag + ', which is older than the ' +
+                    (_built or '?') + ' this deployment runs. Nothing was '
+                    'changed. Try again in a few minutes.')
+            raise RuntimeError(
+                refusal[1].strip() + ' Nothing was changed. Switch the ATLAS '
+                'channel back to the one this deployment came from, then press '
+                'Update.')
+
         if os.path.isdir(os.path.join(dirpath, '.git')):
             plog(f'  Already cloned at {dirpath} — fetching {tag}')
             ctx['_module_git'](dirpath, 'checkout', '--', '.', timeout=60)
@@ -4718,6 +4744,30 @@ def _parse_version(text):
         return None
 
 
+def _downgrade_lines(current, target, channel):
+    """The refusal Update and Deploy both give, or None when `target` is not older.
+
+    ⚠️ **One check, two buttons (ops #982).** Update refused a downgrade and
+    Deploy did not: pressing Deploy on a built 2.3.0 deployment with the channel
+    on `main` (offering 2.2.2) checked out 2.2.2 and rebuilt it against a
+    database 2.3.0 had migrated, and the api stopped answering. ATLAS 2.x is
+    forward-only, so every path that can move a checkout backwards asks here.
+    An unreadable version on either side is no evidence of a downgrade (a
+    first deploy has no VERSION yet), so it is not refused.
+    """
+    here, there = _parse_version(current), _parse_version(target)
+    if not (here and there and there < here):
+        return None
+    return [
+        '✗ This deployment is on ' + (current or '?') + ', which is '
+        'newer than what the ' + channel + ' channel offers (' + target + ').',
+        '  Refusing to downgrade: ' + target + ' would run against a '
+        'database ' + (current or 'a newer release') + ' has migrated.',
+        '  Switch back to the channel it came from, or publish a '
+        'forward fix.',
+    ]
+
+
 def _channel_of(ctx=None, settings=None):
     """The release channel this box follows. `main` unless told otherwise.
 
@@ -5218,7 +5268,8 @@ def _run_update(ctx, inst=None):
              ' → ' + channel + ' offers ' + target)
 
         here, there = _parse_version(current), _parse_version(target)
-        if here and there and there < here:
+        refusal = _downgrade_lines(current, target, channel)
+        if refusal:
             # ⚠️ **Behind, not equal — and this is a refusal, not a no-op.**
             # It happens when a box switches from `dev` to `main`, or when a
             # release is withdrawn by moving `main` back. Running older code
@@ -5226,13 +5277,8 @@ def _run_update(ctx, inst=None):
             # loss, so the way back is a forward fix on the channel, never this
             # button. Said plainly, because a button that looks like it did
             # nothing is a button an operator presses again.
-            plog('✗ This deployment is on ' + (current or '?') + ', which is '
-                 'newer than what the ' + channel + ' channel offers (' +
-                 target + ').')
-            plog('  Refusing to downgrade: ' + target + ' would run against a '
-                 'database ' + (current or 'a newer release') + ' has migrated.')
-            plog('  Switch back to the channel it came from, or publish a '
-                 'forward fix.')
+            for line in refusal:
+                plog(line)
             _reconcile_access(ctx, inst, plog)
             slot.update({'running': False, 'complete': True, 'error': False})
             return
