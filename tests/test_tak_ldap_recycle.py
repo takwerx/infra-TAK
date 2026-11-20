@@ -28,6 +28,7 @@ _tak_recycle_after_ldap_outage() and its helpers are cut out of app.py and run a
 box: docker, systemctl, ldapsearch, TAK's Marti API, the ports and the clock are stubbed.
 """
 
+import contextlib
 import datetime
 import io
 import json
@@ -407,6 +408,7 @@ class Box:
                 ns[c] = _const(c)
         ns['_tak_https_broken_alert'] = lambda *a, **k: box.alerts.append((box.t, a, k))
         ns['_tak_ldap_recycle_lock'] = threading.Lock()
+        ns['_ldap_pw_file'] = lambda pw: contextlib.nullcontext('/run/fake/ldap-pw')   # L4 (v10.4.3)
         exec(re.search(r'^_LDAP_PROBE_STEPS = \(.*?^\)\n', APP, re.S | re.M).group(0), ns)   # v10.4.3 W5
         for name in ('_epoch_from_rfc3339', '_docker_started_epoch', '_tak_started_epoch', '_tak_wait_ready',
                      '_tak_ldap_recycle_request', '_tak_recycle_after_ldap_outage',
@@ -2132,7 +2134,9 @@ def test_restart_and_ldapsearch_are_argv_not_shell():
 def _watch(box, busy=''):
     ns = box.ns()
     ns['_authentik_busy_reason'] = lambda: busy
-    exec(compile(_src('_tak_ldap_groups_watch'), 'app.py:_tak_ldap_groups_watch', 'exec'), ns)
+    ns['_TAK_GROUPS_WATCH_RESTART_EVERY_S'] = _const('_TAK_GROUPS_WATCH_RESTART_EVERY_S')
+    for name in ('_tak_ldap_groups_watch', '_tak_groups_watch_mark'):
+        exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
     # the recycle the watch calls must be the one in this namespace
     return ns['_tak_ldap_groups_watch'](box.log.append)
 
@@ -2170,3 +2174,24 @@ def test_w3_skips(setup):
                                         else {'healed_ldap_start': T0 - HOUR})
     assert _watch(box, busy='Authentik update' if setup == 'busy' else '') is False
     assert box.restarts() == [] and box.user_api == []
+
+
+def test_w3_restarts_tak_at_most_once_per_window():
+    # Security review M1: a cause a restart does not fix (here: TAK still gives no groups after
+    # it) must not restart TAK on every tick after its boot window.
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others',
+                      https_after_restart='no_groups')
+    box.settings['tak_ldap_recycle'] = {'healed_ldap_start': T0 - HOUR}
+    assert _watch(box) is True
+    assert len(box.restarts()) == 1
+    for _ in range(4):                                   # the next 4 ticks, past TAK's boot window
+        box.t += 1200
+        box.settings['tak_ldap_recycle'].pop('pending', None)
+        box.settings['tak_ldap_recycle'].pop('requested_epoch', None)
+        assert _watch(box) is False
+    assert len(box.restarts()) == 1
+    held = [l for l in box.log if 'Not restarting again within' in l]
+    assert len(held) == 1                                # said once, not every tick
+    box.t += _const('_TAK_GROUPS_WATCH_RESTART_EVERY_S')
+    box.settings['tak_ldap_recycle'].pop('pending', None)
+    assert _watch(box) is True and len(box.restarts()) == 2

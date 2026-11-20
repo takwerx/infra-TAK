@@ -224,3 +224,17 @@ def test_broker_denies_kill_of_anything_else(broker, pid):
 def test_broker_denies_other_kill_shapes(broker, argv):
     with pytest.raises(broker.Denied):
         broker.check_exec(argv)
+
+
+@pytest.mark.parametrize('rc,out', [(0, ''), (0, '\n'), (1, 'a' * 64 + '\n')])
+def test_broker_never_kills_when_the_running_set_is_unknown(monkeypatch, rc, out):
+    # Security review L3: an empty `docker ps` (docker hiccup, other runtime) or a failed one
+    # must deny — never read as "every container is gone".
+    spec = importlib.util.spec_from_file_location('tb_kill_test2', BROKER)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    monkeypatch.setattr(m.shutil, 'which', lambda n, path=None: '/usr/bin/docker')
+    monkeypatch.setattr(m.subprocess, 'run',
+                        lambda *a, **k: types.SimpleNamespace(returncode=rc, stdout=out, stderr=''))
+    with pytest.raises(m.Denied):
+        m._running_container_ids()

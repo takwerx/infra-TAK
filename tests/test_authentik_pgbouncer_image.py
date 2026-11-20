@@ -141,6 +141,8 @@ def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pas
     for name in ('_ensure_authentik_pgbouncer_image', '_authentik_ldap_sa_search', '_authentik_ldap_sa_group_probe',
                  '_authentik_ldap_sa_groups_settle', '_compose_set_service_image'):
         exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
+    # L4 (v10.4.3): after the execs — _src() of the function before it carries the real class
+    ns['_ldap_pw_file'] = lambda pw: contextlib.nullcontext('/run/fake/ldap-pw')
     out = ns['_ensure_authentik_pgbouncer_image'](log.append)
     on_disk = yaml.safe_load((ak / 'docker-compose.yml').read_text())
     return out, on_disk, calls, settings, log, live

@@ -77217,16 +77217,41 @@ _PGB_SWAP_LDAP_STABLE_S = 45
 _PGB_SWAP_LDAP_EVERY_S = 5
 
 
+class _ldap_pw_file:
+    """Security review L4 (v10.4.3): `with _ldap_pw_file(pw) as path:` — a 0600 temp file
+    holding the password verbatim, for `ldapsearch -y`, so the password is not in argv
+    (/proc/<pid>/cmdline, readable by every local user). Removed on exit."""
+
+    def __init__(self, password):
+        self._password, self._path = password, None
+
+    def __enter__(self):
+        fd, self._path = tempfile.mkstemp(prefix='ldap-pw-')
+        with os.fdopen(fd, 'w') as f:
+            f.write(self._password)            # -y reads the file verbatim: no newline
+        return self._path
+
+    def __exit__(self, *exc):
+        try:
+            os.unlink(self._path)
+        except (OSError, TypeError):
+            pass
+        return False
+
+
 def _authentik_ldap_sa_search(ldap_pass, flt, size_limit):
     """One ldapsearch as adm_ldapservice through the LOCAL outpost (users OU, memberOf only).
     Returns (rc, users, tak_memberof, detail); rc None when ldapsearch could not run.
     The password is never logged."""
+    # Security review L4: password via a 0600 file (`-y`), not argv (`-w`) — this probe now
+    # runs every 10 min (W3).
     try:
-        r = subprocess.run(
-            ['ldapsearch', '-x', '-H', 'ldap://127.0.0.1:389',
-             '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
-             '-b', 'ou=users,dc=takldap', '-s', 'one', '-z', str(size_limit), flt, 'memberOf'],
-            capture_output=True, text=True, timeout=20)
+        with _ldap_pw_file(ldap_pass) as pw_path:
+            r = subprocess.run(
+                ['ldapsearch', '-x', '-H', 'ldap://127.0.0.1:389',
+                 '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-y', pw_path,
+                 '-b', 'ou=users,dc=takldap', '-s', 'one', '-z', str(size_limit), flt, 'memberOf'],
+                capture_output=True, text=True, timeout=20)
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
         return None, 0, 0, f"ldapsearch {type(e).__name__}"
     lines = (r.stdout or '').splitlines()
@@ -77505,11 +77530,12 @@ def _ldap_users_tak_groups(ldap_pass, cns=None):
                     for i in range(0, len(cns), 50)]
     for search in searches:
         try:
-            r = subprocess.run(
-                ['ldapsearch', '-LLL', '-x', '-o', 'ldif-wrap=no', '-H', 'ldap://127.0.0.1:389',
-                 '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
-                 '-b', 'ou=users,dc=takldap', '-s', 'one'] + search + ['memberOf'],
-                capture_output=True, text=True, timeout=20)
+            with _ldap_pw_file(ldap_pass) as pw_path:    # L4: not in argv (runs every 10 min, W3)
+                r = subprocess.run(
+                    ['ldapsearch', '-LLL', '-x', '-o', 'ldif-wrap=no', '-H', 'ldap://127.0.0.1:389',
+                     '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-y', pw_path,
+                     '-b', 'ou=users,dc=takldap', '-s', 'one'] + search + ['memberOf'],
+                    capture_output=True, text=True, timeout=20)
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
             return None
         if r.returncode not in (0, 4):
@@ -78547,6 +78573,11 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         return True
 
 
+# Security review M1: a cause a TAK restart does not fix (e.g. one user's groups mapped wrong
+# in TAK) would otherwise restart TAK on every tick after its boot window, ~every 20 min.
+_TAK_GROUPS_WATCH_RESTART_EVERY_S = 21600   # 6 h
+
+
 def _tak_ldap_groups_watch(plog):
     """v10.4.3 W3: continuous check for "TAK gives no groups while LDAP does" — the stuck
     state of akres E3c after an outpost restart the console did not see at all (or saw while
@@ -78578,9 +78609,33 @@ def _tak_ldap_groups_watch(plog):
         return False
     if verdict != 'broken':
         return False
+    st = load_settings().get('tak_ldap_recycle') or {}
+    last = float(st.get('groups_watch_restart_epoch') or 0)
+    if time.time() - last < _TAK_GROUPS_WATCH_RESTART_EVERY_S:
+        if not st.get('groups_watch_held_said'):
+            plog(f"  ✗ {tag}: {summary} — TAK gives no groups while LDAP does, but this check already "
+                 f"restarted TAK {int((time.time() - last) // 60)} min ago and a restart did not fix it. "
+                 f"Not restarting again within {_TAK_GROUPS_WATCH_RESTART_EVERY_S // 3600} h: check this "
+                 f"user's groups in TAK Portal and CoreConfig's <ldap> settings")
+            _tak_groups_watch_mark(groups_watch_held_said=True)
+        return False
     plog(f"  ✗ {tag}: {summary} — TAK gives no groups while LDAP does; running the TAK LDAP heal")
     _tak_ldap_recycle_request('TAK gives no groups while LDAP does (continuous check)')
-    return _tak_recycle_after_ldap_outage(plog, tag, check_outpost=True)
+    restarted = _tak_recycle_after_ldap_outage(plog, tag, check_outpost=True)
+    if restarted:
+        _tak_groups_watch_mark(groups_watch_restart_epoch=time.time(), groups_watch_held_said=False)
+    return restarted
+
+
+def _tak_groups_watch_mark(**kv):
+    try:
+        s = load_settings()
+        cur = dict(s.get('tak_ldap_recycle') or {})
+        cur.update(kv)
+        s['tak_ldap_recycle'] = cur
+        save_settings(s)
+    except Exception:
+        pass
 
 
 def _ak_ldap_path_starts():

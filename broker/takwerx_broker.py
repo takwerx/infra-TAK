@@ -2285,7 +2285,12 @@ def _running_container_ids():
                        timeout=15, env={'PATH': BROKER_TRUSTED_PATH, 'LC_ALL': 'C'})
     if r.returncode != 0:
         raise Denied('kill: docker ps failed — cannot prove the process is orphaned')
-    return {c.strip() for c in r.stdout.split() if c.strip()}
+    ids = {c.strip() for c in r.stdout.split() if c.strip()}
+    if not ids:
+        # Security review L3: an empty list is far likelier a docker hiccup (or another
+        # runtime's container) than "every container is gone" — never kill on it.
+        raise Denied('kill: docker ps listed no running containers — cannot prove the process is orphaned')
+    return ids
 
 
 def _check_kill(argv):
