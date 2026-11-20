@@ -1673,7 +1673,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.4.3-alpha"
+VERSION = "10.4.4-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -53728,6 +53728,12 @@ _CT_MEDIA_APPLY_SH = r'''
 exec 8>/tmp/.ct-media-heal.lock
 command -v flock >/dev/null 2>&1 && flock 8
 F=/mediamtx.yml
+# ops #950 (ARM fresh install, 10.4.3 candidate): right after a recreate the image's /start is still
+# running `node /dist/configure.js`, which reads this file and writes it back before it starts MediaMTX.
+# An edit that lands in that window is undone by the write, or leaves the file torn, and MediaMTX then
+# starts from a file with no api and no playback. Wait (20 s at most) until that script has ended.
+w=0
+while [ $w -lt 40 ] && ps 2>/dev/null | grep -q '[c]onfigure\.js'; do sleep 0.5; w=$((w+1)); done
 state() {
 if [ "$(grep -cE '^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):' $F 2>/dev/null)" = 5 ] \
  && grep -q "^hlsVariant: mpegts" $F 2>/dev/null \
@@ -53754,8 +53760,7 @@ if [ "$1" != ok ]; then
   grep -vE '^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):' "$F" > "$F.ops950.tmp"
   [ $? -le 1 ] || { rm -f "$F.ops950.tmp"; echo "cannot read $F" >&2; exit 1; }
   printf 'hlsVariant: mpegts\nhlsAlwaysRemux: no\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n' >> "$F.ops950.tmp"
-  cat "$F.ops950.tmp" > "$F"
-  rm -f "$F.ops950.tmp"
+  mv -f "$F.ops950.tmp" "$F" || { rm -f "$F.ops950.tmp"; echo "cannot replace $F" >&2; exit 1; }
 fi
 for f in /lib/persist.ts /dist/lib/persist.js; do
   [ -f "$f" ] && sed -i "s/'ephemeral', 'false'/'ephemeral', 'all'/g" "$f"
@@ -122022,6 +122027,7 @@ _MODULE_CTX = {
     '_get_authentik_env_value': _get_authentik_env_value,
     '_ensure_authentik_tvr_app': _ensure_authentik_tvr_app,
     '_deregister_authentik_proxy_app': _deregister_authentik_proxy_app,
+    '_w1_reassert_app_mfa': _w1_reassert_app_mfa,   # ATLAS (ops #985): a new app gets the MFA gate on a Hardened box
     # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION;
     # W10: the shared infratak network + the CloudTAK override refresh (api recreate)
     '_get_tak_deployment_config': _get_tak_deployment_config,
