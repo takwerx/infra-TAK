@@ -25,6 +25,7 @@ fail2ban until EPEL is installed.
 """
 
 import ast
+import io
 import os as _real_os
 import pathlib
 import types
@@ -34,6 +35,7 @@ APP = (REPO / 'app.py').read_text(encoding='utf-8')
 TREE = ast.parse(APP)
 
 EPEL_URL = 'https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm'
+EPEL_URL_10 = 'https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm'
 
 
 def _func(name, required=True):
@@ -48,8 +50,9 @@ def _func(name, required=True):
 class FakeBox:
     """A box whose package manager only knows fail2ban once EPEL is installed."""
 
-    def __init__(self, family, epel=False, epel_release_pkg=True):
+    def __init__(self, family, epel=False, epel_release_pkg=True, version_id='9.4'):
         self.family = family            # 'rhel' | 'debian'
+        self.version_id = version_id    # what this box's /etc/os-release says
         self.epel = epel
         self.epel_release_pkg = epel_release_pkg   # False = genuine RHEL (URL only)
         self.fail2ban = False
@@ -71,7 +74,7 @@ class FakeBox:
                     if not self.epel_release_pkg:
                         return out(1, 'Error: Unable to find a match: epel-release')
                     self.epel = True
-                elif a == EPEL_URL:
+                elif a in (EPEL_URL, EPEL_URL_10):
                     self.epel = True
                 elif a == 'fail2ban':
                     if self.epel:
@@ -111,8 +114,15 @@ def _ns(box):
         def __getattr__(self, name):
             return getattr(_real_os, name)
 
+    def fake_open(path, *a, **kw):
+        # The code reads /etc/os-release for the EL major version. CI runs on Ubuntu
+        # (VERSION_ID 24.04), so without this the test would ask for epel-...-24.
+        if path == '/etc/os-release':
+            return io.StringIO(f'ID=rocky\nVERSION_ID="{box.version_id}"\n')
+        return open(path, *a, **kw)
+
     fake_subprocess = types.SimpleNamespace(run=box.run, TimeoutExpired=Exception)
-    ns = {'os': _Os(), 'subprocess': fake_subprocess,
+    ns = {'os': _Os(), 'subprocess': fake_subprocess, 'open': fake_open,
           'load_settings': lambda: settings, 'save_settings': lambda s: None,
           '_sudo_wrap': lambda cmd: list(cmd)}
     for name in ('_distro_family', '_pkg_mgr', '_pkg_install', '_pkg_ensure_epel',
@@ -146,7 +156,15 @@ def test_genuine_rhel_without_epel_release_package_uses_the_fedora_rpm():
     box = FakeBox('rhel', epel=False, epel_release_pkg=False)
     log = _run_install(box)
     assert box.fail2ban, f'fail2ban was not installed; log: {log}'
-    assert ['dnf', 'install', '-y', EPEL_URL] in box.cmds
+    assert ['dnf', 'install', '-y', EPEL_URL] in box.cmds, box.cmds
+
+
+def test_genuine_rhel_10_asks_for_the_el10_epel_rpm():
+    """The EPEL rpm URL follows this box's major version, not a fixed 9."""
+    box = FakeBox('rhel', epel=False, epel_release_pkg=False, version_id='10.0')
+    _run_install(box)
+    assert box.fail2ban
+    assert ['dnf', 'install', '-y', EPEL_URL_10] in box.cmds, box.cmds
 
 
 def test_epel_already_present_is_left_alone():
