@@ -62,6 +62,7 @@ from . import register_module, job_log, job_state, get_ctx
 # ⚠️ The sizing modes live in the instance model, not here. Two copies of
 # 'fixed'/'dynamic' would drift, and the one that drifted would be the one
 # deciding whether an image reserves its blocks.
+from . import atlas_access
 from . import atlas_backup
 from . import atlas_instances
 from . import atlas_renewal
@@ -1934,6 +1935,19 @@ def remove_agency_admin_group(ctx, inst, plog=None):
             body = _urlreq.urlopen(req, timeout=10).read().decode()
             return json.loads(body or '{}')
 
+        # ⚠️ The access policy goes first, with the deployment. A later
+        # deployment on the same slug then starts from the administrators
+        # alone, not from whatever groups this one's policy held (ops #979).
+        try:
+            if atlas_access.remove(atlas_access.Api(ak_url, headers),
+                                   names['authentik_slug']) and plog:
+                plog('Authentik access policy "%s" removed'
+                     % atlas_access.policy_name(names['authentik_slug']))
+        except Exception as exc:
+            if plog:
+                plog('⚠ Authentik access policy could not be removed: %s'
+                     % str(exc)[:80])
+
         found = api('core/groups/?name=%s' % _q(group_name))
         for group in found.get('results', []):
             # ⚠️ Exact match. Authentik's `?name=` is a filter, not an
@@ -1989,11 +2003,16 @@ def agency_admin_group_outcome(ctx, inst, ak_url, ak_headers, plog=None):
     tile said nothing. An agency deployment could then run with no admin
     group, and the only symptom was its administrators being turned away.
 
-    ⚠️ **Bound beside "Allow authentik Admins", never instead of it.** Measured
-    on the box: the ATLAS applications run with `policy_engine_mode: any`, so
-    bindings are alternatives — the global administrators keep their access and
-    the agency's gain theirs. Replacing the policy binding would lock the global
-    administrator out of every agency console at once.
+    ⚠️ **One access policy, not a binding per group (ops #979).** Authentik
+    treats separate bindings as alternatives only under `policy_engine_mode:
+    any`. The Hardened posture sets `all` on every login application (its MFA
+    step), and there a second group binding is a second requirement: an agency
+    administrator who was not also an Authentik administrator got "Permission
+    denied". `atlas_access.ensure` makes one expression policy (global admins OR
+    this agency's group), binds it, and only then removes the separate "Allow
+    authentik Admins" binding and any direct group binding it replaces. It means
+    the same under `any` and `all`, and the global administrators keep their
+    access.
 
     ⚠️ **Empty on purpose.** Nobody is put in the group here; that is the
     operator's decision and the only part of this that should be manual.
@@ -2054,37 +2073,14 @@ def agency_admin_group_outcome(ctx, inst, ak_url, ak_headers, plog=None):
             return failed('Could not create the agency admin group', exc)
 
     # --- and its way in ----------------------------------------------------- #
-    try:
-        app = api('core/applications/%s/' % names['authentik_slug'])
-        target = app['pk']
-        bindings = api('policies/bindings/?target=%s&page_size=100' % target)
-        ours = [b for b in bindings.get('results', [])
-                if str(b.get('group')) == str(group_pk)]
-        # ⚠️ A binding that is there but disabled or negated admits nobody — the
-        # exact silent state this check exists to surface — so it is not
-        # "present". And it is NOT re-enabled here: somebody switched it off in
-        # Authentik, and that is their decision to undo (v10.2.8, PR #89 review).
-        if ours and not any(b.get('enabled', True) and not b.get('negate')
-                            for b in ours):
-            detail = ('"%s" is bound to this deployment, but the binding is '
-                      'disabled or negated in Authentik — its members are '
-                      'turned away until it is re-enabled there' % group_name)
-            log('  ⚠ ' + detail)
-            return outcome('failed', detail)
-        if ours:
-            log('  ✓ "%s" already admitted to this deployment' % group_name)
-            return outcome('created' if created else 'present')
-        api('policies/bindings/', {
-            'target': target, 'group': group_pk,
-            # ⚠️ After the admins policy, which sits at 0. Order does not decide
-            # the outcome under `any`, but it keeps the list readable in
-            # Authentik's own UI.
-            'order': 10, 'negate': False, 'enabled': True, 'timeout': 30,
-        }, method='POST')
-        log('  ✓ "%s" admitted to this deployment only' % group_name)
-        return outcome('created')
-    except Exception as exc:
-        return failed('Could not admit the agency admin group', exc)
+    result = atlas_access.ensure(atlas_access.Api(ak_url, ak_headers),
+                                 names['authentik_slug'], add=[group_name],
+                                 plog=log)
+    if result['status'] == 'failed':
+        return outcome('failed', 'Could not admit the agency admin group: %s'
+                       % result['detail'])
+    return outcome('created' if created or result['status'] == 'created'
+                   else 'present')
 
 
 def agency_group_key(inst=None):
@@ -4390,6 +4386,17 @@ def _restrict_to_admins(ak_url, ak_headers, plog=None, app_slug='atlas'):
         # to nothing at all while the log said it was restricted.
         app_pk = _get('core/applications/%s/' % app_slug)['pk']
 
+        bindings = _get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
+        # ⚠️ An ATLAS access policy (global admins OR this deployment's group,
+        # `atlas_access`) is the restriction too, and it must stand alone: a
+        # second "Allow authentik Admins" binding beside it is one more
+        # requirement under `policy_engine_mode: all` and turns the agency's
+        # administrators away (ops #979). Checked first, so this never re-adds
+        # the binding the agency reconcile just replaced.
+        if any(atlas_access.is_access_binding(b) for b in bindings):
+            log("  ✓ Console restricted to Authentik administrators and this "
+                "deployment's admin group (access policy already bound)")
+            return True
         policy_pk = None
         for p in _get('policies/all/?page_size=200').get('results', []):
             if p.get('name') == policy_name:
@@ -4401,7 +4408,6 @@ def _restrict_to_admins(ak_url, ak_headers, plog=None, app_slug='atlas'):
                 f"application by hand.")
             return False
 
-        bindings = _get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
         if any(str(b.get('policy')) == str(policy_pk) or
                (b.get('policy_obj', {}) or {}).get('name') == policy_name
                for b in bindings):
@@ -4951,10 +4957,39 @@ def _reconcile_roster(ctx, inst, plog):
     """
     try:
         dirpath = instance_paths(ctx, inst)['dir']
+        restarted = True
         if atlas_roster.ensure(ctx, inst, dirpath, write_env_value, plog)['env_changed']:
-            _compose(ctx, 'up -d api', timeout=300, inst=inst)
+            r = _compose(ctx, 'up -d api', timeout=300, inst=inst)
+            restarted = getattr(r, 'returncode', 1) == 0
+        # ⚠️ **After the restart** (Security read, ops #978), so ATLAS knows
+        # the group's name before its first member is let in, and on **both**
+        # versions: the file says what was checked out, the container what
+        # serves. A failed rebuild or Deploy run again on an older tag makes
+        # them differ, and then the group stays out.
+        installed = _installed_version(ctx, inst)
+        # Waited for only when the checkout could admit the group at all.
+        running = (_settled_running_version(ctx, inst)
+                   if atlas_roster.admits_role(installed)
+                   else _running_version(ctx, inst))
+        atlas_roster.admit(ctx, inst, dirpath, installed, running, plog,
+                           restarted=restarted)
     except Exception as exc:
         plog('  ⚠ Could not reconcile the standard admins: %s' % str(exc)[:80])
+
+
+def _settled_running_version(ctx, inst, tries=24, delay=5):
+    """`_running_version`, waiting up to two minutes for `api` to answer.
+
+    ⚠️ Right after a rebuild or a restart the container is still starting, and
+    None then would keep the standard group out until the next update.
+    """
+    for attempt in range(tries):
+        version = _running_version(ctx, inst)
+        if version:
+            return version
+        if attempt + 1 < tries:
+            time.sleep(delay)
+    return None
 
 
 def _reconcile_access(ctx, inst, plog):

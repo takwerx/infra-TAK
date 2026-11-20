@@ -99,14 +99,30 @@ def test_no_two_deployments_share_an_admin_group():
 
 
 class FakeAuthentik:
-    """Enough of Authentik's API to answer and record."""
+    """Enough of Authentik's API to answer and record.
 
-    def __init__(self, groups=(), apps=None, bindings=(), fail=()):
+    ⚠️ Stateful for access policies (ops #979): a policy or binding that is
+    created is there for the next read, and a DELETE removes it, so the order of
+    `calls` shows whether anything was removed before its replacement was bound.
+    """
+
+    def __init__(self, groups=(), apps=None, bindings=(), fail=(), policies=(),
+                 fail_post=()):
         self.groups = list(groups)
         self.apps = apps or {'atlas-corona': {'pk': 'app-pk'}}
         self.bindings = list(bindings)
+        self.policies = list(policies)
         self.fail = set(fail)
+        self.fail_post = set(fail_post)  # fail only a POST to these
         self.posted = []
+        self.calls = []   # (METHOD, url) in the order they happened
+        self.deleted = []  # urls
+
+    def _policy_name(self, pk):
+        for p in self.policies:
+            if p['pk'] == pk:
+                return p['name']
+        return None
 
     def open(self, req, timeout=None):
         url = req.full_url
@@ -118,12 +134,40 @@ class FakeAuthentik:
         # Python — measured, not assumed. Reading it raised AttributeError, the
         # module's own `except` swallowed it, and every test here passed against
         # the fallback path instead of the one it was written for.
-        if getattr(req, 'method', None) == 'POST' or req.data:
+        method = getattr(req, 'method', None) or ('POST' if req.data else 'GET')
+        self.calls.append((method, url))
+        if method == 'DELETE':
+            self.deleted.append(url)
+            pk = url.rstrip('/').rsplit('/', 1)[-1]
+            self.bindings = [b for b in self.bindings if b.get('pk') != pk]
+            self.policies = [p for p in self.policies if p['pk'] != pk]
+            return _Response({})
+        if method == 'PATCH':
+            body = json.loads(req.data.decode())
+            self.posted.append((url, body))
+            pk = url.rstrip('/').rsplit('/', 1)[-1]
+            for p in self.policies:
+                if p['pk'] == pk:
+                    p.update(body)
+            return _Response({'pk': pk})
+        if method == 'POST':
+            if any(t in url for t in self.fail_post):
+                raise OSError('boom')
             body = json.loads(req.data.decode())
             self.posted.append((url, body))
             if 'core/groups/' in url:
                 created = dict(body, pk='group-pk')
                 self.groups.append(created)
+                return _Response(created)
+            if 'policies/expression/' in url:
+                created = dict(body, pk='policy-pk-%d' % (len(self.policies) + 1))
+                self.policies.append(created)
+                return _Response(created)
+            if 'policies/bindings/' in url:
+                created = dict(body, pk='binding-pk-%d' % (len(self.bindings) + 1))
+                created.setdefault('group', None)
+                created['policy_obj'] = {'name': self._policy_name(body.get('policy'))}
+                self.bindings.append(created)
                 return _Response(created)
             return _Response({'pk': 'binding-pk'})
         if 'core/groups/' in url:
@@ -131,6 +175,8 @@ class FakeAuthentik:
         if 'core/applications/' in url:
             slug = url.rstrip('/').rsplit('/', 1)[-1]
             return _Response(self.apps[slug])
+        if 'policies/expression/' in url:
+            return _Response({'results': list(self.policies)})
         if 'policies/bindings/' in url:
             return _Response({'results': list(self.bindings)})
         raise AssertionError('unexpected call: ' + url)
@@ -220,32 +266,58 @@ def test_the_group_is_never_a_superuser_group(authentik):
     assert body['is_superuser'] is False
 
 
-def test_the_group_is_bound_to_that_deployment_s_application(authentik):
+def test_the_group_is_admitted_by_one_access_policy(authentik):
+    """⚠️ One expression policy (global admins OR the agency group), not a
+    second binding beside "Allow authentik Admins": under
+    `policy_engine_mode: all` a second binding is a second requirement (ops #979)."""
     fake = authentik(FakeAuthentik())
 
     atlas.ensure_agency_admin_group(None, CORONA, 'http://ak', {})
 
+    policies = [b for url, b in fake.posted if 'policies/expression/' in url]
     bindings = [b for url, b in fake.posted if 'policies/bindings/' in url]
 
+    assert [p['name'] for p in policies] == ['ATLAS access: atlas-corona']
+    assert 'name="authentik Admins"' in policies[0]['expression']
+    assert 'name="atlas-corona-admins"' in policies[0]['expression']
     assert len(bindings) == 1
     assert bindings[0]['target'] == 'app-pk'
-    assert bindings[0]['group'] == 'group-pk'
+    assert bindings[0]['policy'] == 'policy-pk-1'
+    assert 'group' not in bindings[0]
     assert bindings[0]['enabled'] is True
     assert bindings[0]['negate'] is False
 
 
-def test_the_existing_admins_binding_is_left_alone(authentik):
-    """⚠️ **The load-bearing property.** `policy_engine_mode` is `any`, so the
-    two bindings are alternatives. Replacing the admins policy — rather than
-    adding beside it — would lock the global administrator out of every agency
-    console at once."""
+def test_the_admins_binding_is_replaced_only_after_the_policy_is_bound(authentik):
+    """⚠️ **The load-bearing property.** The global administrators keep their
+    access through the new policy, so the old "Allow authentik Admins" binding
+    goes. But never first: an application with no binding is open to every
+    signed-in user, and a failed bind must leave the old one in place."""
     fake = authentik(FakeAuthentik(bindings=[
-        {'pk': 'b0', 'policy': 'p1', 'group': None, 'order': 0}]))
+        {'pk': 'b0', 'policy': 'p1', 'group': None, 'order': 0, 'enabled': True,
+         'negate': False, 'policy_obj': {'name': 'Allow authentik Admins'}}]))
 
     atlas.ensure_agency_admin_group(None, CORONA, 'http://ak', {})
 
-    assert not any(b.get('_delete') for _u, b in fake.posted)
-    assert all('DELETE' not in url for url, _b in fake.posted)
+    kinds = [m for m, _u in fake.calls if m in ('POST', 'DELETE')]
+    bind = next(i for i, (m, u) in enumerate(fake.calls)
+                if m == 'POST' and 'policies/bindings/' in u)
+    drop = next(i for i, (m, u) in enumerate(fake.calls) if m == 'DELETE')
+
+    assert bind < drop
+    assert fake.deleted == ['http://ak/api/v3/policies/bindings/b0/']
+    assert 'DELETE' in kinds
+
+
+def test_a_failed_bind_leaves_the_old_binding_in_place(authentik):
+    fake = FakeAuthentik(bindings=[
+        {'pk': 'b0', 'policy': 'p1', 'group': None, 'order': 0, 'enabled': True,
+         'negate': False, 'policy_obj': {'name': 'Allow authentik Admins'}}],
+        fail_post=('policies/bindings/',))
+    authentik(fake)
+
+    assert atlas.ensure_agency_admin_group(None, CORONA, 'http://ak', {}) is None
+    assert fake.deleted == []
 
 
 def test_an_existing_group_is_reused_not_duplicated(authentik):
@@ -260,17 +332,24 @@ def test_an_existing_group_is_reused_not_duplicated(authentik):
     assert not [b for url, b in fake.posted if 'core/groups/' in url]
 
 
-def test_an_existing_binding_is_not_added_twice(authentik):
+def test_an_existing_access_policy_is_not_added_twice(authentik):
     """Reconciled on every update, so this runs many times over a deployment's
     life."""
+    policy = {'pk': 'pol1', 'name': 'ATLAS access: atlas-corona',
+              'expression': 'return ak_is_group_member(request.user, name="authentik Admins") '
+                            'or ak_is_group_member(request.user, name="atlas-corona-admins")'}
     fake = authentik(
         FakeAuthentik(groups=[{'name': 'atlas-corona-admins',
                                'is_superuser': False, 'pk': 'g9'}],
-                      bindings=[{'pk': 'b1', 'group': 'g9', 'order': 10}]))
+                      policies=[policy],
+                      bindings=[{'pk': 'b1', 'policy': 'pol1', 'group': None,
+                                 'order': 0, 'enabled': True, 'negate': False,
+                                 'policy_obj': {'name': policy['name']}}]))
 
     atlas.ensure_agency_admin_group(None, CORONA, 'http://ak', {})
 
-    assert not [b for url, b in fake.posted if 'policies/bindings/' in url]
+    assert fake.posted == []
+    assert fake.deleted == []
 
 
 def test_the_plain_deployment_gets_no_group_of_its_own(authentik):

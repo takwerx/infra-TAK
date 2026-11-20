@@ -93,6 +93,7 @@ from collections import defaultdict, deque
 # imports nothing from app.py — seams flow the other way, via the ctx dict
 # built at the bottom of this file (mod_registry.load_all/init_registry).
 import modules as mod_registry
+from modules import atlas_access as _atlas_access
 from modules import etlrunner as _etl
 
 # v10.2.23 (ops #109): a client that reset TCP before its TLS handshake killed the
@@ -66083,6 +66084,12 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
                 for b in bindings
             )
             if already:
+                return 'already'
+            # An ATLAS application carries its own access policy (global admins OR
+            # the deployment's group). Adding "Allow authentik Admins" beside it is
+            # one more requirement under policy_engine_mode=all (Hardened posture),
+            # which turns the agency's administrators away (ops #979).
+            if any(_atlas_access.is_access_binding(b) for b in bindings):
                 return 'already'
             try:
                 _api_post('policies/bindings/', {
