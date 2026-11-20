@@ -5090,8 +5090,6 @@ def _reconcile_access(ctx, inst, plog):
     # ⚠️ Idempotent, and the only route by which a provider created with the
     # wrong hostname is ever corrected — see the function.
     _reconcile_provider_host(ctx, inst, plog)
-    # ⚠️ Last, so the application's own bindings are final first (ops #985).
-    _reassert_mfa(ctx, plog)
 
 
 def _reassert_mfa(ctx, plog):

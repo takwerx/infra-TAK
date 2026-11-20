@@ -218,11 +218,12 @@ def test_deploy_sweeps_after_the_access_policy_and_the_roster():
     assert tail.index("ctx['generate_caddyfile']") < tail.index("ctx['_caddy_reload']")
 
 
-def test_every_update_sweeps_too():
+def test_the_update_path_is_left_alone():
+    # Deploy path only (lead's call): the post-update reconcile is ops #919's, and an update
+    # never makes a new app, so the console's boot-time sweep already covers it.
     src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
-    access = _body(src, '_reconcile_access')
 
-    assert access.index('_reconcile_agency_group(') < access.index('_reassert_mfa(ctx, plog)')
+    assert '_reassert_mfa' not in _body(src, '_reconcile_access')
 
 
 def test_the_console_hands_the_sweep_to_the_module():
