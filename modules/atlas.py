@@ -4056,6 +4056,10 @@ def deploy(ctx, job, params):
             _reconcile_agency_group(ctx, _inst, plog)
             # ATLAS W495: after the agency group, which its role is scoped to.
             _reconcile_roster(ctx, _inst, plog)
+            # ⚠️ Last of the Authentik steps, after the access policy is bound
+            # (ops #985): on a Hardened box a new application must carry the
+            # require-MFA binding like every other login app.
+            _reassert_mfa(ctx, plog)
             # Re-emit now that the application exists: the console vhost only
             # grows its forward_auth block once Authentik is in the picture.
             ctx['generate_caddyfile'](ctx['load_settings']())
@@ -5088,6 +5092,32 @@ def _reconcile_access(ctx, inst, plog):
     _reconcile_provider_host(ctx, inst, plog)
 
 
+def _reassert_mfa(ctx, plog):
+    """On a Hardened box, put the require-MFA binding on every login app.
+
+    ⚠️ **Reported from a real box (ops #985):** a new agency deployment on a
+    Hardened box came up with policy mode `any` and only its own access
+    binding, so the agency's administrators signed in without the MFA step
+    every other app asks for. Hardening binds MFA to the apps that exist when
+    it runs; an app made afterwards is covered only by the console's boot-time
+    sweep, and a module deploy does not restart the console. Remote Assist and
+    NetBird call the same sweep at the end of their deploy; ATLAS did not.
+
+    The sweep is the console's own (`_w1_reassert_app_mfa`), so the policy,
+    the engine mode and the record that Hardening reverts from stay in one
+    place. It does nothing when Hardening is not applied. Never raises: a
+    deploy or an update must not fail over it.
+    """
+    sweep = (ctx or {}).get('_w1_reassert_app_mfa')
+    if not sweep:
+        return False
+    try:
+        return bool(sweep(plog))
+    except Exception as exc:
+        plog('  ⚠ Could not check the MFA requirement: %s' % str(exc)[:80])
+        return False
+
+
 def _reconcile_provider_host(ctx, inst, plog):
     """Make sure Authentik's proxy provider names the host Caddy serves.
 
@@ -5663,6 +5693,59 @@ def refresh_databases(ctx, log):
             continue
         name = atlas_instances.derive(inst)['name']
         out[name] = refresh_database(ctx, inst, lambda m, n=name: log(n + ': ' + m))
+    return out
+
+
+def converge_access(ctx, ak_url, ak_headers, log):
+    """ops #919: the one access policy for every deployment, after a console update.
+
+    The console's boot converge calls this, through the module spec, right after
+    `_ensure_app_access_policies`. {deployment name: ensure status, or 'skipped'
+    when its application is not in Authentik}. Never raises.
+
+    ⚠️ **Update Now has to be enough** (10.4.3 T&E, ops #984). A box on 10.4.2
+    has "Allow authentik Admins" (and, for an agency, its group bound directly)
+    on each ATLAS application. Under the Hardened posture's `all` that is the
+    agency-admin lockout of ops #979. Both the boot converge and `_restrict_to_admins`
+    read that binding as "already restricted", so before this only a press of
+    Update on the ATLAS page swapped it for the access policy.
+
+    ⚠️ **Nothing new is let in.** The agency's own group (the one 10.4.2 already
+    bound) is added; the standard group is not: only an ATLAS Update admits it,
+    after it has checked the running container (`_reconcile_roster`). A policy
+    changed by hand is reported and left; a failure leaves the old bindings
+    (`atlas_access.ensure`). The group itself is never created here.
+    """
+    import urllib.error
+    out = {}
+    try:
+        instances = load_instances(ctx)
+    except Exception as exc:
+        log('ATLAS access: could not read the deployments: %s' % str(exc)[:80])
+        return out
+    api = atlas_access.Api(ak_url, ak_headers)
+    for inst in instances:
+        names = atlas_instances.derive(inst)
+        name = names['name']
+        app_slug = atlas_instances.authentik_names(inst)['app_slug']
+
+        def say(msg, n=name):
+            log('ATLAS %s: %s' % (n, msg.strip()))
+        try:
+            try:
+                api.call('core/applications/%s/' % app_slug)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
+                # Not registered (yet): Deploy makes the policy with the app.
+                out[name] = 'skipped'
+                continue
+            add = [names['admin_group']] if names['slug'] else []
+            out[name] = atlas_access.ensure(api, app_slug, add=add,
+                                            plog=say)['status']
+        except Exception as exc:
+            say('⚠ access policy not checked: %s' % str(exc)[:80])
+            out[name] = 'failed'
     return out
 
 
@@ -6876,6 +6959,9 @@ def register(ctx):
         'tak_ca_changed': tak_ca_changed,
         # ops #755: called by the console after its own update (PostgreSQL security minors).
         'refresh_databases': refresh_databases,
+        # ops #919: called by the console's boot converge (so after its own
+        # update), to swap every ATLAS application to its one access policy.
+        'converge_access': converge_access,
         'uninstall': uninstall,
         'control_map': {
             'start':   lambda c: _compose_argv(c, 'up', '-d', 'api'),
