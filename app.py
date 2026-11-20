@@ -84808,14 +84808,18 @@ entries:
             plog("")
             plog("🔑 Ensuring password-recovery flow (no Email Relay configured)...")
             _ensure_recovery_flow_standalone(env_path, plog)
-        # Final LDAP restart: ensure container has the injected token and internal URL (after SMTP/recreate)
+        # Final LDAP step: ensure the container has the injected token and internal URL (after
+        # SMTP/recreate). v10.4.3 W2: `up -d --no-deps ldap`, not `restart` — `restart` never
+        # applied a compose change anyway (same container config), and it restarted the outpost
+        # on every deploy/Reconfigure (each one a ~3-in-5 TAK risk under load, akres E3c).
+        # `up` recreates it only when its compose config changed.
         try:
-            _r = _ak_compose_subprocess(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']), 'deploy-ldap-final-restart', plog,
+            _r = _ak_compose_subprocess(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', 'ldap']), 'deploy-ldap-final-restart', plog,
                                         wait=_AK_COMPOSE_LOCK_WAIT_LONG_S, cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
             if _r.returncode == _AK_COMPOSE_LOCK_BUSY_RC:
                 plog(f"  ⚠ LDAP final restart {_r.stdout}")
             else:
-                plog("  ✓ LDAP container restarted (final)")
+                plog("  ✓ LDAP container up to date (final; recreated only if its config changed)")
         except Exception:
             pass
         if not ldap_svc_pass:
@@ -120516,8 +120520,22 @@ def _post_update_auto_deploy():
                                     print("Post-update: Authentik compose — formatting-only change, no container recreate")
                             except Exception:
                                 pass
+                        # v10.4.3 W2: every outpost recreate is a ~3-in-5 risk of TAK getting stuck
+                        # under load (akres E3c), while server/worker recreates were 0/9. So ldap is
+                        # recreated only when ITS OWN service section changed (in E3 it did: cap_drop).
+                        _ldap_section_changed = True
                         if _ak_recreate:
-                            print("Post-update: Authentik compose hardened — recreating worker/server, then ldap")
+                            try:
+                                import yaml as _yaml_ldap
+                                _ldap_section_changed = (
+                                    ((_yaml_ldap.safe_load(_ak) or {}).get('services') or {}).get('ldap')
+                                    != ((_yaml_ldap.safe_load(_ak_orig) or {}).get('services') or {}).get('ldap'))
+                            except Exception:
+                                _ldap_section_changed = True    # can't tell: recreate as before
+                        if _ak_recreate:
+                            print("Post-update: Authentik compose hardened — recreating worker/server"
+                                  + (", then ldap" if _ldap_section_changed
+                                     else " (ldap section unchanged — LDAP outpost NOT recreated)"))
                             # ops #30: LDAP after the server is healthy, never in the same
                             # `up` (an outpost that starts against the old server panics
                             # when that server goes away mid start-up).
@@ -120529,8 +120547,8 @@ def _post_update_auto_deploy():
                                         _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'worker', 'server']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=120
                                     )
                                     _wait_for_authentik_stack_healthy(lambda m: print(f"Post-update: {m}"), timeout=180)
-                                    if _ldap_core_gate(['docker', 'compose', 'up', 'ldap'], 'post-update-hardening-recreate',
-                                                       lambda m: print(f"Post-update:{m}", flush=True), wait_s=30):   # v10.4.3 W7
+                                    if _ldap_section_changed and _ldap_core_gate(['docker', 'compose', 'up', 'ldap'], 'post-update-hardening-recreate',
+                                                       lambda m: print(f"Post-update:{m}", flush=True), wait_s=30):   # v10.4.3 W2 + W7
                                         with _ldap_outpost_restart_watch('post-update-hardening-recreate'):   # v10.4.3 W1
                                             subprocess.run(
                                                 _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=90
