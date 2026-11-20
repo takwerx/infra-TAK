@@ -46677,6 +46677,14 @@ def _takportal_build_settings_dict(settings):
     # NOT emitted: it means "when the PORTAL last handshook", a fact we do not own.
     if tak_local and os.path.exists(os.path.expanduser('~/TAK-Portal/data/ssh/tak_ssh_ed25519')):
         _built["TAK_SSH_ONBOARDED"] = "true"
+    # ops #987 (TAK Portal 2.0.36+, TAK-Portal PR 115): tell the portal TAK Server runs in Docker, and
+    # which container. SEED-ONLY like every key above (never in TAKPORTAL_AUTHORITATIVE_KEYS), so a
+    # portal that already has a value of its own, or an operator who switched it back, keeps it.
+    # A portal that does not know these keys ignores them. TAK_ENROLL_HOST is the operator's own
+    # (the name devices use from outside); we do not guess it.
+    if tak_local and _tak_is_container():
+        _built["TAK_SERVER_MODE"] = "docker"
+        _built["TAK_DOCKER_CONTAINER"] = TAK_CONTAINER
     return _built
 
 
@@ -47124,6 +47132,16 @@ def _takportal_ssh_probe(timeout=20):
              "elif sudo -n -u tak id >/dev/null 2>&1; then echo nopasswd; "
              "elif [ -r /opt/tak/CoreConfig.xml ] && [ -w /opt/tak/CoreConfig.xml ]; then echo direct; "
              "else echo none; fi")
+    if _tak_is_container():
+        # ops #987: the same two checks TAK Portal's own Docker-mode probe runs (takSsh.service.js
+        # shellProbeNopasswdRootAccess / shellProbeNopasswdAsTakUser), through the container. A host
+        # read of /opt/tak/CoreConfig.xml proves nothing here: that path is a symlink the console
+        # user can read, and the portal never uses it in Docker mode.
+        c = TAK_CONTAINER
+        probe = ("if [ \"$(id -u)\" = 0 ]; then echo root; "
+                 f"elif sudo -n docker exec -i {c} cat /opt/tak/CoreConfig.xml >/dev/null 2>&1 "
+                 f"&& sudo -n docker exec -i -u tak {c} id >/dev/null 2>&1; then echo nopasswd; "
+                 "else echo none; fi")
     # StrictHostKeyChecking=no + UserKnownHostsFile=/dev/null are deliberate and
     # bounded HERE, and must not be copied to a probe with a different target: the
     # host is the hardcoded loopback literal 127.0.0.1 (never settings, never user
@@ -47160,6 +47178,18 @@ TAKPORTAL_CONTAINER_TAK_NOTE = (
     "restart TAK Server or sync plugins to the Update Server yet. Users and QR "
     "enrollment work. Requested upstream: "
     "https://github.com/ValleyTacticalSolutions/TAK-Portal/issues/61")
+
+# ops #987: TAK Portal's Docker TAK Server support (PR 115) ships services/takServerMode.service.js.
+# A portal checkout that has it can use the Docker grant; one that lacks it keeps the note above.
+TAKPORTAL_DOCKER_FEATURE_FILE = os.path.join('services', 'takServerMode.service.js')
+
+
+def _takportal_portal_supports_docker():
+    """True when the TAK Portal checkout in the console user's home has Docker TAK Server support."""
+    portal = os.path.expanduser('~/TAK-Portal')
+    if os.path.islink(portal):
+        return False
+    return os.path.isfile(os.path.join(portal, TAKPORTAL_DOCKER_FEATURE_FILE))
 
 
 TAKPORTAL_CADDY_SHIM_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -47553,10 +47583,12 @@ def _takportal_setup_ssh(log_fn=None):
         # probes 'root'), TAK Portal's cert/restart/plugin commands target a host
         # tak user and takserver.service that do not exist. Not verified, and not
         # a failure either: the caller reports it as a known limitation.
-        if _tak_is_container():
+        if _tak_is_container() and not _takportal_portal_supports_docker():
             if log_fn:
                 log_fn(f"  ⏭ Privileged TAK Portal extras unavailable — {TAKPORTAL_CONTAINER_TAK_NOTE}")
             return False
+        # A portal with Docker TAK Server support (ops #987) falls through to the probe, which
+        # checks the grant through the container (see _takportal_ssh_probe).
 
         # v10.1.53 (W6): prove it. This function used to return True here having
         # verified NOTHING beyond "docker cp did not error" — so a portal that
@@ -48119,8 +48151,19 @@ def takportal_ssh_status():
         row('TAK Server', 'na', 'not on this host',
             'SSH from TAK Portal is configured by hand in the portal UI for a remote TAK Server.')
         return jsonify(out)
-    if tak_container:
+    if tak_container and not _takportal_portal_supports_docker():
         row('TAK Server', 'na', 'containerized install', TAKPORTAL_CONTAINER_TAK_NOTE)
+        return jsonify(out)
+    if tak_container:
+        # ops #987: this portal can drive Docker TAK Server. Report what the probe proves.
+        verdict, detail = _takportal_ssh_probe()
+        if verdict in ('root', 'nopasswd'):
+            row('TAK Server', 'ok', 'Docker TAK Server',
+                'TAK Portal reaches TAK Server through its container (certs, config, restart).')
+        else:
+            row('TAK Server', 'warn', 'Docker TAK Server',
+                'TAK Portal cannot run docker commands for TAK Server yet'
+                + (f': {detail}' if detail else '') + '. Use Repair on this card.')
         return jsonify(out)
 
     portal = _takportal_get_existing_settings()
@@ -48262,7 +48305,8 @@ def takportal_ssh_repair():
         ok = _takportal_setup_ssh(log_fn=lambda m: log.append(m))
         verdict, detail = _takportal_ssh_probe()
         note = TAKPORTAL_CONTAINER_TAK_NOTE if (not ok and os.path.isdir('/opt/tak')
-                                                and _tak_is_container()) else ''
+                                                and _tak_is_container()
+                                                and not _takportal_portal_supports_docker()) else ''
         return jsonify({'success': True, 'verified': ok, 'probe': verdict,
                         'detail': detail, 'note': note, 'log': log})
     except Exception as e:
