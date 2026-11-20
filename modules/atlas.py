@@ -4954,27 +4954,50 @@ def _reconcile_roster(ctx, inst, plog):
     to the agency admin group and must never be scoped to one that is missing.
     Restarts `api` when `.env` changed, so ATLAS starts with the current token.
     Never raises; see `atlas_roster`.
+
+    ⚠️ **`admit` runs even when the set-up or the restart failed** (Security
+    read, ops #978). It is also the step that takes the group *out*: a
+    `_compose` timeout that skipped it would leave a group admitted on an ATLAS
+    that may no longer know its name. A failure before it counts as "not
+    restarted", and unknown versions keep the group out.
     """
+    restarted = True
+    dirpath = None
     try:
         dirpath = instance_paths(ctx, inst)['dir']
-        restarted = True
         if atlas_roster.ensure(ctx, inst, dirpath, write_env_value, plog)['env_changed']:
             r = _compose(ctx, 'up -d api', timeout=300, inst=inst)
             restarted = getattr(r, 'returncode', 1) == 0
+    except Exception as exc:
+        restarted = False
+        plog('  ⚠ Could not reconcile the standard admins: %s' % str(exc)[:80])
+    try:
+        if dirpath is None:
+            dirpath = instance_paths(ctx, inst)['dir']
         # ⚠️ **After the restart** (Security read, ops #978), so ATLAS knows
         # the group's name before its first member is let in, and on **both**
         # versions: the file says what was checked out, the container what
         # serves. A failed rebuild or Deploy run again on an older tag makes
         # them differ, and then the group stays out.
-        installed = _installed_version(ctx, inst)
-        # Waited for only when the checkout could admit the group at all.
-        running = (_settled_running_version(ctx, inst)
-                   if atlas_roster.admits_role(installed)
-                   else _running_version(ctx, inst))
+        installed = running = container_group = None
+        try:
+            installed = _installed_version(ctx, inst)
+            # Waited for only when the checkout could admit the group at all.
+            if atlas_roster.admits_role(installed):
+                running = _settled_running_version(ctx, inst)
+                # ⚠️ The name as the running container has it, not as `.env`
+                # has it: a restart that failed on an earlier update is not
+                # in `restarted` (Security read, ops #978).
+                container_group = _compose_exec(
+                    ctx, ['printenv', atlas_roster.ENV_GROUP], inst=inst)
+            else:
+                running = _running_version(ctx, inst)
+        except Exception as exc:
+            plog('  ⚠ ATLAS version not read: %s' % str(exc)[:80])
         atlas_roster.admit(ctx, inst, dirpath, installed, running, plog,
-                           restarted=restarted)
+                           restarted=restarted, container_group=container_group)
     except Exception as exc:
-        plog('  ⚠ Could not reconcile the standard admins: %s' % str(exc)[:80])
+        plog('  ⚠ Could not check the standard admins\' access: %s' % str(exc)[:80])
 
 
 def _settled_running_version(ctx, inst, tries=24, delay=5):

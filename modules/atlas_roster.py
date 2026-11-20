@@ -407,7 +407,8 @@ def _env_value(dirpath, key):
     return None
 
 
-def admit(ctx, inst, dirpath, installed, running, plog, restarted=True, opener=None):
+def admit(ctx, inst, dirpath, installed, running, plog, restarted=True, opener=None,
+          container_group=None):
     """Let the standard group into ATLAS, or keep it out. Never raises.
 
     Called after `ensure` and after the `api` restart it asked for.
@@ -419,6 +420,14 @@ def admit(ctx, inst, dirpath, installed, running, plog, restarted=True, opener=N
     ⚠️ Also kept out while `.env` does not name the group: a 2.3.0 ATLAS
     without `TAKMDM_STANDARD_ADMIN_GROUP` and with a blank admin group takes
     every member for a super admin.
+
+    ⚠️ **And while the running container does not** (Security read, ops #978).
+    `container_group` is `TAKMDM_STANDARD_ADMIN_GROUP` as the `api` container
+    has it (`printenv`), or None when it could not be read. `restarted` only
+    knows about this run: a restart that failed on an earlier update leaves the
+    name in `.env` with nothing left to restart, and the next update would let
+    the group in. The container's own value is the one ATLAS acts on, so it
+    must equal the group's name; anything else, unreadable included, is out.
     """
     n = names(inst)
     try:
@@ -435,6 +444,12 @@ def admit(ctx, inst, dirpath, installed, running, plog, restarted=True, opener=N
             blocker = 'ATLAS could not be restarted with the group\'s name'
         elif _env_value(dirpath, ENV_GROUP) != n['standard_group']:
             blocker = 'the deployment\'s .env does not name the group yet'
+        elif (admitted(installed, running) and
+              (container_group or '').strip() != n['standard_group']):
+            # Only asked of an ATLAS that could take the group at all, so an
+            # older one still logs "predates the standard role".
+            blocker = ('the running ATLAS does not have the group\'s name '
+                       '(restart ATLAS, then run Update)')
         mark, note = ensure_access(api, n, installed, running, plog, blocker=blocker)
         plog('  %s "%s" %s' % (mark, n['standard_group'], note))
     except Exception as exc:
@@ -488,14 +503,23 @@ def remove(ctx, inst, opener=None):
         # agency teardown removes its own earlier (`remove_agency_admin_group`);
         # the plain deployment has no agency group, so this is its only way
         # out. Runs after the application is deregistered (`remove_instance`).
-        if atlas_access.remove(api, n['application']):
-            gone.append('access policy "%s"' % atlas_access.policy_name(n['application']))
+        # ⚠️ Kept while the application is still there (`atlas_access.remove`);
+        # the rest of the teardown goes on, and the note says why it stayed.
+        kept = None
+        try:
+            if atlas_access.remove(api, n['application']):
+                gone.append('access policy "%s"' % atlas_access.policy_name(n['application']))
+        except Exception as exc:
+            kept = 'access policy kept: %s' % str(exc)[:100]
         group = _find(api, 'core/groups/', 'name', n['standard_group'])
         if group is not None:
             members = len(group.get('users') or [])
             api.call('core/groups/%s/' % group['pk'], method='DELETE')
             gone.append('group "%s"%s' % (n['standard_group'], ' (it had %d member%s)' % (
                 members, '' if members == 1 else 's') if members else ''))
-        return 'standard admins: %s removed' % ', '.join(gone) if gone else None
+        parts = ['%s removed' % ', '.join(gone)] if gone else []
+        if kept:
+            parts.append(kept)
+        return 'standard admins: %s' % '; '.join(parts) if parts else None
     except Exception as exc:
         return 'standard admins not removed: %s' % str(exc)[:80]

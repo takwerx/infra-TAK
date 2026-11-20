@@ -37,6 +37,7 @@ and the application says no, which is the most confusing shape a lockout takes.
 import json
 import pathlib
 import sys
+import urllib.error
 
 import pytest
 
@@ -174,6 +175,9 @@ class FakeAuthentik:
             return _Response({'results': list(self.groups)})
         if 'core/applications/' in url:
             slug = url.rstrip('/').rsplit('/', 1)[-1]
+            if slug not in self.apps:
+                # Like Authentik: an application that is not there is a 404.
+                raise urllib.error.HTTPError(url, 404, 'Not Found', {}, None)
             return _Response(self.apps[slug])
         if 'policies/expression/' in url:
             return _Response({'results': list(self.policies)})

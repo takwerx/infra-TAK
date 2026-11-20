@@ -290,15 +290,21 @@ def _ctx(token='admin-token', domain='auth.example.com'):
 
 
 def _ensure(deployment, ak, inst=CORONA, ctx=None, installed=None, running='same',
-            restarted=True):
-    """`ensure`, then (when `installed` is given) `admit`, as `_reconcile_roster` does."""
+            restarted=True, container='env'):
+    """`ensure`, then (when `installed` is given) `admit`, as `_reconcile_roster` does.
+
+    `container` is what `printenv` in the running `api` answers; by default the
+    value `.env` holds, as after a restart that worked.
+    """
     log = []
     result = roster.ensure(ctx or _ctx(), inst, str(deployment), atlas.write_env_value,
                            log.append, opener=ak)
     if installed != 'skip':
+        if container == 'env':
+            container = roster._env_value(str(deployment), roster.ENV_GROUP)
         roster.admit(ctx or _ctx(), inst, str(deployment), installed,
                      installed if running == 'same' else running, log.append,
-                     restarted=restarted, opener=ak)
+                     restarted=restarted, opener=ak, container_group=container)
     return result, log
 
 
@@ -777,16 +783,23 @@ def test_reconcile_restarts_api_before_it_admits(monkeypatch, tmp_path, env_chan
     monkeypatch.setattr(atlas, '_installed_version', lambda ctx, inst: '2.3.0')
     monkeypatch.setattr(atlas, '_settled_running_version',
                         lambda ctx, inst: order.append('version') or '2.3.0')
+    monkeypatch.setattr(atlas, '_compose_exec',
+                        lambda ctx, argv, inst=None: order.append(argv[0]) or
+                        'atlas-corona-standard-admins\n')
     seen = {}
 
-    def admit(ctx, inst, dirpath, installed, running, plog, restarted=True):
+    def admit(ctx, inst, dirpath, installed, running, plog, restarted=True,
+              container_group=None):
         order.append('admit')
-        seen.update(installed=installed, running=running, restarted=restarted)
+        seen.update(installed=installed, running=running, restarted=restarted,
+                    container_group=container_group)
     monkeypatch.setattr(atlas.atlas_roster, 'admit', admit)
     atlas._reconcile_roster({}, CORONA, lambda m: None)
-    want = ['ensure'] + (['up -d api'] if env_changed else []) + ['version', 'admit']
+    want = (['ensure'] + (['up -d api'] if env_changed else []) +
+            ['version', 'printenv', 'admit'])
     assert order == want
-    assert seen == {'installed': '2.3.0', 'running': '2.3.0', 'restarted': restarted}
+    assert seen == {'installed': '2.3.0', 'running': '2.3.0', 'restarted': restarted,
+                    'container_group': 'atlas-corona-standard-admins\n'}
 
 
 def test_reconcile_does_not_wait_for_an_atlas_that_cannot_admit(monkeypatch, tmp_path):
@@ -813,6 +826,127 @@ def test_removal_of_the_plain_deployment_removes_its_access_policy(deployment, a
     ak.add_group('authentik Admins', superuser=True)
     _ensure(deployment, ak, inst=PLAIN, installed='2.3.0')
     assert any(p['name'] == 'ATLAS access: atlas' for p in ak.policies.values())
+    ak.applications.pop('atlas')  # `remove_instance` deregisters it first
     note = roster.remove(_ctx(), PLAIN, opener=ak)
     assert ak.policies == {}
     assert 'access policy "ATLAS access: atlas"' in note
+
+
+# --------------------------------------------------------------------------- #
+# Security read of the merged rework (ops #978, follow-up items 1 and 2)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize('mode', MODES)
+@pytest.mark.parametrize('container', [None, '', 'atlas-other-standard-admins',
+                                       'atlas-corona-standard-admins-x'])
+def test_a_container_without_the_group_name_keeps_the_group_out(deployment, box,
+                                                                 mode, container):
+    """Item 1: `.env` has the name and both versions are 2.3.0, but the running
+    container does not have it (a restart that failed on an earlier update).
+    ATLAS would take a member for a super admin, so the group stays out."""
+    _result, log = _ensure(deployment, box, installed='2.3.0', container=container)
+    assert _env(deployment)['TAKMDM_STANDARD_ADMIN_GROUP'] == 'atlas-corona-standard-admins'
+    assert not box.can_open('atlas-corona', STANDARD, mode)
+    assert box.can_open('atlas-corona', AGENCY, mode)
+    assert box.can_open('atlas-corona', GLOBAL, mode)
+    assert 'running ATLAS does not have the group' in log[-1]
+
+
+def test_a_container_that_lost_the_name_takes_the_group_out_again(deployment, box):
+    _ensure(deployment, box, installed='2.3.0')
+    assert box.can_open('atlas-corona', STANDARD, 'all')
+    _result, log = _ensure(deployment, box, installed='2.3.0', container=None)
+    assert not box.can_open('atlas-corona', STANDARD, 'all')
+    assert 'taken out of ATLAS access' in log[-1]
+
+
+def test_the_container_name_with_a_newline_is_still_the_name(deployment, box):
+    """`printenv` ends its answer with a newline."""
+    _ensure(deployment, box, installed='2.3.0',
+            container='atlas-corona-standard-admins\n')
+    assert box.can_open('atlas-corona', STANDARD, 'all')
+
+
+def _reconcile(monkeypatch, deployment, ak, env_changed=False, compose=None,
+               container='atlas-corona-standard-admins\n', version='2.3.0'):
+    """`_reconcile_roster` itself, with the real `admit` against the fake."""
+    logged = []
+    monkeypatch.setattr(atlas, 'instance_paths', lambda ctx, inst: {'dir': str(deployment)})
+    monkeypatch.setattr(atlas.atlas_roster, 'ensure',
+                        lambda *a, **k: {'env_changed': env_changed})
+    monkeypatch.setattr(atlas, '_compose', compose or (lambda *a, **k: _Ran(0)))
+    monkeypatch.setattr(atlas, '_installed_version', lambda ctx, inst: version)
+    monkeypatch.setattr(atlas, '_settled_running_version', lambda ctx, inst: version)
+    monkeypatch.setattr(atlas, '_running_version', lambda ctx, inst: version)
+    asked = []
+    monkeypatch.setattr(atlas, '_compose_exec',
+                        lambda ctx, argv, inst=None: asked.append(argv) or container)
+    monkeypatch.setattr(roster.urllib.request, 'urlopen', ak)
+    atlas._reconcile_roster(_ctx(), CORONA, logged.append)
+    return logged, asked
+
+
+@pytest.mark.parametrize('container,admitted', [
+    (None, False),                                   # printenv found nothing
+    ('atlas-other-standard-admins\n', False),
+    ('atlas-corona-standard-admins\n', True),        # the restart worked
+])
+def test_reconcile_reads_the_name_from_the_running_container(monkeypatch, deployment,
+                                                             box, container, admitted):
+    """Item 1, through `_reconcile_roster`: no restart in this run (`.env`
+    unchanged), so only the container can say whether ATLAS has the name."""
+    _ensure(deployment, box, installed='skip')
+    logged, asked = _reconcile(monkeypatch, deployment, box, container=container)
+    assert asked == [['printenv', 'TAKMDM_STANDARD_ADMIN_GROUP']]
+    assert box.can_open('atlas-corona', STANDARD, 'all') is admitted
+    assert box.can_open('atlas-corona', AGENCY, 'all')
+
+
+def test_reconcile_does_not_ask_an_older_atlas_for_the_name(monkeypatch, deployment, box):
+    _ensure(deployment, box, installed='skip')
+    logged, asked = _reconcile(monkeypatch, deployment, box, version='2.2.2')
+    assert asked == []
+    assert 'predates the standard role' in logged[-1]
+
+
+def test_a_restart_that_times_out_still_takes_the_group_out(monkeypatch, deployment, box):
+    """Item 2: `_compose` raises on a timeout. That used to skip `admit`, the
+    step that takes the group out, and leave it admitted."""
+    import subprocess
+    _ensure(deployment, box, installed='2.3.0')
+    assert box.can_open('atlas-corona', STANDARD, 'all')
+
+    def timeout(*a, **k):
+        raise subprocess.TimeoutExpired('docker compose up -d api', 300)
+    logged, _asked = _reconcile(monkeypatch, deployment, box, env_changed=True,
+                                compose=timeout)
+    assert not box.can_open('atlas-corona', STANDARD, 'all')
+    assert box.can_open('atlas-corona', AGENCY, 'all')
+    assert any('Could not reconcile the standard admins' in m for m in logged)
+    assert 'taken out of ATLAS access' in logged[-1]
+
+
+def test_a_failed_version_read_still_takes_the_group_out(monkeypatch, deployment, box):
+    _ensure(deployment, box, installed='2.3.0')
+
+    def broken(ctx, inst):
+        raise OSError('docker not answering')
+    logged, _asked = _reconcile(monkeypatch, deployment, box)
+    monkeypatch.setattr(atlas, '_installed_version', broken)
+    atlas._reconcile_roster(_ctx(), CORONA, logged.append)
+    assert not box.can_open('atlas-corona', STANDARD, 'all')
+    assert any('ATLAS version not read' in m for m in logged)
+
+
+def test_removal_keeps_the_policy_of_an_application_still_there(deployment, ak):
+    """Item 3: the deregistration failed, so the application is still in
+    Authentik. Its policy stays (no binding would open it to everyone); the
+    rest of the teardown goes on and the note says why."""
+    ak.add_group('authentik Admins', superuser=True)
+    _ensure(deployment, ak, inst=PLAIN, installed='2.3.0')
+    note = roster.remove(_ctx(), PLAIN, opener=ak)
+    assert any(p['name'] == 'ATLAS access: atlas' for p in ak.policies.values())
+    assert not ak.can_open('atlas', NOBODY, 'any')
+    assert 'access policy kept' in note and 'still in Authentik' in note
+    assert 'atlas-standard-admins' not in {g['name'] for g in ak.groups.values()}
+    assert ak.roles == {} and ak.tokens == {}
