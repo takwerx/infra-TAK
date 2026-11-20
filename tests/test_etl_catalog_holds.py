@@ -17,9 +17,10 @@
 """An ETL on hold stays uninstallable (operator, v10.4.0 T&E, 2026-11-15).
 
 etl-arcgis: a security report sent to the COE on 2026-11-09 (ticket #979) held it. The COE fixed
-the problem in v7.34.0 (newest v7.35.1), the diff was reviewed and the ETL ran on a box
-(ops #899, 2026-11-17), so the hold is lifted and the catalog pins v7.35.1. It must never go
-back to a version before 7.34.0.
+the problem in v7.34.0, the diff was reviewed and the ETL ran on a box (ops #899, 2026-11-17),
+so the hold is lifted and the catalog offers v7.35.1 or newer. It must never go back to a
+version before 7.35.1. The tests ask for "at least the fixed release", not an exact pin, so a
+later signed catalog bump does not break them.
 
 etl-cotrip-signs and etl-cotrip-weather (ops #833, 2026-11-16): their Dockerfile security report
 went to the COE the same day and is still open, so they stay held."""
@@ -42,7 +43,7 @@ HOLDS_FILE = REPO / 'modules' / 'etlrunner' / 'holds.json'
 # Every ETL still held for the COE security report of 2026-11-09. Each must stay in holds.json.
 COE_HELD = ['etl-cotrip-signs', 'etl-cotrip-weather']
 # etl-arcgis was held too until the COE fixed it upstream (v7.34.0 and later; ops #899).
-ARCGIS_FIXED_SHA = '7c99969125671cef4256e98100a614fc841a3c59'     # v7.35.1 (annotated tag peeled)
+ARCGIS_FIXED_VERSION = (7, 35, 1)                                   # the release reviewed and run on a box (ops #899)
 
 
 def _load(name):
@@ -61,13 +62,15 @@ def test_arcgis_is_not_held_and_the_catalog_offers_the_fixed_release():
     e = next(x for x in etl.bundled_catalog()['entries'] if x['prefix'] == 'etl-arcgis')
     assert e['reviewed'] and 'note' not in e
     assert etl.installable(e) == (True, '')
-    assert (e['ref'], e['version'], e['sha']) == ('v7.35.1', '7.35.1', ARCGIS_FIXED_SHA)
-    assert ARCGIS_FIXED_SHA in e['logo'] and ARCGIS_FIXED_SHA in e['readme']
+    assert _semver(e['version']) >= ARCGIS_FIXED_VERSION
+    # the sha belongs to the ref it names: the entry's own files are served from that sha
+    assert e['ref'] == 'v' + e['version']
+    assert len(e['sha']) == 40 and e['sha'] in e['logo'] and e['sha'] in e['readme']
 
 
 def test_arcgis_pin_is_never_older_than_the_security_fix():
     e = next(x for x in etl.bundled_catalog()['entries'] if x['prefix'] == 'etl-arcgis')
-    assert _semver(e['version']) >= (7, 34, 0)
+    assert _semver(e['version']) >= (7, 34, 0)      # the COE security fix
 
 
 def test_every_held_entry_in_the_bundle_is_unreviewed():
@@ -164,8 +167,11 @@ def test_guard_dog_tells_an_operator_with_the_old_arcgis_to_update():
     items, _known = etl.notify_items(catalog, {'etl-arcgis': ['7.33.0']}, {'etl-arcgis'})
     mine = [i for i in items if i['key'] == 'etl:etl-arcgis']
     assert len(mine) == 1
-    assert mine[0]['installed'] == 'v7.33.0' and mine[0]['target'] == 'v7.35.1'
-    assert mine[0]['identity'] == ARCGIS_FIXED_SHA
+    entry = next(x for x in catalog if x['prefix'] == 'etl-arcgis')
+    assert _semver(entry['version']) >= ARCGIS_FIXED_VERSION
+    assert mine[0]['installed'] == 'v7.33.0' and mine[0]['target'] == 'v' + entry['version']
+    assert _semver(mine[0]['target'].lstrip('v')) >= ARCGIS_FIXED_VERSION
+    assert mine[0]['identity'] == entry['sha']
     assert 'Update' in mine[0]['how']
 
 

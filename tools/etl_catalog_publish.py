@@ -15,6 +15,15 @@ It never commits and never pushes. The bundled and published files are byte-iden
 on this infra-TAK release and a box that fetched the catalog see the same thing.
 
     python3 tools/etl_catalog_publish.py --out ~/GitHub/infratak-etl-catalog
+
+Rules that go with every signed-catalog PR (ops #977):
+  * The last step is the infra-TAK PR that copies catalog.json exactly as it is on the catalog
+    repo's main into modules/etlrunner/catalog.json. A box that cannot fetch the live catalog
+    uses the bundled copy, so a stale copy means old ETL versions. The weekly workflow
+    .github/workflows/etl-catalog-freshness.yml (tools/etl_catalog_freshness.py) goes red when
+    the bundled serial is behind the live one.
+  * A test that names an ETL version asks for "at least X", never an exact pin. An exact pin
+    breaks on the next catalog bump (the two etl-arcgis tests broke on v7.36.0 for that reason).
 """
 import argparse
 import base64

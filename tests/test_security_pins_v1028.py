@@ -88,6 +88,14 @@ def test_coturn_pin_has_the_4_19_security_fixes():
     assert re.fullmatch(r'\d+\.\d+\.\d+', pin)
 
 
+def test_coturn_pin_has_the_4_19_2_security_fixes():
+    # ops #962: upstream 4.19.2 (Nov 18, 2026) security fixes in the UDP and DTLS listeners.
+    # The pin must never slide back below 4.19.2.
+    pin = re.search(r"^COTURN_IMAGE = 'coturn/coturn:([^']+)'", APP, re.M).group(1)
+    assert _v(pin) >= (4, 19, 2)
+    assert re.fullmatch(r'\d+\.\d+\.\d+', pin)
+
+
 def test_coturn_flags_avoid_the_ones_418_removed():
     # ops #201: the override is built in one place for install and the startup converge
     body = APP[APP.index('def _coturn_override_content('):]

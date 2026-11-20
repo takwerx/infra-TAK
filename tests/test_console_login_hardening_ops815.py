@@ -21,7 +21,9 @@ The contract pinned here, with the real functions from app.py in a small Flask a
   the setup-AP link to /connectivity still works;
 - in Hardened posture a session with no activity stamp is an expired session, a password
   login stamps one, a password login at / starts from an empty session, and an error
-  in the lock ends the session instead of letting the request through;
+  in the lock ends the session instead of letting the request through; a password
+  sign-in sent with the expired cookie works the first time, except where the Authentik
+  sign-out must run first;
 - the three endpoints meant for the box's own scripts refuse a request that came through
   a proxy on the box (X-Forwarded-For), like /api/guarddog/cloudtak-repair does;
 - /logout only acts on a request from the console's own origin;
@@ -320,6 +322,135 @@ def test_hardened_lock_still_works_the_normal_way(console):
     _login(console, c)
     assert c.get('/console', base_url=CONSOLE).status_code == 200
     assert c.get('/api/metrics', base_url=CONSOLE).status_code == 200
+
+
+@pytest.mark.parametrize('path', ['/login', '/'])
+def test_sign_in_right_after_the_idle_lock_works_the_first_time(console, path):
+    """The 10.4.2 T&E saw a password session "still open" 10 s past the limit. It was not:
+    the background call was told 401 on time, but the sign-in that came next (same cookie,
+    no page load in between) was sent back to /login with its password unread, so the
+    test tool only got in again one poll later."""
+    console.state['hardening'] = {'posture': 'hardened',
+                                  'applied': {'W2_session': {'idle_max_seconds': 30}}}
+    c = console.app.test_client()
+    _login(console, c)
+    console.clock.offset = 29
+    assert c.get('/api/metrics', base_url=CONSOLE).status_code == 200
+    console.clock.offset = 32                       # past the limit: locked at once
+    assert c.get('/api/metrics', base_url=CONSOLE).status_code == 401
+    audits = len(console.state['audits'])
+    r = _login(console, c, path)                    # the first sign-in after the lock
+    assert r.status_code == 302 and r.headers['Location'] == '/console', r.headers['Location']
+    assert console.state['audits'][audits:] == [('auth:login-password', 'console password / break-glass')]
+    assert c.get('/console', base_url=CONSOLE).status_code == 200
+    assert c.get('/api/metrics', base_url=CONSOLE).status_code == 200
+
+
+@pytest.mark.parametrize('path', ['/login', '/'])
+def test_wrong_password_right_after_the_idle_lock_gets_the_error_and_no_session(console, path):
+    console.state['hardening'] = HARDENED
+    c = console.app.test_client()
+    _forge_session(c, authenticated=True, authentik_username='someone.else',
+                   last_activity=int(time.time()) - 4000)
+    r = c.post(path, data={'password': 'wrong-guess-123'}, base_url=CONSOLE,
+               headers={'Origin': CONSOLE})
+    assert r.status_code == 200 and 'Invalid password' in r.get_data(as_text=True)
+    assert len(_log_lines(console)) == 1            # recorded as a failed login
+    with c.session_transaction(base_url=CONSOLE) as s:
+        assert not s.get('authenticated') and 'authentik_username' not in s
+    assert c.get('/console', base_url=CONSOLE).status_code == 401
+
+
+SIGNOUT = CONSOLE + '/outpost.goauthentik.io/sign_out'
+
+
+def _arm_sso_signout(console):
+    """W-IDLE armed and the console SSO-locked, with app.py's own test for it: an expired
+    session on a request that came through Authentik is also signed out of Authentik."""
+    console.state['hardening'] = {
+        'posture': 'hardened',
+        'applied': {'W2_session': {'idle_max_seconds': 1800},
+                    'W1_sso': {'caddy_login_locked': True},
+                    'WIDLE': {'mode': 'sso_signout', 'signout_url': SIGNOUT}}}
+    for name in ('_w1_console_locked', '_widle_sso_logout_active'):
+        exec(_func_src(name), console.ns)
+    console.ns['_console_signout_url'] = lambda: SIGNOUT
+
+
+VIA_AUTHENTIK = {'X-Authentik-Username': 'akadmin'}      # what Caddy adds after forward_auth
+
+
+def test_sign_in_right_after_the_idle_lock_works_with_sso_signout_armed(console):
+    """test12 in the T&E: W-IDLE armed, a password session on the IP and port way in
+    (no Authentik in front of it, so there is nothing to sign out of)."""
+    _arm_sso_signout(console)
+    c = console.app.test_client()
+    _login(console, c, '/')
+    console.clock.offset = 1900
+    assert c.get('/api/metrics', base_url=CONSOLE).status_code == 401
+    r = _login(console, c, '/')
+    assert r.status_code == 302 and r.headers['Location'] == '/console', r.headers['Location']
+    assert c.get('/api/metrics', base_url=CONSOLE).status_code == 200
+
+
+@pytest.mark.parametrize('values', [
+    {'auth_via': 'sso', 'authentik_username': 'akadmin'},         # made by Authentik
+    {'authentik_username': 'akadmin'},                            # cookie from before ops #813
+    {'auth_via': 'password', 'authentik_username': 'akadmin'},    # password session seen through Authentik
+    {'auth_via': 'password'},
+])
+@pytest.mark.parametrize('password', [RIGHT, 'wrong-guess-123'])
+def test_sign_in_does_not_skip_the_authentik_sign_out(console, values, password):
+    """With W-IDLE armed, a sign-in POST that came through Authentik must not leave a live
+    Authentik session behind an ended console session: the next page would sign the
+    browser in again with no prompt."""
+    _arm_sso_signout(console)
+    c = console.app.test_client()
+    _forge_session(c, authenticated=True, last_activity=int(time.time()) - 4000, **values)
+    r = c.post('/login', data={'password': password}, base_url=CONSOLE,
+               headers=dict(VIA_AUTHENTIK, Origin=CONSOLE))
+    assert r.status_code == 302 and r.headers['Location'] == SIGNOUT, r.headers['Location']
+    assert console.state['audits'] == [] and _log_lines(console) == []   # password not read
+    with c.session_transaction(base_url=CONSOLE) as s:
+        assert not s.get('authenticated')
+
+
+def test_an_expired_authentik_session_sent_to_the_port_gets_no_way_in(console):
+    """The Authentik-made cookie replayed on the IP and port way in, with a wrong password."""
+    _arm_sso_signout(console)
+    c = console.app.test_client()
+    _forge_session(c, authenticated=True, auth_via='sso', authentik_username='akadmin',
+                   last_activity=int(time.time()) - 4000)
+    r = c.post('/', data={'password': 'wrong-guess-123'}, base_url=CONSOLE,
+               headers={'Origin': CONSOLE})
+    assert r.status_code == 200 and 'Invalid password' in r.get_data(as_text=True)
+    with c.session_transaction(base_url=CONSOLE) as s:
+        assert dict(s) == {}
+    assert c.get('/console', base_url=CONSOLE).status_code == 401
+
+
+@pytest.mark.parametrize('method,path', [('POST', '/logout'), ('GET', '/login'), ('GET', '/'),
+                                         ('GET', '/console')])
+def test_only_a_sign_in_passes_an_expired_session(console, method, path):
+    """Every other request with an expired session is still sent to the sign-in page."""
+    console.state['hardening'] = HARDENED
+    c = console.app.test_client()
+    _forge_session(c, authenticated=True, last_activity=int(time.time()) - 4000)
+    r = c.open(path, method=method, base_url=CONSOLE, headers={'Origin': CONSOLE})
+    assert r.status_code == 302 and r.headers['Location'].endswith('/login')
+    assert console.state['ended_all'] == 0          # an expired session cannot end the others
+    with c.session_transaction(base_url=CONSOLE) as s:
+        assert not s.get('authenticated')
+
+
+@pytest.mark.parametrize('path', ['/login', '/'])
+def test_sign_in_still_works_when_the_lock_itself_fails(console, path):
+    """An error in the lock ends the session, but must not eat the password that comes with it."""
+    console.state['hardening'] = {'posture': 'hardened', 'applied': {'W2_session': 'broken'}}
+    c = console.app.test_client()
+    _forge_session(c, authenticated=True, last_activity=int(time.time()))
+    r = _login(console, c, path)
+    assert r.status_code == 302 and r.headers['Location'] == '/console'
 
 
 def test_page_use_keeps_a_hardened_session_alive(console):

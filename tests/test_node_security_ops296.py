@@ -62,7 +62,7 @@ PS = (
     'eud-remote-assist-web-1|eud-remote-assist|web\n'
 )
 FIXED = {'tak-portal': 'v22.23.5', 'tak-portal-worker': 'v22.23.5', 'cloudtak-api-1': 'v26.13.1',
-         'cloudtak-events-1': 'v26.13.1', 'nodered': 'v22.23.4',   # nodered: upstream image, still 22.23.4 (ops #824)
+         'cloudtak-events-1': 'v26.13.1', 'nodered': 'v22.23.5',
          'eud-remote-assist-server-1': 'v22.23.5',
          'cloudtak-media-1': 'v24.22.0'}   # upstream image: must never be looked at
 
@@ -127,15 +127,19 @@ def test_table_covers_the_fixed_versions_from_the_advisory():
     assert new['fixed'] == {22: '22.23.5', 24: '24.22.3', 26: '26.13.1'}
 
 
-def test_node_red_is_not_claimed_while_its_upstream_image_is_still_on_22_23_4():
-    # nodered/node-red:4.1.17-22 (pushed 2026-10-21) has no 22.23.5 rebuild; Update cannot clear
-    # the flag, so it must not be shown or mailed (ops #824). Other modules on 22.23.4 are.
+def test_node_red_is_claimed_now_that_its_pin_is_on_a_node_22_23_5_image():
+    # ops #935: nodered/node-red:4.1.18-22 (pushed 2026-11-17) is on Node 22.23.5, so Update can
+    # clear the flag and Node-RED on 22.23.4 is flagged like every other module (it was left out
+    # in ops #824 while its upstream had no rebuild). Red when 'nodered' is still upstream_pending.
     n = _ns({})
-    assert n['_node_releases_missing']('v22.23.4', 'nodered') == []
-    assert [r['id'] for r in n['_node_releases_missing']('v22.23.4', 'takportal')] == ['CVE-2026-123864']
-    # still flagged for the older release it can fix
-    assert [r['id'] for r in n['_node_releases_missing']('v22.23.3', 'nodered')] == ['CVE-2026-111497']
-    assert n['_node_security_gaps']({'nodered': {'nodered': 'v22.23.4'}}) == {}
+    assert [r['id'] for r in n['_node_releases_missing']('v22.23.4', 'nodered')] == ['CVE-2026-123864']
+    assert [r['id'] for r in n['_node_releases_missing']('v22.23.3', 'nodered')] == [
+        'CVE-2026-111497', 'CVE-2026-123864']
+    assert n['_node_releases_missing']('v22.23.5', 'nodered') == []
+    assert sorted(n['_node_security_gaps']({'nodered': {'nodered': 'v22.23.4'}})) == ['nodered']
+    assert n['_node_security_gaps']({'nodered': {'nodered': 'v22.23.5'}}) == {}
+    # Print (Node 24, never built by CloudTAK Update) is still the one left out
+    assert n['NODE_SECURITY_RELEASES'][-1]['upstream_pending'] == ('cloudtak-print',)
 
 
 def test_a_module_on_the_previous_fix_is_flagged_for_the_new_release():
@@ -157,7 +161,7 @@ def test_only_the_node_containers_of_the_four_modules_are_probed():
     assert got == {
         'takportal': {'tak-portal': 'v22.23.5', 'tak-portal-worker': 'v22.23.5'},
         'cloudtak': {'cloudtak-api-1': 'v26.13.1', 'cloudtak-events-1': 'v26.13.1'},
-        'nodered': {'nodered': 'v22.23.4'},
+        'nodered': {'nodered': 'v22.23.5'},
         'remote_assist': {'eud-remote-assist-server-1': 'v22.23.5'},
     }
     # not Postgres, nginx, Authentik, or the CloudTAK media helper
@@ -238,6 +242,8 @@ def _sweep(node_by_container, state, ps_rc=0, settings=None):
         '_console_pending_update': lambda s: None,
         '_os_security_items': lambda seen, unknown, now=None: [],
         '_postgres_security_items': lambda unknown: [],   # ops #754
+        '_java_restart_items': lambda unknown: [],   # ops #963
+        '_java_image_items': lambda unknown: [],   # ops #968
         '_postgres_remote_security_items': lambda unknown: [],   # ops #760
         '_detect_cloudtak_plugins': lambda: [],
         '_apply_security_identity': lambda i: i,
@@ -279,9 +285,16 @@ def test_box_on_the_previous_fix_gets_the_email_for_the_new_release():
     assert saved[-1] == {'node:remote_assist': 'node-CVE-2026-123864', 'node:takportal': 'node-CVE-2026-123864'}
 
 
-def test_node_red_on_22_23_4_gets_no_email_until_its_image_is_rebuilt():
+def test_node_red_on_22_23_4_gets_the_email_now_that_its_image_is_rebuilt():
+    # ops #935: 4.1.18-22 is on Node 22.23.5, so a box still on 4.1.17-22 (Node 22.23.4) is told to
+    # press Update, and Update (the pin move in _auto_nodered) clears it. Was "no email" in ops #824.
     r, sent, saved = _sweep(dict(FIXED, nodered='v22.23.4'), {})
-    assert r == {'pending': [], 'emailed': False} and sent == [] and saved == []
+    assert r['emailed'] is True and len(sent) == 1
+    subj, body = sent[0]
+    assert subj == '🔒 Security update pending on tak-prod-1 — update this machine'
+    assert '  • Node.js inside Node-RED is out of date' in body
+    assert 'Newer Node.js fixes CVE-2026-123864:' in body and 'v22.23.4' in body
+    assert saved[-1] == {'node:nodered': 'node-CVE-2026-123864'}
 
 
 PS_PRINT = PS + 'cloudtak-print|cloudtak|cloudtak-print\n'
@@ -312,7 +325,8 @@ def test_box_on_fixed_node_gets_no_email():
 
 def test_same_old_node_mails_once_then_again_for_the_next_release():
     old = dict(FIXED, nodered='v22.23.1')
-    state = {'node:nodered': 'node-CVE-2026-111497'}
+    # ops #935: Node-RED is claimed for both releases now, so its identity names both
+    state = {'node:nodered': 'node-CVE-2026-111497+CVE-2026-123864'}
     r, sent, _ = _sweep(old, state)
     assert sent == [] and r['emailed'] is False
     # once the operator updated, the entry is pruned so a later regression mails again
@@ -345,7 +359,7 @@ def test_card_flag_names_the_node_the_cve_and_the_button():
     n = _ns({'nodered': 'v22.23.1'})
     gap = n['_node_security_gaps'](n['_node_container_versions']())['nodered']
     assert n['_node_card_flag'](gap) == (
-        'Security update: Node.js on this module is out of date (v22.23.1, CVE-2026-111497). Press Update.')
+        'Security update: Node.js on this module is out of date (v22.23.1, CVE-2026-111497, CVE-2026-123864). Press Update.')
 
 
 def test_card_gaps_come_from_the_same_probe_and_are_cached():

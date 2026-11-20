@@ -93,6 +93,7 @@ from collections import defaultdict, deque
 # imports nothing from app.py — seams flow the other way, via the ctx dict
 # built at the bottom of this file (mod_registry.load_all/init_registry).
 import modules as mod_registry
+from modules import atlas_access as _atlas_access
 from modules import etlrunner as _etl
 
 # v10.2.23 (ops #109): a client that reset TCP before its TLS handshake killed the
@@ -1672,7 +1673,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.4.2-alpha"
+VERSION = "10.4.3-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -3646,6 +3647,75 @@ def _patch_tak_dockerfile_cacerts(build_ctx, app_dockerfile, log_fn=None):
         return False
     _log(f"  Patched {os.path.basename(app_dockerfile)}: CA trust store update "
          f"({len(_JDK_DISTRUSTED_CA_ALIASES)} root(s) the OS vendors no longer trust).")
+    return True
+
+
+# ops #963 — TAK's 5.8 hardened bundle pins its Java in one line of Dockerfile.hardened-takserver:
+#     ARG BASE_DEPLOY_TAG=17.0.19_10-jdk-ubi10-minimal
+# (verified in takserver-docker-hardened-5.8-RELEASE-75.zip, 2026-11-19). `docker build --pull`
+# refreshes a MUTABLE tag, but a pin to one exact Temurin build never moves, so a TAK Server built
+# from this bundle stays on Java 17.0.19 (April 2026) with nothing on the box to say so.
+# This constant is the newest Temurin 17 jdk-ubi10-minimal tag on Docker Hub. 17.0.21_9 is the
+# October 2026 release (Adoptium 2026-10-22). Adoptium's November 18 build, 17.0.21.1+2, has no
+# eclipse-temurin tag yet (checked 2026-11-19): bump this one constant to its
+# 17.0.21.1_2-jdk-ubi10-minimal tag when Docker Hub lists it. A test pins the value.
+# https://hub.docker.com/_/eclipse-temurin/tags?name=17.0.21
+# https://adoptium.net/temurin/release-notes/?version=jdk-17.0.21.1+2
+_TEMURIN17_FIXED_TAG = '17.0.21_9-jdk-ubi10-minimal'
+_TEMURIN_JDK_TAG_RE = re.compile(r'(\d+(?:\.\d+){1,3})_(\d+)-jdk-ubi10-minimal')
+_TEMURIN_PIN_LINE_RE = re.compile(
+    r'(?m)^(?P<pre>ARG[ \t]+BASE_DEPLOY_TAG=)(?P<tag>\d+(?:\.\d+){1,3}_\d+-jdk-ubi10-minimal)[ \t]*$')
+
+
+def _temurin_tag_key(tag):
+    """Sortable (feature, interim, update, patch, build) for a Temurin '17.0.19_10-jdk-ubi10-minimal'
+    style tag, or None when the tag is any other shape."""
+    m = _TEMURIN_JDK_TAG_RE.fullmatch(tag or '')
+    if not m:
+        return None
+    parts = [int(x) for x in m.group(1).split('.')]
+    parts += [0] * (4 - len(parts))
+    return tuple(parts) + (int(m.group(2)),)
+
+
+def _patch_tak_hardened_java_pin(build_ctx, app_dockerfile, log_fn=None):
+    """Move the bundle's pinned Temurin 17 base up to _TEMURIN17_FIXED_TAG. Idempotent.
+
+    Touches only an `ARG BASE_DEPLOY_TAG=<Temurin 17 jdk-ubi10-minimal tag>` line whose build is
+    OLDER than the fixed one. A newer pin, another major, a JRE or non-UBI tag, an ARG we cannot
+    read as a Temurin tag, or a Dockerfile without the line is built exactly as shipped, and so is
+    one we cannot read or write (same contract as the patchers above)."""
+    _log = log_fn or (lambda m: print(m, flush=True))
+    if not app_dockerfile:
+        return False
+    df = os.path.join(build_ctx, app_dockerfile)
+    try:
+        with open(df) as f:
+            src = f.read()
+    except Exception as e:
+        _log(f"  (could not read {os.path.basename(app_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    fixed = _temurin_tag_key(_TEMURIN17_FIXED_TAG)
+    old_tags = []
+
+    def _bump(m):
+        key = _temurin_tag_key(m.group('tag'))
+        if key is None or key[0] != fixed[0] or key >= fixed:
+            return m.group(0)
+        old_tags.append(m.group('tag'))
+        return m.group('pre') + _TEMURIN17_FIXED_TAG
+
+    new = _TEMURIN_PIN_LINE_RE.sub(_bump, src)
+    if new == src:
+        return False
+    try:
+        with open(df, 'w') as f:
+            f.write(new)
+    except Exception as e:
+        _log(f"  (could not patch {os.path.basename(app_dockerfile)}: {str(e)[:120]} — building as shipped)")
+        return False
+    _log(f"  Patched {os.path.basename(app_dockerfile)}: Java base {old_tags[0]} → {_TEMURIN17_FIXED_TAG} "
+         "(TAK pins an exact Temurin build, so a newer Java would never arrive on its own).")
     return True
 
 
@@ -6847,6 +6917,14 @@ def os_updates_api():
     rb['cve_banner'] = _kernel_cve_banner(rb['running']) if rb['kernel'] else None
     data['reboot'] = rb
     data['reboot_required'] = bool(data.get('reboot_required') or rb['pending'])
+    # ops #963: same idea for Java: the new JDK is on disk but TAK Server still runs the old one.
+    # A /proc read and a stat, so it is read fresh on every call like the kernel state.
+    data['java_restart'] = _java_restart_state()
+    # ops #968: Docker installs: the Java inside the TAK Server image is older than the newest we build.
+    # Cached 5 minutes (a `docker exec`); never raises, claims nothing it could not read.
+    _jf = _tak_container_java_facts_cached()
+    data['java_image'] = {'stale': bool(_jf['applicable'] and _jf['stale']), 'running': _jf['running'],
+                          'newest': _jf['newest'], 'sig': _jf['sig'], 'how': _JAVA_IMAGE_HOW}
     return jsonify(data)
 
 
@@ -8034,8 +8112,21 @@ def _enforce_session_idle_lock():
                 # Don't reset the clock or kill the SSO session on a background poll — just
                 # signal expiry. The true re-prompt fires on the next full-page navigation.
                 return jsonify({'error': 'Session expired (idle lock).', 'login_required': True}), 401
+            # ops #815 follow-up: a password sign-in (the form on / and /login posts back
+            # to its own path) that arrives with the expired cookie used to be sent to
+            # /login with its password unread, so the first sign-in after a lock did
+            # nothing and only the second one worked (10.4.2 T&E: a test tool that signs
+            # in again on a 401 looked as if the lock was 10 s late). The session is
+            # ended here either way; the sign-in route then checks the password itself.
+            # NOT when the Authentik sign-out below applies (W-IDLE armed and this request
+            # came through Authentik): there it must run first, or a wrong password would
+            # leave the Authentik session alive to sign the browser in again with no prompt.
+            signin_post = request.method == 'POST' and request.path in ('/login', '/')
+            sso_signout = _widle_sso_logout_active(h)
             session.clear()  # local lock always holds, regardless of what follows
-            if _widle_sso_logout_active(h):
+            if signin_post and not sso_signout:
+                return None
+            if sso_signout:
                 # Sign out of the forward_auth outpost so the next request re-prompts. Must be an
                 # ABSOLUTE URL on the SSO vhost — request.host/host_url are the loopback upstream
                 # Caddy proxies to (127.0.0.1:5001). v10.1.60 (W5, GH #65): resolve it LIVE from
@@ -8060,6 +8151,10 @@ def _enforce_session_idle_lock():
             session.clear()
         except Exception:
             pass
+        if request.method == 'POST' and request.path in ('/login', '/'):
+            # The session is ended; the sign-in route checks the password in this request.
+            # This path never signed out of Authentik, so nothing is given up here.
+            return None
         return redirect(url_for('login'))
 
 # v0.9.58: the auto-reload "Session expired — signing you back in…" band-aid was REMOVED.
@@ -19630,7 +19725,9 @@ def remote_assist_page():
 
 
 # CoTURN image is PINNED (never :latest) — supply-chain rule. Bump deliberately.
-COTURN_IMAGE = 'coturn/coturn:4.19.1'   # ops #816: SECURITY — 4.19.0 fixes reads past a short key, a mismatched
+COTURN_IMAGE = 'coturn/coturn:4.19.2'   # ops #962: SECURITY — upstream 4.19.2 (Nov 18, 2026) security fixes in the
+# UDP and DTLS listeners; no CVE or GHSA at the time of the bump.
+# ops #816: 4.19.0 fixes reads past a short key, a mismatched
 # realm accepted on connection-bind, a Redis reply offset and a blacklist race; 4.19.1 adds per-source DTLS half-open
 # limits, plaintext on a DTLS port, an oversize TCP/TLS frame and the admin HTTP server (no CVE published
 # at the time of the bump). Earlier: v10.2.8 W8 moved 4.14.0 -> 4.18.0
@@ -20380,17 +20477,7 @@ def guarddog_page():
     notifications_configured = bool((settings.get('guarddog_alert_email') or '').strip())
     # Detect if Guard Dog config is current or needs re-deploy
     _gd_dep_ver = settings.get('guarddog_deployed_version', '')
-    _gd_dep_email = settings.get('guarddog_deployed_email', '')
-    _gd_dep_nick = settings.get('guarddog_deployed_nickname', '')
-    _gd_cur_email = (settings.get('guarddog_alert_email') or '').strip()
-    _gd_cur_nick = (settings.get('guarddog_server_nickname') or '').strip()
-    gd_needs_update = (
-        gd.get('installed') and (
-            _gd_dep_ver != VERSION or
-            _gd_dep_email != _gd_cur_email or
-            _gd_dep_nick != _gd_cur_nick
-        )
-    )
+    gd_needs_update = _guarddog_needs_update(settings, gd.get('installed'))
     # Last-run timestamps for scheduled maintenance timers
     def _timer_last_run(stamp_file):
         """Read last-run UTC timestamp written by the script itself, or fall back to systemd."""
@@ -29362,17 +29449,18 @@ NODE_SECURITY_RELEASES = (
     # responses. The same release fixes more HTTP/2 and TLS flaws (CVE-2026-123865, -123866,
     # -123872 High). https://nodejs.org/en/blog/vulnerability/november-2026-security-releases
     # `upstream_pending`: module keys whose image we cannot rebuild and whose upstream has not
-    # shipped the fix yet (nodered/node-red:4.1.17-22 is still on 22.23.4, last pushed
-    # 2026-10-21). They are left out of the flag and the email, because pressing Update could
-    # never clear them. Remove the key the day Node-RED ships a rebuilt tag and NODERED_IMAGE
-    # moves to it. A container name works too: `cloudtak-print` (Node 24, the TAK Portal
+    # shipped the fix yet. They are left out of the flag and the email, because pressing Update
+    # could never clear them. Remove the key the day the upstream ships a rebuilt tag and the
+    # pin moves to it (Node-RED did on 2026-11-17: nodered/node-red:4.1.18-22 is on 22.23.5, so
+    # its key left this list and NODERED_IMAGE moved, ops #935). A container name works too:
+    # `cloudtak-print` (Node 24, the TAK Portal
     # Marketplace Print plugin) is left out for the same reason. The CloudTAK card's Update
     # never builds it (its compose file is kept out of COMPOSE_FILE on purpose, see
     # _CLOUDTAK_PRINT_PLUGIN_COMPOSE), so a red CloudTAK flag for it could never clear. Print
     # also serves cleartext HTTP on a loopback port, which CVE-2026-123864 does not touch.
     {'id': 'CVE-2026-123864', 'released': '2026-11-11',
      'fixed': {22: '22.23.5', 24: '24.22.3', 26: '26.13.1'},
-     'upstream_pending': ('nodered', 'cloudtak-print'),
+     'upstream_pending': ('cloudtak-print',),
      'reason': 'several flaws in how Node.js handles HTTPS and HTTP/2, including one that can '
                'leak server memory into web responses'},
 )
@@ -29604,6 +29692,310 @@ def _postgres_security_items(unknown):
         unknown.add('pg-host')
         print(f"[update-notify] PostgreSQL security check failed: {e}", flush=True)
         return []
+
+
+# ── ops #963: a Java update the running TAK Server has not picked up ────────────────────────
+# apt (unattended-upgrades) and dnf install a new JDK on disk by themselves, but a running JVM
+# keeps the OLD one in memory until its process restarts. needrestart is list-only here
+# (NEEDRESTART_MODE='l') and TAK Server is never restarted behind the operator's back, so a
+# box could run a Java with known TLS/JGSS flaws for weeks while every panel said "up to date".
+# The signal is what is INSTALLED vs what is RUNNING (like the kernel, ops #154): a TAK Server
+# Java process that started before the JDK on disk was last written is on the old Java.
+# Only the console user's own read access is needed: /proc/PID/{cmdline,stat} are world
+# readable and a stat of the JDK files needs no privilege. Native installs only: a Docker TAK
+# Server carries its own Java inside the image (see the --pull on its builds; ops #968 reports
+# that Java separately, _tak_container_java_facts).
+_JAVA_PKG_MAJOR_RE = re.compile(r'(?:java-(\d+)-openjdk|openjdk-(\d+)|temurin-(\d+))')
+
+
+def _java_proc_start_epoch(stat_text, btime, hz):
+    """Start time (epoch seconds) of a process from the text of /proc/PID/stat, or None.
+    Field 22 is the start in clock ticks since boot; the command name (field 2) may hold
+    spaces and parentheses, so count from the LAST ')'."""
+    try:
+        rest = stat_text[stat_text.rindex(')') + 2:].split()
+        return float(btime) + int(rest[19]) / float(hz)
+    except (ValueError, IndexError, TypeError, ZeroDivisionError):
+        return None
+
+
+def _java_is_tak_cmdline(argv):
+    """True when `argv` (a /proc cmdline split on NUL) is one of TAK Server's own JVMs:
+    a `java` that is run with a TAK Spring profile or from /opt/tak."""
+    if not argv or os.path.basename(argv[0]) != 'java':
+        return False
+    return any(a.startswith('-Dspring.profiles.active=') or '/opt/tak/' in a for a in argv[1:])
+
+
+def _tak_native_java_procs(proc='/proc'):
+    """[{pid, start, java}] for TAK Server's JVMs on this host ([] on a Docker install or when
+    /proc cannot be read). `java` is the first word of the command line."""
+    try:
+        if _tak_is_container():
+            return []
+        btime = None
+        with open(f'{proc}/stat') as f:
+            for ln in f:
+                if ln.startswith('btime '):
+                    btime = float(ln.split()[1])
+                    break
+        hz = os.sysconf('SC_CLK_TCK')
+        names = [n for n in os.listdir(proc) if n.isdigit()]
+    except Exception:
+        return []
+    out = []
+    for n in names:
+        try:
+            with open(f'{proc}/{n}/cmdline', 'rb') as f:
+                argv = [a.decode('utf-8', 'replace') for a in f.read().split(b'\0') if a]
+            if not _java_is_tak_cmdline(argv):
+                continue
+            with open(f'{proc}/{n}/stat') as f:
+                start = _java_proc_start_epoch(f.read(), btime, hz)
+        except Exception:
+            continue          # the process ended, or is hidden from this user
+        if start is not None:
+            out.append({'pid': int(n), 'start': start, 'java': argv[0]})
+    return out
+
+
+def _java_installed_at(java):
+    """(epoch, real path) of when the JDK behind `java` was last written to disk: the newest
+    change time of its bin/java and lib/server/libjvm.so (dpkg and rpm write a new file for
+    each, so the change time is the install time). (None, '') when it cannot be read.
+    A `java` given as a path that no longer exists was removed by an update: (inf, path)."""
+    cands = [java] if os.path.isabs(java) else []
+    w = shutil.which('java')
+    if w:
+        cands.append(w)
+    for c in cands:
+        real = os.path.realpath(c)
+        files = [real, os.path.join(os.path.dirname(os.path.dirname(real)), 'lib', 'server', 'libjvm.so')]
+        times = []
+        for p in files:
+            try:
+                times.append(os.stat(p).st_ctime)
+            except OSError:
+                pass
+        if times:
+            return max(times), real
+        if c is java:
+            return float('inf'), real     # the JVM this process started from is gone
+    return None, ''
+
+
+def _java_stale_procs(procs, installed_at):
+    """The `procs` that started BEFORE their JDK was last written (pure). `installed_at` maps
+    a java path to (epoch, real path). Returns (stale procs, newest finite install epoch or
+    0.0, the JDK path)."""
+    cache, stale, real_java, newest = {}, [], '', 0.0
+    for p in procs:
+        if p['java'] not in cache:
+            cache[p['java']] = installed_at(p['java'])
+        when, real = cache[p['java']]
+        if when is not None and p['start'] < when:
+            stale.append(p)
+            real_java = real_java or real
+            if when != float('inf'):
+                newest = max(newest, when)
+    return stale, newest, real_java
+
+
+def _java_restart_state():
+    """What the console needs to say "restart TAK Server to use the new Java". Never raises.
+    {'stale': [pid, ...], 'installed_at': epoch, 'java': JDK path, 'sig': str}; `stale` is
+    empty when TAK Server started after the JDK last changed (or on Docker)."""
+    st = {'stale': [], 'installed_at': 0.0, 'java': '', 'sig': ''}
+    try:
+        stale, newest, real = _java_stale_procs(_tak_native_java_procs(), _java_installed_at)
+    except Exception:
+        return st
+    if stale:
+        st.update({'stale': sorted(p['pid'] for p in stale), 'installed_at': newest, 'java': real,
+                   'sig': ('java@%d' % int(newest)) if newest else 'java@removed'})
+    return st
+
+
+def _java_package_candidates(real_java, pkg_mgr):
+    """JDK package names to ask the package manager about, from the JDK's own path."""
+    m = _JAVA_PKG_MAJOR_RE.search(real_java or '')
+    major = next((g for g in m.groups() if g), '17') if m else '17'
+    if pkg_mgr == 'dnf':
+        return [f'java-{major}-openjdk-headless', f'java-{major}-openjdk', f'java-{major}-openjdk-devel']
+    return [f'openjdk-{major}-jre-headless', f'openjdk-{major}-jdk-headless',
+            f'openjdk-{major}-jre', f'openjdk-{major}-jdk']
+
+
+def _java_update_security(state):
+    """{pkg, version, how_known} when the installed JDK is a VERIFIED security build (Ubuntu's
+    -security pocket for it, or a dnf security advisory that lists the installed version);
+    None when it is not, or it is not a distro package (Temurin by hand). Raises when the
+    package manager could not answer, so the caller can tell "not security" from "could not
+    tell": never a guess either way (same rule as _staged_kernel_security)."""
+    mgr = _pkg_mgr()
+    names = _java_package_candidates(state.get('java'), mgr)
+    have = _installed_pkg_versions(names)
+    for name in names:
+        ver = have.get(name)
+        if not ver:
+            continue
+        if mgr == 'dnf':
+            # dnf lists EVERY installed package's advisories here (the name argument does not
+            # filter updateinfo), so match this package's own name and installed build.
+            for a in _dnf_security_advisories(['--installed', name]):
+                if a['nevra'].startswith(name + '-') and ver.split(':')[-1] in a['nevra']:
+                    return {'pkg': name, 'version': ver,
+                            'how_known': a['id'] + (' (%s)' % a['severity'] if a['severity'] else '')}
+            return None
+        r = subprocess.run([_real_bin('apt-cache'), 'policy', name],
+                           capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            raise RuntimeError('apt-cache policy failed (rc=%s)' % r.returncode)
+        return ({'pkg': name, 'version': ver, 'how_known': 'Ubuntu security update'}
+                if _apt_policy_installed_from_security(r.stdout) else None)
+    return None
+
+
+_JAVA_RESTART_HOW = ('TAK Server page → Restart TAK Server. Clients reconnect by themselves; '
+                     'pick a quiet moment if you are mid-operation.')
+
+
+def _java_restart_items(unknown):
+    """Update-email item (ops #963): a verified Java SECURITY build is installed and the
+    running TAK Server still uses the old one. One mail per Java install (the identity is the
+    install time), not repeated; gone once TAK Server restarts. A package manager that cannot
+    answer goes into `unknown` so its dedup state is carried, never re-mailed on a guess."""
+    try:
+        st = _java_restart_state()
+        if not st['stale']:
+            return []
+        sec = _java_update_security(st)
+    except Exception as e:
+        unknown.add('java-restart')
+        print(f"[update-notify] Java restart check failed: {e}", flush=True)
+        return []
+    if not sec:
+        return []
+    return [{'key': 'java-restart', 'label': 'Java (TAK Server)',
+             'installed': 'TAK Server is running the old Java',
+             'target': f"{sec['pkg']} {sec['version']}",
+             'summary': 'Java security update installed: restart TAK Server to use it',
+             'identity': st['sig'],
+             'security': ["The new Java is installed on this machine, but TAK Server started before it "
+                          "and keeps running the old one until it restarts.",
+                          f"It fixes Java security flaws, including in the TLS code behind the client "
+                          f"ports ({sec['how_known']}: {sec['pkg']} {sec['version']})."],
+             'how': _JAVA_RESTART_HOW}]
+
+
+# ── ops #968: Docker TAK Server, the Java inside the image ──────────────────────────────────
+# A Docker TAK Server carries its OWN Java inside its image, so the host's package manager and
+# the restart check above never see it. The image is built from the takserver-docker zip when
+# TAK Server is installed or updated; _patch_tak_hardened_java_pin / `docker build --pull` (ops
+# #963) make a rebuild take the newest Java we know, but nothing said that a rebuild was due.
+# This compares the Java the RUNNING container reports with that same pin (_TEMURIN17_FIXED_TAG,
+# the one constant that moves when Docker Hub lists a newer Temurin 17 tag). Read only: one
+# `docker exec takserver java -version`, no restart, no change. A runtime we cannot read as
+# Temurin 17, or a container that is not running, claims nothing.
+_JAVA_RUNTIME_RE = re.compile(r'Temurin-(\d+(?:\.\d+){1,3})\+(\d+)')
+
+
+def _temurin_runtime_build(java_version_text):
+    """('17.0.19+10', sortable key) from the text `java -version` prints for a Temurin runtime
+    ("OpenJDK Runtime Environment Temurin-17.0.19+10 (build ...)"), else (None, None). The key
+    has the same shape as _temurin_tag_key's, so a runtime and a Docker tag compare directly."""
+    m = _JAVA_RUNTIME_RE.search(java_version_text or '')
+    if not m:
+        return None, None
+    parts = [int(x) for x in m.group(1).split('.')]
+    parts += [0] * (4 - len(parts))
+    return '%s+%s' % (m.group(1), m.group(2)), tuple(parts) + (int(m.group(2)),)
+
+
+def _temurin_tag_build(tag):
+    """'17.0.21+9' for a '17.0.21_9-jdk-ubi10-minimal' style tag, else ''."""
+    m = _TEMURIN_JDK_TAG_RE.fullmatch(tag or '')
+    return '%s+%s' % (m.group(1), m.group(2)) if m else ''
+
+
+def _tak_container_java_facts():
+    """What the console and the update email need about the Java inside the Docker TAK Server
+    container. Read only, never raises.
+    {'applicable': a Docker install whose running container we could ask,
+     'readable': False when it should have been answerable but was not (the email then carries
+                 its earlier state instead of guessing),
+     'stale': its Temurin 17 is OLDER than the newest we pin, 'running': '17.0.19+10',
+     'newest': '17.0.21+9', 'sig': identity of this gap, 'why': when nothing is claimed}."""
+    f = {'applicable': False, 'readable': True, 'stale': False, 'running': '', 'newest': '',
+         'sig': '', 'why': ''}
+    try:
+        if not _tak_is_container():
+            f['why'] = 'TAK Server does not run as a container here'
+            return f
+        if not _tak_container_running(TAK_CONTAINER):
+            f['readable'] = False
+            f['why'] = 'the TAK Server container is not running'
+            return f
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', TAK_CONTAINER, 'java', '-version']),
+                           capture_output=True, text=True, timeout=30)
+        out = (r.stdout or '') + (r.stderr or '')      # java prints its version on stderr
+        if r.returncode != 0:
+            f['readable'] = False
+            f['why'] = 'could not ask the container for its Java'
+            return f
+        running, rkey = _temurin_runtime_build(out)
+        newest = _temurin_tag_build(_TEMURIN17_FIXED_TAG)
+        fkey = _temurin_tag_key(_TEMURIN17_FIXED_TAG)
+        if not running or not newest or not fkey:
+            f['why'] = 'the container does not run a Temurin Java we can compare'
+            return f
+        f.update({'applicable': True, 'running': running, 'newest': newest})
+        if rkey[0] == fkey[0] and rkey < fkey:        # same Java line (17), older build
+            f['stale'] = True
+            f['sig'] = 'java-image@%s>%s' % (running, newest)
+    except Exception as e:
+        f['readable'] = False
+        f['why'] = 'check failed: ' + str(e)[:120]
+    return f
+
+
+_tak_java_img_cache = {'at': 0.0, 'data': None}
+
+
+def _tak_container_java_facts_cached(max_age=300):
+    """The console page asks on every visit; a `docker exec` each time is not free."""
+    now = time.time()
+    if _tak_java_img_cache['data'] is not None and now - _tak_java_img_cache['at'] < max_age:
+        return _tak_java_img_cache['data']
+    d = _tak_container_java_facts()
+    _tak_java_img_cache.update({'at': now, 'data': d})
+    return d
+
+
+_JAVA_IMAGE_HOW = ('TAK Server page → Update TAK Server, with the next takserver-docker zip. The update '
+                   'rebuilds the image with the newer Java. Nothing changes until then.')
+
+
+def _java_image_items(unknown):
+    """Update-email item (ops #968): the Docker TAK Server image carries an older Java than the
+    newest we build. One mail per gap (the identity names both builds), gone once the image is
+    rebuilt. Not marked a security fix: we cannot say which advisories lie between two builds
+    without a source for them, and an unproven "security" claim is the thing we never send.
+    A container that could not be asked goes into `unknown` so its state is carried."""
+    f = _tak_container_java_facts_cached()
+    if not f['readable']:
+        unknown.add('java-image')
+        return []
+    if not (f['applicable'] and f['stale']):
+        return []
+    return [{'key': 'java-image', 'label': 'Java (TAK Server container)',
+             'installed': 'Java ' + f['running'], 'target': 'Java ' + f['newest'],
+             'summary': 'Java inside the TAK Server container: a newer Java is available',
+             'identity': f['sig'],
+             'detail': [f"TAK Server runs Java {f['running']}. Java {f['newest']} is available.",
+                        'TAK Server in Docker carries its own Java inside its image, so system updates '
+                        'never change it. New Java releases include fixes for Java security flaws.'],
+             'how': _JAVA_IMAGE_HOW}]
 
 
 # ops #760: TAK Server's database on ANOTHER machine. The host check above only sees PostgreSQL
@@ -30965,6 +31357,10 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
         print(f"[update-notify] OS security check failed: {e}", flush=True)
     # ops #754: PostgreSQL security update for the host install (TAK Server's own database)
     pending.extend(_postgres_security_items(unknown))
+    # ops #963: a Java security update that is installed but that TAK Server has not restarted onto
+    pending.extend(_java_restart_items(unknown))
+    # ops #968: the Java INSIDE the Docker TAK Server image (native installs are the line above)
+    pending.extend(_java_image_items(unknown))
     # ops #755: ...and the TAK Server database CONTAINER (built once at install, never refreshed)
     try:
         pending.extend(_tak_db_refresh_items())
@@ -36355,6 +36751,44 @@ CADDY_APT_TIMEOUT = 900       # seconds for one apt-get line of the Caddy deploy
 CADDY_APT_LOCK_WAIT = 300     # seconds to wait for the apt lock before each apt line
 
 
+CADDY_FETCH_TRIES = 5
+CADDY_FETCH_DELAY = 10
+# 5 tries x (30 s limit + 10 s wait) with room to spare; the plain 120 s shell limit is too short.
+CADDY_FETCH_TIMEOUT = 300
+
+
+def _caddy_fetch_shell(url, sink, tries=CADDY_FETCH_TRIES, delay=CADDY_FETCH_DELAY):
+    """Shell text that downloads `url` and feeds it to `sink` (a command reading stdin), trying
+    up to `tries` times, `delay` seconds apart (ops #947).
+
+    The Caddy repo key and sources list came from a one-shot `curl -f ... | gpg`. When Cloudsmith
+    answered badly for a moment (seen in the 10.4.2 Ubuntu 22.04 update test), `curl -f` hid the
+    HTTP status and gpg printed only "no valid OpenPGP data found", the install failed with no
+    retry, and every later module failed with it. Here the status is read with `-w` and printed
+    on every failed try, and the last line says how many tries were made. A download that
+    arrives (HTTP 200) but that `sink` rejects (a cut-off body) is tried again too.
+    `url` and `sink` are fixed literals from this file, never user input."""
+    return (
+        f'# fetch {url}\n'
+        't=$(mktemp) || exit 1\n'
+        'n=0; rc=1\n'
+        f'while [ "$n" -lt {int(tries)} ]; do\n'
+        '  n=$((n+1))\n'
+        f'  code=$(curl -1sL --connect-timeout 10 --max-time 30 -o "$t" -w "%{{http_code}}" "{url}")\n'
+        '  if [ "$code" = 200 ]; then\n'
+        f'    if {sink} < "$t"; then rc=0; break; fi\n'
+        f'    echo "try $n of {int(tries)}: got HTTP 200 but could not use the file" >&2\n'
+        '  else\n'
+        f'    echo "try $n of {int(tries)}: HTTP ${{code:-none}} from {url}" >&2\n'
+        '  fi\n'
+        f'  if [ "$n" -lt {int(tries)} ]; then sleep {int(delay)}; fi\n'
+        'done\n'
+        'rm -f "$t"\n'
+        f'if [ "$rc" != 0 ]; then echo "gave up after {int(tries)} tries: {url}" >&2; fi\n'
+        'exit $rc\n'
+    )
+
+
 def _caddy_apt_shell(cmd, plog, timeout=None):
     """Run one shell string of the Caddy apt-repo setup. apt-get lines wait (bounded) for the apt
     lock first, get the slow-mirror limit and are retried once if apt still lost the race for the
@@ -36484,21 +36918,20 @@ def _caddy_ensure_apt_repo(log_fn=None):
             # literals rather than a loop variable so no variable is ever handed to
             # shell=True — same commands run by run_caddy_deploy()'s Step 1.
             _key = subprocess.run(
-                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" '
-                '| gpg --batch --yes --dearmor '
-                '-o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>&1',
-                shell=True, capture_output=True, text=True, timeout=120, env=env)
+                ['sh', '-c', _caddy_fetch_shell('https://dl.cloudsmith.io/public/caddy/stable/gpg.key',
+                                                'gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>&1')],
+                capture_output=True, text=True, timeout=CADDY_FETCH_TIMEOUT, env=env)
             if _key.returncode != 0:
                 _log(f'could not fetch the Caddy signing key: '
-                     f'{(_key.stderr or _key.stdout).strip()[:200]}')
+                     f'{(_key.stderr or _key.stdout).strip()[-300:]}')
                 return False
             _src = subprocess.run(
-                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt" '
-                '| tee /etc/apt/sources.list.d/caddy-stable.list 2>&1',
-                shell=True, capture_output=True, text=True, timeout=120, env=env)
+                ['sh', '-c', _caddy_fetch_shell('https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt',
+                                                'tee /etc/apt/sources.list.d/caddy-stable.list 2>&1')],
+                capture_output=True, text=True, timeout=CADDY_FETCH_TIMEOUT, env=env)
             if _src.returncode != 0:
                 _log(f'could not write the Caddy sources list: '
-                     f'{(_src.stderr or _src.stdout).strip()[:200]}')
+                     f'{(_src.stderr or _src.stdout).strip()[-300:]}')
                 return False
         _apt_wait_for_lock(log_fn=log_fn)
         subprocess.run('apt-get update -qq 2>&1', shell=True, capture_output=True,
@@ -43886,8 +44319,10 @@ def run_caddy_deploy(domain):
             plog("  Adding Caddy repository...")
             cmds = [
                 'apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl 2>&1',
-                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/gpg.key" | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>&1',
-                'curl -1sLf "https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt" | tee /etc/apt/sources.list.d/caddy-stable.list 2>&1',
+                _caddy_fetch_shell('https://dl.cloudsmith.io/public/caddy/stable/gpg.key',
+                                   'gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg 2>&1'),
+                _caddy_fetch_shell('https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt',
+                                   'tee /etc/apt/sources.list.d/caddy-stable.list 2>&1'),
                 'apt-get update -qq 2>&1',
             ]
             for cmd in cmds:
@@ -43895,9 +44330,10 @@ def run_caddy_deploy(domain):
                 # the non-root console routes their privileged binaries through the
                 # broker via the shim PATH (env). No-op env as root. ops #605: apt lines
                 # wait for the apt lock and get a slow-mirror limit (_caddy_apt_shell).
-                r = _caddy_apt_shell(cmd, plog)
+                r = _caddy_apt_shell(cmd, plog,
+                                     timeout=CADDY_FETCH_TIMEOUT if cmd.startswith('# fetch ') else None)
                 if r.returncode != 0:
-                    err = (r.stderr.strip() or r.stdout.strip())[:300]
+                    err = (r.stderr.strip() or r.stdout.strip())[-300:]
                     plog(f"✗ Caddy install failed at: {cmd[:60]}")
                     plog(f"  Error: {err}")
                     caddy_deploy_status.update({'running': False, 'error': True})
@@ -45406,6 +45842,25 @@ def _safe_module_version_info(key, info):
     return out
 
 
+def _guarddog_needs_update(settings, installed):
+    """True when the Guard Dog page offers "Update Guard Dog" (ops #972, infra-TAK #590).
+
+    One answer for both screens: the page banner and the main-page card badge. The
+    deployed scripts differ from the running console, or the alert email / server
+    nickname changed since the last deploy. A newer console RELEASE is not a Guard
+    Dog update: the scripts follow the console on its startup, and the console has
+    its own Update Available banner. Showing it on the card too left a blue "update"
+    with no button on the Guard Dog page.
+    """
+    if not installed:
+        return False
+    return bool(
+        (settings.get('guarddog_deployed_version', '') != VERSION)
+        or (settings.get('guarddog_deployed_email', '') != (settings.get('guarddog_alert_email') or '').strip())
+        or (settings.get('guarddog_deployed_nickname', '') != (settings.get('guarddog_server_nickname') or '').strip())
+    )
+
+
 def get_all_module_versions():
     """Return dict of module_key -> {version, update_available, latest?} for console cards.
 
@@ -45467,17 +45922,12 @@ def get_all_module_versions():
         _set('netbird', _get_netbird_version_info)
     if modules.get('remote_assist', {}).get('installed'):
         _set('remote_assist', _get_remote_assist_version_info)
-    # Guard Dog: version/update follow infra-TAK (scripts ship with console; "Update Guard Dog" uses same codebase)
+    # Guard Dog: the card shows an update only when the Guard Dog page offers one
+    # (ops #972): same helper as the page. A newer console release is the console's
+    # own banner; the scripts follow it on startup.
     if modules.get('guarddog', {}).get('installed'):
         gd_latest = update_cache.get('latest')
-        gd_update = False
-        if gd_latest and (update_cache.get('checked') or 0) > 0:
-            try:
-                def _tv(v):
-                    return tuple(int(p) for p in (v or '').replace('-alpha', '').replace('-beta', '').split('.')[:3])
-                gd_update = _tv(gd_latest) > _tv(VERSION) and gd_latest.strip() != (VERSION or '').strip()
-            except (ValueError, IndexError):
-                pass
+        gd_update = _guarddog_needs_update(load_settings(), True)
         result['guarddog'] = {'version': VERSION, 'update_available': gd_update, 'latest': gd_latest}
     # ops #296: red "Node.js is out of date" flag — same table as the security email.
     try:
@@ -53256,7 +53706,8 @@ def _cloudtak_refresh_override(plog=None):
 # and runs COMPILED js from /dist (the v9.6.0 TS build rewrite): patch BOTH the old
 # .ts source paths (≤v9.1.1 runs them directly) and the new /dist/lib/*.js.
 _CT_MEDIA_CHECK_SH = r'''
-if grep -q "^hlsVariant: mpegts" /mediamtx.yml 2>/dev/null \
+if [ "$(grep -cE '^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):' /mediamtx.yml 2>/dev/null)" = 5 ] \
+ && grep -q "^hlsVariant: mpegts" /mediamtx.yml 2>/dev/null \
  && grep -qE "^hlsAlwaysRemux: (no|false)" /mediamtx.yml 2>/dev/null \
  && grep -q "^hlsSegmentCount: 3" /mediamtx.yml 2>/dev/null \
  && grep -q "^hlsSegmentDuration: 500ms" /mediamtx.yml 2>/dev/null \
@@ -53274,15 +53725,47 @@ done
 printf '%s %s %s\n' "$H" "$R" "$P"
 '''
 _CT_MEDIA_APPLY_SH = r'''
-sed -i "/^hlsVariant:/d; /^hlsAlwaysRemux:/d; /^hlsSegmentCount:/d; /^hlsSegmentDuration:/d; /^hlsPartDuration:/d" /mediamtx.yml
-printf 'hlsVariant: mpegts\nhlsAlwaysRemux: no\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n' >> /mediamtx.yml
+exec 8>/tmp/.ct-media-heal.lock
+command -v flock >/dev/null 2>&1 && flock 8
+F=/mediamtx.yml
+state() {
+if [ "$(grep -cE '^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):' $F 2>/dev/null)" = 5 ] \
+ && grep -q "^hlsVariant: mpegts" $F 2>/dev/null \
+ && grep -qE "^hlsAlwaysRemux: (no|false)" $F 2>/dev/null \
+ && grep -q "^hlsSegmentCount: 3" $F 2>/dev/null \
+ && grep -q "^hlsSegmentDuration: 500ms" $F 2>/dev/null \
+ && grep -q "^hlsPartDuration: 200ms" $F 2>/dev/null; then H=ok; else H=drift; fi
+R=na
+for f in /lib/persist.ts /dist/lib/persist.js; do
+  [ -f "$f" ] || continue
+  if grep -qF "'ephemeral', 'all'" "$f"; then [ "$R" = drift ] || R=ok; else R=drift; fi
+done
+P=na
+for f in /lib/payload.ts /dist/lib/payload.js; do
+  [ -f "$f" ] || continue
+  if grep -qF "replace(/#/g, '%23')" "$f"; then [ "$P" = drift ] || P=ok; else P=drift; fi
+done
+printf '%s %s %s\n' "$H" "$R" "$P"
+}
+converged() { set -- $(state); [ "$1" = ok ] && [ "$2" != drift ] && [ "$3" != drift ]; }
+if converged; then echo UNCHANGED; exit 0; fi
+set -- $(state)
+if [ "$1" != ok ]; then
+  grep -vE '^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):' "$F" > "$F.ops950.tmp"
+  [ $? -le 1 ] || { rm -f "$F.ops950.tmp"; echo "cannot read $F" >&2; exit 1; }
+  printf 'hlsVariant: mpegts\nhlsAlwaysRemux: no\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n' >> "$F.ops950.tmp"
+  cat "$F.ops950.tmp" > "$F"
+  rm -f "$F.ops950.tmp"
+fi
 for f in /lib/persist.ts /dist/lib/persist.js; do
   [ -f "$f" ] && sed -i "s/'ephemeral', 'false'/'ephemeral', 'all'/g" "$f"
 done
 for f in /lib/payload.ts /dist/lib/payload.js; do
   [ -f "$f" ] && sed -i "s|source: path.proxy,|source: path.proxy.startsWith('srt://') ? path.proxy.replace(/#/g, '%23') : path.proxy,|" "$f"
 done
-true
+if converged; then echo CHANGED; exit 0; fi
+echo "media profile did not converge: $(state)" >&2
+exit 1
 '''
 
 
@@ -53371,6 +53854,153 @@ def _ct_media_converged(check_out):
     return len(p) >= 3 and p[0] == 'ok' and p[1] in ('ok', 'na') and p[2] in ('ok', 'na')
 
 
+# ops #950 (follow-up): a box that already holds a doubled hls key is stuck. MediaMTX refuses the file,
+# the media container exits and restarts in a loop, and `docker exec` into it fails, so the heal that
+# runs INSIDE the container can never run. These helpers fix /mediamtx.yml from OUTSIDE with `docker cp`
+# (which works on a stopped or restarting container) and then restart it.
+_CT_MEDIA_HLS_KEYS = ('hlsVariant', 'hlsAlwaysRemux', 'hlsSegmentCount', 'hlsSegmentDuration', 'hlsPartDuration')
+_CT_MEDIA_HLS_BLOCK = ('hlsVariant: mpegts', 'hlsAlwaysRemux: no', 'hlsSegmentCount: 3',
+                       'hlsSegmentDuration: 500ms', 'hlsPartDuration: 200ms')
+
+
+def _ct_media_fix_yml(text):
+    """Return (new_text, changed) for the contents of the media container's /mediamtx.yml.
+    Same rule as the in-container scripts: exactly one of each of the five hls keys, with our values.
+    A file that already holds exactly that comes back unchanged."""
+    key_re = re.compile(r'^(' + '|'.join(_CT_MEDIA_HLS_KEYS) + r'):')
+    lines = text.splitlines()
+    mine = [ln for ln in lines if key_re.match(ln)]
+    converged = (
+        len(mine) == 5
+        and len({ln.split(':', 1)[0] for ln in mine}) == 5
+        and any(ln.startswith('hlsVariant: mpegts') for ln in mine)
+        and any(re.match(r'^hlsAlwaysRemux: (no|false)', ln) for ln in mine)
+        and any(ln.startswith('hlsSegmentCount: 3') for ln in mine)
+        and any(ln.startswith('hlsSegmentDuration: 500ms') for ln in mine)
+        and any(ln.startswith('hlsPartDuration: 200ms') for ln in mine))
+    if converged:
+        return text, False
+    kept = [ln for ln in lines if not key_re.match(ln)]
+    return '\n'.join(kept + list(_CT_MEDIA_HLS_BLOCK)) + '\n', True
+
+
+# Remote (ssh) version of the same repair, run as `sh -s CONTAINER` on the remote host. Prints FIXED,
+# FINE (the file is already right, so the container fails for another reason) or FAIL.
+_CT_MEDIA_OUTSIDE_SH = r'''
+m="$1"
+[ -n "$m" ] || { echo FAIL; exit 0; }
+t=$(mktemp -d) || { echo FAIL; exit 0; }
+trap 'rm -rf "$t"' EXIT
+K='^(hlsVariant|hlsAlwaysRemux|hlsSegmentCount|hlsSegmentDuration|hlsPartDuration):'
+docker cp "$m:/mediamtx.yml" "$t/in.yml" >/dev/null 2>&1 || { echo FAIL; exit 0; }
+if [ "$(grep -cE "$K" "$t/in.yml")" = 5 ] \
+ && grep -q "^hlsVariant: mpegts" "$t/in.yml" \
+ && grep -qE "^hlsAlwaysRemux: (no|false)" "$t/in.yml" \
+ && grep -q "^hlsSegmentCount: 3" "$t/in.yml" \
+ && grep -q "^hlsSegmentDuration: 500ms" "$t/in.yml" \
+ && grep -q "^hlsPartDuration: 200ms" "$t/in.yml"; then echo FINE; exit 0; fi
+grep -vE "$K" "$t/in.yml" > "$t/out.yml"
+[ $? -le 1 ] || { echo FAIL; exit 0; }
+printf 'hlsVariant: mpegts\nhlsAlwaysRemux: no\nhlsSegmentCount: 3\nhlsSegmentDuration: 500ms\nhlsPartDuration: 200ms\n' >> "$t/out.yml"
+docker cp "$t/out.yml" "$m:/mediamtx.yml" >/dev/null 2>&1 || { echo FAIL; exit 0; }
+docker cp "$m:/mediamtx.yml" "$t/back.yml" >/dev/null 2>&1 || { echo FAIL; exit 0; }
+[ "$(grep -cE "$K" "$t/back.yml")" = 5 ] || { echo FAIL; exit 0; }
+docker restart "$m" >/dev/null 2>&1 || { echo FAIL; exit 0; }
+echo FIXED
+'''
+
+
+def _ct_media_state(media):
+    """(status, exit_code) of the media container from docker inspect, or ('', 0) when unknown."""
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', '-f', '{{.State.Status}} {{.State.ExitCode}}', media]),
+            capture_output=True, text=True, timeout=15)
+        parts = (r.stdout or '').split()
+        if r.returncode == 0 and len(parts) >= 2:
+            return parts[0], int(parts[1])
+    except Exception:
+        pass
+    return '', 0
+
+
+def _ct_media_can_be_stuck(status, exit_code):
+    """Only a container that is looping or crashed can be stuck on a bad yml. One stopped on purpose
+    (exit 0) or not started yet is left alone."""
+    return status in ('restarting', 'running') or (status == 'exited' and exit_code != 0)
+
+
+def _cloudtak_media_repair_outside(media, plog=None):
+    """ops #950 follow-up: repair /mediamtx.yml of a media container that `docker exec` cannot reach.
+    Reads the file with `docker cp`, fixes the five hls keys, copies it back, checks the copy, and
+    restarts the container. Returns 'fixed', 'fine' (the file is already right) or 'error'."""
+    def _log(m):
+        (plog or (lambda x: print(x, flush=True)))(m)
+    import fcntl
+    import io as _io
+    import tarfile as _tarfile
+    lock_fd = None
+    tmp = None
+    try:
+        status, code = _ct_media_state(media)
+        if not _ct_media_can_be_stuck(status, code):
+            return 'error'
+        # One repair at a time on this console (several heal paths call this).
+        lock_fd = os.open(os.path.join(tempfile.gettempdir(), '.infratak-ct-media-repair.lock'),
+                          os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        cp = subprocess.run(_sudo_wrap(['docker', 'cp', f'{media}:/mediamtx.yml', '-']),
+                            capture_output=True, timeout=30)
+        if cp.returncode != 0 or not cp.stdout:
+            _log(f"  ⚠ cloudtak-media repair: could not read /mediamtx.yml ({(cp.stderr or b'').decode('utf-8', 'replace').strip()[:160]})")
+            return 'error'
+        with _tarfile.open(fileobj=_io.BytesIO(cp.stdout)) as tf:
+            member = next((m for m in tf.getmembers() if m.isfile()), None)
+            if member is None:
+                return 'error'
+            text = tf.extractfile(member).read().decode('utf-8', 'replace')
+        new_text, changed = _ct_media_fix_yml(text)
+        if not changed:
+            return 'fine'
+        fd, tmp = tempfile.mkstemp(prefix='ct-media-', suffix='.yml')
+        with os.fdopen(fd, 'w') as f:
+            f.write(new_text)
+        os.chmod(tmp, 0o644)
+        put = subprocess.run(_sudo_wrap(['docker', 'cp', tmp, f'{media}:/mediamtx.yml']),
+                             capture_output=True, text=True, timeout=30)
+        if put.returncode != 0:
+            _log(f"  ⚠ cloudtak-media repair: could not write /mediamtx.yml ({(put.stderr or put.stdout or '').strip()[:160]})")
+            return 'error'
+        back = subprocess.run(_sudo_wrap(['docker', 'cp', f'{media}:/mediamtx.yml', '-']),
+                              capture_output=True, timeout=30)
+        try:
+            with _tarfile.open(fileobj=_io.BytesIO(back.stdout)) as tf:
+                member = next(m for m in tf.getmembers() if m.isfile())
+                check = tf.extractfile(member).read().decode('utf-8', 'replace')
+        except Exception:
+            check = ''
+        if not check or _ct_media_fix_yml(check)[1]:
+            _log("  ⚠ cloudtak-media repair: the file did not read back correct")
+            return 'error'
+        subprocess.run(_sudo_wrap(['docker', 'restart', media]), capture_output=True, text=True, timeout=60)
+        _log("  ✓ cloudtak-media was failing on a bad /mediamtx.yml: repaired from outside and restarted")
+        return 'fixed'
+    except Exception as e:
+        _log(f"  ⚠ cloudtak-media repair error (non-fatal): {e}")
+        return 'error'
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+
+
 def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
     """v0.9.48: self-heal the CloudTAK embedded MediaMTX (cloudtak-media) — CONVERGENCE,
     not an event handler. Reads the live container state first and only patches
@@ -53397,21 +54027,41 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
             import base64
             chk_b64 = _b64.b64encode(_CT_MEDIA_CHECK_SH.encode()).decode()
             apply_b64 = _b64.b64encode(_CT_MEDIA_APPLY_SH.encode()).decode()
+            outside_b64 = _b64.b64encode(_CT_MEDIA_OUTSIDE_SH.encode()).decode()
             # base64 strings are quoting-safe; decode on the remote host and pipe into
             # the container's sh via stdin (`docker exec -i`).
             cmd = (
-                "for i in $(seq 1 %d); do "
+                "for i in $(seq 1 %(tries)d); do "
                 "m=$(docker ps --filter name=cloudtak-media --format '{{.Names}}' | head -n1); "
                 "[ -n \"$m\" ] && break; sleep 1; done; "
+                # ops #950 follow-up: a container in a restart loop or exited is not always in `docker ps`.
+                "[ -n \"$m\" ] || m=$(docker ps -a --filter name=cloudtak-media --format '{{.Names}}' | head -n1); "
                 "if [ -z \"$m\" ]; then echo NOCONTAINER; exit 0; fi; "
-                "out=$(echo %s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null); "
+                "fixed=0; "
+                "out=$(echo %(chk)s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null); "
+                # docker exec printed nothing: the container is not running. If it is looping or crashed,
+                # its /mediamtx.yml may be bad (a doubled hls key), so fix the file from outside.
+                "if [ -z \"$out\" ]; then "
+                "st=$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' \"$m\" 2>/dev/null); "
+                "case \"$st\" in \"restarting \"*|\"running \"*|\"exited \"[1-9]*) ;; *) echo NOCONTAINER; exit 0;; esac; "
+                "rr=$(echo %(outside)s | base64 -d | sh -s \"$m\"); "
+                "case \"$rr\" in *FIXED*) ;; *FINE*) echo STUCK-OTHER-CAUSE; exit 0;; *) echo FAIL; exit 0;; esac; "
+                "for i in $(seq 1 30); do [ \"$(docker inspect -f '{{.State.Running}}' \"$m\" 2>/dev/null)\" = true ] && break; sleep 1; done; "
+                "fixed=1; "
+                "out=$(echo %(chk)s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null); "
+                "fi; "
                 "set -- $out; "
                 # v10.1.8: compare against the check script's ACTUAL output ("ok ok na").
                 # The old comparison ("mpegts"/"true") never matched → every remote heal
                 # re-applied + restarted the media container needlessly.
-                "if [ \"$1\" = ok ] && { [ \"$2\" = ok ] || [ \"$2\" = na ]; } && { [ \"$3\" = ok ] || [ \"$3\" = na ]; }; then echo OK; exit 0; fi; "
-                "echo %s | base64 -d | docker exec -i \"$m\" sh && docker restart \"$m\" >/dev/null && echo HEALED || echo FAIL"
-            ) % (tries, chk_b64, apply_b64)
+                "if [ \"$1\" = ok ] && { [ \"$2\" = ok ] || [ \"$2\" = na ]; } && { [ \"$3\" = ok ] || [ \"$3\" = na ]; }; then "
+                "if [ \"$fixed\" = 1 ]; then echo HEALED; else echo OK; fi; exit 0; fi; "
+                # ops #950: the apply script locks and re-checks inside the container; UNCHANGED means
+                # another heal already fixed it (and restarts it), so no second restart here.
+                "ao=$(echo %(apply)s | base64 -d | docker exec -i \"$m\" sh) || { echo FAIL; exit 0; }; "
+                "case \"$ao\" in *UNCHANGED*) echo OK;; "
+                "*) docker restart \"$m\" >/dev/null && echo HEALED || echo FAIL;; esac"
+            ) % {'tries': tries, 'chk': chk_b64, 'outside': outside_b64, 'apply': apply_b64}
             ok, out = _ssh_probe(remote_cfg, cmd, timeout=120)
             out = (out or '').strip()
             if ok and 'HEALED' in out:
@@ -53432,10 +54082,34 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
                 break
             time.sleep(1)
         if not media:
+            # ops #950 follow-up: a container that crashed and is not restarting is missing from plain `docker ps`.
+            r = subprocess.run(
+                _sudo_wrap(['docker', 'ps', '-a', '--filter', 'name=cloudtak-media', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=15)
+            names = [n for n in (r.stdout or '').split() if n.strip()]
+            if names and _ct_media_can_be_stuck(*_ct_media_state(names[0])):
+                media = names[0]
+        if not media:
             return False  # CloudTAK media not up — nothing to heal (silent on the no-wait path)
         cur = subprocess.run(
             _sudo_wrap(['docker', 'exec', '-i', media, 'sh']),
             input=_CT_MEDIA_CHECK_SH, capture_output=True, text=True, timeout=25)
+        if not (cur.stdout or '').strip():
+            # ops #950 follow-up: docker exec printed nothing, so the container is not running (a restart
+            # loop on a doubled hls key). The heal inside it cannot run: fix /mediamtx.yml from outside.
+            fixed = _cloudtak_media_repair_outside(media, plog=plog)
+            if fixed != 'fixed':
+                if fixed == 'fine':
+                    _log("  ⚠ cloudtak-media is not running but its /mediamtx.yml is correct: another cause, not healed")
+                return False
+            for _ in range(30):
+                if _ct_media_state(media)[0] == 'running':
+                    break
+                time.sleep(1)
+            cur = subprocess.run(
+                _sudo_wrap(['docker', 'exec', '-i', media, 'sh']),
+                input=_CT_MEDIA_CHECK_SH, capture_output=True, text=True, timeout=25)
+            if _ct_media_converged(cur.stdout):
+                return True  # the repair restarted it and nothing else drifted
         if _ct_media_converged(cur.stdout):
             return True  # already converged — no restart
         ap = subprocess.run(
@@ -53444,6 +54118,10 @@ def _cloudtak_media_hls_heal(plog=None, remote_cfg=None, wait=False):
         if ap.returncode != 0:
             _log(f"  ⚠ cloudtak-media heal apply failed: {(ap.stderr or ap.stdout or '').strip()[:200]}")
             return False
+        if 'UNCHANGED' in (ap.stdout or ''):
+            # ops #950: the apply script holds a lock inside the container and re-checks under it.
+            # Another heal fixed the file while this one waited, and that heal restarts the container.
+            return True
         subprocess.run(_sudo_wrap(['docker', 'restart', media]), capture_output=True, text=True, timeout=60)
         _log("  ✓ cloudtak-media healed (HLS=mpegts/alwaysRemux + reaper ephemeral-aware)")
         return True
@@ -53549,6 +54227,234 @@ def _cloudtak_upload_limit_heal(plog=None, remote_cfg=None, wait=False):
     except Exception as e:
         _log(f"  ⚠ CloudTAK upload limit error (non-fatal): {e}")
         return False
+
+
+# ops #969 (infra-TAK #589): CloudTAK refuses to save the schedule or the login (environment) of a
+# server-wide ETL layer. Every ETL layer infra-TAK makes is server-wide (connection 0). The UI saves
+# it with PATCH /api/connection/0/layer/ID/incoming (and /outgoing), and CloudTAK's two routes declare
+# `connectionid: Type.Integer({ minimum: 1 })` and have no connection-0 branch (Create, Delete, Update
+# Layer and Get Layer have one), so the save is refused with "Validation Error" (400, then 404 once the
+# limit is relaxed). Reported upstream as dfpc-coe/CloudTAK#2042. Until a CloudTAK release carries the
+# fix, this gives both routes the branch the sibling routes use: connection 0 is allowed for an admin
+# only, and the layer must have no connection. It edits the compiled route inside the api container
+# (a recreate brings back the original, so it runs wherever the upload-limit heal runs) and restarts
+# the api once, because node has already loaded the route. A route that already declares minimum 0 is
+# left alone (upstream fixed it), and so is any file whose shape differs from what this expects: that
+# is never counted as drift. A restart rewrites nginx.conf, so the upload-limit heal runs again
+# straight after. The script prints OK <mtime> for a patched file: the console compares that time
+# with the container's start, so a patched file that the api never reloaded (a failed restart, a
+# console stopped between the edit and the restart) is drift too, and the restart is only done while
+# the api answers (never in the middle of first-boot migrations).
+_CT_ETL_LAYER_SH = r'''cd /home/etl/api 2>/dev/null || { echo NOCONF; exit 0; }
+F=dist/stateless/routes/connection-layer.js
+[ -f "$F" ] || { echo NOCONF; exit 0; }
+command -v node >/dev/null 2>&1 || { echo NOCONF; exit 0; }
+MODE=__MODE__ F="$F" node - <<'JS'
+const fs = require('fs');
+const cp = require('child_process');
+const F = process.env.F;
+const MODE = process.env.MODE;
+const t = fs.readFileSync(F, 'utf8');
+const MIN1 = 'connectionid: Type.Integer({ minimum: 1 })';
+const MIN0 = 'connectionid: Type.Integer({ minimum: 0 })';
+const OLDAUTH = [
+  '            const { connection } = await Auth.is_connection(config, req, {',
+  '                resources: [',
+  '                    { access: AuthResourceAccess.CONNECTION, id: req.params.connectionid },',
+  '                    { access: AuthResourceAccess.LAYER, id: req.params.layerid },',
+  '                ],',
+  '            }, req.params.connectionid);',
+  '            const layer = await layerControl.from(connection, req.params.layerid);',
+  ''].join('\n');
+const NEWAUTH = [
+  '            // ops #969 (infra-TAK #589): connection 0 is a server-wide layer, admin only (as in Create Incoming)',
+  '            let connection = null;',
+  '            let layer;',
+  '            if (req.params.connectionid === 0) {',
+  '                await Auth.as_user(config, req, { admin: true });',
+  '                layer = await layerControl.from(null, req.params.layerid);',
+  '                if (layer.connection !== null) {',
+  "                    throw new Err(400, null, 'Layer is not an admin layer');",
+  '                }',
+  '            }',
+  '            else {',
+  '                const auth = await Auth.is_connection(config, req, {',
+  '                    resources: [',
+  '                        { access: AuthResourceAccess.CONNECTION, id: req.params.connectionid },',
+  '                        { access: AuthResourceAccess.LAYER, id: req.params.layerid },',
+  '                    ],',
+  '                }, req.params.connectionid);',
+  '                connection = auth.connection;',
+  '                layer = await layerControl.from(connection, req.params.layerid);',
+  '            }',
+  ''].join('\n');
+const OLDCMP = 'if (layer.connection !== connection.id) {';
+const NEWCMP = 'if (connection && layer.connection !== connection.id) {';
+const shape = () => { console.log('SHAPE'); process.exit(0); };
+let out = t;
+let need = 0;
+for (const d of ['Update an incoming layer configuration', 'Update an outgoing layer configuration']) {
+  const i = out.indexOf(d);
+  if (i < 0) shape();
+  const j = out.indexOf(MIN1, i);
+  if (j < 0 || j - i > 200) {
+    const z = out.indexOf(MIN0, i);
+    if (z >= 0 && z - i <= 200) continue;   // this route already takes connection 0: upstream fixed it
+    shape();
+  }
+  const k = out.indexOf(OLDAUTH, j);
+  if (k < 0 || k - j > 1500) shape();
+  out = out.slice(0, j) + MIN0 + out.slice(j + MIN1.length, k) + NEWAUTH + out.slice(k + OLDAUTH.length);
+  if (d.indexOf('incoming') >= 0) {
+    // only inside this route: the check that the layer belongs to the connection must cope with no connection
+    const c = out.indexOf(OLDCMP, j);
+    if (c < 0 || c - j > 4000) shape();
+    out = out.slice(0, c) + NEWCMP + out.slice(c + OLDCMP.length);
+  }
+  need++;
+}
+if (need === 0) {
+  console.log(t.indexOf('connection 0 is a server-wide layer, admin only') >= 0
+    ? 'OK ' + Math.floor(fs.statSync(F).mtimeMs / 1000) : 'UPSTREAM');
+  process.exit(0);
+}
+if (MODE !== 'apply') { console.log('MISSING'); process.exit(0); }
+const tmp = F.replace(/\.js$/, '.ops969.' + process.pid + '.tmp.js');
+try {
+  fs.writeFileSync(tmp, out);
+  const chk = cp.spawnSync(process.execPath, ['--check', tmp]);
+  if (chk.status !== 0) {
+    console.log('FAIL');
+  } else {
+    if (!fs.existsSync(F + '.ops969.bak')) fs.copyFileSync(F, F + '.ops969.bak');
+    fs.renameSync(tmp, F);
+    console.log('HEALED');
+  }
+} catch (e) {
+  console.log('FAIL');
+} finally {
+  try { fs.unlinkSync(tmp); } catch (e) { /* already renamed or never written */ }
+}
+JS
+'''
+_cloudtak_etl_heal_lock = threading.Lock()
+
+
+def _ct_etl_stale(script_out, started):
+    """True when the script said OK <mtime> and the api container started before that time: the
+    route file was edited but the api never reloaded it. started = `docker inspect` StartedAt text."""
+    try:
+        parts = (script_out or '').split()
+        if len(parts) != 2 or parts[0] != 'OK':
+            return False
+        import calendar
+        s = calendar.timegm(time.strptime((started or '').strip()[:19], '%Y-%m-%dT%H:%M:%S'))
+        return int(parts[1]) > s + 1
+    except (ValueError, TypeError):
+        return False
+
+
+def _cloudtak_etl_layer_heal(plog=None, remote_cfg=None, wait=False):
+    """ops #969: let an admin save the schedule and login of a server-wide ETL layer (see the block
+    comment above). Convergence like _cloudtak_upload_limit_heal: it reads the live route first and
+    edits it only when it still has the minimum-1 connection id, so a converged box, or a CloudTAK
+    that already carries the upstream fix, is a no-op with no restart. After an edit (or when an
+    earlier edit was never reloaded) it restarts the api container once, but only while the api
+    answers, waits for it, then runs the upload-limit heal again (a start rewrites nginx.conf).
+    `wait=True` waits for the container to exist (use it right after `up -d`).
+    Returns True if converged (already there, applied, or not ours to touch: upstream fixed it or the
+    file differs from what the patch expects), False on error, no container, or an api that is not
+    answering yet (the drift check retries that)."""
+    def _log(m):
+        (plog or (lambda x: print(x, flush=True)))(m)
+    tries = 30 if wait else 1
+    script = _CT_ETL_LAYER_SH.replace('__MODE__', 'apply')
+    if not _cloudtak_etl_heal_lock.acquire(timeout=300):
+        _log("  ⚠ CloudTAK ETL layer fix: another run is still going; left for the next check")
+        return False
+    try:
+        if remote_cfg:
+            b64 = _b64.b64encode(script.encode()).decode()
+            cmd = (
+                "for i in $(seq 1 %d); do "
+                "m=$(docker ps --filter name=cloudtak-api- --format '{{.Names}}' | head -n1); "
+                "[ -n \"$m\" ] && out=$(echo %s | base64 -d | docker exec -i \"$m\" sh 2>/dev/null) "
+                "&& [ \"$out\" != NOCONF ] && break; sleep 2; done; "
+                "if [ \"$out\" = HEALED ]; then "
+                "for i in $(seq 1 40); do c=$(docker exec \"$m\" curl -s -o /dev/null -w '%%{http_code}' "
+                "http://localhost:5000/api 2>/dev/null); [ \"$c\" = 200 ] && break; sleep 3; done; "
+                "if [ \"$c\" = 200 ] && docker restart \"$m\" >/dev/null 2>&1; then "
+                "for i in $(seq 1 40); do c=$(docker exec \"$m\" curl -s -o /dev/null -w '%%{http_code}' "
+                "http://localhost:5000/api 2>/dev/null); [ \"$c\" = 200 ] && break; sleep 3; done; "
+                "[ \"$c\" = 200 ] || out=NOAPI; else out=NOAPI; fi; fi; "
+                "echo \"${out:-NOCONTAINER}\""
+            ) % (tries, b64)
+            ok, out = _ssh_probe(remote_cfg, cmd, timeout=30 + 2 * tries + 300)
+            out = ((out or '').strip().splitlines()[-1:] or [''])[0]
+        else:
+            def _answers(name, polls):
+                for n in range(polls):
+                    c = subprocess.run(
+                        _sudo_wrap(['docker', 'exec', name, 'curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
+                                    'http://localhost:5000/api']),
+                        capture_output=True, text=True, timeout=20)
+                    if (c.stdout or '').strip() == '200':
+                        return True
+                    if n + 1 < polls:
+                        time.sleep(3)
+                return False
+            out = 'NOCONTAINER'
+            name = ''
+            for _ in range(tries):
+                r = subprocess.run(
+                    _sudo_wrap(['docker', 'ps', '--filter', 'name=cloudtak-api-', '--format', '{{.Names}}']),
+                    capture_output=True, text=True, timeout=15)
+                names = [n for n in (r.stdout or '').split() if n.strip()]
+                if names:
+                    name = names[0]
+                    ap = subprocess.run(
+                        _sudo_wrap(['docker', 'exec', '-i', name, 'sh']),
+                        input=script, capture_output=True, text=True, timeout=40)
+                    out = ((ap.stdout or '').strip().splitlines()[-1:] or [''])[0]
+                    if out != 'NOCONF':
+                        break
+                time.sleep(2)
+            restart = out == 'HEALED'
+            if out.startswith('OK '):
+                st = subprocess.run(
+                    _sudo_wrap(['docker', 'inspect', name, '--format', '{{.State.StartedAt}}']),
+                    capture_output=True, text=True, timeout=20)
+                restart = _ct_etl_stale(out, st.stdout)
+                if restart:
+                    _log("  ℹ CloudTAK ETL layer fix is in the route file but the api started before it: restarting it")
+                else:
+                    out = 'OK'
+            if restart:
+                # never restart in the middle of first-boot migrations: the file is edited either way,
+                # and the drift check sees the api started before the edit and restarts it later
+                if not _answers(name, 40 if wait else 1):
+                    out = 'NOAPI'
+                else:
+                    rs = subprocess.run(_sudo_wrap(['docker', 'restart', name]),
+                                        capture_output=True, text=True, timeout=120)
+                    out = 'HEALED' if rs.returncode == 0 and _answers(name, 40) else 'NOAPI'
+        if out == 'HEALED':
+            _log("  ✓ CloudTAK ETL layers: an admin can now save the schedule and login of a server-wide layer (api restarted once)")
+            _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # the restart rewrote nginx.conf
+            return True
+        if out in ('OK', 'UPSTREAM'):
+            return True  # already there, or CloudTAK carries the fix itself - silent
+        if out == 'SHAPE':
+            _log("  ℹ CloudTAK ETL layer fix not applied: the api's layer routes differ from what it expects (left unchanged)")
+            return True  # never counted as drift
+        if wait or out in ('FAIL', 'NOAPI'):
+            _log(f"  ⚠ CloudTAK ETL layer fix not applied ({out or 'no answer'}); saving the schedule or login of a server-wide ETL layer may fail")
+        return False
+    except Exception as e:
+        _log(f"  ⚠ CloudTAK ETL layer fix error (non-fatal): {e}")
+        return False
+    finally:
+        _cloudtak_etl_heal_lock.release()
 
 
 def _compose_cmd(remote_cfg=None):
@@ -55649,6 +56555,13 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
         api = os.path.join(ct_dir, 'api')
         cfg = os.path.join(api, 'eslint.config.js')
         oxc = os.path.join(api, '.oxlintrc.json')
+        # GH #583: the api arm must never go quiet. 13.124.0 swapped the linter and the arm
+        # returned with no word, while the success line below (written for the web app arm)
+        # read as if the plugins were shielded. api_why is set whenever the api is not covered.
+        api_why = None
+        if not (os.path.isfile(cfg) or os.path.isfile(oxc)):
+            api_why = ("the CloudTAK api has no lint config this shield knows "
+                       "(api/eslint.config.js or api/.oxlintrc.json)")
         if os.path.isfile(cfg) or os.path.isfile(oxc):
             extras = set()
             routes = os.path.join(api, 'stateless', 'routes')
@@ -55678,6 +56591,9 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
                 new = text[:at] + '\n' + block + text[at:]
             else:
                 new = text
+                if not os.path.isfile(oxc):
+                    api_why = ("api/eslint.config.js has no `export default tseslint.config(` "
+                               "line to add the skip to")
             if new != text:
                 _cloudtak_rewrite_in_place(cfg, new)
                 changed.append(os.path.relpath(cfg, ct_dir))
@@ -55701,9 +56617,13 @@ def _cloudtak_shield_foreign_plugins(ct_dir, plog):
             except ValueError:
                 plog("  ⚠ api/.oxlintrc.json is not plain JSON, so the build was not set to skip "
                      "non-infra-TAK plugins for OXLint (non-fatal)")
+                api_why = ''          # said above
         if changed:
             plog(f"  Plugins not installed by infra-TAK ({', '.join(foreign)}): the image build skips "
                  f"lint/typecheck for them, as TAK Portal's marketplace set it ({', '.join(changed)})")
+        if api_why:
+            plog(f"  ⚠ The api lint is NOT set to skip those plugins: {api_why}. The api image build "
+                 f"may fail on lint errors in their files (non-fatal). Please report it with this log.")
     except Exception as e:
         plog(f"  ⚠ Could not set the build to skip non-infra-TAK plugins (non-fatal): {str(e)[:160]}")
 
@@ -56742,8 +57662,10 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
         rate_limited = False
         out_of_memory = None
         lint_fail = None
+        lint_tool = 'ESLint'
         lint_file = None
         lint_plugins = []
+        lint_files = []
         vite_fail = None
         vite_detail = None
         vite_wait = 0
@@ -56765,6 +57687,9 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
                 m = re.search(r'/app/plugins/([\w.-]+)/', lint_file)
                 if m and m.group(1) not in lint_plugins:
                     lint_plugins.append(m.group(1))
+            m = re.search(r'\[((?:[\w.-]+/)*[\w.-]+\.(?:ts|js|mjs|cjs)):\d+:\d+\]', ln)
+            if m and m.group(1) not in lint_files:
+                lint_files.append(m.group(1))
             if 'error TS' in ln:
                 m = re.search(r'(?:^|[\s/])(plugin-([\w.-]+)\.ts)\(', ln)
                 if m:
@@ -56796,6 +57721,11 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             # a passing lint prints "✖ 119 problems (0 errors, 119 warnings)" too
             elif lint_fail is None and re.search(r'✖ \d+ problems? \([1-9]\d* errors?', ln):
                 lint_fail = ln.strip()
+            # GH #583: CloudTAK 13.124.0 lints the api with OXLint: "Found 0 warnings and 17 errors."
+            # (a clean run prints "... and 0 errors."), each finding followed by ",-[path:line:col]"
+            elif lint_fail is None and re.search(r'Found \d+ warnings? and [1-9]\d* errors?', ln):
+                lint_fail = ln.strip()
+                lint_tool = 'OXLint'
             elif vite_fail is None and 'error during build' in ln:
                 vite_fail = ln.strip()
             if failed_step is None and 'did not complete successfully' in ln:
@@ -56840,8 +57770,11 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             out.append('  Check this server can reach registry.npmjs.org, then retry.')
         elif lint_fail:
             out.append('')
-            out.append('Likely cause: the CloudTAK lint check (ESLint) failed.')
+            out.append('Likely cause: the CloudTAK lint check (%s) failed.' % lint_tool)
             out.append('  %s' % lint_fail[:220])
+            if lint_files:
+                out.append('  Files with findings: %s%s' % (', '.join(lint_files[:6]),
+                                                           ' ...' if len(lint_files) > 6 else ''))
             if lint_plugins:
                 out.append('  Errors are in CloudTAK plugin folder(s): %s (app/plugins/)'
                            % ', '.join(lint_plugins))
@@ -57119,6 +58052,7 @@ def run_cloudtak_deploy(cfg=None):
             else:
                 plog("⚠ No FQDN configured. Use remote direct URL on port 5000.")
             # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware reaper) on the remote.
+            _cloudtak_etl_layer_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #969
             _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #470
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ CloudTAK remote deployment complete")
@@ -57862,6 +58796,7 @@ def run_cloudtak_deploy(cfg=None):
 
         # v0.9.48 (Part B+C/D): self-heal cloudtak-media (HLS config + ephemeral-aware
         # reaper) — a fresh install creates the container from the image default.
+        _cloudtak_etl_layer_heal(plog=plog, wait=True)   # ops #969
         _cloudtak_upload_limit_heal(plog=plog, wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, wait=True)
         _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
@@ -58007,6 +58942,7 @@ def run_cloudtak_redeploy(cfg=None):
                 # "Caddy reloaded" printed even when the reload failed.
                 _caddy_apply_and_verify(plog, 'CloudTAK', [_get_service_domain(settings, 'cloudtak_map')], settings)
             # v0.9.48 (Part B+C/D): re-apply cloudtak-media self-heal (HLS + reaper) on remote.
+            _cloudtak_etl_layer_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #969
             _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # ops #470
             _cloudtak_media_hls_heal(plog=plog, remote_cfg=remote_cfg, wait=True)
             plog("✓ Update config & restart done (remote)")
@@ -58126,6 +59062,7 @@ def run_cloudtak_redeploy(cfg=None):
             _caddy_apply_and_verify(plog, 'CloudTAK', [_get_service_domain(settings, 'cloudtak_map')], settings)
         # v0.9.48 (Part B+C/D): force-recreate above reverted cloudtak-media to the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
+        _cloudtak_etl_layer_heal(plog=plog, wait=True)   # ops #969
         _cloudtak_upload_limit_heal(plog=plog, wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, wait=True)
         _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
@@ -58510,9 +59447,21 @@ def _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=None, remote_cfg=None
         return False
 
 
-def _cloudtak_update_failed_note(plog):
+# GH #583: failures that come from code in the tree (a lint, type or bundler error) fail the
+# same way on every run. The footer must not tell the operator to just try again for those.
+_CT_REPEATABLE_CAUSES = ('Likely cause: a CloudTAK PLUGIN server route',
+                         'Likely cause: the CloudTAK TypeScript check',
+                         'Likely cause: the CloudTAK lint check',
+                         'Likely cause: the CloudTAK web app build (vite)')
+
+
+def _cloudtak_update_failed_note(plog, hints=None):
     plog("  CloudTAK is still running on the previous build — nothing was removed.")
-    plog("  Fix the cause above (a GitHub 5xx during the build is transient — just run Update again).")
+    if any(str(h).strip().startswith(_CT_REPEATABLE_CAUSES) for h in (hints or ())):
+        plog("  Fix the cause above first. Running Update again will fail the same way: this error "
+             "is in the code that is being built, it is not a one-off network problem.")
+    else:
+        plog("  Fix the cause above (a GitHub 5xx during the build is transient — just run Update again).")
 
 
 def _cloudtak_docker(argv, remote_cfg=None, timeout=60):
@@ -59184,14 +60133,15 @@ def run_cloudtak_update():
                 _cloudtak_drop_build_data(cloudtak_dir)
                 if proc.returncode != 0:
                     plog(f"✗ Build failed with exit code {proc.returncode}")
-                    for _hint in _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir):
+                    _hints = _cloudtak_build_failure_hint(list(_build_tail), cloudtak_dir)
+                    for _hint in _hints:
                         plog(_hint)
                     _undo_plugin_moves()
                     _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
                     # ops #129: services that DID build were re-tagged; take the tags back so the
                     # next recreate (boot heal, Update config) cannot start a new image on the old tree.
                     _cloudtak_restore_images(_ct_snap, plog)
-                    _cloudtak_update_failed_note(plog)
+                    _cloudtak_update_failed_note(plog, _hints)
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
             except subprocess.TimeoutExpired:
@@ -59262,6 +60212,7 @@ def run_cloudtak_update():
         _cloudtak_postgis_extensions_upgrade(plog=plog, remote_cfg=(remote_cfg if is_remote else None))
         # v0.9.48 (Part B+C/D): the rebuild recreated cloudtak-media from the image
         # default — re-apply the self-heal (HLS config + ephemeral-aware reaper).
+        _cloudtak_etl_layer_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)   # ops #969
         _cloudtak_upload_limit_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)   # ops #470
         _cloudtak_media_hls_heal(plog=plog, remote_cfg=(remote_cfg if is_remote else None), wait=True)
         if not is_remote:
@@ -65134,6 +66085,12 @@ def _ensure_app_access_policies(ak_url, ak_headers, plog=None):
             )
             if already:
                 return 'already'
+            # An ATLAS application carries its own access policy (global admins OR
+            # the deployment's group). Adding "Allow authentik Admins" beside it is
+            # one more requirement under policy_engine_mode=all (Hardened posture),
+            # which turns the agency's administrators away (ops #979).
+            if any(_atlas_access.is_access_binding(b) for b in bindings):
+                return 'already'
             try:
                 _api_post('policies/bindings/', {
                     'target': app_pk, 'policy': pol_pk,
@@ -65367,11 +66324,15 @@ def _nodered_port_holders_as_conflicts(port=1880):
 # (built 2025-03-17). Node 20 went end of life 2026-04-30, and the image carries jsonata
 # 2.0.5 (CVE-2026-77413/14/15, code execution from an attacker-controlled expression,
 # fixed 2.2.1), multer 1.4.5-lts.1 (DoS via http-in uploads) and ws 7.5.10 (CVE-2026-48779).
-# 4.1.17-22 = Node-RED 4.1.17 on Node 22.23.4 (2026-10-21), amd64 + arm64. 22.23.4 is
-# Node's October 2026 security release (4.1.16-22 shipped Node 22.23.3). Exact tag on
-# purpose: the plain `4.1` tag is stale and there is no bare `4.1.17`. Fresh deploys
-# write it, and Update moves every existing box onto it (_auto_nodered).
-NODERED_IMAGE = 'nodered/node-red:4.1.17-22'
+# 4.1.18-22 = Node-RED 4.1.18 on Node 22.23.5 (2026-11-17), amd64 + arm64. 22.23.5 is
+# Node's November 2026 security release (4.1.17-22 shipped Node 22.23.4, 4.1.16-22 shipped
+# 22.23.3). 4.1.18 is also a Node-RED hardening release: the editor's live-update channel
+# checks the session token, Projects file paths stay inside their folder, package and SSH key
+# names are validated, prototype writes are blocked (ops #935). Exact tag on purpose: the
+# plain `4.1` tag is stale and there is no bare `4.1.18`. Fresh deploys write it, and Update
+# moves every existing box onto it (_auto_nodered). Stay on the 4.x / Node 22 line: 5.0.x is
+# on Node 24, a bigger change.
+NODERED_IMAGE = 'nodered/node-red:4.1.18-22'
 _NODERED_IMAGE_LINE_RE = re.compile(r'^(\s*image:\s*)nodered/node-red:\S+[ \t]*$', re.M)
 
 
@@ -90352,6 +91313,37 @@ rotate_intca_log = []
 rotate_intca_status = {'running': False, 'complete': False, 'error': False}
 
 
+def _ca_name_in_cert_folder(cert_dir, name):
+    """Files in `cert_dir` that already carry the CA name `name` (empty list: the name is free).
+
+    ops #942: `makeCert.sh ca NAME` on a name whose files are already there does not stop with
+    an error. keytool asks "Existing entry alias ... exists, overwrite? [no]" and takes the one
+    `y` the console pipes in, so the script's own "move files around so the new CA becomes the
+    working CA? [y/n]" gets end-of-file, prints "Ok, not overwriting existing keys", exits 0 and
+    leaves ca.pem on the root. The same files also belong to a client certificate or an older CA
+    of that name (`admin`, `takserver`, an earlier INT-CA-01): makeCert.sh would overwrite its
+    key. Names are compared in lower case: the rotation state and the truststore carry-forward
+    key every CA by its lower-case alias.
+    """
+    try:
+        present = {f.lower(): f for f in os.listdir(cert_dir)}
+    except OSError:
+        return []   # cannot tell: the check after makeCert.sh still catches a stopped rotation
+    n = (name or '').lower()
+    candidates = [f'{n}{s}' for s in ('.pem', '.key', '.csr', '.crl', '.jks', '.p12', '-trusted.pem',
+                                      '-signing.jks', '-signing.p12', '-signing.pem')]
+    candidates += [f'truststore-{n}.jks', f'truststore-{n}.p12']
+    return [present[c] for c in candidates if c in present]
+
+
+def _tak_working_ca_cn(cert_dir='/opt/tak/certs/files'):
+    """Subject CN of ca.pem, the CA that signs what TAK Server issues next ('' if unreadable)."""
+    try:
+        return _pem_cn_and_expiry(_read_priv(os.path.join(cert_dir, 'ca.pem')))[0]
+    except Exception:
+        return ''
+
+
 def _rotate_client_cert_names(cert_dir, skip=()):
     """Client certs Rotate Intermediate CA re-issues: each NAME.p12 that is not CA material.
 
@@ -91043,6 +92035,11 @@ def takserver_rotate_intca():
         return jsonify({'error': 'Could not detect current intermediate CA name from ca.pem'}), 500
     if new_ca_name == old_ca_name:
         return jsonify({'error': f'New CA name must be different from current ({old_ca_name})'}), 400
+    # ops #942: refuse before anything changes. makeCert.sh cannot make a CA over files of that name.
+    if _ca_name_in_cert_folder(cert_dir, new_ca_name):
+        return jsonify({'error': f'A certificate named {new_ca_name} is already in the certificate '
+                                 f'folder, choose another name (for example the next number after '
+                                 f'your earlier CAs).'}), 400
 
     # Optional new cert password (save so thread uses it for new keystores)
     new_cert_password = (data.get('new_cert_password') or '').strip()
@@ -91107,6 +92104,13 @@ def takserver_rotate_intca():
             log(f"  New CA: {new_ca_name}")
             log("")
 
+            # ops #941: files an old restore re-owned to uid 1000 stop makeCert.sh's chmod in
+            # the container (Step 3 failed). Give them back first; idempotent.
+            try:
+                _tak_cert_owner_repair(lambda m: log(f"  {m}"), cert_dir=cert_dir)
+            except Exception as _own_e:
+                log(f"  ⚠ Certificate folder owner repair skipped: {str(_own_e)[:120]}")
+
             # Save current (old) intermediate to a named file before we overwrite ca.pem — needed for transition bundle and truststore
             old_pem = os.path.join(cert_dir, f'{old_ca_name}.pem')
             if not os.path.exists(old_pem):
@@ -91134,6 +92138,12 @@ def takserver_rotate_intca():
             _patch_cert_metadata_password(cert_pass)
             if not run(f'cd /opt/tak/certs && echo "y" | runuser -u tak -- /opt/tak/certs/makeCert.sh ca "{new_ca_name}" 2>&1'):
                 raise Exception('Failed to create new intermediate CA')
+            # ops #942: makeCert.sh exits 0 even when it stops before it makes the new CA the
+            # working one. Only the file itself says whether it did.
+            _working = _tak_working_ca_cn(cert_dir)
+            if _working != new_ca_name:
+                raise Exception(f'makeCert.sh finished but the working CA (ca.pem) is '
+                                f'{_working or "unreadable"}, not {new_ca_name}. Nothing after Step 2 was done')
             log(f"✓ Intermediate CA {new_ca_name} created")
             # ops #831: the new CA's key files are for the TAK Server account only.
             try:
@@ -98833,11 +99843,12 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         # which is exactly right for a hardened bundle: that one is UBI-based and needs no patch.
         _patch_tak_db_dockerfile(new_ctx, ulog)
         _patch_tak_hardened_dockerfile(new_ctx, (_app_df, _db_df), ulog)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_hardened_java_pin(new_ctx, _app_df, ulog)   # ops #963 — pinned Temurin build never moves
         _patch_tak_db_pgdg_releasever(new_ctx, _db_df, ulog)   # ops #686 — PGDG lags new RHEL minors
         _patch_tak_dockerfile_cacerts(new_ctx, _app_df, ulog)   # ops #200 — JDK's own CA roots
         if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
             return _fail("DB image build failed.")
-        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build --pull -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
             return _fail("TAK Server image build failed.")
         ulog("✓ Images built")
         # The hardened 5.8 images run as tak:0 / postgres:0, not root, and the tree they
@@ -100915,11 +101926,12 @@ def _deploy_takserver_container(config):
         log_step(f'  bundle layout: {_app_df} / {_db_df}')
         _patch_tak_db_dockerfile(build_ctx, log_step)   # GH #69 — EOL bullseye, see the helper
         _patch_tak_hardened_dockerfile(build_ctx, (_app_df, _db_df), log_step)   # UBI 10 OpenSSL pin vs newer curl
+        _patch_tak_hardened_java_pin(build_ctx, _app_df, log_step)   # ops #963 — pinned Temurin build never moves
         _patch_tak_db_pgdg_releasever(build_ctx, _db_df, log_step)   # ops #686 — PGDG lags new RHEL minors
         _patch_tak_dockerfile_cacerts(build_ctx, _app_df, log_step)   # ops #200 — JDK's own CA roots
         if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1', "Building takserver_db image..."):
             log_step("✗ takserver_db image build failed."); deploy_status.update({'error': True, 'running': False}); return
-        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
+        if not run_cmd(f'cd {shlex.quote(build_ctx)} && docker build --pull -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1', "Building takserver image..."):
             log_step("✗ takserver image build failed."); deploy_status.update({'error': True, 'running': False}); return
         log_step("✓ Images built")
 
@@ -103745,6 +104757,98 @@ def _ca_private_verdict_or_refuse_all(cert_dir):
             def __contains__(self, _name):
                 return True
         return _All()
+
+
+# ops #941: the uid an OLD restore (before ops #839) gave the whole certificate folder on a
+# Docker TAK box whose container could not be asked: a made-up 1000, with group 0.
+_RESTORE_MADE_UP_UID = 1000
+
+
+def _tak_cert_owner_repair(plog=None, cert_dir=None):
+    """ops #941 — give a Docker TAK box's certificate folder back to the TAK container's user.
+
+    A restore made by code older than ops #839 (every release up to 10.4.1) chowned the whole
+    folder to a made-up uid 1000 (group 0) when the container was stopped. The newer restore
+    keeps the right owner, but it does not repair a folder the old one already re-owned. On such
+    a box the container user (uid 1001 on the hardened image) can still write the files through
+    group 0, but makeCert.sh also runs `chmod og-rwx takserver.key`, and chmod on a file owned by
+    another uid fails with "Operation not permitted". So Rotate Intermediate CA stopped at
+    Step 3 ("Failed to create new server certificate") and TAK Server stayed "health: starting"
+    (verified on a throwaway ARM Docker box, ops #941).
+
+    Only the exact signature of that old restore is changed: owner uid 1000, group = the
+    container's group, and only when the container does NOT run as uid 1000 (the stock image
+    does, and there nothing is wrong). Any other owner is left alone. Links are re-owned
+    themselves (`-h`), never what they point at. If the container's ids cannot be read, nothing
+    changes: no guess (ops #839). Native TAK Server has no such folder owner: no-op.
+
+    Returns the number of entries repaired."""
+    d = cert_dir or _CERT_FILES_DIR
+
+    def _say(m):
+        (plog or (lambda x: print(f"Cert folder owner: {x}", flush=True)))(m)
+
+    if not _tak_is_container() or not os.path.isdir(d):
+        return 0
+    try:
+        cuid, cgid = (int(x) for x in _tak_container_ids())
+    except Exception:
+        return 0
+    if cuid == _RESTORE_MADE_UP_UID:
+        return 0
+
+    def _stale():
+        n = 0
+        try:
+            tops = [d]
+            for root, dirs, files in os.walk(d, followlinks=False):
+                tops += [os.path.join(root, x) for x in dirs + files]
+            for p in tops:
+                try:
+                    st = os.lstat(p)
+                except OSError:
+                    continue
+                if st.st_uid == _RESTORE_MADE_UP_UID and st.st_gid == cgid:
+                    n += 1
+        except OSError:
+            pass
+        return n
+
+    before = _stale()
+    if not before:
+        return 0
+    frm = f'--from={_RESTORE_MADE_UP_UID}:{cgid}'
+    try:
+        subprocess.run(_sudo_wrap(['chown', '-R', '-h', frm, f'{cuid}:{cgid}', d]),
+                       capture_output=True, text=True, timeout=120)
+    except Exception:
+        pass
+    left = _stale()
+    if left:
+        # A host chown on the bundle tree can report success and change nothing
+        # (_container_own_tree): do it as root inside the image, on the mounted folder.
+        try:
+            subprocess.run(_sudo_wrap(['docker', 'run', '--rm', '--user', '0',
+                                       '-v', f'{os.path.realpath(d)}:/mnt/certs',
+                                       '--entrypoint', 'sh', TAK_CONTAINER, '-c',
+                                       f'chown -R -h {frm} {cuid}:{cgid} /mnt/certs']),
+                           capture_output=True, text=True, timeout=120)
+        except Exception:
+            pass
+        left = _stale()
+    fixed = before - left
+    if fixed:
+        _say(f"{fixed} entr{'y' if fixed == 1 else 'ies'} in {d} were owned by uid "
+             f"{_RESTORE_MADE_UP_UID} (an old restore) and now belong to the TAK container's user "
+             f"{cuid}:{cgid}")
+        try:
+            audit('cert_owner_repair', f'dir={d} entries={fixed}')
+        except Exception:
+            pass
+    if left:
+        _say(f"⚠ {left} entr{'y' if left == 1 else 'ies'} in {d} could not be given to the TAK "
+             f"container's user {cuid}:{cgid}; Rotate CA may fail until they are")
+    return fixed
 
 
 def _tak_ca_private_lockdown(plog=None, cert_dir=None, live=True):
@@ -112614,6 +113718,7 @@ def _cloudtak_recreate_and_heal(ct_dir, log, pull=False, wait_s=0):
     log("CloudTAK recreated with hardened port bindings")
     # v0.9.48 (Part B+C/D): recreate reverted cloudtak-media to image default —
     # re-apply the self-heal (HLS config + ephemeral-aware reaper).
+    _cloudtak_etl_layer_heal(plog=log, wait=True)   # ops #969
     _cloudtak_upload_limit_heal(plog=log, wait=True)   # ops #470: the recreate rewrote nginx.conf
     if not _cloudtak_media_hls_heal(wait=True):
         return 'heal'
@@ -112748,6 +113853,28 @@ def _startup_heal_cloudtak_media_hls():
 _startup_heal_cloudtak_media_hls()
 
 
+def _startup_heal_cloudtak_etl_layer():
+    """ops #969: the same check-before-apply heal as above for the ETL layer routes, after every console
+    start, but off the start path (an edit restarts the api, a minute or two) and only when no compose
+    or build run is changing the stack. If it is busy, Guard Dog's drift check ('etl') repairs it later."""
+    def _run():
+        try:
+            time.sleep(60)
+            _ct_dir = os.path.expanduser('~/CloudTAK')
+            if not (os.path.exists(os.path.join(_ct_dir, 'docker-compose.yml'))
+                    or os.path.exists(os.path.join(_ct_dir, 'compose.yaml'))):
+                return  # CloudTAK not installed locally (or split/remote) - nothing to heal here
+            busy = _cloudtak_stack_busy_procs()
+            if busy is None or busy:
+                return
+            _cloudtak_etl_layer_heal()
+        except Exception as _e:
+            print(f"Startup self-heal: CloudTAK ETL layer fix error (non-fatal): {_e}", flush=True)
+    threading.Thread(target=_run, daemon=True, name='cloudtak-etl-heal').start()
+
+_startup_heal_cloudtak_etl_layer()
+
+
 # ops #197: Guard Dog repairs CloudTAK by itself after a compose run that skipped our override.
 #
 # TAK Portal's marketplace rebuilds CloudTAK with its own command,
@@ -112805,8 +113932,9 @@ def _cloudtak_stack_busy_procs():
 
 def _cloudtak_drift(ct_dir):
     """What a compose run without infra-TAK's override left behind. Returns
-    {'kind': 'recreate'|'print'|'media'|'upload'|'', 'no_override': [names], 'print': [names],
-     'hls': True|False|None, 'upload': True|False|None, 'media_image': str, 'api_ca': True|False|None}.
+    {'kind': 'recreate'|'print'|'media'|'upload'|'etl'|'', 'no_override': [names], 'print': [names],
+     'hls': True|False|None, 'upload': True|False|None, 'etl': True|False|None, 'media_image': str,
+     'api_ca': True|False|None}.
     'recreate': a running CloudTAK container was created without docker-compose.override.yml
     (its compose config_files label) — image pins, console CA and the HLS profile all need the
     recreate. 'print' (ops #222): only TAK Portal's Print runs without infra-TAK's Print overlay
@@ -112815,10 +113943,13 @@ def _cloudtak_drift(ct_dir):
     (ops #161). 'upload' (ops #502): only the 25G /api/server/tileset rule is gone from the api's
     nginx.conf, which any recreate of the api (a TAK Portal plugin install or update) rewrites —
     the upload-limit heal alone fixes that. upload None = could not read, or nginx.conf.js has
-    not written the real config yet: not drift."""
+    not written the real config yet: not drift. 'etl' (ops #969): the api's layer routes were rewritten
+    by a recreate, so saving the schedule or login of a server-wide ETL layer is refused again; the ETL
+    layer heal alone fixes that. etl None = could not read, a CloudTAK that carries the fix itself, or a
+    file that differs from what the patch expects: not drift."""
     out = {'kind': '', 'no_override': _cloudtak_containers_without_override(ct_dir),
            'print': _cloudtak_print_drift(ct_dir),
-           'hls': None, 'upload': None, 'media_image': '', 'api_ca': None}
+           'hls': None, 'upload': None, 'etl': None, 'media_image': '', 'api_ca': None}
     media = ((_ct_docker_out(['ps', '--filter', 'name=cloudtak-media', '--format', '{{.Names}}']) or '').split() or [''])[0]
     if media:
         chk = _ct_docker_out(['exec', '-i', media, 'sh'], timeout=25, stdin=_CT_MEDIA_CHECK_SH)
@@ -112829,6 +113960,16 @@ def _cloudtak_drift(ct_dir):
     chk = (chk or '').strip().splitlines()[-1:] or ['']
     if chk[0] in ('OK', 'MISSING'):
         out['upload'] = chk[0] == 'OK'
+    chk = _ct_docker_out(['exec', '-i', 'cloudtak-api-1', 'sh'], timeout=25,
+                         stdin=_CT_ETL_LAYER_SH.replace('__MODE__', 'check'))
+    chk = (chk or '').strip().splitlines()[-1:] or ['']
+    if chk[0].split(' ')[0] in ('OK', 'UPSTREAM', 'MISSING'):
+        out['etl'] = chk[0].split(' ')[0] != 'MISSING'
+        if out['etl'] and chk[0].startswith('OK '):
+            # edited, but did the api reload it? (a failed restart, a console stopped between the two)
+            started = _ct_docker_out(['inspect', 'cloudtak-api-1', '--format', '{{.State.StartedAt}}'])
+            if _ct_etl_stale(chk[0], started):
+                out['etl'] = False
     env = _ct_docker_out(['inspect', 'cloudtak-api-1', '--format', '{{json .Config.Env}}'])
     if env:
         try:
@@ -112843,6 +113984,8 @@ def _cloudtak_drift(ct_dir):
         out['kind'] = 'media'
     elif out['upload'] is False:
         out['kind'] = 'upload'
+    elif out['etl'] is False:
+        out['kind'] = 'etl'
     return out
 
 
@@ -112857,6 +114000,8 @@ def _cloudtak_drift_summary(d):
         parts.append('HLS profile missing')
     if d.get('upload') is False:
         parts.append('tileset upload limit missing')
+    if d.get('etl') is False:
+        parts.append('ETL layer save fix missing')
     if d.get('media_image'):
         parts.append(f"media image {d['media_image']}")
     if d.get('api_ca') is not None:
@@ -113002,6 +114147,11 @@ def _cloudtak_autorepair_run(ct_dir, drift):
         if not why and drift['kind'] != 'recreate' and drift.get('upload') is False:
             if not _cloudtak_upload_limit_heal(plog=_log, wait=True):
                 why = 'the tileset upload limit did not re-apply'
+        # ops #969: the ETL layer fix. After a recreate it already ran inside _cloudtak_recreate_and_heal.
+        # It restarts the api, so it re-applies the upload limit itself.
+        if not why and drift['kind'] != 'recreate' and drift.get('etl') is False:
+            if not _cloudtak_etl_layer_heal(plog=_log, wait=True):
+                why = 'the ETL layer save fix did not re-apply'
         # ops #222: every repair ends with Print set up — the recreate above leaves cloudtak-print
         # alone (it isn't in COMPOSE_FILE), and TAK Portal starts it without our overlay.
         if not why and _cloudtak_print_converge(ct_dir, _log) == 'failed':
@@ -113038,7 +114188,9 @@ def _cloudtak_autorepair_notify(before, after):
                             "Portal's compose file and docker-compose.custom.yml kept), then re-applied "
                             "the HLS profile",
                 'print': "restarted TAK Portal's Print (cloudtak-print) on 127.0.0.1:5010 for /print-api",
-                'upload': "re-applied the 25G tileset upload limit to the CloudTAK api's nginx"
+                'upload': "re-applied the 25G tileset upload limit to the CloudTAK api's nginx",
+                'etl': "re-applied the fix that lets an admin save the schedule and login of a server-wide "
+                       "ETL layer (restarted the CloudTAK api once)"
                 }.get(before['kind'], 're-applied the HLS profile to cloudtak-media')
         line = (f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')} | cloudtak-watch | repaired automatically, "
                 f"nothing to do (likely a TAK Portal marketplace install) | "
@@ -114095,6 +115247,16 @@ def _startup_app_access_policy_converge(log=None):
             _l('Authentik API not ready — retries on next restart/deploy')
             return
         _ensure_app_access_policies(ak_url, ak_headers, plog=_l)
+        # ops #919: after it, so Update Now alone moves every ATLAS application
+        # from "Allow authentik Admins" to its one access policy. Under the
+        # Hardened posture's policy_engine_mode=all the old binding locks the
+        # agency's administrators out (ops #979).
+        try:
+            _atlas_conv = (mod_registry.MODULES.get('atlas') or {}).get('converge_access')
+            if _atlas_conv:
+                _atlas_conv(mod_registry.get_ctx(), ak_url, ak_headers, _l)
+        except Exception as _ace:
+            _l(f'ATLAS access swap error (non-fatal): {str(_ace)[:160]}')
     except Exception as _e:
         try:
             _l(f'error (non-fatal): {str(_e)[:200]}')
@@ -116220,6 +117382,14 @@ def _startup_migrations():
             _heal_nodered_cert_read_access(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _nrh_e:
             print(f"Startup migration: Node-RED cert heal error (non-fatal): {_nrh_e}", flush=True)
+
+        # ops #941 — a Docker TAK box whose certificate folder an old restore re-owned to
+        # uid 1000: give it back to the container's user, or Rotate CA fails at Step 3.
+        # Before the lockdown, which reads the owners. Idempotent: a stat per entry.
+        try:
+            _tak_cert_owner_repair(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _cor_e:
+            print(f"Startup migration: cert folder owner repair error (non-fatal): {_cor_e}", flush=True)
 
         # ops #831 — existing boxes: the CA key files (and each snapshot's copy of them) get
         # the file modes a new deploy sets. Only CA private material; client files and the

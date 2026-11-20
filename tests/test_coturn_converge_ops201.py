@@ -113,8 +113,8 @@ def test_old_4140_override_is_rewritten_and_only_coturn_recreated(tmp_path):
     n, calls, _ = _ns(tmp_path, SETTINGS)
     assert n['_coturn_converge_override']() == 'rewritten'
     new = p.read_text()
-    assert 'image: coturn/coturn:4.19.1' in new and '4.14.0' not in new
-    assert n['COTURN_IMAGE'] == 'coturn/coturn:4.19.1'
+    assert 'image: coturn/coturn:4.19.2' in new and '4.14.0' not in new
+    assert n['COTURN_IMAGE'] == 'coturn/coturn:4.19.2'
     # port, user, password, realm and external IP kept from the file
     for keep in ('"3479:3479/tcp"', '"3479:3479/udp"', '--listening-port=3479',
                  '--user=turnuser:s3cretPass9', '--realm=tak.example.com',
@@ -123,6 +123,27 @@ def test_old_4140_override_is_rewritten_and_only_coturn_recreated(tmp_path):
     compose = [a for a, _ in calls if a[:2] == ['docker', 'compose']]
     assert compose == [['docker', 'compose', '-f', str(tmp_path / 'docker-compose.yml'),
                         '-f', str(p), 'up', '-d', '--no-deps', 'coturn']]
+
+
+def test_4191_override_moves_to_4192_and_keeps_every_other_line(tmp_path):
+    # ops #962: the update path from the 4.19.1 pin (shipped in 10.4.1). A box whose override is
+    # current in every way except the image tag must be rewritten, and only the image line may change.
+    p = _write(tmp_path, OLD_OVERRIDE)
+    n, _, _ = _ns(tmp_path, SETTINGS)
+    assert n['_coturn_converge_override']() == 'rewritten'
+    current = p.read_text()
+    assert 'image: coturn/coturn:4.19.2' in current
+    shipped = current.replace('image: coturn/coturn:4.19.2', 'image: coturn/coturn:4.19.1')
+    p.write_text(shipped)
+    n2, calls, logs = _ns(tmp_path, SETTINGS)
+    assert n2['_coturn_converge_override']() == 'rewritten'
+    after = p.read_text()
+    assert after == current
+    assert [l for l in shipped.splitlines() if l not in after.splitlines()] == ['    image: coturn/coturn:4.19.1']
+    compose = [a for a, _ in calls if a[:2] == ['docker', 'compose']]
+    assert compose == [['docker', 'compose', '-f', str(tmp_path / 'docker-compose.yml'),
+                        '-f', str(p), 'up', '-d', '--no-deps', 'coturn']]
+    assert any('CoTURN updated to coturn/coturn:4.19.2' in l for l in logs)
 
 
 def test_file_values_win_over_settings(tmp_path):
