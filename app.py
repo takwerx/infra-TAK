@@ -78036,9 +78036,10 @@ def _tak_user_marti_req(cert, key, url, method='GET', timeout=20):
     return code, data
 
 
-def _tak_api_user_check_once(cn, ldap_groups):
+def _tak_api_user_check_once(cn, ldap_groups, groups_only=False):
     """One HTTPS login as `cn` (see `_tak_api_user_check`). Returns (verdict, summary);
-    verdict 'nocert' = no test cert could be made (trying again won't change that)."""
+    verdict 'nocert' = no test cert could be made (trying again won't change that).
+    `groups_only` (v10.4.3 W3): stop after groups/all — no mission list, no test mission."""
     workdir = tempfile.mkdtemp(prefix='tak-api-check-')
     try:
         try:
@@ -78058,6 +78059,8 @@ def _tak_api_user_check_once(cn, ldap_groups):
         if not have:
             return 'broken', (f"TAK's API gave {cn} {'no groups' if code == 200 else f'HTTP {code}'} on "
                               f"groups/all, while LDAP gives {len(ldap_groups)} ({', '.join(sorted(ldap_groups)[:5])})")
+        if groups_only:
+            return 'ok', f"HTTPS as {cn}: groups/all gives {len(got)} group(s)"
         code, data = req('missions')
         if code == 0 or code >= 500:
             return 'unknown', f"TAK's API didn't answer {cn}'s mission list ({f'HTTP {code}' if code else 'no answer'})"
@@ -78087,7 +78090,8 @@ def _tak_api_user_check_once(cn, ldap_groups):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, early=False, exclude=(), info=None):
+def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, early=False, exclude=(), info=None,
+                        groups_only=False):
     """Does TAK's HTTPS/API side give cert users their LDAP groups? (ops #139)
 
     Picks a real non-admin LDAP user with a read/write TAK group (one connected right now if
@@ -78141,7 +78145,7 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
         rnd += 1
         for n in range(1, _TAK_API_CHECK_TRIES + 1):
             logins.append(time.time())
-            verdict, summary = _tak_api_user_check_once(cn, ldap_groups)
+            verdict, summary = _tak_api_user_check_once(cn, ldap_groups, groups_only=groups_only)
             if verdict != 'broken':
                 break   # ok, or the API / cert can't be used: logging in again right away won't help
         if verdict == 'ok':
@@ -78541,6 +78545,42 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             _alert(f'TAK Server restarted, but users STILL get no groups: {api_summary}')
             _finish('restarted, HTTPS still broken')
         return True
+
+
+def _tak_ldap_groups_watch(plog):
+    """v10.4.3 W3: continuous check for "TAK gives no groups while LDAP does" — the stuck
+    state of akres E3c after an outpost restart the console did not see at all (or saw while
+    TAK was in a state the W1 hook did not catch). Runs on the spiral monitor's 10-min tick.
+    One known LDAP user: LDAP memberOf (W5 probe) vs TAK's HTTPS groups/all (groups only, no
+    test mission). Mismatch with LDAP good -> a recycle request and the W1 heal path
+    (_tak_recycle_after_ldap_outage: normal rounds, 240 s window, restart). Quiet when fine.
+    Returns True only when TAK was restarted."""
+    tag = 'TAK groups watch'
+    try:
+        if not os.path.exists('/opt/tak/CoreConfig.xml') or not _coreconfig_has_ldap():
+            return False
+        tak_start = _tak_started_epoch()
+        if tak_start is None or time.time() - tak_start < _TAK_BOOT_HTTPS_CHECK_AFTER_S:
+            return False                       # not running / still in its boot window
+        if _console_update_in_progress() or _authentik_busy_reason():
+            return False
+        if (load_settings().get('tak_ldap_recycle') or {}).get('pending'):
+            return False                       # the recycle already owns this outage
+        ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+        if not ldap_pass or not _ensure_ldapsearch():
+            return False
+        bound, tak_groups, _ = _authentik_ldap_sa_group_probe(ldap_pass)
+        if not bound or not tak_groups:
+            return False                       # LDAP not good: not TAK's fault, not ours to fix here
+        verdict, summary = _tak_api_user_check(lambda m: None, tag, ldap_pass, wait_s=0, groups_only=True)
+    except Exception as e:
+        plog(f"  {tag}: check error (non-fatal): {str(e)[:160]}")
+        return False
+    if verdict != 'broken':
+        return False
+    plog(f"  ✗ {tag}: {summary} — TAK gives no groups while LDAP does; running the TAK LDAP heal")
+    _tak_ldap_recycle_request('TAK gives no groups while LDAP does (continuous check)')
+    return _tak_recycle_after_ldap_outage(plog, tag, check_outpost=True)
 
 
 def _ak_ldap_path_starts():
@@ -83133,10 +83173,18 @@ def _authentik_spiral_monitor():
             # authentik-watch restarts Authentik on its own, and a request kept because LDAP
             # wasn't healthy yet waited for the next console start. Silent and cheap when
             # there is nothing to heal (two start times, one file).
+            _tak_restarted = False
             try:
-                _tak_recycle_after_ldap_outage(_mon_log, 'periodic LDAP outage check', check_outpost=True)
+                _tak_restarted = _tak_recycle_after_ldap_outage(_mon_log, 'periodic LDAP outage check', check_outpost=True)
             except Exception as _tr_e:
                 print(f"[spiral monitor] TAK LDAP recycle error (non-fatal): {_tr_e}", flush=True)
+            # v10.4.3 W3: TAK stuck with no groups while LDAP gives them — whatever restarted
+            # the outpost (or nothing did). Quiet and cheap when fine (one LDAP search, one login).
+            if not _tak_restarted:
+                try:
+                    _tak_ldap_groups_watch(_mon_log)
+                except Exception as _gw_e:
+                    print(f"[spiral monitor] TAK groups watch error (non-fatal): {_gw_e}", flush=True)
             # ops #565: a client TAK never looked up (no outage to trigger the heal above)
             try:
                 _tak_drop_stuck_unnamed_sessions(_mon_log)

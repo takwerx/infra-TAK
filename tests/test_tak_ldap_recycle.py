@@ -2125,3 +2125,48 @@ def test_restart_and_ldapsearch_are_argv_not_shell():
         assert 'shell=True' not in _src(name), name
     src = _src('_tak_recycle_after_ldap_outage')
     assert "['systemctl', 'restart', 'takserver']" in src and "['docker', 'restart', TAK_CONTAINER]" in src
+
+
+# ── v10.4.3 W3: continuous "TAK gives no groups while LDAP does" check ───────────────
+
+def _watch(box, busy=''):
+    ns = box.ns()
+    ns['_authentik_busy_reason'] = lambda: busy
+    exec(compile(_src('_tak_ldap_groups_watch'), 'app.py:_tak_ldap_groups_watch', 'exec'), ns)
+    # the recycle the watch calls must be the one in this namespace
+    return ns['_tak_ldap_groups_watch'](box.log.append)
+
+
+def test_w3_stuck_tak_with_good_ldap_is_found_and_healed():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others')
+    box.settings['tak_ldap_recycle'] = {'healed_ldap_start': T0 - HOUR}   # nothing pending
+    assert _watch(box) is True
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']]
+    assert any('TAK groups watch' in l and 'no groups while LDAP does' in l for l in box.log)
+
+
+def test_w3_healthy_tak_is_silent_and_creates_no_mission():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR)
+    box.settings['tak_ldap_recycle'] = {'healed_ldap_start': T0 - HOUR}
+    assert _watch(box) is False
+    assert box.restarts() == [] and box.log == []
+    calls = [(m, u.split('?')[0].rsplit('/Marti/api/', 1)[1]) for _, m, u in box.user_api]
+    assert calls == [('GET', 'groups/all')]                  # groups only: no mission list/create
+
+
+@pytest.mark.parametrize('setup', ['pending', 'update', 'busy', 'young_tak', 'ldap_down', 'no_ldap_coreconfig'])
+def test_w3_skips(setup):
+    kw = dict(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others')
+    if setup == 'update':
+        kw['update_in_progress'] = True
+    if setup == 'young_tak':
+        kw['tak_start'] = T0 - 120
+    if setup == 'no_ldap_coreconfig':
+        kw['coreconfig'] = False
+    if setup == 'ldap_down':
+        kw['ldap'] = lambda b: (49, 0)
+    box = healthy_box(**kw)
+    box.settings['tak_ldap_recycle'] = ({'pending': ['x'], 'requested_epoch': T0 - 10} if setup == 'pending'
+                                        else {'healed_ldap_start': T0 - HOUR})
+    assert _watch(box, busy='Authentik update' if setup == 'busy' else '') is False
+    assert box.restarts() == [] and box.user_api == []
