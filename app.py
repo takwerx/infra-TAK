@@ -92299,6 +92299,58 @@ def _rotate_coreconfig_truststore(cc_text):
     return path, html.unescape(p.group(1)) if p else ''
 
 
+def _coreconfig_signing_ca(cc_text):
+    """Name of the CA whose signing keystore CoreConfig's <TAKServerCAConfig> names, from
+    keystoreFile="certs/files/NAME-signing.jks" ('' when the element or the pattern is absent)."""
+    m = re.search(r'<TAKServerCAConfig\b[^>]*\bkeystoreFile="([^"]*)"', cc_text or '')
+    base = (m.group(1) if m else '').rsplit('/', 1)[-1]
+    return base[:-len('-signing.jks')] if base.endswith('-signing.jks') and len(base) > len('-signing.jks') else ''
+
+
+def _coreconfig_truststore_ca(cc_text):
+    """NAME from the truststore-NAME.jks that the <tls> under <security> enforces ('' otherwise)."""
+    path, _pw = _rotate_coreconfig_truststore(cc_text)
+    base = os.path.basename(path or '')
+    return base[len('truststore-'):-len('.jks')] if re.match(r'^truststore-.+\.jks$', base) else ''
+
+
+def _coreconfig_point_at_ca(cc_text, old_ca_name, new_ca_name):
+    """CoreConfig.xml with its CA references moved to new_ca_name (ops #986).
+
+    The names to replace are the ones the FILE holds: the signing keystore of
+    <TAKServerCAConfig> and the truststore of <security><tls>. They used to be taken from
+    ca.pem, which runs ahead of CoreConfig.xml after a rotation that stopped half-way (ca.pem is
+    the new CA from Step 2 on, CoreConfig.xml is written only at Step 6). The replace then found
+    nothing, the step still logged success, and TAK Server kept signing with the old CA."""
+    text = cc_text or ''
+    sign_old = _coreconfig_signing_ca(text)
+    if sign_old and sign_old != new_ca_name:
+        text = re.sub(r'(<TAKServerCAConfig\b[^>]*\bkeystoreFile="(?:[^"]*/)?)' + re.escape(sign_old)
+                      + r'(-signing\.jks")', lambda m: m.group(1) + new_ca_name + m.group(2), text, count=1)
+    trust_old = _coreconfig_truststore_ca(text)
+    if trust_old and trust_old != new_ca_name:
+        sec = re.search(r'<security\b.*?</security>', text, re.S)
+        if sec:
+            fixed = re.sub(r'(<tls\b[^>]*\btruststoreFile="(?:[^"]*/)?truststore-)' + re.escape(trust_old)
+                           + r'(\.jks")', lambda m: m.group(1) + new_ca_name + m.group(2), sec.group(0), count=1)
+            text = text[:sec.start()] + fixed + text[sec.end():]
+    if old_ca_name and old_ca_name in text:
+        text = text.replace(old_ca_name, new_ca_name)
+    return text
+
+
+def _coreconfig_ca_mismatch(cc_text, new_ca_name):
+    """What CoreConfig.xml still names that is not new_ca_name: [] when it is all on the new CA."""
+    left = []
+    sign = _coreconfig_signing_ca(cc_text)
+    if sign and sign != new_ca_name:
+        left.append(f'signing keystore {sign}-signing.jks')
+    trust = _coreconfig_truststore_ca(cc_text)
+    if trust and trust != new_ca_name:
+        left.append(f'truststore truststore-{trust}.jks')
+    return left
+
+
 def _pem_key(pem):
     """The base64 body of a PEM cert, whitespace-free: equal for the same cert in any store."""
     m = re.search(r'-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----', pem or '', re.S)
@@ -92681,13 +92733,26 @@ def takserver_rotate_intca():
             log("Step 6/7: Updating CoreConfig.xml...")
             # v10.0.5 non-root: sed isn't broker-routed + /opt/tak is tak:tak — rewrite
             # CoreConfig via broker read-modify-write.
-            for _cc in ('/opt/tak/CoreConfig.xml', '/opt/tak/CoreConfig.example.xml'):
-                try:
-                    _t = _read_priv(_cc)
-                    if old_ca_name in _t:
-                        _write_priv(_cc, _t.replace(old_ca_name, new_ca_name))
-                except Exception:
-                    pass
+            # ops #986: the live CoreConfig.xml is moved by the names IT holds (ca.pem can be
+            # ahead of it after a half-failed rotation), and the step fails if it still names
+            # another CA afterwards. The example file is only a template: old name only.
+            try:
+                _t = _read_priv('/opt/tak/CoreConfig.xml')
+                _t2 = _coreconfig_point_at_ca(_t, old_ca_name, new_ca_name)
+                if _t2 != _t:
+                    _write_priv('/opt/tak/CoreConfig.xml', _t2)
+                _left = _coreconfig_ca_mismatch(_read_priv('/opt/tak/CoreConfig.xml'), new_ca_name)
+            except Exception as _cc_e:
+                raise Exception(f'CoreConfig.xml could not be updated or read back: {str(_cc_e)[:160]}')
+            if _left:
+                raise Exception(f'CoreConfig.xml still names {" and ".join(_left)} after the update, '
+                                f'not {new_ca_name}. TAK Server was not restarted')
+            try:
+                _t = _read_priv('/opt/tak/CoreConfig.example.xml')
+                if old_ca_name in _t:
+                    _write_priv('/opt/tak/CoreConfig.example.xml', _t.replace(old_ca_name, new_ca_name))
+            except Exception:
+                pass
             # v10.3.5 W9: issued certs can't outlive the new intermediate.
             try:
                 _t, _cl = _coreconfig_clamp_issued_validity(_read_priv('/opt/tak/CoreConfig.xml'), cert_dir)

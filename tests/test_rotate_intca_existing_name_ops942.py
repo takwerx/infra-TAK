@@ -84,6 +84,23 @@ def _func(name, required=True):
     return None
 
 
+def coreconfig_naming(ca):
+    """The parts of CoreConfig.xml that name the CA: the enforced truststore, the enrollment
+    signing keystore, and a Federation <tls> with a truststore of its own."""
+    return (
+        '<Configuration xmlns="http://bbn.com/marti/xml/config">\n'
+        '<security><tls keystore="JKS" keystoreFile="certs/files/takserver.jks" keystorePass="atakatak" '
+        f'truststore="JKS" truststoreFile="certs/files/truststore-{ca}.jks" truststorePass="atakatak" '
+        'context="TLSv1.2" keymanager="SunX509"/></security>\n'
+        '<certificateSigning CA="TAKServer"><certificateConfig><nameEntries>'
+        '<nameEntry name="O" value="TAK"/></nameEntries></certificateConfig>'
+        f'<TAKServerCAConfig keystore="JKS" keystoreFile="certs/files/{ca}-signing.jks" keystorePass="atakatak" '
+        'validityDays="730" signatureAlg="SHA256WithRSA"/></certificateSigning>\n'
+        '<federation><tls keystore="JKS" keystoreFile="certs/files/takserver.jks" keystorePass="atakatak" '
+        'truststore="JKS" truststoreFile="certs/files/fed-truststore.jks" truststorePass="atakatak"/></federation>\n'
+        '</Configuration>\n')
+
+
 def _make_ca_files(files, name, signing=True):
     """What an earlier makeCert.sh ca NAME left in the folder."""
     for ext in ('.pem', '.key', '.csr', '.crl', '-trusted.pem'):
@@ -103,9 +120,13 @@ class Box:
     """A box whose working CA is INT-CA-B2 (rotated B1 then B2 before), root in root-ca.pem."""
 
     def __init__(self, tmp_path):
+        self.tak = tmp_path          # stands in for /opt/tak
         self.certs = tmp_path / 'certs'
         self.files = self.certs / 'files'
         self.files.mkdir(parents=True)
+        # ops #986: Step 6 reads CoreConfig.xml back and fails when it names another CA
+        (self.tak / 'CoreConfig.xml').write_text(coreconfig_naming('INT-CA-B2'))
+        (self.tak / 'CoreConfig.example.xml').write_text(coreconfig_naming('INT-CA-B2'))
         (self.certs / 'makeCert.sh').write_text(FAKE_MAKECERT)
         os.chmod(self.certs / 'makeCert.sh', 0o755)
         _self_signed(self.files, 'ROOT-CA-01', 'root-ca')
@@ -137,8 +158,8 @@ class Box:
             'load_settings': lambda: {}, 'save_settings': lambda s: None,
             '_get_tak_cert_password': lambda s: 'atakatak',
             '_tak_cert_job_busy': lambda: False,
-            '_read_priv': lambda p: open(p).read(),
-            '_write_priv': lambda p, t: None,
+            '_read_priv': lambda p: open(self._real(p)).read(),
+            '_write_priv': lambda p, t: open(self._real(p), 'w').write(t),
             # the box's own commands, run in the scratch folder; the TAK account's chown/chmod are no-ops
             '_rotate_tak_cert_cmd': lambda cmd: ('true' if 'chown tak:tak' in cmd or 'systemctl' in cmd else
                                                  cmd.replace('runuser -u tak -- ', '')
@@ -151,7 +172,6 @@ class Box:
             '_tak_server_cert_issue': lambda *a, **k: steps.append('server-cert') or True,
             '_rotate_client_cert_names': lambda *a, **k: [],
             '_rotate_reissue_cert': lambda *a, **k: True,
-            '_rotate_coreconfig_truststore': lambda x: ('', ''),
             '_rotate_tak_live_certs_by_issuer': lambda: {},
             '_rotate_carry_forward_truststore': lambda *a, **k: None,
             '_rotate_sh': lambda *a, **k: None,
@@ -168,11 +188,15 @@ class Box:
             '_ca_rotation_date': lambda t: 'date',
             '_ca_rotation_send': lambda *a, **k: {'sent': False, 'message': 'not sent'},
         }
-        for name in ('_validate_ca_name', '_pem_cn_and_expiry', '_ca_name_in_cert_folder', '_tak_working_ca_cn'):
-            src = _func(name, required=name in ('_validate_ca_name', '_pem_cn_and_expiry'))
+        for name in ('_validate_ca_name', '_pem_cn_and_expiry', '_ca_name_in_cert_folder', '_tak_working_ca_cn',
+                     '_rotate_coreconfig_truststore', '_coreconfig_signing_ca', '_coreconfig_truststore_ca',
+                     '_coreconfig_point_at_ca', '_coreconfig_ca_mismatch'):
+            src = _func(name, required=name in ('_validate_ca_name', '_pem_cn_and_expiry',
+                                                '_rotate_coreconfig_truststore'))
             if src:   # a fix that adds these on top of an older app.py has them; the base does not
                 exec(compile(src, 'app.py', 'exec'), ns)
         ns['datetime'] = __import__('datetime').datetime
+        ns['html'] = __import__('html')
         src = _func('takserver_rotate_intca').replace("'/opt/tak/certs/files'", '_CERT_FILES_DIR')
         exec(compile(src, 'app.py', 'exec'), ns)
         self.ns = ns
@@ -185,6 +209,13 @@ class Box:
         app = flask.Flask('ops942')
         app.add_url_rule('/rotate', view_func=ns['takserver_rotate_intca'], methods=['POST'])
         self.client = app.test_client()
+
+    def _real(self, path):
+        """/opt/tak/... on the box is under tmp_path here."""
+        return str(self.tak / path[len('/opt/tak/'):]) if path.startswith('/opt/tak/') else path
+
+    def corecfg(self):
+        return (self.tak / 'CoreConfig.xml').read_text()
 
     def rotate(self, name):
         r = self.client.post('/rotate', json={'new_ca_name': name, 'password': PASSWORD})
