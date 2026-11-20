@@ -59721,6 +59721,98 @@ def _cloudtak_drop_build_data(cloudtak_dir):
         pass
 
 
+# ops #983 (infra-TAK #601): a CloudTAK Update on a nearly full disk ran the 3-minute build, died
+# with "no space left on device" (tippecanoe make, npm install), and the revert of the checkout
+# failed for the same reason. The floor is MEASURED, not guessed (ops #983, Ubuntu 22.04 x86_64,
+# CloudTAK 13.124.0, Docker 29.10): a no-cache build of the four CloudTAK images with every layer
+# new wrote 11.3 GB (images 6.6 GB + build cache); the ready-made images `up -d` can pull (media,
+# postgis, garage) add 1.7 GB; the TAK Portal print image on test12 is 2.1 GB. 11.3 + 1.7 + 2.1 =
+# 15.1 GB, rounded up to 16. The old images and old build cache stay until pruned, so none of it
+# is given back during the update. One number for every box (fleet constant, no per-box tiers).
+_CLOUDTAK_UPDATE_MEASURED_GB = 16
+_CLOUDTAK_UPDATE_MIN_FREE = _CLOUDTAK_UPDATE_MEASURED_GB * 1024 ** 3
+_CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT = 1024 ** 3   # the checkout itself: the new tag's files, ~0.3 GB
+
+
+def _cloudtak_fs_free_local(path):
+    """(filesystem id, free bytes a non-root process may use) for the filesystem holding `path`,
+    or (None, None) when it cannot be read. Walks up to the nearest ancestor that can be read:
+    /var/lib/docker is root-only (mode 710), so a non-root console asks about /var/lib instead."""
+    probe = path
+    while probe:
+        try:
+            st = os.statvfs(probe)
+            return os.stat(probe).st_dev, st.f_bavail * st.f_frsize
+        except OSError:
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+    return None, None
+
+
+def _cloudtak_fs_free_remote(remote_cfg, path):
+    """The same (filesystem id, free bytes) for `path` on the remote CloudTAK host, over SSH."""
+    q = f'"{path}"' if re.fullmatch(r'\$HOME/[A-Za-z0-9._-]+', path) else shlex.quote(path)
+    ok, out = _ssh_probe(
+        remote_cfg,
+        f"p={q}; while [ ! -e \"$p\" ] && [ \"$p\" != / ]; do p=$(dirname \"$p\"); done; "
+        "df -P -B1 \"$p\" | awk 'NR==2{print $1, $4}'", timeout=30)
+    try:
+        fsid, free = (out or '').strip().splitlines()[-1].split()
+        return fsid, int(free)
+    except Exception:
+        return None, None
+
+
+def _cloudtak_update_space_problem(cloudtak_dir, remote_cfg=None):
+    """None when there is room for a CloudTAK Update, or a dict describing what is short.
+
+    Two places fill up: the Docker data folder (the rebuilt images and the build cache) and the
+    CloudTAK checkout. They are usually one disk; when they are, the bigger need applies to it.
+    A number that cannot be read never blocks an Update (the old behaviour stays)."""
+    try:
+        rc, out, _err = _cloudtak_docker(['docker', 'info', '--format', '{{.DockerRootDir}}'],
+                                         remote_cfg=remote_cfg, timeout=30)
+        docker_root = (out or '').strip().splitlines()[-1] if rc == 0 and (out or '').strip() else ''
+    except Exception:
+        docker_root = ''
+    if not docker_root.startswith('/'):
+        docker_root = '/var/lib/docker'
+    ct_path = '~/CloudTAK' if remote_cfg is not None else cloudtak_dir
+    if remote_cfg is not None:
+        d_id, d_free = _cloudtak_fs_free_remote(remote_cfg, docker_root)
+        c_id, c_free = _cloudtak_fs_free_remote(remote_cfg, '$HOME/CloudTAK')
+    else:
+        d_id, d_free = _cloudtak_fs_free_local(docker_root)
+        c_id, c_free = _cloudtak_fs_free_local(ct_path)
+    checks = []   # (what, where, free, need)
+    if d_free is not None:
+        need = _CLOUDTAK_UPDATE_MIN_FREE
+        if c_free is not None and c_id == d_id:
+            need += _CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT
+        checks.append(('the CloudTAK images and build cache', docker_root, d_free, need))
+    if c_free is not None and not (d_free is not None and c_id == d_id):
+        checks.append(('the CloudTAK files', ct_path, c_free, _CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT))
+    for what, where, free, need in checks:
+        if free < need:
+            return {'what': what, 'where': where, 'free': free, 'need': need}
+    return None
+
+
+def _cloudtak_update_space_lines(problem):
+    """The log lines for a refused Update: what is short, that nothing changed, what to do."""
+    gb = 1024 ** 3
+    return [
+        f"✗ Not enough free disk space to update CloudTAK: {problem['free'] / gb:.1f} GB free for "
+        f"{problem['what']} ({problem['where']}); the update needs about {problem['need'] / gb:.0f} GB.",
+        "  Nothing was changed. CloudTAK is still running as before.",
+        "  Free some space, then press Update again. Safe ways: run `docker builder prune -f` and",
+        "  `docker image prune -f` on this server (old build cache and unused image layers), and",
+        "  delete old logs or backups. Do not delete Docker volumes: they hold your data.",
+    ]
+
+
 def run_cloudtak_update():
     """Fetch latest stable release tag, checkout, rebuild images, restart. Preserves DB and config."""
     def plog(msg):
@@ -59786,6 +59878,15 @@ def run_cloudtak_update():
                 plog(f"✗ {release_tag} is older than the {from_ver} already running; not downgrading. Nothing was changed.")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+        # ops #983: refuse BEFORE anything is checked out or built when the disk cannot hold the
+        # rebuild. A full disk used to fail the build after minutes and leave the checkout unwritable.
+        _space = _cloudtak_update_space_problem(None if is_remote else os.path.expanduser('~/CloudTAK'),
+                                                remote_cfg=(remote_cfg if is_remote else None))
+        if _space:
+            for _l in _cloudtak_update_space_lines(_space):
+                plog(_l)
+            cloudtak_deploy_status.update({'running': False, 'error': True})
+            return
         _mod_result_versions('cloudtak', frm=from_ver, to=(release_tag or '').lstrip('vV'))
 
         plog("")
