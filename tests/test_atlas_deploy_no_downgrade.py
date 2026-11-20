@@ -162,6 +162,25 @@ def test_the_offline_pin_is_checked_too(rig, monkeypatch):
     assert git_calls == []
 
 
+def test_the_offline_pin_refusal_blames_github_not_the_channel(rig, monkeypatch):
+    """⚠️ "Switch the channel back" is the wrong advice when the cause is GitHub
+    being unreadable or rate-limited (60 an hour per address, easy to hit)."""
+    monkeypatch.setattr(atlas, 'ATLAS_TAG', 'v2.2.0')
+    _job, log, _git = rig('2.3.0', {}, ls_remote=False)
+
+    last = log.splitlines()[-1]
+    assert 'ERROR' in last and 'GitHub' in last and 'Try again' in last, last
+    assert 'Switch the ATLAS channel back' not in last, last
+
+
+def test_a_channel_refusal_still_says_to_switch_the_channel_back(rig):
+    _job, log, _git = rig('2.3.0', {'main': '2.2.2'})
+
+    last = log.splitlines()[-1]
+    assert 'Switch the ATLAS channel back' in last, last
+    assert 'GitHub' not in last, last
+
+
 def test_update_and_deploy_give_the_same_refusal():
     """One helper, so the two buttons cannot drift apart again."""
     lines = atlas._downgrade_lines('2.3.0', '2.2.2', 'main')

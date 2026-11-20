@@ -3686,11 +3686,21 @@ def deploy(ctx, job, params):
         # migrated). Asked before git touches the checkout, so a refusal leaves
         # the box as it was. The pin fallback is checked too: it is the older
         # release most likely to be offered.
-        refusal = _downgrade_lines(_installed_version(ctx, _inst),
-                                   tag.lstrip('vV'), _channel_of(ctx))
+        _built = _installed_version(ctx, _inst)
+        refusal = _downgrade_lines(_built, tag.lstrip('vV'), _channel_of(ctx))
         if refusal:
             for line in refusal:
                 plog(line)
+            if _is_pin_fallback(tag, expected):
+                # ⚠️ The cause is GitHub, not the channel. "Switch the channel
+                # back" would send an operator the wrong way, and GitHub's
+                # unauthenticated limit (60 an hour per address) is easy to hit.
+                raise RuntimeError(
+                    'ATLAS could not read the release list from GitHub (it '
+                    'may be rate-limited), and the only release left was the '
+                    'old built-in ' + tag + ', which is older than the ' +
+                    (_built or '?') + ' this deployment runs. Nothing was '
+                    'changed. Try again in a few minutes.')
             raise RuntimeError(
                 refusal[1].strip() + ' Nothing was changed. Switch the ATLAS '
                 'channel back to the one this deployment came from, then press '
