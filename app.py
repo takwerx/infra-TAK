@@ -119175,6 +119175,107 @@ def _post_update_service_recovery_sweep(plog):
     }
 
 
+# v10.4.3 W4: one orphan-postgres killer for the three post-update passes. The old
+# shm-recreate pass killed (PIDs before) ∩ (PIDs after) of EVERY UID-70 postgres —
+# tak-portal-postgres is UID 70 too, so on a root console it killed TAK Portal's
+# database; on a non-root console the bare `kill` failed and it still logged
+# "killed orphaned postgres" ×21. Rules now: a PID is an orphan only when its cgroup
+# names exactly one container AND that container is not running (and, when the
+# caller names owners, is one of them). The kill goes through _sudo_wrap (the broker
+# re-proves the same thing in _check_kill) and "killed" is logged only on rc 0.
+_PG_CGROUP_CONTAINER_RE = re.compile(r'(?:docker-|/docker/|libpod-|/libpod/)([0-9a-f]{64})')
+
+
+def _pg_proc_container_id(pid):
+    """Container id named by a UID-70 `postgres` PID's cgroup, else None."""
+    try:
+        with open(f'/proc/{pid}/status') as f:
+            status = f.read()
+        with open(f'/proc/{pid}/comm') as f:
+            comm = f.read().strip()
+        with open(f'/proc/{pid}/cgroup') as f:
+            cgroup = f.read()
+    except OSError:
+        return None
+    uid_line = next((ln for ln in status.splitlines() if ln.startswith('Uid:')), '')
+    uids = uid_line.split()[1:]
+    if not uids or uids[0] != '70' or not comm.startswith('postgres'):
+        return None
+    ids = set(_PG_CGROUP_CONTAINER_RE.findall(cgroup))
+    return ids.pop() if len(ids) == 1 else None
+
+
+def _container_postgres_pids():
+    """{pid: container_id} for every UID-70 postgres process inside a container."""
+    out = {}
+    try:
+        names = os.listdir('/proc')
+    except OSError:
+        return out
+    for n in names:
+        if n.isdigit():
+            cid = _pg_proc_container_id(n)
+            if cid:
+                out[n] = cid
+    return out
+
+
+def _docker_container_full_id(name):
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.Id}}', name]),
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    cid = (r.stdout or '').strip()
+    return cid if r.returncode == 0 and re.fullmatch(r'[0-9a-f]{64}', cid) else None
+
+
+def _kill_orphan_postgres(log, label='', owner_ids=None):
+    """Kill container postgres processes whose container is gone. Returns killed PIDs.
+
+    owner_ids: optional set of full container ids — only orphans of those containers
+    are touched (the shm pass passes authentik-postgresql-1's pre-stop id).
+    /proc is scanned BEFORE `docker ps`, so a container that starts between the two
+    is already in the running set and its postgres is never taken for an orphan."""
+    pfx = f'{label} — ' if label else ''
+    candidates = _container_postgres_pids()
+    if not candidates:
+        return []
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--no-trunc']),
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        log(f'{pfx}orphan postgres check skipped — docker ps failed: {e}')
+        return []
+    if r.returncode != 0:
+        log(f'{pfx}orphan postgres check skipped — docker ps rc={r.returncode}')
+        return []
+    running = {c.strip() for c in r.stdout.split() if c.strip()}
+    if not running:
+        # Never kill blind: an empty list here is far more likely a docker hiccup
+        # than "every container on the box is gone".
+        return []
+    killed = []
+    for pid, cid in sorted(candidates.items(), key=lambda kv: int(kv[0])):
+        if cid in running:
+            continue
+        if owner_ids is not None and cid not in owner_ids:
+            continue
+        try:
+            k = subprocess.run(_sudo_wrap(['kill', '-9', pid]), capture_output=True, text=True, timeout=15)
+        except Exception as e:
+            log(f'{pfx}could not kill orphaned postgres PID {pid} (container {cid[:12]} gone): {e}')
+            continue
+        if k.returncode == 0:
+            killed.append(pid)
+            log(f'{pfx}killed orphaned postgres PID {pid} (container {cid[:12]} is gone)')
+        else:
+            err = ((k.stderr or '') + (k.stdout or '')).strip().splitlines()
+            log(f'{pfx}could not kill orphaned postgres PID {pid} (container {cid[:12]} gone): '
+                f'rc={k.returncode} {err[-1][:200] if err else ""}'.rstrip())
+    return killed
+
+
 def _post_update_auto_deploy():
     """After a console update, automatically re-deploy Guard Dog and reconfigure Authentik.
 
@@ -120000,15 +120101,13 @@ def _post_update_auto_deploy():
                                 for _svc in _deduped:
                                     print(f"Post-update: Authentik — removed duplicate cap_drop in {_svc} section")
                         if _shm_needs_pg_recreate:
-                            # Record all UID-70 postgres PIDs before stopping so we can kill
-                            # any that survive the container recreate (docker's default 10s stop
-                            # timeout is too short for a loaded postgres checkpoint — the process
-                            # can outlive the container and continue pegging CPU as an orphan).
-                            _old_pg_pids_r = subprocess.run(
-                                "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
-                                shell=True, capture_output=True, text=True, timeout=5
-                            )
-                            _old_pg_pids = set(_old_pg_pids_r.stdout.split()) if _old_pg_pids_r.returncode == 0 else set()
+                            # Record authentik-postgresql-1's container id before stopping so
+                            # we can kill ITS postgres processes that survive the recreate
+                            # (docker's default 10s stop timeout is too short for a loaded
+                            # postgres checkpoint — the process can outlive the container and
+                            # keep pegging CPU as an orphan). v10.4.3 W4: by container id, not
+                            # by UID 70 — tak-portal-postgres is UID 70 too.
+                            _old_pg_cid = _docker_container_full_id('authentik-postgresql-1')
                             # Stop with a longer timeout so postgres can finish its checkpoint cleanly.
                             # ops #178: stop + up in one compose-lock hold, so Guard Dog cannot
                             # land a down+up between them.
@@ -120024,18 +120123,12 @@ def _post_update_auto_deploy():
                                     print("Post-update: Postgres shm recreate skipped — compose lock busy; it applies on the next stack recreate", flush=True)
                             import time as _shm_t
                             _shm_t.sleep(5)
-                            # Kill any postgres processes that survived the container stop.
-                            # Only after a stop that actually ran: skipped, every one of these
-                            # PIDs is the LIVE postgres.
-                            if _locked and _old_pg_pids:
-                                _surviving_r = subprocess.run(
-                                    "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
-                                    shell=True, capture_output=True, text=True, timeout=5
-                                )
-                                _surviving = set(_surviving_r.stdout.split()) if _surviving_r.returncode == 0 else set()
-                                for _orphan_pid in (_old_pg_pids & _surviving):
-                                    subprocess.run(['kill', '-9', _orphan_pid], capture_output=True, timeout=5)
-                                    print(f"Post-update: killed orphaned postgres process PID {_orphan_pid}")
+                            # Kill old-container postgres processes that survived the stop.
+                            # Only after a stop that actually ran, and only the old
+                            # authentik-postgresql-1 container's — never another container's.
+                            if _locked and _old_pg_cid:
+                                _kill_orphan_postgres(lambda m: print(f"Post-update: {m}", flush=True),
+                                                      owner_ids={_old_pg_cid})
                         # ops #123: recreate only when the compose MEANS something different.
                         # A formatting-only diff (v10.2.22's width=200 dump re-wrapped long
                         # lines) recreated worker/server/ldap on every updating box: each LDAP
@@ -120094,24 +120187,7 @@ def _post_update_auto_deploy():
                         # authentik-postgresql-1 but live in their own container, and killing them
                         # restarts CloudTAK on every update.
                         try:
-                            _running_r = subprocess.run(
-                                _sudo_wrap(['docker', 'ps', '-q', '--no-trunc']),
-                                capture_output=True, text=True, timeout=10
-                            )
-                            _running_ids = {c[:12] for c in _running_r.stdout.split() if c}
-                            if _running_ids:
-                                _all_pg_r = subprocess.run(
-                                    "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
-                                    shell=True, capture_output=True, text=True, timeout=5
-                                )
-                                for _pid in _all_pg_r.stdout.split():
-                                    try:
-                                        _cg = open(f'/proc/{_pid}/cgroup').read()
-                                        if not any(_rid in _cg for _rid in _running_ids):
-                                            subprocess.run(['kill', '-9', _pid], capture_output=True, timeout=5)
-                                            print(f"Post-update: killed orphaned postgres PID {_pid} (cgroup matches no running container)")
-                                    except Exception:
-                                        pass
+                            _kill_orphan_postgres(lambda m: print(f"Post-update: {m}", flush=True))
                         except Exception as _orp_e:
                             print(f"Post-update: orphan postgres check error (non-fatal): {_orp_e}")
                 except Exception as _e:
@@ -121129,24 +121205,7 @@ def _post_update_auto_deploy():
             # killed by previously broken "not in authentik-postgresql-1" check that took down
             # cloudtak-postgis-1 processes on every update.
             try:
-                _final_running_r = subprocess.run(
-                    _sudo_wrap(['docker', 'ps', '-q', '--no-trunc']),
-                    capture_output=True, text=True, timeout=10
-                )
-                _final_running_ids = {c[:12] for c in _final_running_r.stdout.split() if c}
-                if _final_running_ids:
-                    _final_pg_r = subprocess.run(
-                        "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
-                        shell=True, capture_output=True, text=True, timeout=5
-                    )
-                    for _final_pid in _final_pg_r.stdout.split():
-                        try:
-                            _final_cg = open(f'/proc/{_final_pid}/cgroup').read()
-                            if not any(_rid in _final_cg for _rid in _final_running_ids):
-                                subprocess.run(['kill', '-9', _final_pid], capture_output=True, timeout=5)
-                                print(f"Post-update: final pass — killed orphaned postgres PID {_final_pid} (cgroup matches no running container)")
-                        except Exception:
-                            pass
+                _kill_orphan_postgres(lambda m: print(f"Post-update: {m}", flush=True), label='final pass')
             except Exception as _final_orp_e:
                 print(f"Post-update: final orphan check error (non-fatal): {_final_orp_e}")
 

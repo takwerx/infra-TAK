@@ -107,6 +107,12 @@ def evaluate_cmd(slots, dyn):
         return 'BYPASS', 'sudo-prefixed: runs directly, not via broker'
     if dyn and base in PATHISH:
         return 'DYNAMIC', 'variable path operand (hand-confirmed allowlisted dirs)'
+    # v10.4.3 W4: `kill -9 <pid>` is allowed only for a PID the broker proves, from live
+    # /proc + `docker ps`, is an orphaned container postgres. No static filler can be one,
+    # so a variable PID is DYNAMIC (tests/test_post_update_orphan_postgres_kill.py pins
+    # the rule); the fixed `kill -9` shape is still checked here.
+    if dyn and base == 'kill' and slots[1:2] == [['-9']] and len(slots) == 3 and not slots[2]:
+        return 'DYNAMIC', 'PID proved orphaned at runtime by _check_kill'
     # fill dynamic slots with a neutral non-flag token; expand ternary slots
     concrete_slots = [s if s else ['PKGorUNIT'] for s in slots]
     for combo in itertools.product(*concrete_slots[:24]):

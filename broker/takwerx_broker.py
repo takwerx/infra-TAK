@@ -2116,6 +2116,11 @@ def check_exec(argv, cwd=None):
     if base == 'bash':
         _check_bash(argv)
         return argv
+    # `kill` is not a general allow: only `kill -9 <pid>` of an orphaned container
+    # postgres the broker proves itself (v10.4.3 W4, _check_kill).
+    if base == 'kill':
+        _check_kill(argv)
+        return argv
     if base in EXEC_DENY:
         raise Denied(f'binary is denied: {base}')
     if base not in EXEC_ALLOW:
@@ -2247,6 +2252,60 @@ def _check_wg(argv):
     if len(argv) >= 2 and argv[1] == 'show':
         return
     raise Denied('wg: only `wg show` is allowed')
+
+
+_CGROUP_CONTAINER_ID = re.compile(r'(?:docker-|/docker/|libpod-|/libpod/)([0-9a-f]{64})')
+
+
+def _proc_orphan_postgres_container(pid):
+    """v10.4.3 W4: return the container id a PID's cgroup names, if — and only if —
+    the PID is a UID-70 `postgres` process inside a container cgroup. Else None."""
+    try:
+        with open(f'/proc/{pid}/status') as f:
+            status = f.read()
+        with open(f'/proc/{pid}/comm') as f:
+            comm = f.read().strip()
+        with open(f'/proc/{pid}/cgroup') as f:
+            cgroup = f.read()
+    except OSError:
+        return None
+    uid_line = next((ln for ln in status.splitlines() if ln.startswith('Uid:')), '')
+    uids = uid_line.split()[1:]
+    if not uids or uids[0] != '70' or not comm.startswith('postgres'):
+        return None
+    ids = set(_CGROUP_CONTAINER_ID.findall(cgroup))
+    return ids.pop() if len(ids) == 1 else None
+
+
+def _running_container_ids():
+    docker = shutil.which('docker', path=BROKER_TRUSTED_PATH)
+    if not docker:
+        raise Denied('kill: docker not found — cannot prove the process is orphaned')
+    r = subprocess.run([docker, 'ps', '-q', '--no-trunc'], capture_output=True, text=True,
+                       timeout=15, env={'PATH': BROKER_TRUSTED_PATH, 'LC_ALL': 'C'})
+    if r.returncode != 0:
+        raise Denied('kill: docker ps failed — cannot prove the process is orphaned')
+    return {c.strip() for c in r.stdout.split() if c.strip()}
+
+
+def _check_kill(argv):
+    """kill: exactly `kill -9 <pid>`, and only for an ORPHANED container postgres
+    (v10.4.3 W4). The post-update shm recreate can leave a container's postgres
+    alive after its container is gone; the non-root console has to reach root to
+    stop it. The broker proves the target itself instead of trusting the caller:
+      * UID 70 and comm `postgres*` (the alpine/debian postgres images' user),
+      * its cgroup names exactly one container (never a host process), and
+      * that container is NOT running (a live container's postgres — Authentik,
+        TAK Portal, CloudTAK postgis — is never touched).
+    Any other signal, PID shape or target is denied."""
+    if (len(argv) != 3 or argv[0] != 'kill' or argv[1] != '-9'
+            or not argv[2].isascii() or not argv[2].isdigit() or int(argv[2]) <= 1):
+        raise Denied('kill: only `kill -9 <pid>` is allowed')
+    cid = _proc_orphan_postgres_container(argv[2])
+    if not cid:
+        raise Denied(f'kill: PID {argv[2]} is not a container postgres process')
+    if cid in _running_container_ids():
+        raise Denied(f'kill: PID {argv[2]} belongs to a running container — not an orphan')
 
 
 def _check_pg_lsclusters(argv):

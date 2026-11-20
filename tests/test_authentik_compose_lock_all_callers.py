@@ -213,13 +213,16 @@ def test_module_compose_locks_locally_and_leaves_remote_alone(console):
 # ── a busy lock must not strand a half-applied change ───────────────────────
 
 def test_skipped_pg_shm_recreate_never_kills_the_live_postgres():
-    # The orphan-kill takes "UID-70 postgres PIDs from before the stop that are still there".
-    # With the stop skipped that is every live postgres, so it may only run after a real stop.
+    # The orphan-kill takes the old authentik-postgresql-1 container's surviving postgres.
+    # With the stop skipped that container is still the live one, so it may only run after a
+    # real stop. (v10.4.3 W4: by container id, not UID-70 PIDs — see
+    # tests/test_post_update_orphan_postgres_kill.py.)
     src = ast.get_source_segment(APP, FUNCS['_post_update_auto_deploy'])
     i = src.index("_authentik_compose_lock('post-update-pg-shm-recreate')")
     tail = src[i:i + 2500]
-    assert 'if _locked and _old_pg_pids:' in tail
-    assert tail.index('if _locked and _old_pg_pids:') < tail.index("'kill', '-9'")
+    assert 'if _locked and _old_pg_cid:' in tail
+    assert tail.index('if _locked and _old_pg_cid:') < tail.index('_kill_orphan_postgres(')
+    assert 'owner_ids={_old_pg_cid}' in tail
 
 
 @pytest.mark.parametrize('fn', ['_apply_authentik_ldap_routing_repair', '_ensure_authentik_ldap_outpost_on_fqdn'])
