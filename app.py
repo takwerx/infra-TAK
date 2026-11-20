@@ -54230,33 +54230,42 @@ def _cloudtak_upload_limit_heal(plog=None, remote_cfg=None, wait=False):
 
 
 # ops #969 (infra-TAK #589): CloudTAK refuses to save the schedule or the login (environment) of a
-# server-wide ETL layer. Every ETL layer infra-TAK makes is server-wide (connection 0). The UI saves
-# it with PATCH /api/connection/0/layer/ID/incoming (and /outgoing), and CloudTAK's two routes declare
-# `connectionid: Type.Integer({ minimum: 1 })` and have no connection-0 branch (Create, Delete, Update
-# Layer and Get Layer have one), so the save is refused with "Validation Error" (400, then 404 once the
-# limit is relaxed). Reported upstream as dfpc-coe/CloudTAK#2042. Until a CloudTAK release carries the
-# fix, this gives both routes the branch the sibling routes use: connection 0 is allowed for an admin
-# only, and the layer must have no connection. It edits the compiled route inside the api container
-# (a recreate brings back the original, so it runs wherever the upload-limit heal runs) and restarts
-# the api once, because node has already loaded the route. A route that already declares minimum 0 is
-# left alone (upstream fixed it), and so is any file whose shape differs from what this expects: that
-# is never counted as drift. A restart rewrites nginx.conf, so the upload-limit heal runs again
-# straight after. The script prints OK <mtime> for a patched file: the console compares that time
-# with the container's start, so a patched file that the api never reloaded (a failed restart, a
-# console stopped between the edit and the restart) is drift too, and the restart is only done while
-# the api answers (never in the middle of first-boot migrations).
+# server-wide ETL layer, and an ETL on such a layer cannot keep its session. Every ETL layer infra-TAK
+# makes is server-wide (connection 0). Two parts, both edits of compiled routes inside the api container:
+#  1. The UI saves a layer with PATCH /api/connection/0/layer/ID/incoming (and /outgoing). CloudTAK's two
+#     routes (connection-layer.js) declare `connectionid: Type.Integer({ minimum: 1 })` and have no
+#     connection-0 branch (Create, Delete, Update Layer and Get Layer have one), so the save is refused
+#     with "Validation Error" (400, then 404 once the limit is relaxed). dfpc-coe/CloudTAK#2042.
+#  2. A running ETL stores its cached session with PUT /api/connection/null/layer/ID/incoming/ephemeral:
+#     the ETL library builds the URL from the layer's connection, which is null for a server-wide layer.
+#     The two ephemeral routes (connection-layer-ephemeral.js) take only an integer of 1 or more and call
+#     Auth.is_connection, so every run fails right after the login ("Failed to put ephemeral values to
+#     ETL") and the login repeats every run. dfpc-coe/CloudTAK#2047.
+# Until a CloudTAK release carries the fixes, this gives the routes the branch their siblings use:
+# connection 0 (and, for ephemeral only, the word null the ETL library sends) is allowed for an admin
+# only, plus, for ephemeral, that layer's own ETL token; the layer must have no connection. A connection
+# token never reaches it (its id of 0 would match any connection token). The edit goes into the compiled
+# route inside the api container (a recreate brings back the original, so it runs wherever the
+# upload-limit heal runs) and the api is restarted once, because node has already loaded the routes. A
+# route that already declares minimum 0 is left alone (upstream fixed it), and so is any file whose
+# shape differs from what this expects: that is never counted as drift. A restart rewrites nginx.conf, so
+# the upload-limit heal runs again straight after. The script prints one line: OK <mtime> for a patched
+# file: the console compares that time with the container's start, so a patched file that the api never
+# reloaded (a failed restart, a console stopped between the edit and the restart) is drift too, and the
+# restart is only done while the api answers (never in the middle of first-boot migrations).
 _CT_ETL_LAYER_SH = r'''cd /home/etl/api 2>/dev/null || { echo NOCONF; exit 0; }
 F=dist/stateless/routes/connection-layer.js
 [ -f "$F" ] || { echo NOCONF; exit 0; }
 command -v node >/dev/null 2>&1 || { echo NOCONF; exit 0; }
-MODE=__MODE__ F="$F" node - <<'JS'
+MODE=__MODE__ F="$F" E=dist/stateless/routes/connection-layer-ephemeral.js node - <<'JS'
 const fs = require('fs');
 const cp = require('child_process');
-const F = process.env.F;
 const MODE = process.env.MODE;
-const t = fs.readFileSync(F, 'utf8');
 const MIN1 = 'connectionid: Type.Integer({ minimum: 1 })';
 const MIN0 = 'connectionid: Type.Integer({ minimum: 0 })';
+const SHAPE = {};
+const shape = () => { throw SHAPE; };
+// ---- connection-layer.js: PATCH incoming and outgoing (ops #969, CloudTAK#2042)
 const OLDAUTH = [
   '            const { connection } = await Auth.is_connection(config, req, {',
   '                resources: [',
@@ -54290,51 +54299,141 @@ const NEWAUTH = [
   ''].join('\n');
 const OLDCMP = 'if (layer.connection !== connection.id) {';
 const NEWCMP = 'if (connection && layer.connection !== connection.id) {';
-const shape = () => { console.log('SHAPE'); process.exit(0); };
-let out = t;
-let need = 0;
-for (const d of ['Update an incoming layer configuration', 'Update an outgoing layer configuration']) {
-  const i = out.indexOf(d);
-  if (i < 0) shape();
-  const j = out.indexOf(MIN1, i);
-  if (j < 0 || j - i > 200) {
-    const z = out.indexOf(MIN0, i);
-    if (z >= 0 && z - i <= 200) continue;   // this route already takes connection 0: upstream fixed it
-    shape();
+const DONE1 = 'connection 0 is a server-wide layer, admin only';
+function planLayer(t) {
+  let out = t;
+  let need = 0;
+  for (const d of ['Update an incoming layer configuration', 'Update an outgoing layer configuration']) {
+    const i = out.indexOf(d);
+    if (i < 0) shape();
+    const j = out.indexOf(MIN1, i);
+    if (j < 0 || j - i > 200) {
+      const z = out.indexOf(MIN0, i);
+      if (z >= 0 && z - i <= 200) continue;   // this route already takes connection 0: upstream fixed it
+      shape();
+    }
+    const k = out.indexOf(OLDAUTH, j);
+    if (k < 0 || k - j > 1500) shape();
+    out = out.slice(0, j) + MIN0 + out.slice(j + MIN1.length, k) + NEWAUTH + out.slice(k + OLDAUTH.length);
+    if (d.indexOf('incoming') >= 0) {
+      // only inside this route: the check that the layer belongs to the connection must cope with no connection
+      const c = out.indexOf(OLDCMP, j);
+      if (c < 0 || c - j > 4000) shape();
+      out = out.slice(0, c) + NEWCMP + out.slice(c + OLDCMP.length);
+    }
+    need++;
   }
-  const k = out.indexOf(OLDAUTH, j);
-  if (k < 0 || k - j > 1500) shape();
-  out = out.slice(0, j) + MIN0 + out.slice(j + MIN1.length, k) + NEWAUTH + out.slice(k + OLDAUTH.length);
-  if (d.indexOf('incoming') >= 0) {
-    // only inside this route: the check that the layer belongs to the connection must cope with no connection
-    const c = out.indexOf(OLDCMP, j);
-    if (c < 0 || c - j > 4000) shape();
-    out = out.slice(0, c) + NEWCMP + out.slice(c + OLDCMP.length);
+  return { out, need, done: t.indexOf(DONE1) >= 0 };
+}
+// ---- connection-layer-ephemeral.js: PUT incoming and outgoing ephemeral (ops #969, CloudTAK#2047)
+const UNION = "connectionid: Type.Union([Type.Integer({ minimum: 0 }), Type.Literal('null')])";
+const DONE2 = 'a server-wide layer stores its own ephemeral values';
+function oldEphAuth(kind) {
+  return [
+  '            const { connection } = await Auth.is_connection(config, req, {',
+  '                resources: [',
+  '                    { access: AuthResourceAccess.CONNECTION, id: req.params.connectionid },',
+  '                    { access: AuthResourceAccess.LAYER, id: req.params.layerid },',
+  '                ],',
+  '            }, req.params.connectionid);',
+  '            if (connection.readonly)',
+  "                throw new Err(400, null, 'Connection is Read-Only mode');",
+  '            const layer = await config.models.Layer.augmented_from(req.params.layerid);',
+  '            if (layer.connection !== connection.id) {',
+  "                throw new Err(400, null, 'Layer does not belong to this connection');",
+  '            }',
+  '            else if (!layer.' + kind + ') {',
+  ''].join('\n');
+}
+function newEphAuth(kind) {
+  return [
+  '            // ops #969 (infra-TAK #589): ' + DONE2 + '. The ETL library puts null in the URL for it',
+  '            // (0 once CloudTAK sends that): this layer\'s own ETL token or an admin, and the layer must have no connection',
+  '            let connection = null;',
+  '            let layer;',
+  "            if (req.params.connectionid === 0 || req.params.connectionid === 'null') {",
+  '                const auth = await Auth.is_auth(config, req, {',
+  '                    resources: [{ access: AuthResourceAccess.LAYER, id: req.params.layerid }],',
+  '                });',
+  '                if (auth.access !== AuthResourceAccess.LAYER) {',
+  '                    await Auth.as_user(config, req, { admin: true });',
+  '                }',
+  '                layer = await config.models.Layer.augmented_from(req.params.layerid);',
+  '                if (layer.connection !== null) {',
+  "                    throw new Err(400, null, 'Layer is not an admin layer');",
+  '                }',
+  '            }',
+  '            else {',
+  '                const auth = await Auth.is_connection(config, req, {',
+  '                    resources: [',
+  '                        { access: AuthResourceAccess.CONNECTION, id: req.params.connectionid },',
+  '                        { access: AuthResourceAccess.LAYER, id: req.params.layerid },',
+  '                    ],',
+  '                }, req.params.connectionid);',
+  '                connection = auth.connection;',
+  '                if (connection.readonly)',
+  "                    throw new Err(400, null, 'Connection is Read-Only mode');",
+  '                layer = await config.models.Layer.augmented_from(req.params.layerid);',
+  '                if (layer.connection !== connection.id) {',
+  "                    throw new Err(400, null, 'Layer does not belong to this connection');",
+  '                }',
+  '            }',
+  '            if (!layer.' + kind + ') {',
+  ''].join('\n');
+}
+function planEphemeral(t) {
+  let out = t;
+  let need = 0;
+  for (const kind of ['incoming', 'outgoing']) {
+    const i = out.indexOf("name: '" + (kind === 'incoming' ? 'Incoming' : 'Outgoing') + " Ephemeral'");
+    if (i < 0) shape();
+    const j = out.indexOf(MIN1, i);
+    if (j < 0 || j - i > 300) {
+      const z = out.indexOf(MIN0, i);
+      const u = out.indexOf(UNION, i);
+      if ((z >= 0 && z - i <= 300) || (u >= 0 && u - i <= 300)) continue;   // ours already, or upstream fixed it
+      shape();
+    }
+    const o = oldEphAuth(kind);
+    const k = out.indexOf(o, j);
+    if (k < 0 || k - j > 1500) shape();
+    out = out.slice(0, j) + UNION + out.slice(j + MIN1.length, k) + newEphAuth(kind) + out.slice(k + o.length);
+    need++;
   }
-  need++;
+  return { out, need, done: t.indexOf(DONE2) >= 0 };
 }
-if (need === 0) {
-  console.log(t.indexOf('connection 0 is a server-wide layer, admin only') >= 0
-    ? 'OK ' + Math.floor(fs.statSync(F).mtimeMs / 1000) : 'UPSTREAM');
-  process.exit(0);
-}
-if (MODE !== 'apply') { console.log('MISSING'); process.exit(0); }
-const tmp = F.replace(/\.js$/, '.ops969.' + process.pid + '.tmp.js');
-try {
-  fs.writeFileSync(tmp, out);
-  const chk = cp.spawnSync(process.execPath, ['--check', tmp]);
-  if (chk.status !== 0) {
-    console.log('FAIL');
-  } else {
+// ---- one file: SHAPE, OK <mtime>, UPSTREAM, MISSING (check), HEALED or FAIL (apply), NOCONF (not there)
+function handle(F, plan) {
+  if (!fs.existsSync(F)) return 'NOCONF';
+  const t = fs.readFileSync(F, 'utf8');
+  let p;
+  try { p = plan(t); } catch (e) { if (e === SHAPE) return 'SHAPE'; throw e; }
+  if (p.need === 0) {
+    return p.done ? 'OK ' + Math.floor(fs.statSync(F).mtimeMs / 1000) : 'UPSTREAM';
+  }
+  if (MODE !== 'apply') return 'MISSING';
+  const tmp = F.replace(/\.js$/, '.ops969.' + process.pid + '.tmp.js');
+  try {
+    fs.writeFileSync(tmp, p.out);
+    const chk = cp.spawnSync(process.execPath, ['--check', tmp]);
+    if (chk.status !== 0) return 'FAIL';
     if (!fs.existsSync(F + '.ops969.bak')) fs.copyFileSync(F, F + '.ops969.bak');
     fs.renameSync(tmp, F);
-    console.log('HEALED');
+    return 'HEALED';
+  } catch (e) {
+    return 'FAIL';
+  } finally {
+    try { fs.unlinkSync(tmp); } catch (e) { /* already renamed or never written */ }
   }
-} catch (e) {
-  console.log('FAIL');
-} finally {
-  try { fs.unlinkSync(tmp); } catch (e) { /* already renamed or never written */ }
 }
+const r = [handle(process.env.F, planLayer), handle(process.env.E, planEphemeral)].filter((x) => x !== 'NOCONF');
+const times = r.filter((x) => x.indexOf('OK ') === 0).map((x) => Number(x.split(' ')[1]));
+console.log(r.length === 0 ? 'NOCONF'
+  : r.indexOf('FAIL') >= 0 ? 'FAIL'
+  : r.indexOf('HEALED') >= 0 ? 'HEALED'
+  : r.indexOf('MISSING') >= 0 ? 'MISSING'
+  : times.length ? 'OK ' + Math.max.apply(null, times)
+  : r.indexOf('UPSTREAM') >= 0 ? 'UPSTREAM' : 'SHAPE');
 JS
 '''
 _cloudtak_etl_heal_lock = threading.Lock()
@@ -54355,8 +54454,8 @@ def _ct_etl_stale(script_out, started):
 
 
 def _cloudtak_etl_layer_heal(plog=None, remote_cfg=None, wait=False):
-    """ops #969: let an admin save the schedule and login of a server-wide ETL layer (see the block
-    comment above). Convergence like _cloudtak_upload_limit_heal: it reads the live route first and
+    """ops #969: let an admin save the schedule and login of a server-wide ETL layer, and let an ETL
+    on it store its session (see the block comment above). Convergence like _cloudtak_upload_limit_heal: it reads the live route first and
     edits it only when it still has the minimum-1 connection id, so a converged box, or a CloudTAK
     that already carries the upstream fix, is a no-op with no restart. After an edit (or when an
     earlier edit was never reloaded) it restarts the api container once, but only while the api
@@ -54439,7 +54538,7 @@ def _cloudtak_etl_layer_heal(plog=None, remote_cfg=None, wait=False):
                                         capture_output=True, text=True, timeout=120)
                     out = 'HEALED' if rs.returncode == 0 and _answers(name, 40) else 'NOAPI'
         if out == 'HEALED':
-            _log("  ✓ CloudTAK ETL layers: an admin can now save the schedule and login of a server-wide layer (api restarted once)")
+            _log("  ✓ CloudTAK ETL layers: an admin can now save the schedule and login of a server-wide layer, and its ETL keeps its session between runs (api restarted once)")
             _cloudtak_upload_limit_heal(plog=plog, remote_cfg=remote_cfg, wait=True)   # the restart rewrote nginx.conf
             return True
         if out in ('OK', 'UPSTREAM'):
@@ -54448,7 +54547,7 @@ def _cloudtak_etl_layer_heal(plog=None, remote_cfg=None, wait=False):
             _log("  ℹ CloudTAK ETL layer fix not applied: the api's layer routes differ from what it expects (left unchanged)")
             return True  # never counted as drift
         if wait or out in ('FAIL', 'NOAPI'):
-            _log(f"  ⚠ CloudTAK ETL layer fix not applied ({out or 'no answer'}); saving the schedule or login of a server-wide ETL layer may fail")
+            _log(f"  ⚠ CloudTAK ETL layer fix not applied ({out or 'no answer'}); saving the schedule or login of a server-wide ETL layer, or its ETL keeping a session, may fail")
         return False
     except Exception as e:
         _log(f"  ⚠ CloudTAK ETL layer fix error (non-fatal): {e}")
