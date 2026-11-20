@@ -136,7 +136,8 @@ def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pas
     # ops #178: the compose calls go through the locked runner; the lock is stubbed above.
     ns['_ak_compose_subprocess'] = lambda cmd, holder, plog=None, wait=None, **kw: ns['subprocess'].run(cmd, **kw)
     ns['_AK_COMPOSE_LOCK_BUSY_RC'] = 75
-    for name in ('_ensure_authentik_pgbouncer_image', '_authentik_ldap_sa_group_probe',
+    ns['_ldap_outpost_restart_watch'] = lambda reason, plog=None: contextlib.nullcontext()   # v10.4.3 W1
+    for name in ('_ensure_authentik_pgbouncer_image', '_authentik_ldap_sa_search', '_authentik_ldap_sa_group_probe',
                  '_authentik_ldap_sa_groups_settle', '_compose_set_service_image'):
         exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
     out = ns['_ensure_authentik_pgbouncer_image'](log.append)
@@ -308,7 +309,7 @@ def test_sa_password_is_never_logged(tmp_path):
 
 
 def test_probe_reads_memberof_the_way_tak_server_does():
-    src = _src('_authentik_ldap_sa_group_probe')
+    src = _src('_authentik_ldap_sa_search')    # v10.4.3 W5: the search moved here
     assert "'cn=adm_ldapservice,ou=users,dc=takldap'" in src
     assert "'ldap://127.0.0.1:389'" in src
     assert "'memberOf'" in src

@@ -407,9 +407,10 @@ class Box:
                 ns[c] = _const(c)
         ns['_tak_https_broken_alert'] = lambda *a, **k: box.alerts.append((box.t, a, k))
         ns['_tak_ldap_recycle_lock'] = threading.Lock()
+        exec(re.search(r'^_LDAP_PROBE_STEPS = \(.*?^\)\n', APP, re.S | re.M).group(0), ns)   # v10.4.3 W5
         for name in ('_epoch_from_rfc3339', '_docker_started_epoch', '_tak_started_epoch', '_tak_wait_ready',
                      '_tak_ldap_recycle_request', '_tak_recycle_after_ldap_outage',
-                     '_authentik_ldap_sa_group_probe', '_authentik_ldap_sa_groups_settle',
+                     '_authentik_ldap_sa_search', '_authentik_ldap_sa_group_probe', '_authentik_ldap_sa_groups_settle',
                      '_ldap_filter_escape', '_ldap_users_tak_groups', '_ldap_users_tak_group_counts',
                      '_tak_file_users', '_subscription_num',
                      '_tak_device_usernames', '_tak_client_sessions', '_tak_client_sessions_wait',

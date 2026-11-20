@@ -77094,32 +77094,66 @@ _PGB_SWAP_LDAP_STABLE_S = 45
 _PGB_SWAP_LDAP_EVERY_S = 5
 
 
-def _authentik_ldap_sa_group_probe(ldap_pass):
-    """One live LDAP check through the LOCAL outpost, the way TAK Server uses it: bind as
-    adm_ldapservice and read every user's memberOf. Password is never logged.
-
-    Returns (bound, tak_groups, detail): `bound` is a real bind + search (rc 0, or 4 =
-    size limit hit, which still means both worked); `tak_groups` counts memberOf values
-    naming a tak_ group.
-    """
+def _authentik_ldap_sa_search(ldap_pass, flt, size_limit):
+    """One ldapsearch as adm_ldapservice through the LOCAL outpost (users OU, memberOf only).
+    Returns (rc, users, tak_memberof, detail); rc None when ldapsearch could not run.
+    The password is never logged."""
     try:
         r = subprocess.run(
             ['ldapsearch', '-x', '-H', 'ldap://127.0.0.1:389',
              '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
-             '-b', 'ou=users,dc=takldap', '-s', 'one', '-z', '500', '(objectClass=*)', 'memberOf'],
+             '-b', 'ou=users,dc=takldap', '-s', 'one', '-z', str(size_limit), flt, 'memberOf'],
             capture_output=True, text=True, timeout=20)
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
-        return False, 0, f"ldapsearch {type(e).__name__}"
+        return None, 0, 0, f"ldapsearch {type(e).__name__}"
     lines = (r.stdout or '').splitlines()
     users = sum(1 for l in lines if l.startswith('dn: '))
     groups = sum(1 for l in lines if l.lower().startswith('memberof: cn=tak_'))
-    bound = r.returncode in (0, 4)
-    detail = f"ldapsearch rc={r.returncode}, {users} users, {groups} tak_ memberOf"
-    if not bound:
+    detail = f"ldapsearch {flt} rc={r.returncode}, {users} users, {groups} tak_ memberOf"
+    if r.returncode not in (0, 4):
         err = (r.stderr or '').strip().splitlines()
         if err:
             detail += f" ({err[-1][:80]})"
-    return bound, groups, detail
+    return r.returncode, users, groups, detail
+
+
+# v10.4.3 W5: the probe asks for a KNOWN member instead of "the first 500 users". akres E3:
+# on a box with >500 users the -z 500 page held no tak_ member (sort order), so the probe said
+# "LDAP has no groups" and the TAK heal refused to run for 25 min while LDAP was fine.
+_LDAP_PROBE_STEPS = (
+    ('(cn=webadmin)', 1, 'webadmin'),                 # infra-TAK's own admin: tak_ROLE_ADMIN
+    ('(memberOf=cn=tak_*)', 1, 'server-side filter'),  # any tak_ member, if the outpost filters
+    ('(objectClass=*)', 500, 'first 500 users'),       # the pre-W5 scan, last resort
+)
+
+
+def _authentik_ldap_sa_group_probe(ldap_pass):
+    """One live LDAP check through the LOCAL outpost, the way TAK Server uses it: bind as
+    adm_ldapservice and look for a user with tak_ groups. Password is never logged.
+
+    Returns (bound, tak_groups, detail): `bound` is a real bind + search (rc 0, or 4 =
+    size limit hit, which still means both worked); `tak_groups` counts memberOf values
+    naming a tak_ group on the first search that found any.
+
+    v10.4.3 W5: tries `_LDAP_PROBE_STEPS` in order and stops at the first with tak_ groups.
+    A failed bind on the first step is the answer (LDAP not good). A later step that errors
+    (e.g. an outpost that does not do substring matching on memberOf) is skipped, not taken
+    for a failed bind."""
+    tried = []
+    bound_any = False
+    for i, (flt, limit, what) in enumerate(_LDAP_PROBE_STEPS):
+        rc, users, groups, detail = _authentik_ldap_sa_search(ldap_pass, flt, limit)
+        if rc is None:
+            return False, 0, detail
+        ok = rc in (0, 4)
+        if not ok and (i == 0 or rc == 49):
+            return False, 0, detail          # bind / search failing: LDAP is not good
+        if ok:
+            bound_any = True
+            if groups:
+                return True, groups, f"{what}: {detail}"
+        tried.append(f"{what}: {detail}")
+    return bound_any, 0, '; '.join(tried)
 
 
 def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label, tag='pgbouncer image', stats=None):
