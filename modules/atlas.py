@@ -5666,6 +5666,59 @@ def refresh_databases(ctx, log):
     return out
 
 
+def converge_access(ctx, ak_url, ak_headers, log):
+    """ops #919: the one access policy for every deployment, after a console update.
+
+    The console's boot converge calls this, through the module spec, right after
+    `_ensure_app_access_policies`. {deployment name: ensure status, or 'skipped'
+    when its application is not in Authentik}. Never raises.
+
+    ⚠️ **Update Now has to be enough** (10.4.3 T&E, ops #984). A box on 10.4.2
+    has "Allow authentik Admins" (and, for an agency, its group bound directly)
+    on each ATLAS application. Under the Hardened posture's `all` that is the
+    agency-admin lockout of ops #979. Both the boot converge and `_restrict_to_admins`
+    read that binding as "already restricted", so before this only a press of
+    Update on the ATLAS page swapped it for the access policy.
+
+    ⚠️ **Nothing new is let in.** The agency's own group (the one 10.4.2 already
+    bound) is added; the standard group is not: only an ATLAS Update admits it,
+    after it has checked the running container (`_reconcile_roster`). A policy
+    changed by hand is reported and left; a failure leaves the old bindings
+    (`atlas_access.ensure`). The group itself is never created here.
+    """
+    import urllib.error
+    out = {}
+    try:
+        instances = load_instances(ctx)
+    except Exception as exc:
+        log('ATLAS access: could not read the deployments: %s' % str(exc)[:80])
+        return out
+    api = atlas_access.Api(ak_url, ak_headers)
+    for inst in instances:
+        names = atlas_instances.derive(inst)
+        name = names['name']
+        app_slug = atlas_instances.authentik_names(inst)['app_slug']
+
+        def say(msg, n=name):
+            log('ATLAS %s: %s' % (n, msg.strip()))
+        try:
+            try:
+                api.call('core/applications/%s/' % app_slug)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
+                # Not registered (yet): Deploy makes the policy with the app.
+                out[name] = 'skipped'
+                continue
+            add = [names['admin_group']] if names['slug'] else []
+            out[name] = atlas_access.ensure(api, app_slug, add=add,
+                                            plog=say)['status']
+        except Exception as exc:
+            say('⚠ access policy not checked: %s' % str(exc)[:80])
+            out[name] = 'failed'
+    return out
+
+
 def revocation_tick(ctx, log):
     """ATLAS W461: copy TAK Server's revoked certificates to every built
     deployment's renewal container. The container refuses renewal on a copy
@@ -6876,6 +6929,9 @@ def register(ctx):
         'tak_ca_changed': tak_ca_changed,
         # ops #755: called by the console after its own update (PostgreSQL security minors).
         'refresh_databases': refresh_databases,
+        # ops #919: called by the console's boot converge (so after its own
+        # update), to swap every ATLAS application to its one access policy.
+        'converge_access': converge_access,
         'uninstall': uninstall,
         'control_map': {
             'start':   lambda c: _compose_argv(c, 'up', '-d', 'api'),

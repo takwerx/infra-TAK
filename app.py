@@ -1673,7 +1673,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.4.3-alpha"
+VERSION = "10.4.4-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -115727,6 +115727,16 @@ def _startup_app_access_policy_converge(log=None):
             _l('Authentik API not ready — retries on next restart/deploy')
             return
         _ensure_app_access_policies(ak_url, ak_headers, plog=_l)
+        # ops #919: after it, so Update Now alone moves every ATLAS application
+        # from "Allow authentik Admins" to its one access policy. Under the
+        # Hardened posture's policy_engine_mode=all the old binding locks the
+        # agency's administrators out (ops #979).
+        try:
+            _atlas_conv = (mod_registry.MODULES.get('atlas') or {}).get('converge_access')
+            if _atlas_conv:
+                _atlas_conv(mod_registry.get_ctx(), ak_url, ak_headers, _l)
+        except Exception as _ace:
+            _l(f'ATLAS access swap error (non-fatal): {str(_ace)[:160]}')
     except Exception as _e:
         try:
             _l(f'error (non-fatal): {str(_e)[:200]}')
