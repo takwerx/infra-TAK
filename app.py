@@ -46493,7 +46493,11 @@ def _takportal_update_git(portal_dir, plog=None):
 
     if beta:
         out['ref'] = 'origin/main'
-        f = subprocess.run(_git + ['fetch', 'origin', 'main', '--force'],
+        # ops #1016: name the destination ref. Deploy's clone is `--depth 1 --branch <tag>`, so
+        # its only fetch refspec is that one tag; a bare `fetch origin main` then fills
+        # FETCH_HEAD and never creates origin/main, and the checkout below fails.
+        f = subprocess.run(_git + ['fetch', 'origin', '--force',
+                                   '+refs/heads/main:refs/remotes/origin/main'],
                            capture_output=True, text=True, timeout=180)
         if f.returncode != 0:
             err = (f.stderr or f.stdout or '').strip()[:300]
