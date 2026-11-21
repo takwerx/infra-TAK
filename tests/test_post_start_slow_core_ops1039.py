@@ -52,7 +52,8 @@ exit 0
 CURL_STUB = '''#!/bin/sh
 echo "curl $*" >> %(calls)s
 n=$(cat %(state)s/count 2>/dev/null || echo 0); n=$((n + 1)); echo $n > %(state)s/count
-if [ -e %(state)s/noport ]; then printf 000; exit 7; fi    # the port answers nothing (refused / not published)
+if [ -e %(state)s/noport ]; then printf 000; exit 7; fi    # connection refused / port not published (curl exit 7)
+if [ -e %(state)s/timeout ]; then printf 000; exit 28; fi  # the core is too slow to answer (curl exit 28)
 if [ "$n" -gt "$(cat %(state)s/thresh)" ]; then touch %(state)s/ready; printf 200; else printf 503; fi
 exit 0
 '''
@@ -115,7 +116,7 @@ def box(tmp_path):
         f.chmod(0o755)
     (tmp_path / 'uptime').write_text('26.42 99.00\n')
 
-    def run(core_ready_after=0, groups_never=False, noport=False, unhealthy=False, hard_end=None):
+    def run(core_ready_after=0, groups_never=False, noport=False, unhealthy=False, hard_end=None, timeout=False):
         """core_ready_after: how many /-/health/ready/ asks answer 503 first (None = never ready).
         noport: the probe gets no answer at all; unhealthy: Docker does not call authentik-server healthy.
         hard_end: seconds after the script start past which the core wait never goes (default 960)."""
@@ -127,6 +128,8 @@ def box(tmp_path):
             (state / 'ready').write_text('')          # the outpost works; only the probe cannot see the port
         if unhealthy:
             (state / 'unhealthy').write_text('')
+        if timeout:
+            (state / 'timeout').write_text('')
         sp = tmp_path / 'post.sh'
         src = sandbox(POST).replace('ALERT_EMAIL_PLACEHOLDER', 'ops@example.invalid')
         if hard_end is not None:
@@ -220,3 +223,12 @@ def test_the_wait_never_runs_past_the_hard_end_even_when_compose_used_the_time(b
     assert 'outpost NOT recreated' in out
     assert 'Boot sequence complete' in out
     assert calls.count('curl ') <= 3, calls               # no polling loop: asked once, then once after the (empty) wait
+
+
+def test_a_probe_that_times_out_is_a_slow_core_not_a_missing_port(box):
+    """The slow-core box: Docker says authentik-server is healthy, but the core is too slow to answer
+    /-/health/ready/ inside the probe time (curl exit 28). That is NOT ready: wait, never recreate."""
+    out, calls = box(timeout=True, groups_never=True)
+    assert 'Authentik core not ready yet' in out
+    assert 'outpost NOT recreated' in out
+    assert _recreates(calls) == [], calls
