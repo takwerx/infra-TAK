@@ -19259,11 +19259,8 @@ def _takportal_latest_tag(plog=None):
     import urllib.request as _ur
     tag = None
     try:
-        req = _ur.Request('https://api.github.com/repos/ValleyTacticalSolutions/TAK-Portal/releases/latest',
-                          headers={'Accept': 'application/vnd.github+json',
-                                   'User-Agent': 'infra-TAK'})
-        with _ur.urlopen(req, timeout=15) as r:
-            tag = (json.loads(r.read().decode()) or {}).get('tag_name')
+        # ops #1037: skips releases in TAKPORTAL_BROKEN_RELEASES.
+        tag = _takportal_newest_good_release(timeout=15)
     except Exception as e:
         if plog:
             plog(f"  Could not reach the GitHub releases API ({str(e)[:80]}) — using pinned {TAKPORTAL_REF_FALLBACK}")
@@ -44580,6 +44577,52 @@ def _takportal_version_tuple(ver):
     return tuple(parts)
 
 
+# ops #1037: TAK Portal releases that break a feature we ship. Installs, the update badge and
+# Update Now all skip a listed release and use the newest one that is not listed, so the next
+# fixed release is picked up the day it is published (no frozen pin). A box already on a listed
+# release is offered the roll back to the newest good one. The list only ever hides those tags.
+TAKPORTAL_BROKEN_RELEASES = {
+    '2.0.38': ('it removed the marketplace lint skips, so every Marketplace install, update and '
+               'uninstall fails at the CloudTAK build when a plugin ships a route file with '
+               '@ts-nocheck (d4h, cam-depot, replay and others); TAK-Portal#144'),
+}
+
+
+def _takportal_release_is_broken(tag):
+    return str(tag or '').strip().lstrip('vV') in TAKPORTAL_BROKEN_RELEASES
+
+
+def _takportal_newest_good_release(timeout=15):
+    """Newest published TAK Portal release tag that is not in TAKPORTAL_BROKEN_RELEASES, spelled
+    as upstream spelled it (a 'v' kept). None when there is none. Network errors raise: each
+    caller decides what an unreachable GitHub means (see its docstring)."""
+    import json as _json
+    import re as _re
+    # `_ur` is imported PER FUNCTION throughout this file ([[apppy-ur-per-function-import-silent-nameerror]]).
+    import urllib.request as _ur
+    shape = r'^v?\d+(\.\d+){1,3}$'
+
+    def _get(url):
+        req = _ur.Request(url, headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
+        with _ur.urlopen(req, timeout=timeout) as r:
+            return _json.loads(r.read().decode())
+
+    tag = str((_get('https://api.github.com/repos/ValleyTacticalSolutions/TAK-Portal/releases/latest')
+               or {}).get('tag_name') or '').strip()
+    if not _takportal_release_is_broken(tag):
+        return tag or None          # the caller checks its shape, exactly as before
+    best = None
+    for rel in (_get('https://api.github.com/repos/ValleyTacticalSolutions/TAK-Portal/releases?per_page=30') or []):
+        if not isinstance(rel, dict) or rel.get('draft') or rel.get('prerelease'):
+            continue
+        name = str(rel.get('tag_name') or '').strip()
+        if not _re.match(shape, name) or _takportal_release_is_broken(name):
+            continue
+        if best is None or _takportal_version_tuple(name) > _takportal_version_tuple(best):
+            best = name
+    return best
+
+
 def _takportal_head_release_tag(portal_dir):
     """The release tag the ~/TAK-Portal checkout sits on ('2.0.15'), or '' when HEAD is on no
     release tag (beta/main, a pre-tag clone, no git). Local git only — no network, no docker.
@@ -44642,13 +44685,9 @@ def _fetch_takportal_latest(*, fresh=False):
         return c.get('latest')
     c['ts'] = now
     try:
-        req = _ur.Request(
-            'https://api.github.com/repos/ValleyTacticalSolutions/TAK-Portal/releases/latest',
-            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
-        # Short timeout: this runs inline in the /takportal page render.
-        with _ur.urlopen(req, timeout=6) as resp:
-            tag = (json.loads(resp.read().decode()) or {}).get('tag_name')
-        tag = str(tag or '').strip()
+        # Short timeout: this runs inline in the /takportal page render. ops #1037: the newest
+        # release that is not in TAKPORTAL_BROKEN_RELEASES.
+        tag = str(_takportal_newest_good_release(timeout=6) or '').strip()
         if _re.match(r'^v?\d+(\.\d+){1,3}$', tag):
             c['latest'] = tag.lstrip('vV')
     except Exception as e:
@@ -44764,6 +44803,8 @@ def _get_takportal_version_info(fresh=False):
         out['latest'] = latest
         if out['version'] and _takportal_version_tuple(latest) > _takportal_version_tuple(out['version']):
             out['update_available'] = True
+        elif out['version'] and _takportal_release_is_broken(out['version']):
+            out['update_available'] = True      # ops #1037: offer the roll back to `latest`
     else:
         out['latest'] = log_latest
         out['update_available'] = log_update
@@ -46307,11 +46348,8 @@ def _takportal_release_tag_strict(portal_dir, plog=None):
     import urllib.request as _ur
     tag = ''
     try:
-        req = _ur.Request(
-            'https://api.github.com/repos/ValleyTacticalSolutions/TAK-Portal/releases/latest',
-            headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
-        with _ur.urlopen(req, timeout=15) as r:
-            tag = str((json.loads(r.read().decode()) or {}).get('tag_name') or '').strip()
+        # ops #1037: the newest release that is not in TAKPORTAL_BROKEN_RELEASES.
+        tag = str(_takportal_newest_good_release(timeout=15) or '').strip()
     except Exception as e:
         _log(f"  TAK Portal releases API unreachable ({str(e)[:100]}) — trying git tags")
     # Keep the tag EXACTLY as upstream published it (with a 'v' if they used one) —
@@ -46325,7 +46363,7 @@ def _takportal_release_tag_strict(portal_dir, plog=None):
         best, best_key = None, None
         for line in (r.stdout or '').splitlines():
             name = line.strip().rsplit('refs/tags/', 1)[-1].strip()
-            if not re.match(r'^v?\d+\.\d+\.\d+$', name):
+            if not re.match(r'^v?\d+\.\d+\.\d+$', name) or _takportal_release_is_broken(name):
                 continue
             key = _takportal_version_tuple(name)
             if best_key is None or key > best_key:
@@ -46574,8 +46612,13 @@ def _takportal_update_git(portal_dir, plog=None):
     # Beta Mode on and then turned it off converges DOWN to the newest release.
     if from_version and _takportal_version_tuple(from_version) > _takportal_version_tuple(tag):
         out['rolled_back'] = True
-        out['message'] = (f'Rolling back from {from_version} to release {tag} because '
-                          f'Beta Mode is off. Portal data is not reverted.')
+        if _takportal_release_is_broken(from_version):
+            out['message'] = (f'Rolling back from {from_version} to release {tag} because '
+                              f'{from_version} is known to break Marketplace plugin installs. '
+                              f'Portal data is not reverted.')
+        else:
+            out['message'] = (f'Rolling back from {from_version} to release {tag} because '
+                              f'Beta Mode is off. Portal data is not reverted.')
     elif from_version and _takportal_version_tuple(from_version) < _takportal_version_tuple(tag):
         out['message'] = f'Updated from {from_version} to GitHub Release {tag}.'
     else:
