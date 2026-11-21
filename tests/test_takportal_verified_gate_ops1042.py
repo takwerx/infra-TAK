@@ -242,6 +242,22 @@ def test_a_cached_file_edited_on_disk_is_not_trusted(box, keys):
     assert box.deploy_tag() == FLOOR
 
 
+def test_a_gate_box_can_test_a_release_before_it_is_signed_on_main(box, keys):
+    """The gate path: the worker signs X locally (not pushed) and puts the two files in a gate box's
+    cache folder. Deploy and the Update button then use X through the real code, while main still says
+    the older verified release (lower serial: refused as a rollback, so it cannot undo the test)."""
+    old = _doc(7, '2.0.37')
+    box.serve(old, _sign(old, keys['key'], keys['dir']))                  # main: 2.0.37, serial 7
+    cand = _doc(202611211200, '2.0.39', commit='e' * 40)                  # local gate file, newer serial
+    box.cache_file(cand, _sign(cand, keys['key'], keys['dir']))
+    assert box.deploy_tag() == '2.0.39'
+    assert box.update_tag() == '2.0.39'
+    assert box.ns['_takportal_expected_commit']('2.0.39') == 'e' * 40
+    real = _doc(202611211500, '2.0.39', commit='e' * 40)                  # later, the real signing lands on main
+    box.serve(real, _sign(real, keys['key'], keys['dir']))
+    assert box.deploy_tag() == '2.0.39' and box.settings['takportal_verified_serial'] == 202611211500
+
+
 def test_the_cached_answer_survives_github_going_away(box, keys):
     _pass(box, keys, 7, '2.0.37')
     assert box.deploy_tag() == '2.0.37'
