@@ -167,6 +167,7 @@ def _ensure(monkeypatch, tak_start):
         '_test_ldap_bind_dn_verdict': lambda dn, pw: 'ok',
         '_coreconfig_has_ldap': lambda: True,
         '_tak_started_epoch': lambda: tak_start,
+        '_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S': 300,
         '_tak_ldap_recycle_request': lambda reason, need_groups=True, restart=False: events.append(
             ('request', reason, restart)),
     }
@@ -183,6 +184,14 @@ def test_console_recreate_under_a_just_started_tak_asks_for_a_tak_restart_gh616(
     [req] = [e for e in events if e[0] == 'request']
     assert req[2] is True and 'recreated the LDAP outpost' in req[1]
     assert events.index(('recreate', 'ldap-sa-recreate')) < events.index(req)
+
+
+def test_console_recreate_under_an_older_tak_asks_for_the_usual_heal_first_gh616(monkeypatch):
+    """TAK up 2 days: the outage check already covers this; the request keeps its heal-first path
+    (restart only as the fallback), so a recreate does not drop every client for nothing."""
+    events = _ensure(monkeypatch, tak_start=T0 - 2 * 24 * HOUR)
+    [req] = [e for e in events if e[0] == 'request']
+    assert req[2] is False
 
 
 def test_no_restart_request_when_tak_is_not_running_gh616(monkeypatch):

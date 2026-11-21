@@ -86408,11 +86408,16 @@ def _ensure_authentik_ldap_service_account():
         # replaced. Field: after this recreate (boot heal, TAK up 1 min) TAK gave ~99 % of its
         # streaming clients no groups for 8 h, and nothing healed it: the outage check skips an
         # outpost start under a TAK up < 5 min as a box boot. An explicit request has no such
-        # gate; it restarts TAK once LDAP answers again (or at the end of a running update).
+        # gate. Under a TAK that young it asks for a restart (its clients have only just
+        # connected); under an older TAK the usual heal runs first, restart only as its fallback
+        # (the same as the outage check does). Carried out once LDAP answers again, or at the
+        # end of a running console update.
         try:
-            if _coreconfig_has_ldap() and _tak_started_epoch() is not None:
+            _tak_start = _tak_started_epoch() if _coreconfig_has_ldap() else None
+            if _tak_start is not None:
+                _tak_young = time.time() - _tak_start < _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S
                 _tak_ldap_recycle_request('the console recreated the LDAP outpost (service-account '
-                                          'password resync) under a running TAK Server', restart=True)
+                                          'password resync) under a running TAK Server', restart=_tak_young)
         except Exception:
             pass
         # 6. Ensure ldapsearch is available (install ldap-utils / openldap-clients if missing)
