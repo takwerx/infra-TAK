@@ -78383,10 +78383,11 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             _finish('deferred: LDAP not healthy', keep=reasons)
             return False
 
-        # ops #126: heal the connections first; restart TAK only if that can't work, or if
-        # CoreConfig's LDAP credential changed (TAK reads it only at start).
+        # ops #126: heal the connections first; restart TAK only if that can't work, or if the
+        # request needs a restart (CoreConfig's LDAP credential changed, which TAK reads only at
+        # start; GH #616: an outpost recreate under a young TAK, or most clients stuck).
         if must_restart:
-            verdict, summary = 'restart', "CoreConfig's LDAP credential changed; TAK Server loads it only at start"
+            verdict, summary = 'restart', "a TAK Server restart was asked for (LDAP credential changed, outpost recreated under a young TAK, or most clients stuck)"
         else:
             try:
                 verdict, summary = _tak_heal_ldap_sessions(plog, tag, ldap_pass)
