@@ -70054,6 +70054,57 @@ def _idp_bridge_portal_file(path):
         return None
 
 
+# ops #1010: TAK Portal main keeps agencies and agency templates in its Postgres
+# (tables `agencies`, `agency_templates`). On first boot it imports the old JSON
+# files and renames them into data/migrated/, so `cat data/agencies.json` fails on
+# every current portal. These two SELECTs return the SAME shape the JSON files had
+# (camelCase keys), so every consumer below keeps working unchanged.
+_IDP_PORTAL_AGENCIES_SQL = (
+    "SELECT coalesce(json_agg(json_build_object("
+    "'suffix', suffix, 'name', name, 'type', type, 'groupPrefix', group_prefix, "
+    "'color', color, 'usernameTokenPlacement', username_token_placement, "
+    "'isActive', is_active) ORDER BY suffix), '[]'::json) FROM agencies")
+_IDP_PORTAL_TEMPLATES_SQL = (
+    "SELECT coalesce(json_agg(json_build_object("
+    "'name', name, 'agencySuffix', agency_suffix, 'role', role, "
+    "'groups', groups, 'isDefault', is_default) ORDER BY name), '[]'::json) "
+    "FROM agency_templates")
+
+
+def _idp_bridge_portal_db(sql):
+    """Run one JSON-returning SELECT in the TAK Portal Postgres container.
+    A list ([] included: an empty table is a true answer) or None when the
+    container is missing, the exec fails, times out or does not return a list."""
+    try:
+        db = next((c['name'] for c in _takportal_project_containers(all_states=False)
+                   if c.get('service') == 'postgres'), None)
+        if not db:
+            return None
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'exec', db, 'psql', '-U', 'takportal', '-d', 'takportal',
+                        '-tA', '-c', sql]),
+            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return None
+        data = json.loads((r.stdout or '').strip())
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
+
+
+def _idp_bridge_portal_lists():
+    """(agencies, templates) from TAK Portal. Each is a list, or None when the portal
+    cannot be read (the ONLY case callers may call 'not reachable'). Postgres first
+    (current portal); the JSON files only as a fallback for an older portal that has
+    not migrated yet."""
+    agencies = _idp_bridge_portal_db(_IDP_PORTAL_AGENCIES_SQL)
+    templates = _idp_bridge_portal_db(_IDP_PORTAL_TEMPLATES_SQL)
+    if not isinstance(agencies, list) or not isinstance(templates, list):
+        agencies = _idp_bridge_portal_file('/usr/src/app/data/agencies.json')
+        templates = _idp_bridge_portal_file('/usr/src/app/data/agency-templates.json')
+    return agencies, templates
+
+
 def _idp_ak_list(ak_url, ak_headers, path):
     """GET an Authentik list endpoint following pagination; path may carry a query."""
     results, page = [], 1
@@ -70202,8 +70253,7 @@ def _idp_bridge_reconcile(slug, bridge):
         summary['skipped'] = True
         warn('Authentik token unavailable (is Authentik installed?)')
         return summary
-    agencies = _idp_bridge_portal_file('/usr/src/app/data/agencies.json')
-    templates = _idp_bridge_portal_file('/usr/src/app/data/agency-templates.json')
+    agencies, templates = _idp_bridge_portal_lists()
     if not isinstance(agencies, list) or not isinstance(templates, list):
         summary['skipped'] = True
         warn('tak-portal container not readable — sync skipped')
@@ -70518,8 +70568,7 @@ def idp_bridge_status_api():
     incoming groups w/ member counts + mapped template, warnings). Also serves
     the wizard pick-lists (portal agencies + templates). No secrets in here."""
     cfg = _idp_bridges_load()
-    agencies = _idp_bridge_portal_file('/usr/src/app/data/agencies.json')
-    templates = _idp_bridge_portal_file('/usr/src/app/data/agency-templates.json')
+    agencies, templates = _idp_bridge_portal_lists()
     portal_ok = isinstance(agencies, list) and isinstance(templates, list)
     out_bridges = {}
     for slug, b in (cfg.get('bridges') or {}).items():
@@ -70604,7 +70653,7 @@ def idp_bridge_create_api():
     suffix = (d.get('agency_suffix') or '').strip()
     if not re.match(r'^[a-zA-Z0-9_-]{1,32}$', suffix):
         return jsonify({'ok': False, 'error': 'invalid agency'}), 400
-    agencies = _idp_bridge_portal_file('/usr/src/app/data/agencies.json')
+    agencies, _templates = _idp_bridge_portal_lists()
     if not isinstance(agencies, list):
         return jsonify({'ok': False, 'error': 'TAK Portal not reachable (is it installed and running?)'}), 400
     agency = next((a for a in agencies if isinstance(a, dict) and a.get('suffix') == suffix), None)
