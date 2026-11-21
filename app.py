@@ -77406,6 +77406,23 @@ def _docker_started_epoch(container):
     return _epoch_from_rfc3339(parts[1])
 
 
+def _ldap_outpost_local_state():
+    """GH #616: the local LDAP outpost as (running, started epoch or None, health): health is
+    '' when the container has no healthcheck. (False, None, '') when it can't be inspected."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f',
+                                       '{{.State.Running}} {{.State.StartedAt}} '
+                                       '{{if .State.Health}}{{.State.Health.Status}}{{end}}',
+                                       'authentik-ldap-1']),
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return False, None, ''
+    parts = (r.stdout or '').split()
+    if r.returncode != 0 or len(parts) < 2 or parts[0] != 'true':
+        return False, None, ''
+    return True, _epoch_from_rfc3339(parts[1]), (parts[2] if len(parts) > 2 else '')
+
+
 def _ak_container_env_value(container, key):
     """`key`'s value in `container`'s environment ('' if it isn't set), or None when the
     container can't be inspected (missing, remote Authentik, docker error)."""
@@ -78393,10 +78410,11 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             _finish('deferred: LDAP not healthy', keep=reasons)
             return False
 
-        # ops #126: heal the connections first; restart TAK only if that can't work, or if
-        # CoreConfig's LDAP credential changed (TAK reads it only at start).
+        # ops #126: heal the connections first; restart TAK only if that can't work, or if the
+        # request needs a restart (CoreConfig's LDAP credential changed, which TAK reads only at
+        # start; GH #616: an outpost recreate under a young TAK, or most clients stuck).
         if must_restart:
-            verdict, summary = 'restart', "CoreConfig's LDAP credential changed; TAK Server loads it only at start"
+            verdict, summary = 'restart', "a TAK Server restart was asked for (LDAP credential changed, outpost recreated under a young TAK, or most clients stuck)"
         else:
             try:
                 verdict, summary = _tak_heal_ldap_sessions(plog, tag, ldap_pass)
@@ -78591,8 +78609,31 @@ def _authentik_reconfigure_heal_tak_clients(plog, before=None):
 # back the same way is not worth dropping everybody for, so it is retried at most hourly.
 _TAK_STUCK_UNNAMED_MIN_S = 600
 _TAK_STUCK_UNNAMED_COOLDOWN_S = 3600
+# GH #616: "a client that comes back the same way is not worth dropping everybody for" holds for
+# one client. Field (Nov 20): after the console recreated the LDAP outpost under a TAK up 1 min,
+# TAK gave ~99 % of its 55-60 clients no user and no groups; this check dropped 538 connections
+# in 8 h, every client came back the same way, and nothing escalated or alerted. A TAK restart
+# fixed it at once. So when at least _MASS_MIN connections AND at least _MASS_PCT % of all of
+# them are stuck while LDAP answers, TAK's own LDAP path is broken: restart TAK once (at most
+# every _MASS_RESTART_GAP_S) and send the Guard Dog alert email.
+# AJ (Nov 20, "mission critical"): not 20 min. The whole stack (TAK, Authentik, LDAP, groups) gets
+# _MASS_DEADLINE_S after TAK Server starts to come up. A dedicated thread checks every
+# _MASS_TICK_S; _MASS_CHECKS stuck checks in a row (about 3 min) restart TAK, never before TAK has
+# been up _MASS_DEADLINE_S, so a normal slow boot is left alone. Cost when healthy: one read of
+# TAK's subscription list a minute (the same call the 10-min check makes); LDAP is read only while
+# most clients are stuck. Inside the 6-h gap a new stuck state sends the alert only (at most
+# hourly), never a second restart.
+_TAK_STUCK_MASS_MIN = 3
+_TAK_STUCK_MASS_PCT = 50
+_TAK_STUCK_MASS_TICK_S = 60
+_TAK_STUCK_MASS_CHECKS = 3
+_TAK_STUCK_MASS_DEADLINE_S = 300
+_TAK_STUCK_MASS_RESTART_GAP_S = 21600
+_TAK_STUCK_MASS_ALERT_GAP_S = 3600
 _tak_stuck_unnamed_seen = {}    # connection uid → epoch first seen with no user and no groups
 _tak_stuck_unnamed_dropped = {}  # device uid (else '' = any connection without one) → epoch of our last drop
+# GH #616: the 1-minute check's memory: stuck checks in a row, since when, for which TAK start.
+_tak_stuck_mass = {'streak': 0, 'since': 0.0, 'tak_start': None}
 
 
 def _tak_drop_stuck_unnamed_sessions(plog):
@@ -78612,6 +78653,7 @@ def _tak_drop_stuck_unnamed_sessions(plog):
             del _tak_stuck_unnamed_seen[uid]
     for uid in stuck:
         _tak_stuck_unnamed_seen.setdefault(uid, now)
+    # (GH #616: most clients stuck at once is the 1-minute `_tak_stuck_mass_check`, not this.)
     # test12 2026-11-08: TAK gives a connection it never looked up no device uid either, and its
     # number changes at every reconnect, so neither can hold the hourly limit. Without a device
     # uid they all share one slot: a client that keeps coming back this way is dropped once an hour.
@@ -78638,6 +78680,164 @@ def _tak_drop_stuck_unnamed_sessions(plog):
         plog(f"  {tag}: dropped {len(dropped)} connection(s) TAK gave no user and no groups for "
              f"{_TAK_STUCK_UNNAMED_MIN_S // 60}+ min ({', '.join(dropped[:15])}); the clients reconnect and are looked up again")
     return dropped
+
+
+def _tak_stuck_mass_check(plog):
+    """GH #616: one run of the 1-minute stuck-phones check. When at least `_TAK_STUCK_MASS_MIN`
+    connections, and at least `_TAK_STUCK_MASS_PCT` % of all of them, have no user and no groups
+    while LDAP gives users their groups, count one stuck check. `_TAK_STUCK_MASS_CHECKS` in a row,
+    with TAK up `_TAK_STUCK_MASS_DEADLINE_S` or more and no console update running, hand it to
+    `_tak_stuck_mass_escalate` (one restart, else the alert only, at most hourly). A new TAK start, a healthy
+    check or LDAP not answering starts the count over; an unreadable client list counts nothing.
+    Returns what was done: 'restart', 'alert' or None."""
+    tag = 'TAK stuck-phones check'
+    st = _tak_stuck_mass
+
+    def _reset():
+        st.update(streak=0, since=0.0)
+
+    if not os.path.exists('/opt/tak/CoreConfig.xml'):
+        _reset()
+        return None
+    tak_start = _tak_started_epoch()
+    if tak_start is None:
+        _reset()
+        return None
+    if st.get('tak_start') is None or abs(tak_start - st['tak_start']) > 1:
+        _reset()                  # a count is about one TAK start; a restarted TAK starts over
+        st['tak_start'] = tak_start
+    sessions = _tak_client_sessions()
+    if sessions is None:
+        return None               # a busy API is not a verdict: keep the count, add nothing
+    stuck = [x for x in sessions if x['unnamed'] and not x['groups']]
+    if len(stuck) < _TAK_STUCK_MASS_MIN or len(stuck) * 100 < len(sessions) * _TAK_STUCK_MASS_PCT:
+        if st['streak']:
+            plog(f"  {tag}: clients have their groups again (was stuck {st['streak']} check(s) in a row)")
+        _reset()
+        return None
+    if not _coreconfig_has_ldap():
+        _reset()
+        return None
+    ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+    if not ldap_pass or not _ensure_ldapsearch() or _ldap_users_tak_groups(ldap_pass, None) is None:
+        if st['streak']:
+            plog(f"  {tag}: LDAP does not answer — the LDAP outage heal owns this, not a TAK restart")
+        _reset()
+        return None               # a restart would load the same broken LDAP
+    now = time.time()
+    st['streak'] += 1
+    st['since'] = st['since'] or now
+    if st['streak'] == 1:
+        plog(f"  {tag}: {len(stuck)} of {len(sessions)} TAK client connections have no user and no "
+             f"groups while LDAP answers — checking every {_TAK_STUCK_MASS_TICK_S} s; "
+             f"{_TAK_STUCK_MASS_CHECKS} in a row restart TAK Server")
+    if (st['streak'] < _TAK_STUCK_MASS_CHECKS or now - tak_start < _TAK_STUCK_MASS_DEADLINE_S
+            or _console_update_in_progress()):
+        return None
+    done = _tak_stuck_mass_escalate(plog, len(stuck), len(sessions),
+                                    max(1, int((now - st['since']) // 60)), int((now - tak_start) // 60))
+    if done == 'restart':
+        _reset()
+        st['tak_start'] = None
+    return done
+
+
+def _tak_stuck_mass_loop():
+    log = lambda m: print(f"[tak-stuck-check] {m}", flush=True)
+    while True:
+        time.sleep(_TAK_STUCK_MASS_TICK_S)
+        try:
+            _tak_stuck_mass_check(log)
+        except Exception as e:
+            log(f"error (non-fatal): {str(e)[:200]}")
+
+
+def _tak_stuck_mass_escalate(plog, n_stuck, n_total, minutes, tak_up_min):
+    """GH #616: most of TAK's connections have had no user and no groups for `minutes` while
+    LDAP answers. Restart TAK once (through the LDAP recycle, which checks LDAP again first) and
+    send the Guard Dog alert email. At most one restart per `_TAK_STUCK_MASS_RESTART_GAP_S`;
+    inside that gap send the alert only (at most once per `_TAK_STUCK_MASS_ALERT_GAP_S`), so a
+    TAK that comes back stuck is never restarted in a loop. Returns 'restart', 'alert' or None
+    (alert already sent this hour)."""
+    tag = 'TAK stuck-phones check'
+    try:
+        state = dict(load_settings().get('tak_stuck_mass') or {})
+    except Exception:
+        state = {}
+    now = time.time()
+    last = float(state.get('restart_epoch') or 0)
+    detail = (f"{n_stuck} of {n_total} TAK client connections had no user and no groups for "
+              f"{minutes}+ min while LDAP gave users their groups (TAK Server up {tak_up_min} min)")
+
+    def _save(**kw):
+        try:
+            s = load_settings()
+            cur = dict(s.get('tak_stuck_mass') or {})
+            cur.update(kw, stuck=n_stuck, total=n_total)
+            s['tak_stuck_mass'] = cur
+            save_settings(s)
+        except Exception:
+            pass
+
+    if now - last < _TAK_STUCK_MASS_RESTART_GAP_S:
+        ago = int((now - last) // 60)
+        if now - float(state.get('alert_epoch') or 0) < _TAK_STUCK_MASS_ALERT_GAP_S:
+            return None
+        _save(alert_epoch=now)
+        plog(f"  ✗ {tag}: {detail}. TAK Server was already restarted for this {ago} min ago; at most "
+             f"one restart per {_TAK_STUCK_MASS_RESTART_GAP_S // 3600} h — NOT restarting again, alert sent")
+        _tak_stuck_clients_alert(plog, 'TAK Server NOT restarted again', detail, restarted_min_ago=ago)
+        return 'alert'
+    _save(restart_epoch=now)   # the restart mail does not hold back a "still stuck" mail
+    plog(f"  ✗ {tag}: {detail}. TAK Server's own LDAP lookups are broken — restarting TAK Server once")
+    _tak_ldap_recycle_request(f'most TAK clients stuck with no groups ({n_stuck} of {n_total})', restart=True)
+    try:
+        restarted = _tak_recycle_after_ldap_outage(plog, tag, check_outpost=False)
+    except Exception as e:
+        plog(f"  {tag}: TAK LDAP recycle error: {str(e)[:120]}")
+        restarted = False
+    outcome = ('TAK Server restarted' if restarted else
+               'TAK Server restart asked for; the console does it within 10 min once LDAP answers')
+    _tak_stuck_clients_alert(plog, outcome, detail, after_boot=tak_up_min < 30)
+    return 'restart'
+
+
+def _tak_stuck_clients_alert(plog, outcome, detail, after_boot=False, restarted_min_ago=None):
+    """GH #616: Guard Dog email: TAK Server was restarted (or, inside the 6-h gap, was NOT
+    restarted again) because most phones had no groups. Activity log line always, email when a
+    recipient is set. Never raises."""
+    when = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    try:
+        _write_priv('/var/log/takguard/restarts.log',
+                    ' '.join(f"{when} | tak-stuck-clients | {outcome} | {detail}".split()) + '\n', mode='a')
+    except Exception as e:
+        plog(f"  TAK stuck-phones check: Guard Dog activity line not written: {str(e)[:120]}")
+    try:
+        settings = load_settings()
+        to_addr = (settings.get('guarddog_alert_email') or '').strip()
+        if not to_addr:
+            plog("  TAK stuck-phones check: Guard Dog alert email SUPPRESSED (no recipient configured)")
+            return
+        ident = _guarddog_server_identifier(settings) or socket.gethostname()
+        if restarted_min_ago is None:
+            subj = f"⚠ TAK Server restarted: phones had no groups ({ident})"
+            body = (f"Phones had no groups{' after a reboot' if after_boot else ''}. Guard Dog restarted "
+                    f"TAK Server.\n\nPhones (ATAK, iTAK, WinTAK) were connected but had no groups, so they "
+                    f"could not see each other. Login (LDAP) was working. Phones reconnect by themselves "
+                    f"after the restart.\n\nResult: {outcome}\nDetail: {detail}\n\nIf phones still see "
+                    f"nobody in 5 minutes, open the TAK Server page and restart TAK Server."
+                    f"\n\nConsole: {ident}\n\n— Guard Dog")
+        else:
+            subj = f"⚠ Phones have no groups again: TAK Server NOT restarted ({ident})"
+            body = (f"Phones have no groups again. Guard Dog restarted TAK Server {restarted_min_ago} min "
+                    f"ago for the same problem and restarts it at most once every "
+                    f"{_TAK_STUCK_MASS_RESTART_GAP_S // 3600} hours, so it did not restart it again.\n\n"
+                    f"Open the TAK Server page and restart TAK Server. If phones still have no groups "
+                    f"after that, open the Authentik page and check the LDAP outpost.\n\n"
+                    f"Detail: {detail}\n\nConsole: {ident}\n\n— Guard Dog")
+        _guarddog_send_alert_email_via_relay(to_addr, subj, body)
+    except Exception as e:
+        plog(f"  TAK stuck-phones check: Guard Dog alert email failed: {str(e)[:120]}")
 
 
 # New-user enrollment race (root cause of ops #565, nuc 2026-11-09). The LDAP provider runs
@@ -86376,6 +86576,22 @@ def _ensure_authentik_ldap_service_account():
                                         cwd=os.path.expanduser('~/authentik'), capture_output=True, timeout=60)
             if _r.returncode == _AK_COMPOSE_LOCK_BUSY_RC:
                 return False, f'LDAP outpost recreate {_r.stdout.decode()}'
+        # GH #616: a running TAK Server's pooled LDAP connections went to the outpost just
+        # replaced. Field: after this recreate (boot heal, TAK up 1 min) TAK gave ~99 % of its
+        # streaming clients no groups for 8 h, and nothing healed it: the outage check skips an
+        # outpost start under a TAK up < 5 min as a box boot. An explicit request has no such
+        # gate. Under a TAK that young it asks for a restart (its clients have only just
+        # connected); under an older TAK the usual heal runs first, restart only as its fallback
+        # (the same as the outage check does). Carried out once LDAP answers again, or at the
+        # end of a running console update.
+        try:
+            _tak_start = _tak_started_epoch() if _coreconfig_has_ldap() else None
+            if _tak_start is not None:
+                _tak_young = time.time() - _tak_start < _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S
+                _tak_ldap_recycle_request('the console recreated the LDAP outpost (service-account '
+                                          'password resync) under a running TAK Server', restart=_tak_young)
+        except Exception:
+            pass
         # 6. Ensure ldapsearch is available (install ldap-utils / openldap-clients if missing)
         _ensure_ldapsearch()
         # 7. Wait for LDAP outpost ready, then VERIFY with authoritative ldapsearch
@@ -115242,8 +115458,42 @@ _v0_9_12_rep_patched = _startup_fix_reputation_policy_drift()
 # user password from .env + force-recreate LDAP outpost) when the probe fails.
 _STARTUP_LDAP_AK_WAIT_S = 600   # ops #438: how long the boot heal waits for Authentik to answer
 _STARTUP_LDAP_TRANSIENT = ('Connection reset', 'Connection refused', '502', '503', 'timed out')
+# GH #616 (field, Nov 20, reboot 15 min after an update): Authentik's HTTP answered, so the heal
+# probed the bind 23 s after the outpost started. The outpost refused it (it resolved groups only
+# ~100 s after its start), the heal took that for password drift, reset the password and
+# recreated the outpost twice under a TAK Server that had just started — and TAK gave ~99 % of
+# its streaming clients no groups for 8 h. So the LOCAL outpost must be running, healthy and up
+# this long before a bind result counts, and a failed bind counts as drift only when it still
+# fails on every one of the confirm probes, spaced this far apart. Real drift doesn't go away by
+# itself, so waiting costs nothing; a starting outpost always does.
+_STARTUP_LDAP_OUTPOST_UP_S = 120
+_STARTUP_LDAP_FAIL_CONFIRM = 3
+_STARTUP_LDAP_FAIL_GAP_S = 60
 # Set when the boot heal is finished; the 5-min watchdog waits for it so the two never heal at once.
 _startup_ldap_resync_done = threading.Event()
+
+
+def _startup_ldap_outpost_wait(deadline):
+    """GH #616: wait (until epoch `deadline`) for the local LDAP outpost to be running,
+    healthy (when it has a healthcheck), up `_STARTUP_LDAP_OUTPOST_UP_S` and listening on 389 (ops #1017).
+    Returns (True, '') once it is, else (False, why)."""
+    why = 'not checked'
+    while True:
+        running, started, health = _ldap_outpost_local_state()
+        now = time.time()
+        if not running or started is None:
+            why = 'LDAP outpost not running'
+        elif health and health != 'healthy':
+            why = f'LDAP outpost {health}'
+        elif now - started < _STARTUP_LDAP_OUTPOST_UP_S:
+            why = f'LDAP outpost up only {int(now - started)}s'
+        elif not _local_ldap_outpost_listening():
+            why = 'LDAP outpost not listening'   # ops #1017
+        else:
+            return True, ''
+        if now >= deadline:
+            return False, why
+        time.sleep(10)
 
 
 def _startup_resync_ldap_service_account():
@@ -115261,7 +115511,8 @@ def _startup_resync_ldap_service_account():
         # still answered its outpost with 502/503, and the heal died on "Connection reset by
         # peer". At boot the bind fails because Authentik is starting, not because of drift, so
         # wait for it first (the same check the ops #214 watchdogs use). Background thread.
-        if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+        local_ak = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
+        if local_ak:
             ak_deadline = time.time() + _STARTUP_LDAP_AK_WAIT_S
             while (_authentik_busy_reason() or not _local_authentik_http_ok()) and time.time() < ak_deadline:
                 time.sleep(10)
@@ -115269,25 +115520,41 @@ def _startup_resync_ldap_service_account():
                 print(f"Startup migration: Authentik not answering after {_STARTUP_LDAP_AK_WAIT_S}s — "
                       f"leaving the LDAP service account to the 5-min watchdog")
                 return
-            # ops #1017 (test12 and a cloud box, real reboots, Nov 20): Authentik's web side answers
-            # before the LDAP outpost is back (post-start starts the outpost last). ldapsearch then
-            # says "Can't contact LDAP server", which the verdict reads as a failed bind, so every
-            # reboot ran a needless password set plus an outpost recreate. Wait until the outpost
-            # listens, then judge the bind.
-            while not _local_ldap_outpost_listening() and time.time() < ak_deadline:
-                time.sleep(10)
-            if not _local_ldap_outpost_listening():
-                print(f"Startup migration: LDAP outpost not listening after {_STARTUP_LDAP_AK_WAIT_S}s — "
+            # GH #616: Authentik answering is not the outpost being ready. ops #1017 (real reboots on
+            # test12 and a cloud box): post-start starts the outpost last, and ldapsearch against an
+            # outpost that is not back says "Can't contact LDAP server", which the verdict reads as a
+            # failed bind. So the outpost must also listen before the bind is judged.
+            settled, why = _startup_ldap_outpost_wait(ak_deadline)
+            if not settled:
+                print(f"Startup migration: LDAP outpost not settled after {_STARTUP_LDAP_AK_WAIT_S}s ({why}) — "
                       f"leaving the LDAP service account to the 5-min watchdog")
                 return
 
         # Probe: does the bind work today? If yes, idempotent no-op (unless the
         # reputation policy was just patched — in that case TAK Server has been
         # hitting denials and a restart clears any degraded JVM state).
-        try:
-            verdict = _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', env_pass)
-        except Exception:
-            verdict = 'inconclusive'
+        def _probe():
+            try:
+                return _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', env_pass)
+            except Exception:
+                return 'inconclusive'
+
+        verdict = _probe()
+        # GH #616: a failed bind is drift only if it keeps failing on a settled outpost. The heal
+        # resets the password and recreates the outpost under TAK Server — never on one refusal.
+        tries = 1
+        while verdict == 'fail' and local_ak and tries < _STARTUP_LDAP_FAIL_CONFIRM:
+            print(f"Startup migration: LDAP service account bind failed (probe {tries} of "
+                  f"{_STARTUP_LDAP_FAIL_CONFIRM}) — checking again in {_STARTUP_LDAP_FAIL_GAP_S}s before "
+                  f"treating it as password drift")
+            time.sleep(_STARTUP_LDAP_FAIL_GAP_S)
+            settled, why = _startup_ldap_outpost_wait(time.time() + _STARTUP_LDAP_AK_WAIT_S)
+            if not settled:
+                print(f"Startup migration: LDAP outpost not settled ({why}) — not a password drift; "
+                      f"leaving the LDAP service account to the 5-min watchdog")
+                return
+            verdict = _probe()
+            tries += 1
 
         healing_performed = bool(globals().get('_v0_9_12_rep_patched', False))
 
@@ -122162,6 +122429,12 @@ try:
     threading.Thread(target=_ak_directory_watch_loop, daemon=True, name='ak-directory-watch').start()
 except Exception as _e:
     print(f"[startup] failed to start Authentik directory watch (non-fatal): {_e}", flush=True)
+
+# GH #616: most phones stuck with no groups while LDAP answers → one TAK restart, checked every minute.
+try:
+    threading.Thread(target=_tak_stuck_mass_loop, daemon=True, name='tak-stuck-check').start()
+except Exception as _e:
+    print(f"[startup] failed to start TAK stuck-phones check (non-fatal): {_e}", flush=True)
 
 # v10.0.6: in-process scheduled TAK snapshots (replaces the never-functional systemd
 # timer). Reads tak_snapshot_schedule live each tick — no-op while disabled or when

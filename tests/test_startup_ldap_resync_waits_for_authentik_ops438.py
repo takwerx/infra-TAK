@@ -32,9 +32,13 @@ class Boot:
     """Runs _startup_resync_ldap_service_account against a fake box. `ak` is the sequence of
     Authentik answers (True = answers); the last one repeats."""
 
-    def __init__(self, ak=(True,), verdicts=('ok',), resync=((True, 'ok'),), compose=True, outpost=(True,)):
+    def __init__(self, ak=(True,), verdicts=('ok',), resync=((True, 'ok'),), compose=True, outpost=None,
+                 verdict_at=None, listening=(True,)):
+        # GH #616: `outpost(t)` = the local outpost's (running, started, health) at time t (default:
+        # up and healthy for hours); ops #1017: `listening` = the outpost's port-389 answers in turn;
+        # `verdict_at(t)` = the bind verdict at time t (overrides `verdicts`).
         self.ak = list(ak)
-        self.outpost = list(outpost)
+        self.listening = list(listening)
         self.verdicts = list(verdicts)
         self.resync = list(resync)
         self.events = []
@@ -51,12 +55,15 @@ class Boot:
             return a
 
         def outpost_up():
-            a = self.outpost.pop(0) if len(self.outpost) > 1 else self.outpost[0]
+            a = self.listening.pop(0) if len(self.listening) > 1 else self.listening[0]
             self.events.append(('outpost', a))
             return a
 
         def verdict(dn, pw):
-            v = self.verdicts.pop(0) if len(self.verdicts) > 1 else self.verdicts[0]
+            if verdict_at is not None:
+                v = verdict_at(clock[0])
+            else:
+                v = self.verdicts.pop(0) if len(self.verdicts) > 1 else self.verdicts[0]
             self.events.append(('probe', v))
             return v
 
@@ -83,7 +90,10 @@ class Boot:
             '_ensure_authentik_ldap_service_account': ensure,
             '_resync_ldap_credential_to_coreconfig': lambda: (False, ''),
             '_tak_recycle_after_ldap_outage': lambda *a, **k: self.events.append(('recycle',)),
+            '_ldap_outpost_local_state': (lambda: outpost(clock[0])) if outpost else
+                                         (lambda: (True, clock[0] - 36000, 'healthy')),
         }
+        self.clock = clock
         exec(compile(CONSTS + '\n' + _fn('_startup_resync_ldap_service_account'),
                      'app.py:_startup_resync_ldap_service_account', 'exec'), self.ns)
 
@@ -102,8 +112,9 @@ def test_boot_heal_probes_the_bind_only_after_authentik_answers_ops438():
 
 
 def test_boot_heal_retries_once_when_authentik_resets_the_connection_ops438():
-    # The field error, then Authentik answers: the second try heals.
-    b = Boot(verdicts=('fail', 'ok'), resync=((False, FIELD_ERR), (True, 'password set'))).go()
+    # The field error, then Authentik answers: the second try heals. (GH #616: a failed bind
+    # counts as drift only after it failed on every confirm probe, so three fails come first.)
+    b = Boot(verdicts=('fail', 'fail', 'fail', 'ok'), resync=((False, FIELD_ERR), (True, 'password set'))).go()
     assert [e for e in b.events if e[0] == 'resync'] == [('resync', False), ('resync', True)]
     assert any('resync OK' in line for line in b.out)
     assert not any('resync incomplete' in line for line in b.out)
@@ -139,7 +150,7 @@ def test_boot_heal_waits_for_the_ldap_outpost_not_only_authentik_ops1017():
     # Field, test12 and a cloud box, real reboots Nov 20: Authentik answers, the outpost is not back yet,
     # ldapsearch says "Can't contact LDAP server", the verdict is 'fail', and every reboot ran a password
     # set plus an outpost recreate. With the outpost still down at the first probe, nothing may be healed.
-    b = Boot(outpost=(False, False, False, True), verdicts=('fail', 'ok')).go()
+    b = Boot(listening=(False, False, False, True), verdicts=('fail', 'ok')).go()
     first_probe = next(i for i, e in enumerate(b.events) if e[0] == 'probe')
     assert ('outpost', True) in b.events[:first_probe]
     assert b.events[first_probe] == ('probe', 'fail')  # the probe now runs after the outpost listens
@@ -147,7 +158,7 @@ def test_boot_heal_waits_for_the_ldap_outpost_not_only_authentik_ops1017():
 
 
 def test_boot_heal_leaves_it_to_the_watchdog_when_the_outpost_never_listens_ops1017():
-    b = Boot(outpost=(False,)).go()
+    b = Boot(listening=(False,)).go()
     assert not any(e[0] in ('probe', 'resync') for e in b.events)
     assert any('LDAP outpost not listening' in line and '5-min watchdog' in line for line in b.out)
     assert b.ns['_startup_ldap_resync_done'].is_set()
