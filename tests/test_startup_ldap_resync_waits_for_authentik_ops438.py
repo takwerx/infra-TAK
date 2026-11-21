@@ -32,7 +32,10 @@ class Boot:
     """Runs _startup_resync_ldap_service_account against a fake box. `ak` is the sequence of
     Authentik answers (True = answers); the last one repeats."""
 
-    def __init__(self, ak=(True,), verdicts=('ok',), resync=((True, 'ok'),), compose=True):
+    def __init__(self, ak=(True,), verdicts=('ok',), resync=((True, 'ok'),), compose=True, outpost=None,
+                 verdict_at=None):
+        # GH #616: `outpost(t)` = the local outpost's (running, started, health) at time t (default:
+        # up and healthy for hours); `verdict_at(t)` = the bind verdict at time t (overrides `verdicts`).
         self.ak = list(ak)
         self.verdicts = list(verdicts)
         self.resync = list(resync)
@@ -50,7 +53,10 @@ class Boot:
             return a
 
         def verdict(dn, pw):
-            v = self.verdicts.pop(0) if len(self.verdicts) > 1 else self.verdicts[0]
+            if verdict_at is not None:
+                v = verdict_at(clock[0])
+            else:
+                v = self.verdicts.pop(0) if len(self.verdicts) > 1 else self.verdicts[0]
             self.events.append(('probe', v))
             return v
 
@@ -76,7 +82,10 @@ class Boot:
             '_ensure_authentik_ldap_service_account': ensure,
             '_resync_ldap_credential_to_coreconfig': lambda: (False, ''),
             '_tak_recycle_after_ldap_outage': lambda *a, **k: self.events.append(('recycle',)),
+            '_ldap_outpost_local_state': (lambda: outpost(clock[0])) if outpost else
+                                         (lambda: (True, clock[0] - 36000, 'healthy')),
         }
+        self.clock = clock
         exec(compile(CONSTS + '\n' + _fn('_startup_resync_ldap_service_account'),
                      'app.py:_startup_resync_ldap_service_account', 'exec'), self.ns)
 
@@ -95,8 +104,9 @@ def test_boot_heal_probes_the_bind_only_after_authentik_answers_ops438():
 
 
 def test_boot_heal_retries_once_when_authentik_resets_the_connection_ops438():
-    # The field error, then Authentik answers: the second try heals.
-    b = Boot(verdicts=('fail', 'ok'), resync=((False, FIELD_ERR), (True, 'password set'))).go()
+    # The field error, then Authentik answers: the second try heals. (GH #616: a failed bind
+    # counts as drift only after it failed on every confirm probe, so three fails come first.)
+    b = Boot(verdicts=('fail', 'fail', 'fail', 'ok'), resync=((False, FIELD_ERR), (True, 'password set'))).go()
     assert [e for e in b.events if e[0] == 'resync'] == [('resync', False), ('resync', True)]
     assert any('resync OK' in line for line in b.out)
     assert not any('resync incomplete' in line for line in b.out)
