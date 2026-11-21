@@ -199,9 +199,12 @@ def _render_card(key, v):
 def test_card_shows_whats_new_next_to_update(key):
     link = 'https://github.com/x/y/releases/tag/v1.2.3'
     html = _render_card(key, {'version': '1.0.0', 'update_available': True, 'release_notes_url': link})
-    assert 'href="%s"' % link in html
+    assert 'data-url="%s"' % link in html
     assert "What's new" in html
-    assert 'rel="noopener noreferrer"' in html and 'target="_blank"' in html
+    assert 'class="whats-new-link"' in html
+    # The module card is itself an <a href>. An <a> inside it makes the browser close the card's link
+    # early and push the rest out of the card (seen on test12, Nov 21), so the card may hold none.
+    assert '<a ' not in html and '</a>' not in html
 
 
 @pytest.mark.parametrize('key', ['takportal', 'cloudtak', 'authentik', 'mediamtx', 'netbird', 'webodm'])
@@ -210,6 +213,14 @@ def test_card_has_no_link_without_an_update_or_url(key):
     assert "What's new" not in _render_card(key, {'version': '1.0.0', 'update_available': False,
                                                   'release_notes_url': link})
     assert "What's new" not in _render_card(key, {'version': '1.0.0', 'update_available': True})
+
+
+def test_card_markup_holds_no_anchor_whatever_the_state():
+    for v in ({'version': '1', 'update_available': True, 'release_notes_url': 'https://github.com/x/y/releases'},
+              {'version': '1', 'update_available': False},
+              {'version': '1', 'update_available': True}):
+        for key in ('takportal', 'cloudtak', 'authentik', 'mediamtx', 'netbird', 'webodm'):
+            assert '<a ' not in _render_card(key, v)
 
 
 def test_card_escapes_the_url():
@@ -252,9 +263,9 @@ def test_refresh_adds_the_link_for_a_github_url():
     link = 'https://github.com/dfpc-coe/CloudTAK/releases/tag/v13.117.2'
     out = _refresh({'cloudtak': {'version': '13.117.0', 'latest': '13.117.2', 'update_available': True,
                                  'release_notes_url': link}})['module-version-cloudtak']
-    assert 'href="%s"' % link in out
+    assert 'data-url="%s"' % link in out
     assert 'What\'s new' in out
-    assert 'rel="noopener noreferrer"' in out
+    assert '<a ' not in out and '</a>' not in out
 
 
 @pytest.mark.parametrize('bad', ['javascript:alert(1)', 'http://github.com/x', 'https://evil.example/x',
@@ -262,7 +273,7 @@ def test_refresh_adds_the_link_for_a_github_url():
 def test_refresh_refuses_any_url_that_is_not_https_github(bad):
     out = _refresh({'takportal': {'version': '2.0.1', 'update_available': True,
                                   'release_notes_url': bad}})['module-version-takportal']
-    assert 'What\'s new' not in out and 'href' not in out
+    assert 'What\'s new' not in out and 'data-url' not in out
 
 
 def test_refresh_hides_the_link_when_the_update_is_done():
@@ -351,3 +362,56 @@ def test_pages_are_given_the_link_by_their_routes():
     assert 'portal_release_notes_url=portal_release_notes_url' in APP
     assert "ct_vinfo = _with_release_notes_url('cloudtak', ct_vinfo)" in APP
     assert "ak_version_info=_with_release_notes_url('authentik', _get_authentik_version_info())" in APP
+
+
+# ── the click handler: opens github.com in a new tab, and never also follows the card's own link ──
+
+def _click(event_js, url):
+    """Run the page's openWhatsNew(e) with a fake element carrying data-url=url and a fake event."""
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('no node on PATH, so the click handler is unexercised')
+    program = ('var __opened = [], __flags = [];\n'
+               'var window = {open: function(){ __opened.push([].slice.call(arguments)); }};\n'
+               'var document = {addEventListener: function(){}};\n'
+               '%s\n'
+               'var el = {getAttribute: function(n){ return n === "data-url" ? %s : null; }};\n'
+               'var other = {closest: function(){ return null; }};\n'
+               'function ev(type, key, hit){ return {type: type, key: key, target: {closest: function(sel){ return hit ? el : null; }},'
+               ' preventDefault: function(){ __flags.push("prevent"); }, stopPropagation: function(){ __flags.push("stop"); }}; }\n'
+               '%s\n'
+               'console.log(JSON.stringify({opened: __opened, flags: __flags}));\n'
+               % (_function(CONSOLE, 'openWhatsNew'), json.dumps(url), event_js))
+    r = subprocess.run([node, '-'], input=program, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[-2000:]
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+def test_click_opens_the_release_page_in_a_new_tab_and_stops_the_card_link():
+    link = 'https://github.com/goauthentik/authentik/releases/tag/version%2F2026.8.6'
+    got = _click('openWhatsNew(ev("click", "", true));', link)
+    assert got['opened'] == [[link, '_blank', 'noopener,noreferrer']]
+    assert 'prevent' in got['flags'] and 'stop' in got['flags']
+
+
+def test_click_elsewhere_in_the_card_is_left_alone():
+    got = _click('openWhatsNew(ev("click", "", false));', 'https://github.com/x/y/releases')
+    assert got == {'opened': [], 'flags': []}
+
+
+def test_enter_and_space_open_it_and_other_keys_do_not():
+    link = 'https://github.com/x/y/releases'
+    assert len(_click('openWhatsNew(ev("keydown", "Enter", true));', link)['opened']) == 1
+    assert len(_click('openWhatsNew(ev("keydown", " ", true));', link)['opened']) == 1
+    assert _click('openWhatsNew(ev("keydown", "Tab", true));', link) == {'opened': [], 'flags': []}
+
+
+@pytest.mark.parametrize('bad', ['javascript:alert(1)', 'http://github.com/x', 'https://evil.example/x', '', 'data:x'])
+def test_click_refuses_a_url_that_is_not_https_github(bad):
+    got = _click('openWhatsNew(ev("click", "", true));', bad)
+    assert got['opened'] == []
+
+
+def test_the_page_wires_the_handler_to_click_and_keydown():
+    assert "document.addEventListener('click',openWhatsNew);" in CONSOLE
+    assert "document.addEventListener('keydown',openWhatsNew);" in CONSOLE
