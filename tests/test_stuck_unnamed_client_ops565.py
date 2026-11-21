@@ -26,9 +26,11 @@ that way 10 minutes (two ticks); the client reconnects and is looked up again. N
 restart. Same fake box as test_tak_ldap_recycle.
 """
 
+import re
+
 import pytest
 
-from test_tak_ldap_recycle import (Box, HOUR, T0, _const, _src, healthy_box, outage_box, sess)
+from test_tak_ldap_recycle import (APP, Box, HOUR, T0, _const, _src, healthy_box, outage_box, sess)
 
 TICK = 600   # the monitor's period
 
