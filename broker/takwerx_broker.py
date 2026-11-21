@@ -5202,7 +5202,11 @@ TAKPORTAL_HARDENED_MIN_VERSION = (2, 0, 19)
 #             replaces the four `[ -d "$ct" ]` checks and dies unless `$ct/api/package.json`
 #             exists, so a fabricated leftover tree is refused. It only refuses more: no new
 #             command, path, privilege or caller input (8 changed lines, diff read by the ops
-#             worker Sat Nov 21, 2026; ops #1043). Security review: see ops #1043.
+#             worker Sat Nov 21, 2026; ops #1043). Reviewed by Security Sat Nov 21, 2026 (ops #1043):
+#             safe to pin. Two old risks it still carries (also in v3 and v4, tracked by Security
+#             separately, not blockers): `reclaim` does `mkdir -p` and `chown -R` below a checkout
+#             the portal user owns (accepted in ops #295), and `rebuild` lets the portal user build
+#             from compose files it owns.
 TAKPORTAL_HELPER_SHA256 = frozenset({
     'c240a12aa8978e106c94c0303a0e116f3e08dff0ba7c6a9273c0422ad92e3bb4',
     '4d093f4b834bda8ad712c5df4155929dd9b40f4d14ecded0cdd01b84d14c4559',
