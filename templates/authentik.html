@@ -1244,7 +1244,7 @@ document.addEventListener('DOMContentLoaded', function() {
         avail++;
         opts+='<option value="'+escAttr(a.suffix)+'">'+esc(a.name)+' ('+esc(a.groupPrefix)+')</option>';
       });
-      if(!avail){opts='<option value="">- all agencies connected -</option>';}
+      if(!avail){opts='<option value="">'+((D.agencies||[]).length?'- all agencies connected -':'- no agencies in TAK Portal yet -')+'</option>';}
       sel.innerHTML=opts;if(cur){sel.value=cur;}
       idpbPreview();
     }
