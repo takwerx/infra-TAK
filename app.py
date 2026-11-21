@@ -53357,7 +53357,17 @@ MEDIA_INFRA_MULTIARCH = True
 # postgis/postgis publishes amd64 only; imresamu/postgis (the docker-postgis maintainer's
 # mirror, already what arm64 boxes ran via _patch_cloudtak_compose_ports) carries the same tag
 # with an arm64 build. Both checked on Docker Hub 2026-10-20.
-POSTGIS_IMAGE = 'postgis/postgis:17-3.6-alpine'
+# ops #1013 (2026-11-20): postgis/postgis STOPPED rebuilding 17-3.6 on 2026-10-26 when PostGIS 3.7
+# shipped, the same way it stopped 17-3.4. The amd64 17-3.6-alpine image stayed at PostgreSQL 17.11
+# (and Alpine krb5-libs 1.22.2, libxslt 1.1.43-r3, libexpat 2.9.0) while PostgreSQL 17.12 (Nov 12,
+# about 60 fixes) went out; 17-3.7-alpine (pushed 2026-11-14/16) holds PostgreSQL 17.12 and krb5
+# 1.22.3. So amd64 moves to 17-3.7-alpine. imresamu/postgis has NO 17-3.7 tag yet (only 17-3.6 and
+# older minors, rebuilt 2026-11-16: PostgreSQL 17.12, PostGIS 3.6.1, krb5 1.22.3), so arm64 stays
+# on its 17-3.6 build; its amd64 entry is stale (2026-02-09), which is why amd64 does not use it.
+# Same PG major again: the data volume is used as-is, and PostGIS 3.6 → 3.7 is an extension
+# update that _cloudtak_postgis_extensions_upgrade() runs once the new container is up. When
+# imresamu publishes a 17-3.7 tag, move POSTGIS_IMAGE_ARM64 to it so both arches match.
+POSTGIS_IMAGE = 'postgis/postgis:17-3.7-alpine'
 POSTGIS_IMAGE_ARM64 = 'imresamu/postgis:17-3.6-alpine'
 
 # ops #202: containers that make outbound TLS trust the HOST's CA bundle, not the one baked
