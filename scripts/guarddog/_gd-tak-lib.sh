@@ -116,11 +116,18 @@ gd_ldap_groups_ok() {
 # building) answers "not ready" for minutes, and in that time no LDAP outpost can resolve
 # groups, however often it is recreated. Recreating it then only restarts it into the same
 # not-ready core and resets the connections TAK's API holds to it. rc 0 = ready, 1 = not.
+# No answer at all (connection refused: the server has not opened its port yet, or the port is
+# not published on this box) falls back to Docker's own health verdict for authentik-server, so a
+# box where the probe cannot reach the port never holds the boot for the whole budget.
 gd_ak_core_ready() {
   local _code
   _code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 \
            'http://127.0.0.1:9090/-/health/ready/' 2>/dev/null)"
-  [ "$_code" = "200" ]
+  [ "$_code" = "200" ] && return 0
+  if [ -z "$_code" ] || [ "$_code" = "000" ]; then
+    docker ps --filter name=authentik-server --format '{{.Status}}' 2>/dev/null | grep -q healthy && return 0
+  fi
+  return 1
 }
 
 # --- PostgreSQL access (local single-server only; two-server scripts keep their

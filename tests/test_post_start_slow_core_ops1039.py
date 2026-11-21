@@ -38,10 +38,11 @@ GD = REPO / 'scripts' / 'guarddog'
 POST = (GD / 'tak-post-start.sh').read_text()
 LIB = (GD / '_gd-tak-lib.sh').read_text()
 
+# `docker ps --filter ...` says healthy unless state/unhealthy exists (a server still starting)
 DOCKER_STUB = '''#!/bin/sh
 echo "docker $*" >> %(calls)s
 case "$*" in
-  "ps --filter"*) echo "Up 2 minutes (healthy)" ;;
+  "ps --filter"*) if [ -e %(state)s/unhealthy ]; then echo "Up 10 seconds (health: starting)"; else echo "Up 2 minutes (healthy)"; fi ;;
   inspect*) exit 1 ;;
 esac
 exit 0
@@ -51,6 +52,7 @@ exit 0
 CURL_STUB = '''#!/bin/sh
 echo "curl $*" >> %(calls)s
 n=$(cat %(state)s/count 2>/dev/null || echo 0); n=$((n + 1)); echo $n > %(state)s/count
+if [ -e %(state)s/noport ]; then printf 000; exit 7; fi    # the port answers nothing (refused / not published)
 if [ "$n" -gt "$(cat %(state)s/thresh)" ]; then touch %(state)s/ready; printf 200; else printf 503; fi
 exit 0
 '''
@@ -99,7 +101,7 @@ def box(tmp_path):
 
     (gd / '_gd-tak-lib.sh').write_text(sandbox(LIB))
     (gd / 'send-alert-email.sh').write_text('#!/bin/sh\necho "alert-mail $*" >> %s\ncat >/dev/null\n' % calls)
-    (stubs / 'docker').write_text(DOCKER_STUB % {'calls': calls})
+    (stubs / 'docker').write_text(DOCKER_STUB % {'calls': calls, 'state': state})
     (stubs / 'curl').write_text(CURL_STUB % {'calls': calls, 'state': state})
     (stubs / 'ldapsearch').write_text(LDAPSEARCH_STUB % {'calls': calls, 'state': state})
     (stubs / 'timeout').write_text(TIMEOUT_STUB)
@@ -113,11 +115,17 @@ def box(tmp_path):
         f.chmod(0o755)
     (tmp_path / 'uptime').write_text('26.42 99.00\n')
 
-    def run(core_ready_after=0, groups_never=False):
-        """core_ready_after: how many /-/health/ready/ asks answer 503 first (None = never ready)."""
+    def run(core_ready_after=0, groups_never=False, noport=False, unhealthy=False):
+        """core_ready_after: how many /-/health/ready/ asks answer 503 first (None = never ready).
+        noport: the probe gets no answer at all; unhealthy: Docker does not call authentik-server healthy."""
         (state / 'thresh').write_text(str(100000 if core_ready_after is None else core_ready_after))
         if groups_never:
             (state / 'groups-never').write_text('')
+        if noport:
+            (state / 'noport').write_text('')
+            (state / 'ready').write_text('')          # the outpost works; only the probe cannot see the port
+        if unhealthy:
+            (state / 'unhealthy').write_text('')
         sp = tmp_path / 'post.sh'
         sp.write_text(sandbox(POST).replace('ALERT_EMAIL_PLACEHOLDER', 'ops@example.invalid'))
         env = {'PATH': '%s:/usr/bin:/bin:/usr/sbin:/sbin' % stubs, 'HOME': str(home),
@@ -181,3 +189,20 @@ def test_a_ready_core_with_a_broken_outpost_is_still_recreated(box):
     ready = max(i for i, l in enumerate(lines) if l.startswith('curl '))
     assert ready < lines.index('docker compose up -d --force-recreate ldap')
     assert 'Boot sequence complete' in out
+
+
+def test_a_port_that_answers_nothing_falls_back_to_dockers_health_and_does_not_hold_the_boot(box):
+    """The probe cannot reach 9090 (not published here). Docker says authentik-server is healthy: the
+    boot goes on at once instead of waiting out the whole budget."""
+    out, calls = box(noport=True)
+    assert 'core not ready' not in out
+    assert 'LDAP outpost resolving groups' in out
+    assert _recreates(calls) == []
+    assert 'Boot sequence complete' in out
+
+
+def test_a_port_that_answers_nothing_and_a_starting_server_is_still_waited_for(box):
+    out, calls = box(noport=True, unhealthy=True, groups_never=True)
+    assert 'Authentik core not ready yet' in out
+    assert 'outpost NOT recreated' in out
+    assert _recreates(calls) == [], calls
