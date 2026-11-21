@@ -96,7 +96,8 @@ def _ns(**extra):
 def _git_ns(tag='2.0.15', run=None):
     n = _ns(_takportal_beta_mode=lambda: False,
             _module_checkout_ownership_selfheal=lambda d, plog=None: (False, ''),
-            _takportal_release_tag_strict=lambda d, plog=None: tag)
+            _takportal_release_tag_strict=lambda d, plog=None: tag,
+            _takportal_expected_commit=lambda t: '')   # ops #1042: no signed commit to check here
     if run is not None:
         n['subprocess'] = types.SimpleNamespace(run=run, CompletedProcess=subprocess.CompletedProcess)
     exec(compile(GIT, 'app.py', 'exec'), n)
