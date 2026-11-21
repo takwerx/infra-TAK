@@ -1,0 +1,60 @@
+name: CodeQL
+
+# ops #1014: GitHub's own static analysis (CodeQL) on every PR into dev and main, again on dev and
+# main after each merge, and weekly. Results go to the repo's code scanning page (Security tab,
+# visible to people with write access only). Alerts are private: never quote one in a public
+# issue or PR.
+#
+# Three analyses, one per language set, none of them needs a build:
+#   python                  the console, modules, broker, tools (about 440 files)
+#   javascript-typescript   templates' scripts, the CloudTAK plugin, the ETL shim, Node-RED build
+#   actions                 the workflow files themselves (script injection, unpinned actions)
+#
+# NOT a required check yet. It must run clean once on dev before anything makes it required; do
+# not add it to checks-ok in pr-checks.yml or to a ruleset until then.
+#
+# Public repo, GitHub-hosted runner, no secrets, no cost on a public repo.
+# Run it by hand: Actions tab, CodeQL, Run workflow.
+on:
+  pull_request:
+    branches: [dev, main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [dev, main]
+  schedule:
+    - cron: '23 14 * * 3'   # Wednesdays, 6:23 AM PT (7:23 AM in summer)
+  workflow_dispatch:
+
+concurrency:
+  # PRs by number, other runs by branch, so a push to dev never cancels a PR run.
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Nothing is writable by default; the one job below asks for what it needs.
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read            # reads the workflow run to label the analysis
+      security-events: write   # uploads the results to code scanning
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          category: /language:${{ matrix.language }}
