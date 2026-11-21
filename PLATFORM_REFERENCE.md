@@ -256,6 +256,19 @@ Official: [sharp, installation](https://sharp.pixelplumbing.com/install) (the im
   - The flags the v2 level adds that we check: `popcnt`, `sse4_1`, `sse4_2` (in `/proc/cpuinfo`). ARM boxes are not affected.
   - Official docs and what we saw differ on detail: the sharp install page lists only "CPU with SSE4.2" for Linux x64 and does not mention x86-64-v2 or POPCNT, while the error text above names v2. We check the whole v2 set to be safe. The error text was seen; whether sharp enforces every v2 flag was not tested.
 
+## GitHub release pages (the "What's new" link)
+
+Official: [GitHub, linking to a release](https://docs.github.com/repositories/releasing-projects-on-github/linking-to-releases)
+
+- A release page is `https://github.com/OWNER/REPO/releases/tag/TAG`, and `.../releases/latest` redirects to the newest published release. Each upstream names its tags differently, so the console builds the TAG itself and never takes a URL from a module. ✅ verified 2026-11-21 (`git ls-remote --tags`; the Authentik link also opened on a test box console):
+  - Authentik: `version/2026.8.6` (the slash goes in the URL as `%2F`).
+  - CloudTAK `v13.117.2`, NetBird `v0.82.1`, NetBird dashboard `v2.96.1`, WebODM `v4.0.1`, MediaMTX `v1.21.4`: a `v` in front of the version.
+  - TAK Portal: no `v` (`2.0.29`), so the console links `releases/latest`.
+- Caddy and fail2ban update from OS packages, and TAK Server and Federation Hub from tak.gov, so there is no public release page for the version they will install. No link is shown for them.
+- The dashboard module card is itself a link (`<a class="module-card">`). A link inside it makes the browser close the card's link early and push the inner link out of the card. ✅ verified 2026-11-21, Chrome, a test12 console page. The card's "What's new" is a span that opens the page from a click handler.
+
+---
+
 ## Adding to this file
 
 1. Put the fact under the product it belongs to. If the product has no section, add one with its official source.
