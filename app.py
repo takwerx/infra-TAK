@@ -48245,8 +48245,8 @@ def takportal_ssh_status():
                 'CloudTAK marketplace helper not granted: ' + (_h.get('reason') or 'not installed') + '.')
             # A TAK Portal that ships a helper infra-TAK has not pinned. It runs as root, so
             # infra-TAK keeps the pinned one it has until the new bytes are reviewed. Pinned
-            # so far: 2.0.19-2.0.22 and 2.0.29-2.0.36 (apply-caddyfile validates as the caddy user,
-            # ops #340; 2.0.31/2.0.32 ops #538; 2.0.33-2.0.36 ops #848); the 2.0.23-2.0.28 helpers (checked 2.0.24, 2.0.26, 2.0.28) are not, and on those Deploy To Caddy cannot write a
+            # so far: 2.0.19-2.0.22 and 2.0.29-2.0.39 (apply-caddyfile validates as the caddy user,
+            # ops #340; 2.0.31/2.0.32 ops #538; 2.0.33-2.0.38 ops #848; 2.0.39 ops #1043); the 2.0.23-2.0.28 helpers (checked 2.0.24, 2.0.26, 2.0.28) are not, and on those Deploy To Caddy cannot write a
             # root-owned Caddyfile. A Portal NEWER than the last pinned one waits for the next infra-TAK update.
             if _h.get('unreviewed') or 'not reviewed' in (_h.get('reason') or ''):
                 row('Marketplace helper', 'na', 'newer version not reviewed yet',
@@ -48254,7 +48254,7 @@ def takportal_ssh_status():
                     'so infra-TAK keeps the older one. Marketplace steps that need the newer helper '
                     '(for example "Deploy To Caddy", which may fail with "Could not back up '
                     '/etc/caddy/Caddyfile") stay off. On TAK Portal 2.0.23 to 2.0.28, update TAK Portal '
-                    'to 2.0.29 or newer. On a Portal newer than 2.0.36 they wait for the next infra-TAK '
+                    'to 2.0.29 or newer. On a Portal newer than 2.0.39 they wait for the next infra-TAK '
                     'update, which adds the new helper after review. Repair will not change this.')
         elif grant.get('present'):
             row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (does not match this release)',
