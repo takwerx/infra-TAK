@@ -199,10 +199,10 @@
                             </button>
                         </div>
 
-                        <div class='d-flex gap-1 align-items-center'>
+                        <div class='d-flex flex-wrap gap-1 align-items-center'>
                             <select
                                 v-model='presetName'
-                                class='form-select form-select-sm'
+                                class='form-select form-select-sm w-100'
                                 :disabled='busy || running'
                             >
                                 <option value=''>
@@ -218,16 +218,17 @@
                                 </option>
                             </select>
                             <button
-                                class='btn btn-sm btn-outline-primary text-nowrap'
+                                class='btn btn-sm btn-outline-primary text-nowrap flex-fill'
                                 :disabled='busy || running || !presetName'
+                                :title='presetHome ? "Runs where the scenario was made, and brings the map there" : "This scenario has no saved location — it runs around the middle of the map"'
                                 @click='doRunPreset'
                             >
-                                Run at map center
+                                {{ presetHome ? 'Run at its location' : 'Run at map center' }}
                             </button>
                             <button
-                                class='btn btn-sm btn-outline-secondary text-nowrap'
+                                class='btn btn-sm btn-outline-secondary text-nowrap flex-fill'
                                 :disabled='busy || running || !presetName'
-                                title='Start a live session with this scenario already placed at the map center — move units, add or remove them, then save it as a new layout'
+                                :title='(presetHome ? "Start a live session with this scenario placed where it was made" : "Start a live session with this scenario placed at the map center") + " — move units, add or remove them, then save it as a new layout"'
                                 @click='doOpenForEditing'
                             >
                                 Open for editing
@@ -388,6 +389,17 @@
                                     class='form-control form-control-sm'
                                     style='width:70px'
                                 >
+                                <label
+                                    class='form-check form-check-inline mb-0'
+                                    title='While this unit flies an orbit, the cone looks at the orbit center instead of straight ahead (a helicopter keeping its FLIR on the scene)'
+                                >
+                                    <input
+                                        v-model='form.aimCenter'
+                                        type='checkbox'
+                                        class='form-check-input'
+                                    >
+                                    <span class='form-check-label'>Aim at orbit center</span>
+                                </label>
                             </template>
                         </div>
                         <div
@@ -972,7 +984,7 @@ const channelWarning = computed(() => {
 // ── add-unit form ─────────────────────────────────────────────────────────────
 const form = reactive({
     kind: 'ground', callsign: 'ALPHA 1', team: 'Cyan', altFt: 0, speedKt: 3,
-    sensorOn: false, fov: 60, rangeM: 1000, sweep: 0, videoOn: false, stream: '', lat: '', lon: '',
+    sensorOn: false, fov: 60, rangeM: 1000, sweep: 0, aimCenter: false, videoOn: false, stream: '', lat: '', lon: '',
     // v10.1.62: hidden targets, team-marker choice, detection
     silent: false, detectedType: '', eud: true,
     detectOn: false, detKinds: ['air', 'sea', 'ground'] as DetectKind[], detErr: 50, detPct: 100,
@@ -1181,6 +1193,19 @@ function mapCenter(): LatLon {
     return { lat: c.lat, lon: c.lng };
 }
 
+// The selected scenario's home location: a saved layout or a scenario written around a real
+// place runs there, not around whatever the map happens to show.
+const presetHome = computed<LatLon | null>(() => {
+    const c = scenarios.value.find(s => s.name === presetName.value)?.center;
+    return c && Number.isFinite(c.lat) && Number.isFinite(c.lon) ? c : null;
+});
+
+function flyToRun(c: LatLon | null | undefined) {
+    if (!c) return;
+    const map = getMap();
+    map.flyTo({ center: [c.lon, c.lat], zoom: Math.max(map.getZoom(), 14) });
+}
+
 async function doStartLive() {
     const r = await guarded(() => startLive({
         center: mapCenter(), tempo: tempo.value,
@@ -1199,11 +1224,13 @@ async function doStartLive() {
 async function doOpenForEditing() {
     const src = scenarios.value.find(s => s.name === presetName.value);
     if (!src) return;
+    const home = presetHome.value;
     const r = await guarded(() => startLive({
-        center: mapCenter(), tempo: tempo.value, from: src.name, recenter: true,
+        center: home ?? mapCenter(), tempo: tempo.value, from: src.name, recenter: !home,
         confirm_exercise: confirmNeeded.value ? confirmText.value.trim() : undefined,
     }));
     if (r) {
+        if (home) flyToRun(r.center ?? home);
         confirmNeeded.value = '';
         confirmText.value = '';
         openedFrom.value = { name: src.name, title: src.title || src.name };
@@ -1216,11 +1243,13 @@ async function doOpenForEditing() {
 }
 
 async function doRunPreset() {
+    const home = presetHome.value;
     const r = await guarded(() => startRun({
-        scenario: presetName.value, center: mapCenter(), tempo: tempo.value,
+        scenario: presetName.value, center: home ?? mapCenter(), tempo: tempo.value,
         confirm_exercise: confirmNeeded.value ? confirmText.value.trim() : undefined,
     }));
     if (r) {
+        if (home) flyToRun(r.center ?? home);
         confirmNeeded.value = '';
         confirmText.value = '';
         openedFrom.value = null;
@@ -1266,6 +1295,7 @@ function spawnCmd(at: LatLon): Cmd {
     };
     if (form.sensorOn) {
         c.sensor = { fov: form.fov, range_m: form.rangeM, sweep_deg_s: form.sweep };
+        if (form.aimCenter) c.sensor.aim = 'orbit_center';
         const d = detectFromForm();
         if (d) c.sensor.detect = d;
     }

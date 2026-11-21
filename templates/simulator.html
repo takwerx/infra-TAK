@@ -121,7 +121,8 @@ table.lanes{width:100%;border-collapse:collapse;font-size:12px}table.lanes th{fo
     <span id="uploadMsg" class="note"></span>
     <a href="https://github.com/takwerx/infra-TAK/blob/main/docs/SIMULATOR.md" target="_blank" rel="noopener" class="note" style="margin-left:auto;color:var(--cyan)">Scenario format ↗</a>
   </div>
-  <div class="grid3" style="margin-bottom:14px">
+  <div id="homeRow" class="note" style="display:none;margin-bottom:14px"></div>
+  <div class="grid3" id="aoFields" style="margin-bottom:14px">
     <div>
       <label class="form-label">Area of operations</label>
       <select class="form-select" id="cityPick" onchange="pickCity()"></select>
@@ -150,7 +151,7 @@ table.lanes{width:100%;border-collapse:collapse;font-size:12px}table.lanes th{fo
     <input class="form-input" id="exConfirm" style="margin-top:8px" placeholder="">
   </div>
   <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
-    <button class="btn btn-primary" id="btnStart" onclick="runStart()"><span class="material-symbols-outlined" style="font-size:16px">play_arrow</span>Start</button>
+    <button class="btn btn-primary" id="btnStart" onclick="runStart()"><span aria-hidden="true" style="font-size:12px">&#9654;</span>Start</button>
     <button class="btn btn-secondary" id="btnPause" onclick="runCtl('pause')" disabled>Pause</button>
     <button class="btn btn-secondary" id="btnResume" onclick="runCtl('resume')" disabled>Resume</button>
     <button class="btn btn-danger" id="btnStop" onclick="runCtl('stop')" disabled>Stop</button>
@@ -211,7 +212,7 @@ function poll(){
 }
 {% else %}
 const CITIES=[['Nashville, TN',36.16,-86.78],['Denver, CO',39.74,-104.99],['Phoenix, AZ',33.45,-112.07],['Washington, DC',38.89,-77.03],['Los Angeles, CA',34.05,-118.24],['Chicago, IL',41.88,-87.63],['Houston, TX',29.76,-95.37],['Seattle, WA',47.61,-122.33],['Miami, FL',25.77,-80.19],['Anchorage, AK',61.22,-149.90],['Honolulu, HI',21.31,-157.86],['Stockholm, SE',59.33,18.07],['London, UK',51.51,-0.13],['Sydney, AU',-33.87,151.21]];
-let scenarios=[], channels=[], selected=null, statusTimer=null, lastState='idle';
+let scenarios=[], channels=[], selected=null, statusTimer=null, lastState='idle', aoOverride=false;
 function pickCity(){ const v=document.getElementById('cityPick').value; if(v==='custom') return; const c=CITIES[+v]; document.getElementById('lat').value=c[1]; document.getElementById('lon').value=c[2]; }
 function initCities(){ const s=document.getElementById('cityPick'); s.innerHTML=CITIES.map((c,i)=>'<option value="'+i+'">'+esc(c[0])+'</option>').join('')+'<option value="custom">Custom (type coordinates)</option>';
   try{ const saved=JSON.parse(localStorage.getItem('sim.center')||'null'); if(saved){ s.value='custom'; document.getElementById('lat').value=saved.lat; document.getElementById('lon').value=saved.lon; return; } }catch(e){}
@@ -224,7 +225,16 @@ function renderScenarios(){ const box=document.getElementById('scenList'); if(!s
     '<h4>'+esc(s.title||s.name)+'</h4><p>'+esc(bad?('Invalid: '+(s.errors||[]).slice(0,2).join('; ')):(s.story||''))+'</p>'+
     (bad?'':'<div class="meta">'+esc(s.entities)+' entities · '+esc(s.events)+' events · '+Math.round(s.duration_s/60)+' min'+(s.loop?' · loop':'')+(s.video?' · video':'')+(s.sensors_detecting?' · '+esc(s.sensors_detecting)+' detecting':'')+(s.silent?' · '+esc(s.silent)+' silent':'')+(s.upload?' · upload':' · preset')+'</div>')+'</div>'; }).join('');
 }
-function selectScen(name){ selected=name; renderScenarios(); const s=scenarios.find(x=>x.name===name)||{}; document.getElementById('tempo').value=String(s.default_tempo||1);
+// A scenario with a home location (`center`) runs there: the AO fields only matter for a
+// location-independent preset, or when the operator deliberately moves a site scenario.
+function homeOf(s){ return (s&&s.center&&isFinite(s.center.lat)&&isFinite(s.center.lon))?s.center:null; }
+function renderHome(){ const s=scenarios.find(x=>x.name===selected), home=homeOf(s), row=document.getElementById('homeRow'), ao=document.getElementById('aoFields');
+  if(!home){ row.style.display='none'; ao.style.display=''; return; }
+  const where=Number(home.lat).toFixed(5)+', '+Number(home.lon).toFixed(5);
+  row.style.display='';
+  if(aoOverride){ ao.style.display=''; row.innerHTML='Running somewhere else than its saved location ('+esc(where)+'). <a href="#" style="color:var(--cyan)" onclick="aoOverride=false;renderHome();return false">Back to its saved location</a>'; }
+  else { ao.style.display='none'; row.innerHTML='Runs at its saved location: <span class="mono">'+esc(where)+'</span>. <a href="#" style="color:var(--cyan)" onclick="aoOverride=true;renderHome();return false">Run it somewhere else</a>'; } }
+function selectScen(name){ selected=name; aoOverride=false; renderScenarios(); renderHome(); const s=scenarios.find(x=>x.name===name)||{}; document.getElementById('tempo').value=String(s.default_tempo||1);
   const lp=document.getElementById('loadParams'); if(s.generate){ lp.style.display=''; document.getElementById('genCount').value=s.generate.count; document.getElementById('genCount').placeholder=s.generate.count_min+'–'+s.generate.count_max; } else lp.style.display='none';
   const w=document.getElementById('warnBox'); if(s.warn){ w.style.display=''; w.textContent='⚠ '+s.warn; } else w.style.display='none';
   renderLanes(); }
@@ -235,8 +245,11 @@ function renderLanes(){ const s=scenarios.find(x=>x.name===selected); const box=
 function laneMap(){ const m={}; document.querySelectorAll('.lane-sel').forEach(el=>{ m[el.dataset.lane]=el.value; }); return m; }
 function updateExercise(){ const real=[...new Set(Object.values(laneMap()).filter(c=>c!==DEFAULT_CHANNEL))].sort(); const p=document.getElementById('exPanel'); if(real.length){ p.classList.add('open'); document.getElementById('exNames').textContent=real.join(', '); document.getElementById('exConfirm').placeholder=real.join(', '); } else { p.classList.remove('open'); document.getElementById('exConfirm').value=''; } }
 function runStart(){ const msg=document.getElementById('runMsg'); if(!selected){ msg.textContent='Pick a scenario first.'; return; }
-  const lat=parseFloat(document.getElementById('lat').value), lon=parseFloat(document.getElementById('lon').value); if(isNaN(lat)||isNaN(lon)){ msg.textContent='Enter an AO center.'; return; }
-  try{ localStorage.setItem('sim.center', JSON.stringify({lat:lat,lon:lon})); }catch(e){}
+  const home=aoOverride?null:homeOf(scenarios.find(x=>x.name===selected));
+  let lat, lon;
+  if(home){ lat=Number(home.lat); lon=Number(home.lon); }     // its own location; the operator's AO stays remembered for presets
+  else { lat=parseFloat(document.getElementById('lat').value); lon=parseFloat(document.getElementById('lon').value); if(isNaN(lat)||isNaN(lon)){ msg.textContent='Enter an AO center.'; return; }
+    try{ localStorage.setItem('sim.center', JSON.stringify({lat:lat,lon:lon})); }catch(e){} }
   const body={scenario:selected, center:{lat:lat,lon:lon}, tempo:parseInt(document.getElementById('tempo').value,10), lanes:laneMap(), params:{}};
   const lv=document.getElementById('loop').value; if(lv) body.loop=(lv==='true');
   const s=scenarios.find(x=>x.name===selected)||{}; if(s.generate){ const c=parseInt(document.getElementById('genCount').value,10); if(c) body.params.count=c; const i=parseFloat(document.getElementById('genInterval').value); if(i) body.params.interval_s=i; const r=parseInt(document.getElementById('genRate').value,10); if(r) body.params.max_msgs_per_sec=r; }
@@ -270,8 +283,19 @@ function pollPanel(){ api('/api/cloudtak/plugins/log?index=0').then(r=>{ const d
   if(d.complete&&!d.error){ document.getElementById('ctakRow').innerHTML='<span style="color:var(--green)">✓ installed</span> — close every CloudTAK tab and reopen it (its service worker caches the old bundle).'; refreshStatus(); }
   else document.getElementById('ctakRow').innerHTML='✗ install failed — see the log above (the plugin catalog on the CloudTAK page has the same log).'; }).catch(()=>setTimeout(pollPanel,5000)); }
 function fetchLogs(){ api('/api/simulator/logs').then(r=>{ const box=document.getElementById('engLog'); box.innerHTML=(r.d.lines||[]).map(l=>'<div>'+esc(l)+'</div>').join('')||'<div class="note">(no log lines yet)</div>'; box.scrollTop=box.scrollHeight; }); }
-function uploadScenario(inp){ const f=inp.files[0]; if(!f) return; const msg=document.getElementById('uploadMsg'); if(f.size>1000000){ msg.textContent='✗ larger than 1 MB'; return; } const fd=new FormData(); fd.append('file',f); msg.textContent='Validating…';
-  api('/api/simulator/scenarios/upload',{method:'POST',body:fd}).then(r=>{ if(r.ok){ msg.textContent='✓ saved as '+r.d.saved; loadScenarios().then(()=>selectScen(r.d.saved)); } else msg.textContent='✗ '+(r.d.error||'rejected')+(r.d.errors?': '+r.d.errors.slice(0,3).join('; '):''); inp.value=''; }); }
+// Uploads never overwrite on the server. A file whose title matches an existing upload offers
+// to replace it: the new one is saved first and the old one deleted only after that worked,
+// so a rejected file never costs the scenario it was meant to replace.
+async function uploadScenario(inp){ const f=inp.files[0]; if(!f) return; const msg=document.getElementById('uploadMsg'); if(f.size>1000000){ msg.textContent='✗ larger than 1 MB'; inp.value=''; return; }
+  let title=''; try{ title=(JSON.parse(await f.text()).title||'').trim(); }catch(e){}
+  const old=title?scenarios.find(x=>x.upload&&(x.title||'').trim()===title):null;
+  const replace=!!old&&confirm('"'+title+'" is already uploaded. Replace it?\n\nOK replaces it, Cancel keeps both.');
+  const fd=new FormData(); fd.append('file',f); msg.textContent='Validating…';
+  const r=await api('/api/simulator/scenarios/upload',{method:'POST',body:fd}); inp.value='';
+  if(!r.ok){ msg.textContent='✗ '+(r.d.error||'rejected')+(r.d.errors?': '+r.d.errors.slice(0,3).join('; '):''); return; }
+  if(replace){ const d=await api('/api/simulator/scenarios/'+encodeURIComponent(old.name),{method:'DELETE'}); msg.textContent=d.ok?('✓ replaced '+old.name+' with '+r.d.saved):('✓ saved as '+r.d.saved+' — could not delete the old '+old.name+': '+(d.d.error||'failed')); }
+  else msg.textContent='✓ saved as '+r.d.saved;
+  await loadScenarios(); selectScen(r.d.saved); }
 function deleteScenario(name){ if(!confirm('Delete uploaded scenario '+name+'?')) return; api('/api/simulator/scenarios/'+encodeURIComponent(name),{method:'DELETE'}).then(()=>{ if(selected===name) selected=null; loadScenarios(); }); }
 function control(action){ api('/api/simulator/control',{method:'POST',body:JSON.stringify({action:action})}).then(r=>{ if(r.d.success) setTimeout(()=>location.reload(),1500); else alert(r.d.error||'Failed'); }); }
 function openUninstall(){ document.getElementById('sim-uninstall-msg').textContent=''; document.getElementById('sim-uninstall-password').value=''; document.getElementById('sim-uninstall-modal').classList.add('open'); }
