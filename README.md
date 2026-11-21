@@ -291,6 +291,7 @@ seams, privilege model, SSO patterns, review bar):
 | CloudTAK Media | 18554 | RTSP | CloudTAK video tab — RTSP clients |
 | CloudTAK Media | 11935 | RTMP | CloudTAK video tab — RTMP publishers |
 | CloudTAK Media | 18890 | SRT | CloudTAK video tab — SRT clients |
+| MeshRelay *(when deployed)* | 5000 | UDP | Push-to-talk phones (the dashboard is Caddy-only, behind Authentik) |
 | CloudTAK Media | 9997 | HTTPS | Video control — CloudTAK puts this port on every media URL; Caddy answers it (TLS, auth-gated). Blocked, videos opened from a map marker fail with "Failed to generate proxy stream" |
 | TAK Video Restreamer *(when deployed)* | 8555 | RTSPS | TLS-wrapped RTSP (its RTSP and SRT use MediaMTX's 8554 and 8890) |
 | TAK Video Restreamer *(when deployed)* | 1935 | RTMP | RTMP publishers |

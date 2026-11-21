@@ -493,6 +493,8 @@ PATH_ALLOW = (
     '/var/lib/infratak-os-upgrade/',
     '/opt/mediamtx-webeditor/',  # MediaMTX web-editor module dir (owned by the mediamtx account, ops #643)
     '/opt/mediamtx-webeditor-pylib/',  # its Python packages: console-owned, read-only to the editor (ops #643)
+    '/opt/meshrelay/',          # ops #973: MeshRelay binary + web files, root-owned, read-only to `ptt`
+    '/var/lib/meshrelay/',      # ops #973: MeshRelay data (config, users, recordings), owned by `ptt`
     '/var/log/',                # log files (touch /var/log/fail2ban.log, etc.)
     # v10.0.8 harvest additions (PLAN-v10.0.8 §A):
     '/var/lib/takwerx-console/',  # console state dir (mkdir/chown at startup)
@@ -666,9 +668,12 @@ def _within_realpath(path, root):
 # (the editor saves with `sed -i`, which needs dir write), so a root write or read
 # there must not follow a link they planted.
 _MEDIAMTX_OWNED_PREFIXES = ('/opt/mediamtx-webeditor/', '/usr/local/etc/')
+# ops #973: the `ptt` account owns /var/lib/meshrelay/ and can plant a link in it, so a
+# root write or read there gets the same real-path check. /opt/meshrelay/ stays root-owned.
+_MESHRELAY_OWNED_PREFIXES = ('/var/lib/meshrelay/',)
 _CONSOLE_OWNED_PREFIXES = ((TAK_BUNDLE_DIR + '/',) + HOME_MODULE_DIRS
                            + ('/var/lib/infratak-backups/', '/opt/mediamtx-webeditor-pylib/')
-                           + _MEDIAMTX_OWNED_PREFIXES)
+                           + _MEDIAMTX_OWNED_PREFIXES + _MESHRELAY_OWNED_PREFIXES)
 
 
 def _path_allowed(path, readonly=False):
@@ -740,6 +745,8 @@ PATH_CLASS = {
     '/var/lib/infratak-os-upgrade/': DEST_VALIDATED,
     '/opt/mediamtx-webeditor/': DEST_DATA,       # runs as the console user
     '/opt/mediamtx-webeditor-pylib/': DEST_DATA, # editor's Python packages: run by the mediamtx account, never by root
+    '/opt/meshrelay/': DEST_DATA,                # ops #973: run by the `ptt` account, never by root
+    '/var/lib/meshrelay/': DEST_DATA,            # ops #973: `ptt`'s data
     '/var/log/': DEST_DATA,                      # broker audit log deny-listed (W0)
     '/var/lib/takwerx-console/': DEST_DATA,
     '/var/lib/caddy/': DEST_DATA,
@@ -838,17 +845,21 @@ UNIT_FILES = frozenset({
     'caddy.service.d/20-takwerx-run.conf',      # ops #814: /run/caddy for Caddy's admin socket
     'mediamtx-webeditor.service.d/10-infratak-journal.conf',
     'mediamtx-webeditor.service.d/20-infratak-home.conf',
+    'ptt-server.service',       # ops #973: MeshRelay PTT server, runs as its own `ptt` account
 })
 _UNIT_FILE_RE = re.compile(r'^tak[a-z0-9]+guard\.(service|timer)$')   # Guard Dog watchers
 # Users a non-root unit may run as, and the groups it may add. A unit running as
 # another user (tak, postgres) would hand the console that account, and `tak` owns
 # files root runs. ops #643: MediaMTX and its web editor run as their own account.
-UNIT_USERS = frozenset({BROKER_USER, 'mediamtx'})
+# ops #973: the MeshRelay PTT server runs as `ptt` (own account, no shell, not in the console group).
+MESHRELAY_USER = 'ptt'
+MESHRELAY_UNIT = 'ptt-server.service'
+UNIT_USERS = frozenset({BROKER_USER, 'mediamtx', MESHRELAY_USER})
 UNIT_GROUPS = frozenset({BROKER_USER, 'caddy', 'systemd-journal'})
 # These must keep a non-root User= (the plan's rule). So their drop-ins are checked
 # as non-root too; every other drop-in counts as root (it can't see its base User=).
 UNIT_MUST_BE_NONROOT = frozenset({'takwerx-console.service', 'mediamtx.service',
-                                  'mediamtx-webeditor.service'})
+                                  'mediamtx-webeditor.service', 'ptt-server.service'})
 _UNIT_EXEC_KEYS = frozenset({'ExecStart', 'ExecStartPre', 'ExecStartPost', 'ExecCondition',
                              'ExecReload', 'ExecStop', 'ExecStopPost'})
 # Keys allowed per section: what the fleet's units and app.py use. An allow-list,
@@ -1167,10 +1178,18 @@ def _check_unit_write(path, content, mode):
             raise Denied(f'unit: {rel} must keep a non-root User=')
         if not root_ctx and user not in UNIT_USERS:
             raise Denied(f'unit: User={user} not allowed')
+        # ops #973 (Security, ops #980): `ptt` runs one unit and that unit runs as nobody else,
+        # with no extra group. UNIT_USERS / UNIT_GROUPS are shared by every unit, so pin it here.
+        if rel == MESHRELAY_UNIT and user != MESHRELAY_USER:
+            raise Denied(f'unit: {rel} must run as User={MESHRELAY_USER}')
+        if user == MESHRELAY_USER and rel != MESHRELAY_UNIT:
+            raise Denied(f'unit: User={MESHRELAY_USER} is only for {MESHRELAY_UNIT}')
     for sec, k, v in lines:
         if k == 'User' and dropin:
             raise Denied('unit: a drop-in may not set User=')
         elif k in ('Group', 'SupplementaryGroups'):
+            if rel == MESHRELAY_UNIT:
+                raise Denied(f'unit: {rel} may not set {k}=')
             if dropin and k == 'Group':
                 raise Denied('unit: a drop-in may not set Group=')
             for g in v.split():
@@ -6951,6 +6970,8 @@ def _evaluate(req):
             _check_etl_egress(req)
         elif op == 'mediamtx_account':
             _check_mediamtx_account(req)
+        elif op == 'meshrelay_account':
+            _check_meshrelay_account(req)
         elif op == 'gd_render':
             _check_gd_render(req)           # ops #645 W2 part 2a
         elif op == 'gd_remove':
@@ -7069,7 +7090,7 @@ def _dispatch(req, peer):
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
     if op in ('pg_dump', 'stack_pg_dump', 'stack_nodered_tar', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
               'takportal_sudoers', 'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
-              'pg_old_cluster', 'mediamtx_account', 'gd_render', 'gd_remove', 'caddy_reload'):
+              'pg_old_cluster', 'mediamtx_account', 'meshrelay_account', 'gd_render', 'gd_remove', 'caddy_reload'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
@@ -7085,6 +7106,8 @@ def _dispatch(req, peer):
             summary = f"action={req.get('action')} major={_PG_OLD_MAJOR}"
         elif op == 'mediamtx_account':
             summary = MEDIAMTX_USER
+        elif op == 'meshrelay_account':
+            summary = MESHRELAY_USER
         elif op == 'disk_reclaim':
             summary = f"mode={req.get('mode')} lv={req.get('confirm_lv') or '-'}"
         elif op == 'takportal_sudoers':
@@ -7132,6 +7155,8 @@ def _dispatch(req, peer):
             return _do_pg_old_cluster(req)
         if op == 'mediamtx_account':
             return _do_mediamtx_account(req)
+        if op == 'meshrelay_account':
+            return _do_meshrelay_account(req)
         if op == 'gd_render':
             return _do_gd_render(req)
         if op == 'gd_remove':
@@ -7500,6 +7525,72 @@ def _do_mediamtx_account(req):
             _MTX_SRV = _start_mediamtx_listener()
     return {'ok': True, 'created': created, 'uid': _mtx_uid(),
             'socket': MEDIAMTX_SOCKET_PATH if _MTX_SRV is not None else ''}
+
+
+def _check_meshrelay_account(req):
+    """Fixed-shape op (ops #973): no arguments are read, so there is nothing to validate."""
+    extra = set(req) - {'op'}
+    if extra:
+        raise Denied(f'meshrelay_account takes no arguments: {sorted(extra)}')
+
+
+_NO_LOGIN_SHELLS = frozenset({'/usr/sbin/nologin', '/sbin/nologin', '/bin/false', '/usr/bin/false'})
+
+
+def _meshrelay_account_problem():
+    """Why an existing `ptt` account is unfit to run the MeshRelay server, or ''.
+    It faces the internet, so it must be exactly what the op creates: uid/gid not 0, no login
+    shell, its own group as the primary group, and no other group at all (a `ptt` in docker,
+    sudo, wheel, disk, shadow or adm would run the server with that reach; Security, ops #980)."""
+    try:
+        pw = pwd.getpwnam(MESHRELAY_USER)
+    except KeyError:
+        return 'missing'
+    if pw.pw_uid == 0 or pw.pw_gid == 0:
+        return 'ptt account is uid/gid 0'
+    if pw.pw_shell not in _NO_LOGIN_SHELLS:
+        return f'ptt account has a login shell: {pw.pw_shell}'
+    try:
+        primary = grp.getgrgid(pw.pw_gid).gr_name
+    except KeyError:
+        return 'ptt account has a primary group that does not exist'
+    if primary != MESHRELAY_USER:
+        return f'ptt account has primary group {primary}, not {MESHRELAY_USER}'
+    extra = sorted(g.gr_name for g in grp.getgrall()
+                   if MESHRELAY_USER in g.gr_mem and g.gr_name != MESHRELAY_USER)
+    if extra:
+        return f'ptt account is in other groups: {", ".join(extra)}'
+    return ''
+
+
+def _do_meshrelay_account(req):
+    """Create the `ptt` system account (own group, no home, no shell) when it is missing.
+    Never adds groups to an existing account, and refuses an existing one that is uid 0, has a
+    login shell, or is in any group besides its own (`_meshrelay_account_problem`). The
+    MeshRelay unit runs as this account (ops #973)."""
+    created = False
+    if _meshrelay_account_problem() == 'missing':
+        groupadd = shutil.which('groupadd', path=BROKER_TRUSTED_PATH)
+        useradd = shutil.which('useradd', path=BROKER_TRUSTED_PATH)
+        if not groupadd or not useradd:
+            return {'ok': False, 'code': 'ERROR', 'error': 'groupadd/useradd not found'}
+        try:
+            grp.getgrnam(MESHRELAY_USER)
+        except KeyError:
+            subprocess.run([groupadd, '--system', MESHRELAY_USER],
+                           capture_output=True, timeout=30)
+        nologin = '/usr/sbin/nologin' if os.path.exists('/usr/sbin/nologin') else '/sbin/nologin'
+        r = subprocess.run([useradd, '--system', '-g', MESHRELAY_USER, '-M', '-d', '/nonexistent',
+                            '-s', nologin, MESHRELAY_USER], capture_output=True, timeout=30)
+        if r.returncode != 0 and _meshrelay_account_problem() == 'missing':
+            return {'ok': False, 'code': 'ERROR',
+                    'error': 'useradd failed: ' + (r.stderr or b'').decode(errors='replace')[-200:]}
+        created = True
+    problem = _meshrelay_account_problem()
+    if problem:
+        return {'ok': False, 'code': 'ERROR', 'error': problem}
+    pw = pwd.getpwnam(MESHRELAY_USER)
+    return {'ok': True, 'created': created, 'uid': pw.pw_uid, 'gid': pw.pw_gid}
 
 
 def _unlink_mediamtx_socket():
