@@ -168,6 +168,56 @@ Official: [Docker restart policies](https://docs.docker.com/engine/containers/st
 - **A unit that is `activating` is not down.** `systemctl is-active` says `activating` while a unit starts; judge it only after the start has finished. 📖 documented (systemd).
 - **A host can answer ping and refuse every TCP port after a reboot.** test6 (Ubuntu 24.04, VPS) did so for 25+ minutes after a real reboot on 2026-11-20 while test12 on the same code came back. Cause not yet known. 👁 observed 2026-11-20 (ops #1017); open question.
 
+### Start-order map (ops #1017, read from the units and scripts of a full-module box, 2026-11-20)
+
+"Enforced" = a unit dependency, a compose `service_healthy` wait or a health wait in code. "Timer-only" = nothing orders it; a per-minute Guard Dog timer or restart policy heals it later. "Nothing" = no order and no heal.
+
+| Service | Needs first | Where the order is kept today | Mark |
+|---|---|---|---|
+| Docker | network-online, containerd, docker.socket, time-set | `docker.service` `After=`/`Requires=`, `Restart=always` | enforced |
+| PostgreSQL (TAK) | disk, network | `takserver.service` `After=postgresql*.service`; Guard Dog `takdbguard` per minute | enforced (TAK side); heal timer-only |
+| TAK Server | PostgreSQL, network | `After=postgresql*.service`, `soft-start.conf`; `tak-boot-sequencer.sh` (ExecStartPre) stops the heavy modules first so TAK gets the CPU | enforced |
+| Authentik DB, Redis, pgbouncer | Docker | compose `depends_on: service_healthy` inside the stack; dockerd ignores `depends_on` after a reboot (GH #64) | timer-only after reboot (post-start + `takauthentikguard`) |
+| Authentik server, worker | Authentik DB, pgbouncer, Docker | sequencer stops them, `tak-post-start` starts them after TAK answers; `takauthentikguard` per minute | enforced (post-start), heal timer-only |
+| LDAP outpost | Authentik server answering | `tak-post-start` waits for it ("resolving groups"); the console boot heal waits for Authentik and (since 06c007e) for the outpost to listen | enforced |
+| TAK clients with groups | LDAP outpost, TAK API | `tak-client-gate` holds 8089 until the API answers; #1015 stuck-phones check | enforced |
+| TAK Portal | TAK Server, Authentik | `tak-post-start` starts it after the session recycle; `taktakportalguard` per minute | enforced + timer |
+| CloudTAK (8 containers) | TAK Server, its own PostGIS | `tak-post-start`, 30 s stagger after TAK Portal; `takcloudtakguard` per minute | enforced + timer |
+| Node-RED | TAK Server | `tak-post-start`, 30 s stagger; `taknoderedguard` per minute | enforced + timer |
+| MediaMTX, web editor | network (editor: MediaMTX) | `tak-post-start` starts it last; `takmediamtxguard`; unit `Restart=always` | enforced + timer |
+| Caddy | network-online, DNS for certificate renewals | `After=network-online.target`, `Requires=`; certificates are kept on disk; `Restart=on-failure` | enforced |
+| Console and broker | network-online | `After=network-online.target`, `Restart=always`; boot heals wait for Authentik; ops #1017 boot check at 10 min | enforced; heal added |
+| Guard Dog timers | none | systemd timers, per minute to daily | timer-only (by design) |
+| fail2ban, tak-health | network, TAK (health) | unit `After=`, `Restart=` | enforced |
+| Any module stopped by the sequencer and not started by `tak-post-start` | | ops #1017 boot check (10+ min after boot, 2 repair rounds, plain-words email) | added in PR 622 |
+
+Gaps this map shows (not yet fixed here): the 30 s gaps in `tak-post-start` put the full stack at about 4.5 to 5.5 minutes on a small cloud box (a design choice: they keep CloudTAK and Node-RED from reaching TAK together); a clock that is wrong at boot and a full disk at boot have no own check.
+
+### Reboot scenarios (ops #1017)
+
+Boxes: C = cloud Ubuntu 22.04 with every module (fresh-install), T12 = test12 (Ubuntu 22.04, TAK with 10 clients). Times are seconds after boot.
+
+| Scenario | Result | Evidence |
+|---|---|---|
+| Plain reboot | pass | C: whole stack OK at 328 s. T12: 273 to 315 s. |
+| Boot script (`tak-post-start`) cut off, as if systemd killed it | pass | C: whole stack OK at 391 s, started by Guard Dog's per-minute guards; the boot check at 10 min found nothing to start. |
+| Modules stopped and their guards off at 9 min | pass | C: boot check at 10 min started mediamtx, authentik server and worker, cloudtak-api, nodered, tak-portal and its worker; every row OK 25 s later; plain-words activity line written. |
+| LDAP outpost late (Authentik up, outpost not listening) | fail on dev, pass here | Dev: every reboot on C and T12 ran a password set plus an outpost recreate. With 06c007e: T12 `password_set` 0, outpost not recreated, TAK started once. |
+| Real reboot with an ATAK client | partly | T12 after reboot: 11 clients, 0 without groups (the emulator joined when ATAK was opened after the reboot; it was not connected during the reboot). |
+| Power loss (no clean shutdown) | code-only | The same units and boot path run; a cloud hard stop was not done. Reason: no box left in time. |
+| Reboot right after Update Now | code-only here | `_boot_recovery_run` waits for a running console update; the update path was covered by #438 and #1015. |
+| Authentik late (45 s, 3 min, never) | code-only here | #1015 `latecore` covers 45 s; "never" leaves it to the 5-min watchdog (tested by unit test). |
+| PostgreSQL or pgbouncer late | code-only | `takserver.service` waits for PostgreSQL; pgbouncer is in the compose wait chain. |
+| Docker daemon late | code-only | The boot check starts `docker` first, then the rest (unit test). |
+| DNS or network late | code-only | `network-online` ordering on Caddy and the console; not forced on a box. |
+| Disk full or clock wrong at boot | code-only, no check exists | Marked "nothing" in the map above. |
+| Caddy certificate not yet issued | code-only | Certificates are kept on disk; Caddy serves the old one. |
+| Interrupted update then reboot | code-only | Covered by #438 (OS upgrade) tests. |
+| Split server (database on another host) | code-only | Not built; needs two cloud boxes. |
+| ARM box | not run | aws-arm was off. |
+| Module installed but disabled | pass (unit test) | A disabled unit or a container without a restart policy is never judged or started. |
+| test6 (VPS) real reboot | fail, cause unknown | Ping answers, every TCP port filtered for 25+ min; needs the provider console. |
+
 ## Shell scripts and systemd units that are rewritten while they run
 
 Official: [bash manual, shell scripts](https://www.gnu.org/software/bash/manual/html_node/Shell-Scripts.html), [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
