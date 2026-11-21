@@ -57987,7 +57987,8 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
                 out.append('  %s not part of CloudTAK: a plugin added %s%s.'
                            % ('This file is' if len(_pf) == 1 else 'These %d files are' % len(_pf),
                               'it' if len(_pf) == 1 else 'them',
-                              ' (plugin: %s)' % ', '.join(_pn) if _pn else ''))
+                              ' (%s: %s)' % ('plugin' if len(_pn) == 1 else 'plugins',
+                                             ', '.join(_pn)) if _pn else ''))
                 if _pn and all(n in ours for n in _pn):
                     out.append('  CloudTAK itself is not the problem. Update or remove that plugin on '
                                'the CloudTAK page, then run Update again.')

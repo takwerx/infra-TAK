@@ -124,6 +124,17 @@ def test_a_plugin_file_with_no_matching_folder_is_still_called_a_plugin_file(tmp
     assert 'CloudTAK Marketplace' in out
 
 
+def test_two_plugins_are_both_named(tmp_path):
+    ct = _tree(tmp_path, plugin_dirs=('replay', 'livewx-radar'))
+    (ct / 'api' / 'stateless' / 'routes').mkdir(parents=True)
+    (ct / 'api' / 'stateless' / 'routes' / 'plugin-livewx.ts').write_text('export {};\n')
+    lines = ['#58     ,-[stateless/lib/replay-player.ts:4:1]',
+             '#58     ,-[stateless/routes/plugin-livewx.ts:9:1]',
+             '#58 Found 0 warnings and 2 errors.', STEP_API]
+    out = '\n'.join(_hint()['_cloudtak_build_failure_hint'](lines, str(ct)))
+    assert 'These 2 files are not part of CloudTAK: a plugin added them (plugins: replay, livewx-radar).' in out, out
+
+
 def test_an_infra_tak_plugin_points_to_the_cloudtak_page(tmp_path):
     ct = _tree(tmp_path)
     out = _text(ct, plugins=[{'install_dir': 'replay', 'name': 'Replay'}])
