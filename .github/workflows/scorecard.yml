@@ -18,7 +18,7 @@ on:
   schedule:
     - cron: '41 14 * * 3'   # Wednesdays, 6:41 AM PT (7:41 AM in summer)
   push:
-    branches: [main]
+    branches: [claude/issue-1014-scorecard-try]
   workflow_dispatch:
 
 permissions: read-all
@@ -41,7 +41,7 @@ jobs:
         with:
           results_file: results.sarif
           results_format: sarif
-          publish_results: true
+          publish_results: false
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: scorecard-sarif
