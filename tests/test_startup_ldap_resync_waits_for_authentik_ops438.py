@@ -33,10 +33,12 @@ class Boot:
     Authentik answers (True = answers); the last one repeats."""
 
     def __init__(self, ak=(True,), verdicts=('ok',), resync=((True, 'ok'),), compose=True, outpost=None,
-                 verdict_at=None):
+                 verdict_at=None, listening=(True,)):
         # GH #616: `outpost(t)` = the local outpost's (running, started, health) at time t (default:
-        # up and healthy for hours); `verdict_at(t)` = the bind verdict at time t (overrides `verdicts`).
+        # up and healthy for hours); ops #1017: `listening` = the outpost's port-389 answers in turn;
+        # `verdict_at(t)` = the bind verdict at time t (overrides `verdicts`).
         self.ak = list(ak)
+        self.listening = list(listening)
         self.verdicts = list(verdicts)
         self.resync = list(resync)
         self.events = []
@@ -50,6 +52,11 @@ class Boot:
         def ak_ok():
             a = self.ak.pop(0) if len(self.ak) > 1 else self.ak[0]
             self.events.append(('ak', a))
+            return a
+
+        def outpost_up():
+            a = self.listening.pop(0) if len(self.listening) > 1 else self.listening[0]
+            self.events.append(('outpost', a))
             return a
 
         def verdict(dn, pw):
@@ -78,6 +85,7 @@ class Boot:
             '_get_authentik_env_value': lambda s, k: 'pw',
             '_authentik_busy_reason': lambda: '',
             '_local_authentik_http_ok': ak_ok,
+            '_local_ldap_outpost_listening': outpost_up,
             '_test_ldap_bind_dn_verdict': verdict,
             '_ensure_authentik_ldap_service_account': ensure,
             '_resync_ldap_credential_to_coreconfig': lambda: (False, ''),
@@ -136,3 +144,28 @@ def test_watchdog_waits_for_the_boot_heal_before_its_first_tick_ops438():
     code = re.sub(r'#.*', '', body)
     assert code.index('_startup_ldap_resync_done') < code.index('while True:')
     assert '.wait(timeout=' in code
+
+
+def test_boot_heal_waits_for_the_ldap_outpost_not_only_authentik_ops1017():
+    # Field, test12 and a cloud box, real reboots Nov 20: Authentik answers, the outpost is not back yet,
+    # ldapsearch says "Can't contact LDAP server", the verdict is 'fail', and every reboot ran a password
+    # set plus an outpost recreate. With the outpost still down at the first probe, nothing may be healed.
+    b = Boot(listening=(False, False, False, True), verdicts=('fail', 'ok')).go()
+    first_probe = next(i for i, e in enumerate(b.events) if e[0] == 'probe')
+    assert ('outpost', True) in b.events[:first_probe]
+    assert b.events[first_probe] == ('probe', 'fail')  # the probe now runs after the outpost listens
+    assert b.slept >= 30
+
+
+def test_boot_heal_leaves_it_to_the_watchdog_when_the_outpost_never_listens_ops1017():
+    b = Boot(listening=(False,)).go()
+    assert not any(e[0] in ('probe', 'resync') for e in b.events)
+    assert any('LDAP outpost not listening' in line and '5-min watchdog' in line for line in b.out)
+    assert b.ns['_startup_ldap_resync_done'].is_set()
+
+
+def test_ldap_outpost_listening_helper_ops1017():
+    body = _fn('_local_ldap_outpost_listening')
+    code = re.sub(r'#.*', '', body)
+    assert "create_connection(('127.0.0.1', 389)" in code
+    assert "target_mode') == 'remote'" in code
