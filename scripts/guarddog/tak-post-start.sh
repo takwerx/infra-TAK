@@ -50,6 +50,7 @@
 # fallback restart targets the takserver container in container mode.
 source /opt/tak-guarddog/_gd-tak-lib.sh 2>/dev/null || true
 
+_ps_t0=$(date +%s)          # ops #1039: this run's start; the unit stops at 1200 s (TimeoutStartSec)
 MAX_WAIT_TAK=900
 MAX_WAIT_AK=300
 INTERVAL=10
@@ -87,7 +88,6 @@ AK_DIR="$(gd_find_stack_dir authentik authentik-server-1)"
 
 if [ -n "$AK_DIR" ]; then
   cd "$AK_DIR"
-  _ak_t0=$(date +%s)
 
   # ops #180: the starts below run under the console's compose lock, ONE hold for the
   # whole stagger, as the watcher does for its down+up. At boot the console runs its own
@@ -137,25 +137,31 @@ if [ -n "$AK_DIR" ]; then
   # /-/health/ready/ before the LDAP check below, so the force-recreate after it never
   # restarts the outpost into a core that is not ready.
   #
-  # Field/T&E (10.4.4, Ubuntu 22.04, core CPU-limited): the server was not healthy until
-  # ~10.5 min after boot. The group check below gave up at 120 s, force-recreated the
-  # outpost into that same not-ready core (it still could not resolve groups: ALERT mail),
-  # and TAK's API, up since 185 s, then had no groups for 23+ min until the console's
-  # last-resort TAK restart. A recreate cannot fix a core that is not ready; it only resets
-  # the connections TAK's API holds to the outpost. The wait shares one budget with the
-  # healthy wait above (_MAX_CORE_TOTAL since the section began), because this script's
-  # unit stops at 1200 s (TimeoutStartSec). Fails open: the 8089 gate is released by the
-  # trap on every exit, and takclientgate.timer is the backstop.
-  _MAX_CORE_TOTAL=720
+  # T&E 10.4.4 (Ubuntu 22.04, core CPU-limited) and the same box again with the core capped
+  # harder: Docker calls authentik-server "healthy" minutes BEFORE /-/health/ready/ answers 200
+  # (healthy at 17:15, ready only at 17:20). The group check below gave up at 120 s, force-
+  # recreated the outpost into that not-ready core (ALERT mail: still cannot resolve groups),
+  # and TAK's HTTPS side then had no groups for 23+ min, until the console's last-resort TAK
+  # restart. A recreate cannot fix a core that is not ready.
+  #
+  # The wait is _CORE_WAIT s counted from here (after `compose up -d` and the healthy wait:
+  # on a slow core `up -d` itself blocks until the server is healthy), and never past
+  # _CORE_HARD_END s after this script started, which leaves time for the steps after it
+  # inside the unit's 1200 s. Fails open: the 8089 gate is released by the trap on every exit,
+  # and takclientgate.timer is the backstop.
+  _CORE_WAIT=420
+  _CORE_HARD_END=960
+  _core_deadline=$(( $(date +%s) + _CORE_WAIT ))
+  [ $_core_deadline -le $(( _ps_t0 + _CORE_HARD_END )) ] || _core_deadline=$(( _ps_t0 + _CORE_HARD_END ))
   _core_ready=1
   if ! gd_ak_core_ready; then
     _core_ready=0
-    _log "Authentik core not ready yet — waiting for /-/health/ready/ before checking LDAP groups (up to ${_MAX_CORE_TOTAL}s after Authentik was started)"
-    while [ $(( $(date +%s) - _ak_t0 )) -lt $_MAX_CORE_TOTAL ]; do
+    _log "Authentik core not ready yet — waiting for /-/health/ready/ before checking LDAP groups (up to $(( _core_deadline - $(date +%s) ))s)"
+    while [ "$(date +%s)" -lt "$_core_deadline" ]; do
       sleep $INTERVAL
       if gd_ak_core_ready; then
         _core_ready=1
-        _log "Authentik core ready ($(( $(date +%s) - _ak_t0 ))s after Authentik was started)"
+        _log "Authentik core ready ($(( $(date +%s) - _ps_t0 ))s after this script started)"
         break
       fi
     done
@@ -207,9 +213,9 @@ if [ -n "$AK_DIR" ]; then
     # the outpost into the same core and only reset TAK's connections to it. Leave it: the
     # outpost serves from its cache or recovers when the core is up, the Guard Dog watcher
     # takes over after its boot grace, and the console checks TAK's groups after boot.
-    _log "ALERT | Authentik core still not ready after ${_MAX_CORE_TOTAL}s and the LDAP outpost is not resolving groups — outpost NOT recreated (it would start into a core that is not ready). Check: docker logs authentik-server-1"
+    _log "ALERT | Authentik core still not ready in the time allowed and the LDAP outpost is not resolving groups — outpost NOT recreated (it would start into a core that is not ready). Check: docker logs authentik-server-1"
     if [ -x /opt/tak-guarddog/send-alert-email.sh ]; then
-      printf '%s\n' "Authentik on $(hostname) was still not ready ${_MAX_CORE_TOTAL}s after boot started it, and the LDAP outpost cannot resolve groups yet. LDAP-authenticated clients get no groups until Authentik is ready. Guard Dog did not restart the outpost, because it would start into the same not-ready core. Investigate: docker logs authentik-server-1; docker stats (CPU and memory)." \
+      printf '%s\n' "Authentik on $(hostname) was still not ready after Guard Dog waited for it at boot, and the LDAP outpost cannot resolve groups yet. LDAP-authenticated clients get no groups until Authentik is ready. Guard Dog did not restart the outpost, because it would start into the same not-ready core. Investigate: docker logs authentik-server-1; docker stats (CPU and memory)." \
         | /opt/tak-guarddog/send-alert-email.sh "Guard Dog: Authentik is slow to start on $(hostname)" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null || true
     fi
   elif [ $_ldap_ok -eq 0 ]; then

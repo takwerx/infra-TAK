@@ -97,7 +97,7 @@ def box(tmp_path):
                    .replace('/home/*/', str(tmp_path / 'nohome') + '/*/')
                    .replace('/root/', str(tmp_path / 'noroot') + '/')
                    # the wall-clock budget, short: the sleep stub does not sleep
-                   .replace('_MAX_CORE_TOTAL=720', '_MAX_CORE_TOTAL=3'))
+                   .replace('_CORE_WAIT=420', '_CORE_WAIT=3'))
 
     (gd / '_gd-tak-lib.sh').write_text(sandbox(LIB))
     (gd / 'send-alert-email.sh').write_text('#!/bin/sh\necho "alert-mail $*" >> %s\ncat >/dev/null\n' % calls)
@@ -115,9 +115,10 @@ def box(tmp_path):
         f.chmod(0o755)
     (tmp_path / 'uptime').write_text('26.42 99.00\n')
 
-    def run(core_ready_after=0, groups_never=False, noport=False, unhealthy=False):
+    def run(core_ready_after=0, groups_never=False, noport=False, unhealthy=False, hard_end=None):
         """core_ready_after: how many /-/health/ready/ asks answer 503 first (None = never ready).
-        noport: the probe gets no answer at all; unhealthy: Docker does not call authentik-server healthy."""
+        noport: the probe gets no answer at all; unhealthy: Docker does not call authentik-server healthy.
+        hard_end: seconds after the script start past which the core wait never goes (default 960)."""
         (state / 'thresh').write_text(str(100000 if core_ready_after is None else core_ready_after))
         if groups_never:
             (state / 'groups-never').write_text('')
@@ -127,7 +128,10 @@ def box(tmp_path):
         if unhealthy:
             (state / 'unhealthy').write_text('')
         sp = tmp_path / 'post.sh'
-        sp.write_text(sandbox(POST).replace('ALERT_EMAIL_PLACEHOLDER', 'ops@example.invalid'))
+        src = sandbox(POST).replace('ALERT_EMAIL_PLACEHOLDER', 'ops@example.invalid')
+        if hard_end is not None:
+            src = src.replace('_CORE_HARD_END=960', '_CORE_HARD_END=%d' % hard_end)
+        sp.write_text(src)
         env = {'PATH': '%s:/usr/bin:/bin:/usr/sbin:/sbin' % stubs, 'HOME': str(home),
                'JAVA_HOME': str(tmp_path / 'nojava'), 'GD_STACK_OWNER': str(os.getuid())}
         r = subprocess.run(['bash', str(sp)], capture_output=True, text=True, env=env, timeout=120)
@@ -206,3 +210,13 @@ def test_a_port_that_answers_nothing_and_a_starting_server_is_still_waited_for(b
     assert 'Authentik core not ready yet' in out
     assert 'outpost NOT recreated' in out
     assert _recreates(calls) == [], calls
+
+
+def test_the_wait_never_runs_past_the_hard_end_even_when_compose_used_the_time(box):
+    """On a slow core `docker compose up -d` itself blocks until the server is healthy. If that used up
+    the budget, there is no wait left (the unit stops at 1200 s) and the script goes on."""
+    out, calls = box(core_ready_after=None, hard_end=-5)
+    assert 'Authentik core not ready yet' in out
+    assert 'outpost NOT recreated' in out
+    assert 'Boot sequence complete' in out
+    assert calls.count('curl ') <= 3, calls               # no polling loop: asked once, then once after the (empty) wait
