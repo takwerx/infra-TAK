@@ -32,6 +32,8 @@ def _versions(settings, latest='10.3.13', installed=True):
         'load_settings': lambda: settings,
         '_node_card_gaps': lambda: {},
         '_safe_module_version_info': lambda key, info: info,
+        # infra-TAK #627: the card data also gets a "What's new" link; Guard Dog has none.
+        '_module_release_notes_url': lambda key, info: '',
     }
     exec(_fn('_guarddog_needs_update') + '\n' + _fn('get_all_module_versions'), ns)
     return ns['get_all_module_versions']()
