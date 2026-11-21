@@ -98,6 +98,49 @@ def test_docker_grant_refused_without_a_root_owned_docker(b):
         b._takportal_sudoers_text(user='takwerx', variant='docker')
 
 
+def _sudo_allows(grant_lines, command):
+    """sudo matches the whole command line against each rule's text, `*` standing for any
+    arguments (sudoers(5), "Wildcards"). Same rule here, nothing smarter."""
+    import re
+    for line in grant_lines:
+        if 'NOPASSWD:' not in line:
+            continue
+        rule = line.split('NOPASSWD:', 1)[1].strip()
+        if re.fullmatch(re.escape(rule).replace(r'\*', '.*'), command):
+            return True
+    return False
+
+
+def test_grant_matches_the_portals_final_docker_commands(b):
+    # The exact strings TAK Portal main (775020d, the 2.0.39 code) builds in
+    # services/takServerMode.service.js and takSsh.service.js, run through `sudo -n`.
+    # Box-tested on a Docker TAK Server 5.8: every one of these ran (ops #987).
+    # Before 36f9d00 -> 665c820 the portal put `--` after the container name, and Docker ran
+    # `--` as the command; the rules fit both forms, so this test pins the current one.
+    rules = _grant(b._takportal_sudoers_text(user='takwerx', variant='docker'))
+    for cmd in (
+        '/usr/bin/docker exec -i takserver cat /opt/tak/CoreConfig.xml',
+        "/usr/bin/docker exec -i takserver tee '/opt/tak/conf/CoreConfig.xml'",
+        '/usr/bin/docker exec -i -u tak takserver id',
+        '/usr/bin/docker exec -i -u tak takserver bash -lc "cd /opt/tak/certs && ./makeCert.sh client x"',
+        '/usr/bin/docker restart takserver',
+        '/bin/docker exec -i takserver ls -l /opt/tak/certs/files',
+    ):
+        assert _sudo_allows(rules, cmd), cmd
+    # What the grant must keep refusing: another container, a different user, another verb,
+    # an option placed before the container name.
+    for cmd in (
+        '/usr/bin/docker exec -i other cat /etc/shadow',
+        '/usr/bin/docker exec -i -u root takserver id',
+        '/usr/bin/docker exec -i --privileged takserver id',
+        '/usr/bin/docker exec -u tak takserver id',
+        '/usr/bin/docker restart authentik-server-1',
+        '/usr/bin/docker run --rm -v /:/h alpine sh',
+        '/usr/bin/docker cp takserver:/opt/tak/CoreConfig.xml /tmp/x',
+    ):
+        assert not _sudo_allows(rules, cmd), cmd
+
+
 def test_native_grant_is_unchanged(b):
     t = b._takportal_sudoers_text(user='takwerx', variant='hardened', helper=False)
     assert 'docker' not in t and 'ALL=(tak) NOPASSWD: ALL' in t and 'restart takserver' in t
