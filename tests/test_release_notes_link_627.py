@@ -314,7 +314,40 @@ def test_cloudtak_page_heading_shows_the_link_only_when_an_update_is_offered():
     assert "What's new" not in off[0] and 'latest' in off[0]
 
 
-def test_both_pages_are_given_the_link_by_their_routes():
+def test_authentik_page_notices_show_the_link_only_when_an_update_is_offered():
+    """Four notices: running and stopped, on the dev channel and on main."""
+    src = (ROOT / 'templates' / 'authentik.html').read_text(encoding='utf-8')
+    lines = [l for l in src.split('\n') if 'ak_version_info.update_available and ak_version_info.latest' in l]
+    assert len(lines) == 2  # the running banner and the stopped banner, each with both channels
+    env = jinja2.Environment(autoescape=True)
+    link = 'https://github.com/goauthentik/authentik/releases/tag/version%2F2026.8.6'
+    for channel in ('dev', 'main'):
+        for line in lines:
+            base = dict(ak_version_info={'version': '2026.8.5', 'latest': '2026.8.6', 'channel': channel,
+                                         'vetted_release': '2026.8.5', 'update_available': True,
+                                         'release_notes_url': link},
+                        ak={'running': True, 'installed': True}, authentik_logo_url='', container_info={})
+            on = env.from_string(line).render(**base)
+            assert 'href="%s"' % link in on and "What's new" in on, channel
+            base['ak_version_info'] = dict(base['ak_version_info'], update_available=False)
+            assert "What's new" not in env.from_string(line).render(**base), channel
+            base['ak_version_info'] = dict(base['ak_version_info'], update_available=True, release_notes_url='')
+            off = env.from_string(line).render(**base)
+            assert "What's new" not in off and 'v2026.8.6 available' in off, channel
+
+
+def test_with_release_notes_url_copies_and_leaves_empty_alone():
+    with_url = _ns()['_with_release_notes_url']
+    cached = {'version': '2026.8.5', 'latest': '2026.8.6', 'update_available': True}
+    got = with_url('authentik', cached)
+    assert got['release_notes_url'].endswith('/releases/tag/version%2F2026.8.6')
+    assert 'release_notes_url' not in cached
+    assert with_url('authentik', {}) == {}
+    assert with_url('authentik', None) is None
+
+
+def test_pages_are_given_the_link_by_their_routes():
     assert "portal_release_notes_url = _module_release_notes_url('takportal', vinfo)" in APP
     assert 'portal_release_notes_url=portal_release_notes_url' in APP
-    assert "'release_notes_url': _module_release_notes_url('cloudtak', ct_vinfo)" in APP
+    assert "ct_vinfo = _with_release_notes_url('cloudtak', ct_vinfo)" in APP
+    assert "ak_version_info=_with_release_notes_url('authentik', _get_authentik_version_info())" in APP

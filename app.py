@@ -32910,9 +32910,7 @@ def cloudtak_page():
                     containers.append({'name': parts[0], 'status': parts[1] if len(parts) > 1 else ''})
         container_info['containers'] = containers
     ct_vinfo = _get_cloudtak_version_info() if cloudtak.get('installed') else {}
-    if ct_vinfo:
-        # infra-TAK #627: "What's new" link (a copy: the helper's dict is not ours to change)
-        ct_vinfo = {**ct_vinfo, 'release_notes_url': _module_release_notes_url('cloudtak', ct_vinfo)}
+    ct_vinfo = _with_release_notes_url('cloudtak', ct_vinfo)   # infra-TAK #627: "What's new" link
     ct_version = ct_vinfo.get('version', '')
     ct_update_available = ct_vinfo.get('update_available', False)
     ct_latest = ct_vinfo.get('latest', '')
@@ -45953,6 +45951,14 @@ def _module_release_notes_url(key, info):
                 if url:
                     return url
     return ''
+
+
+def _with_release_notes_url(key, info):
+    """A copy of one module's version info with its "What's new" link (a copy: the helpers may
+    cache their dict). Returned as is when it is empty or not a dict."""
+    if not isinstance(info, dict) or not info:
+        return info
+    return {**info, 'release_notes_url': _module_release_notes_url(key, info)}
 
 
 def _guarddog_needs_update(settings, installed):
@@ -68795,7 +68801,7 @@ def authentik_page():
         settings=settings, ak=ak, container_info=container_info,
         ak_port=ak_port, authentik_base_url=_get_authentik_base_url(settings),
         takserver_base_url=_get_takserver_base_url(settings), version=VERSION,
-        ak_version_info=_get_authentik_version_info(),
+        ak_version_info=_with_release_notes_url('authentik', _get_authentik_version_info()),
         deploying=authentik_deploy_status.get('running', False),
         deploy_done=authentik_deploy_status.get('complete', False),
         deploy_error=authentik_deploy_status.get('error', False),
