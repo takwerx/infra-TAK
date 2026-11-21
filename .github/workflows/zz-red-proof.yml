@@ -1,0 +1,10 @@
+name: red proof (throwaway, ops 1014)
+on:
+  pull_request:
+    branches: [dev]
+permissions: {}
+jobs:
+  demo:
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "${{ github.event.pull_request.title }}"
