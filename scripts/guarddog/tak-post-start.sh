@@ -87,6 +87,7 @@ AK_DIR="$(gd_find_stack_dir authentik authentik-server-1)"
 
 if [ -n "$AK_DIR" ]; then
   cd "$AK_DIR"
+  _ak_t0=$(date +%s)
 
   # ops #180: the starts below run under the console's compose lock, ONE hold for the
   # whole stagger, as the watcher does for its down+up. At boot the console runs its own
@@ -132,6 +133,34 @@ if [ -n "$AK_DIR" ]; then
   done
   [ $_t -ge $MAX_WAIT_AK ] && _log "Authentik server not healthy after ${MAX_WAIT_AK}s, continuing"
 
+  # ops #1039: a SLOW core is not a broken outpost. Wait for the core to answer
+  # /-/health/ready/ before the LDAP check below, so the force-recreate after it never
+  # restarts the outpost into a core that is not ready.
+  #
+  # Field/T&E (10.4.4, Ubuntu 22.04, core CPU-limited): the server was not healthy until
+  # ~10.5 min after boot. The group check below gave up at 120 s, force-recreated the
+  # outpost into that same not-ready core (it still could not resolve groups: ALERT mail),
+  # and TAK's API, up since 185 s, then had no groups for 23+ min until the console's
+  # last-resort TAK restart. A recreate cannot fix a core that is not ready; it only resets
+  # the connections TAK's API holds to the outpost. The wait shares one budget with the
+  # healthy wait above (_MAX_CORE_TOTAL since the section began), because this script's
+  # unit stops at 1200 s (TimeoutStartSec). Fails open: the 8089 gate is released by the
+  # trap on every exit, and takclientgate.timer is the backstop.
+  _MAX_CORE_TOTAL=720
+  _core_ready=1
+  if ! gd_ak_core_ready; then
+    _core_ready=0
+    _log "Authentik core not ready yet — waiting for /-/health/ready/ before checking LDAP groups (up to ${_MAX_CORE_TOTAL}s after Authentik was started)"
+    while [ $(( $(date +%s) - _ak_t0 )) -lt $_MAX_CORE_TOTAL ]; do
+      sleep $INTERVAL
+      if gd_ak_core_ready; then
+        _core_ready=1
+        _log "Authentik core ready ($(( $(date +%s) - _ak_t0 ))s after Authentik was started)"
+        break
+      fi
+    done
+  fi
+
   # v10.1.55 (W5, GH #64): verify the outpost RESOLVES GROUPS, not merely that it binds.
   #
   # This used to be `gd_tcp_up 127.0.0.1 389`, which passes the instant the outpost
@@ -150,6 +179,8 @@ if [ -n "$AK_DIR" ]; then
   _log "Checking LDAP outpost can resolve groups (not just bind)..."
   _t=0
   _MAX_LDAP=120
+  # ops #1039: no point in a 120 s search for groups against a core that never became ready.
+  [ $_core_ready -eq 1 ] || _MAX_LDAP=$INTERVAL
   _ldap_ok=0
   while [ $_t -lt $_MAX_LDAP ]; do
     gd_ldap_groups_ok "$AK_DIR"; _rc=$?
@@ -171,7 +202,17 @@ if [ -n "$AK_DIR" ]; then
     _t=$((_t + INTERVAL))
   done
 
-  if [ $_ldap_ok -eq 0 ]; then
+  if [ $_ldap_ok -eq 0 ] && [ $_core_ready -eq 0 ]; then
+    # ops #1039: the core never answered ready in the budget above, so a recreate would start
+    # the outpost into the same core and only reset TAK's connections to it. Leave it: the
+    # outpost serves from its cache or recovers when the core is up, the Guard Dog watcher
+    # takes over after its boot grace, and the console checks TAK's groups after boot.
+    _log "ALERT | Authentik core still not ready after ${_MAX_CORE_TOTAL}s and the LDAP outpost is not resolving groups — outpost NOT recreated (it would start into a core that is not ready). Check: docker logs authentik-server-1"
+    if [ -x /opt/tak-guarddog/send-alert-email.sh ]; then
+      printf '%s\n' "Authentik on $(hostname) was still not ready ${_MAX_CORE_TOTAL}s after boot started it, and the LDAP outpost cannot resolve groups yet. LDAP-authenticated clients get no groups until Authentik is ready. Guard Dog did not restart the outpost, because it would start into the same not-ready core. Investigate: docker logs authentik-server-1; docker stats (CPU and memory)." \
+        | /opt/tak-guarddog/send-alert-email.sh "Guard Dog: Authentik is slow to start on $(hostname)" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null || true
+    fi
+  elif [ $_ldap_ok -eq 0 ]; then
     _log "LDAP outpost NOT resolving groups after ${_MAX_LDAP}s — force-recreating (this is the GH #64 boot race)"
     # ops #180: under the compose lock too. Busy: skip, and the check below says so.
     gd_ak_lock_take "$AK_LOCK_WAIT"; _lk=$?

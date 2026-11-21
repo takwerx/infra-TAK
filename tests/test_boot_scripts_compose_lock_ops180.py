@@ -101,6 +101,7 @@ def box(tmp_path):
     (stubs / 'id').write_text('#!/bin/sh\nexit 1\n')                 # no local postgres
     (stubs / 'systemctl').write_text('#!/bin/sh\nexit 1\n')          # no MediaMTX
     (stubs / 'timeout').write_text('#!/bin/sh\nexit 1\n')            # every TCP probe: down
+    (stubs / 'curl').write_text('#!/bin/sh\nprintf 200\n')           # Authentik's core is ready (ops #1039)
     for name in ('sleep', 'logger'):
         (stubs / name).write_text('#!/bin/sh\nexit 0\n')
     for f in stubs.iterdir():
