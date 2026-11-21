@@ -74720,6 +74720,19 @@ def _local_authentik_http_ok():
         return False
 
 
+def _local_ldap_outpost_listening():
+    """ops #1017: True when the Authentik LDAP outpost accepts a connection on this box (port 389).
+    A remote Authentik cannot be judged from here, so that counts as listening."""
+    try:
+        cfg = _get_module_deployment_config(load_settings(), 'authentik_deployment')
+        if cfg.get('target_mode') == 'remote':
+            return True
+        with socket.create_connection(('127.0.0.1', 389), timeout=5):
+            return True
+    except Exception:
+        return False
+
+
 def _guarddog_authentik_update_end_when_healthy(max_s=_GD_AUTHENTIK_UPDATE_MAX_S, every_s=5):
     """Remove the marker once Authentik answers again, i.e. after its migrations. Gives up
     at the marker's own timeout (the watcher ignores it from then on anyway)."""
@@ -115240,6 +115253,17 @@ def _startup_resync_ldap_service_account():
                 time.sleep(10)
             if _authentik_busy_reason() or not _local_authentik_http_ok():
                 print(f"Startup migration: Authentik not answering after {_STARTUP_LDAP_AK_WAIT_S}s — "
+                      f"leaving the LDAP service account to the 5-min watchdog")
+                return
+            # ops #1017 (test12 and a cloud box, real reboots, Nov 20): Authentik's web side answers
+            # before the LDAP outpost is back (post-start starts the outpost last). ldapsearch then
+            # says "Can't contact LDAP server", which the verdict reads as a failed bind, so every
+            # reboot ran a needless password set plus an outpost recreate. Wait until the outpost
+            # listens, then judge the bind.
+            while not _local_ldap_outpost_listening() and time.time() < ak_deadline:
+                time.sleep(10)
+            if not _local_ldap_outpost_listening():
+                print(f"Startup migration: LDAP outpost not listening after {_STARTUP_LDAP_AK_WAIT_S}s — "
                       f"leaving the LDAP service account to the 5-min watchdog")
                 return
 
