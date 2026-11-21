@@ -30,8 +30,9 @@ Three fixes, one test group each:
      is drift (no password reset or recreate during outpost startup);
   B. a console recreate of the outpost under a running TAK asks for one TAK restart, at any TAK
      uptime;
-  C. when most connections stay stuck while LDAP answers, the stuck-client check restarts TAK once
-     and sends the Guard Dog alert, instead of dropping connections forever.
+  C. when most connections stay stuck while LDAP answers, a 1-minute check restarts TAK once
+     (3 stuck checks in a row, never before TAK is up 5 min; one restart per 6 h, then the alert
+     only) and sends the Guard Dog alert email, instead of dropping connections forever.
 """
 
 import json
@@ -43,8 +44,7 @@ import urllib.request
 import pytest
 
 from test_startup_ldap_resync_waits_for_authentik_ops438 import Boot
-from test_tak_ldap_recycle import APP, HOUR, T0, Box, _src, healthy_box, sess
-from test_stuck_unnamed_client_ops565 import TICK, monitor
+from test_tak_ldap_recycle import APP, HOUR, T0, Box, _const, _src, healthy_box, sess
 
 
 # ── A. boot heal: no password reset or outpost recreate while the outpost starts ─────────────
@@ -212,7 +212,12 @@ def test_the_request_restarts_a_tak_the_box_boot_rule_would_skip_gh616():
     assert len(box.restarts()) == 1
 
 
-# ── C. most clients stuck while LDAP answers → one TAK restart and an alert ───────────────────
+# ── C. most clients stuck while LDAP answers → one TAK restart and an alert email ─────────────
+# AJ (Nov 20, "mission critical"): the stack gets 5 min after TAK starts; then 3 stuck checks in
+# a row, 1 min apart, restart TAK once. One restart per 6 h; inside that, the alert only.
+
+MIN = 60
+
 
 def mass_box(n_stuck=6, **kw):
     """The field state: TAK's own LDAP lookups fail, so every client comes back with no user and
@@ -226,74 +231,222 @@ def mass_box(n_stuck=6, **kw):
     return box
 
 
-def test_mass_stuck_clients_restart_tak_once_and_alert_gh616():
-    box = mass_box()                                   # 6 of 10 connections stuck
-    tick = monitor(box)
-    assert tick(0) == []
-    assert len(tick(TICK)) == 6                        # 10 min: dropped, as before
-    box.t += 20                                        # they reconnect, stuck again
+def checker(box):
+    """The console's 1-minute stuck-phones thread: one process, so its memory lives across
+    checks. `check(dt)` = dt seconds later, run one check; returns what it did."""
+    ns = box.ns()
+    for c in ('_TAK_STUCK_MASS_MIN', '_TAK_STUCK_MASS_PCT', '_TAK_STUCK_MASS_TICK_S', '_TAK_STUCK_MASS_CHECKS',
+              '_TAK_STUCK_MASS_DEADLINE_S', '_TAK_STUCK_MASS_RESTART_GAP_S', '_TAK_STUCK_MASS_ALERT_GAP_S'):
+        ns[c] = _const(c)
+    ns['_tak_stuck_mass'] = {'streak': 0, 'since': 0.0, 'tak_start': None}
+    ns['_tak_stuck_clients_alert'] = lambda plog, outcome, detail, **kw: box.alerts.append(
+        (box.t, outcome, detail, kw))
+    for name in ('_tak_stuck_mass_escalate', '_tak_stuck_mass_check'):
+        exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
+
+    def check(dt=MIN):
+        box.t += dt
+        return ns['_tak_stuck_mass_check'](box.log.append)
+    return check
+
+
+def test_the_new_numbers_gh616():
+    assert _const('_TAK_STUCK_MASS_TICK_S') == 60
+    assert _const('_TAK_STUCK_MASS_CHECKS') == 3
+    assert _const('_TAK_STUCK_MASS_DEADLINE_S') == 300
+    assert _const('_TAK_STUCK_MASS_RESTART_GAP_S') == 6 * HOUR
+
+
+def test_mass_stuck_clients_restart_tak_after_three_checks_a_minute_apart_gh616():
+    box = mass_box()                                   # 6 of 10 connections stuck, TAK up 3 days
+    check = checker(box)
+    assert check(0) is None and check() is None        # 1st and 2nd stuck check
     assert box.restarts() == []
-    tick(TICK - 20)                                    # 20 min stuck in all: escalate
+    assert check() == 'restart'                        # 3rd in a row, 2 min after the first
     assert len(box.restarts()) == 1
-    assert len(box.alerts) == 1 and 'TAK Server restarted' in box.alerts[0][1]
+    assert len(box.alerts) == 1 and box.alerts[0][1] == 'TAK Server restarted'
     assert '6 of 10' in box.alerts[0][2]
     assert any('restarting TAK Server once' in line for line in box.log)
 
 
-def test_mass_restart_is_at_most_once_per_six_hours_gh616():
-    box = mass_box()
-    tick = monitor(box)
-    tick(0)
-    tick(TICK)
-    box.t += 20
-    tick(TICK - 20)
+def test_field_reboot_restart_at_the_5_minute_deadline_not_before_gh616():
+    """Field: TAK started, phones stuck from its first minute. Restart when TAK has been up 5 min,
+    not at 3 min (a normal slow boot) and not 20 min later."""
+    box = mass_box(tak_start=T0)
+    check = checker(box)
+    done_at = None
+    for _ in range(10):
+        at = box.t + MIN - T0                          # TAK's age when this check runs
+        if check() == 'restart':
+            done_at = at
+            break
+    assert done_at == 5 * MIN
     assert len(box.restarts()) == 1
-    for _ in range(12):                                # 2 h more, still stuck: drops only
-        tick(TICK)
-    assert len(box.restarts()) == 1 and len(box.alerts) == 1
+    assert box.alerts[0][3].get('after_boot') is True
+
+
+def test_a_healthy_check_starts_the_count_over_gh616():
+    box = mass_box()
+    check = checker(box)
+    check(0)
+    check()
+    phones = [s for s in box.subs if s['_cn'].startswith('phone')]
+    saved = [dict(s) for s in phones]
+    for s in phones:                                   # TAK's own refresh gave them their groups
+        s.update(sess(0, s['_cn'], ('OPS',)), subscriptionUid=s['subscriptionUid'])
+    assert check() is None
+    for s, old in zip(phones, saved):                  # and they are lost again
+        s.clear()
+        s.update(old)
+    assert check() is None and check() is None
+    assert box.restarts() == []
+    assert check() == 'restart'
+
+
+def test_an_unreadable_client_list_keeps_the_count_but_adds_nothing_gh616():
+    box = mass_box()
+    check = checker(box)
+    check(0)
+    check()
+    box.api_ok = False
+    assert check() is None
+    box.api_ok = True
+    assert check() == 'restart'                        # 3 stuck checks, not 3 minutes
+
+
+def test_mass_restart_is_at_most_once_per_six_hours_and_never_loops_gh616():
+    box = mass_box()
+    check = checker(box)
+    check(0)
+    check()
+    assert check() == 'restart'
+    did = [check() for _ in range(110)]                # TAK came back stuck; ~2 h of checks
+    assert len(box.restarts()) == 1
+    assert did.count('alert') == 2 and 'restart' not in did     # at ~5 min, then an hour later
+    assert len(box.alerts) == 3
+    assert box.alerts[1][1] == 'TAK Server NOT restarted again'
+    assert box.alerts[1][3].get('restarted_min_ago') is not None
+    assert any('NOT restarting again' in line for line in box.log)
+
+
+def test_a_second_stuck_state_inside_six_hours_alerts_again_without_a_restart_gh616():
+    box = mass_box()
+    check = checker(box)
+    check(0)
+    check()
+    assert check() == 'restart'
+    phones = [s for s in box.subs if s['_cn'].startswith('phone')]
+    saved = [dict(s) for s in phones]
+    for s in phones:                                   # healed by the restart
+        s.update(sess(0, s['_cn'], ('OPS',)), subscriptionUid=s['subscriptionUid'])
+    for _ in range(90):
+        assert check() is None
+    for s, old in zip(phones, saved):                  # 1.5 h later: stuck again
+        s.clear()
+        s.update(old)
+    did = [check() for _ in range(10)]
+    assert did.count('alert') == 1 and 'restart' not in did
+    assert len(box.restarts()) == 1 and len(box.alerts) == 2
+
+
+def test_after_six_hours_a_new_stuck_state_restarts_again_gh616():
+    box = mass_box()
+    check = checker(box)
+    check(0)
+    check()
+    assert check() == 'restart'
+    for _ in range(6 * 60 + 10):
+        check()
+    assert len(box.restarts()) == 2
 
 
 def test_mass_restart_never_into_a_broken_ldap_gh616():
     box = mass_box(ldap=lambda b: (49, 0))
-    tick = monitor(box)
-    for _ in range(6):
-        tick(TICK)
+    check = checker(box)
+    for _ in range(10):
+        check()
     assert box.restarts() == [] and box.alerts == []
 
 
 def test_mass_restart_waits_for_a_running_console_update_gh616():
     box = mass_box(update_in_progress=True)
-    tick = monitor(box)
-    for _ in range(6):
-        tick(TICK)
+    check = checker(box)
+    for _ in range(10):
+        check()
     assert box.restarts() == [] and box.alerts == []
 
 
 def test_a_few_stuck_clients_are_never_a_mass_restart_gh616():
-    """Two stuck phones among ten connections (the ops #565 enrollment race): drops only."""
+    """Two stuck phones among ten connections (the ops #565 enrollment race): the 10-min drop's job."""
     box = mass_box(n_stuck=2)
-    tick = monitor(box)
-    for _ in range(8):
-        tick(TICK)
-        box.t += 20
+    check = checker(box)
+    for _ in range(30):
+        check()
     assert box.restarts() == [] and box.alerts == []
-    assert box.drops()
 
 
 def test_a_minority_stuck_is_never_a_mass_restart_gh616():
-    """Five stuck of twelve (below half): drops only."""
+    """Five stuck of twelve (below half)."""
     box = mass_box(n_stuck=5)
     for i in range(3):
         box.subs.append(sess(80 + i, f'ok{i}'))
         box.ldap_users[f'ok{i}'] = 1
-    tick = monitor(box)
-    for _ in range(8):
-        tick(TICK)
-        box.t += 20
+    check = checker(box)
+    for _ in range(30):
+        check()
     assert box.restarts() == []
 
 
-def test_mass_escalation_code_exists_in_the_monitor_path_gh616():
-    body = _src('_tak_drop_stuck_unnamed_sessions')
-    assert '_tak_stuck_mass_escalate(' in body
-    assert re.search(r'^_TAK_STUCK_MASS_RESTART_GAP_S = \d+', APP, re.M)
+def test_nothing_to_do_without_ldap_in_coreconfig_gh616():
+    box = mass_box(coreconfig=False)
+    check = checker(box)
+    for _ in range(10):
+        check()
+    assert box.restarts() == [] and box.alerts == []
+
+
+def test_the_check_runs_on_its_own_1_minute_thread_not_the_10_minute_monitor_gh616():
+    assert re.search(r"threading\.Thread\(target=_tak_stuck_mass_loop, daemon=True", APP)
+    loop = _src('_tak_stuck_mass_loop')
+    assert 'time.sleep(_TAK_STUCK_MASS_TICK_S)' in loop and '_tak_stuck_mass_check(' in loop
+    assert '_tak_stuck_mass_escalate(' not in _src('_tak_drop_stuck_unnamed_sessions')
+    assert not re.search(r'^_TAK_STUCK_MASS_ESCALATE_S = ', APP, re.M)     # the 20-min rule is gone
+
+
+class _Mail:
+    def __init__(self):
+        self.sent = []
+
+    def __call__(self, to, subj, body):
+        self.sent.append((to, subj, body))
+
+
+def _alert_ns(email='ops@example.org'):
+    mail, lines = _Mail(), []
+    ns = {'datetime': __import__('datetime').datetime, 'socket': __import__('socket'),
+          '_write_priv': lambda p, data, mode='w': lines.append((p, data)),
+          'load_settings': lambda: {'guarddog_alert_email': email},
+          '_guarddog_server_identifier': lambda s: 'box1',
+          '_guarddog_send_alert_email_via_relay': mail,
+          '_TAK_STUCK_MASS_RESTART_GAP_S': _const('_TAK_STUCK_MASS_RESTART_GAP_S')}
+    exec(compile(_src('_tak_stuck_clients_alert'), 'app.py:_tak_stuck_clients_alert', 'exec'), ns)
+    return ns['_tak_stuck_clients_alert'], mail, lines
+
+
+def test_the_restart_alert_is_an_email_in_plain_words_gh616():
+    alert, mail, lines = _alert_ns()
+    alert(print, 'TAK Server restarted', '6 of 10 ...', after_boot=True)
+    [(to, subj, body)] = mail.sent
+    assert to == 'ops@example.org'
+    assert subj == '⚠ TAK Server restarted: phones had no groups (box1)'
+    assert body.startswith('Phones had no groups after a reboot. Guard Dog restarted TAK Server.')
+    assert lines and lines[0][0] == '/var/log/takguard/restarts.log' and 'tak-stuck-clients' in lines[0][1]
+
+
+def test_the_no_restart_alert_says_why_and_what_to_do_gh616():
+    alert, mail, _ = _alert_ns()
+    alert(print, 'TAK Server NOT restarted again', '6 of 10 ...', restarted_min_ago=7)
+    [(_to, subj, body)] = mail.sent
+    assert 'NOT restarted' in subj
+    assert 'restarted TAK Server 7 min ago' in body and 'at most once every 6 hours' in body
+    assert 'open the TAK Server page and restart TAK Server' in body.replace('Open', 'open')

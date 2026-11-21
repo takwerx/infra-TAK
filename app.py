@@ -78586,15 +78586,26 @@ _TAK_STUCK_UNNAMED_COOLDOWN_S = 3600
 # TAK gave ~99 % of its 55-60 clients no user and no groups; this check dropped 538 connections
 # in 8 h, every client came back the same way, and nothing escalated or alerted. A TAK restart
 # fixed it at once. So when at least _MASS_MIN connections AND at least _MASS_PCT % of all of
-# them have stayed stuck for _MASS_ESCALATE_S while LDAP answers, TAK's own LDAP path is broken:
-# restart TAK once (at most every _MASS_RESTART_GAP_S) and send the Guard Dog alert.
+# them are stuck while LDAP answers, TAK's own LDAP path is broken: restart TAK once (at most
+# every _MASS_RESTART_GAP_S) and send the Guard Dog alert email.
+# AJ (Nov 20, "mission critical"): not 20 min. The whole stack (TAK, Authentik, LDAP, groups) gets
+# _MASS_DEADLINE_S after TAK Server starts to come up. A dedicated thread checks every
+# _MASS_TICK_S; _MASS_CHECKS stuck checks in a row (about 3 min) restart TAK, never before TAK has
+# been up _MASS_DEADLINE_S, so a normal slow boot is left alone. Cost when healthy: one read of
+# TAK's subscription list a minute (the same call the 10-min check makes); LDAP is read only while
+# most clients are stuck. Inside the 6-h gap a new stuck state sends the alert only (at most
+# hourly), never a second restart.
 _TAK_STUCK_MASS_MIN = 3
 _TAK_STUCK_MASS_PCT = 50
-_TAK_STUCK_MASS_ESCALATE_S = 1200
+_TAK_STUCK_MASS_TICK_S = 60
+_TAK_STUCK_MASS_CHECKS = 3
+_TAK_STUCK_MASS_DEADLINE_S = 300
 _TAK_STUCK_MASS_RESTART_GAP_S = 21600
+_TAK_STUCK_MASS_ALERT_GAP_S = 3600
 _tak_stuck_unnamed_seen = {}    # connection uid → epoch first seen with no user and no groups
 _tak_stuck_unnamed_dropped = {}  # device uid (else '' = any connection without one) → epoch of our last drop
-_tak_stuck_mass = {'since': 0.0}  # GH #616: epoch since most connections have been stuck (0 = not now)
+# GH #616: the 1-minute check's memory: stuck checks in a row, since when, for which TAK start.
+_tak_stuck_mass = {'streak': 0, 'since': 0.0, 'tak_start': None}
 
 
 def _tak_drop_stuck_unnamed_sessions(plog):
@@ -78614,17 +78625,7 @@ def _tak_drop_stuck_unnamed_sessions(plog):
             del _tak_stuck_unnamed_seen[uid]
     for uid in stuck:
         _tak_stuck_unnamed_seen.setdefault(uid, now)
-    # GH #616: most clients stuck, and staying so across drops → TAK's own LDAP path is broken.
-    if len(stuck) >= _TAK_STUCK_MASS_MIN and len(stuck) * 100 >= len(sessions) * _TAK_STUCK_MASS_PCT:
-        _tak_stuck_mass['since'] = _tak_stuck_mass['since'] or now
-        if (now - _tak_stuck_mass['since'] >= _TAK_STUCK_MASS_ESCALATE_S and not _console_update_in_progress()
-                and _tak_stuck_mass_escalate(plog, len(stuck), len(sessions),
-                                             int((now - _tak_stuck_mass['since']) // 60))):
-            _tak_stuck_mass['since'] = 0.0
-            _tak_stuck_unnamed_seen.clear()
-            return []
-    else:
-        _tak_stuck_mass['since'] = 0.0
+    # (GH #616: most clients stuck at once is the 1-minute `_tak_stuck_mass_check`, not this.)
     # test12 2026-11-08: TAK gives a connection it never looked up no device uid either, and its
     # number changes at every reconnect, so neither can hold the hourly limit. Without a device
     # uid they all share one slot: a client that keeps coming back this way is dropped once an hour.
@@ -78653,31 +78654,114 @@ def _tak_drop_stuck_unnamed_sessions(plog):
     return dropped
 
 
-def _tak_stuck_mass_escalate(plog, n_stuck, n_total, minutes):
-    """GH #616: most of TAK's connections have had no user and no groups for `minutes` while
-    LDAP answers. Restart TAK once (through the LDAP recycle, which first checks LDAP is healthy)
-    and send the Guard Dog alert. At most once per `_TAK_STUCK_MASS_RESTART_GAP_S`; inside that
-    gap the drops go on as before. True when the restart was asked for (done or kept pending)."""
-    tag = 'TAK stuck-client check'
-    try:
-        last = float((load_settings().get('tak_stuck_mass') or {}).get('restart_epoch') or 0)
-    except Exception:
-        last = 0.0
-    if time.time() - last < _TAK_STUCK_MASS_RESTART_GAP_S:
-        return False
+def _tak_stuck_mass_check(plog):
+    """GH #616: one run of the 1-minute stuck-phones check. When at least `_TAK_STUCK_MASS_MIN`
+    connections, and at least `_TAK_STUCK_MASS_PCT` % of all of them, have no user and no groups
+    while LDAP gives users their groups, count one stuck check. `_TAK_STUCK_MASS_CHECKS` in a row,
+    with TAK up `_TAK_STUCK_MASS_DEADLINE_S` or more and no console update running, hand it to
+    `_tak_stuck_mass_escalate` (one restart, else the alert only, at most hourly). A new TAK start, a healthy
+    check or LDAP not answering starts the count over; an unreadable client list counts nothing.
+    Returns what was done: 'restart', 'alert' or None."""
+    tag = 'TAK stuck-phones check'
+    st = _tak_stuck_mass
+
+    def _reset():
+        st.update(streak=0, since=0.0)
+
+    if not os.path.exists('/opt/tak/CoreConfig.xml'):
+        _reset()
+        return None
+    tak_start = _tak_started_epoch()
+    if tak_start is None:
+        _reset()
+        return None
+    if st.get('tak_start') is None or abs(tak_start - st['tak_start']) > 1:
+        _reset()                  # a count is about one TAK start; a restarted TAK starts over
+        st['tak_start'] = tak_start
+    sessions = _tak_client_sessions()
+    if sessions is None:
+        return None               # a busy API is not a verdict: keep the count, add nothing
+    stuck = [x for x in sessions if x['unnamed'] and not x['groups']]
+    if len(stuck) < _TAK_STUCK_MASS_MIN or len(stuck) * 100 < len(sessions) * _TAK_STUCK_MASS_PCT:
+        if st['streak']:
+            plog(f"  {tag}: clients have their groups again (was stuck {st['streak']} check(s) in a row)")
+        _reset()
+        return None
+    if not _coreconfig_has_ldap():
+        _reset()
+        return None
     ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
     if not ldap_pass or not _ensure_ldapsearch() or _ldap_users_tak_groups(ldap_pass, None) is None:
-        return False       # LDAP itself is down: a restart would load the same broken LDAP
+        if st['streak']:
+            plog(f"  {tag}: LDAP does not answer — the LDAP outage heal owns this, not a TAK restart")
+        _reset()
+        return None               # a restart would load the same broken LDAP
+    now = time.time()
+    st['streak'] += 1
+    st['since'] = st['since'] or now
+    if st['streak'] == 1:
+        plog(f"  {tag}: {len(stuck)} of {len(sessions)} TAK client connections have no user and no "
+             f"groups while LDAP answers — checking every {_TAK_STUCK_MASS_TICK_S} s; "
+             f"{_TAK_STUCK_MASS_CHECKS} in a row restart TAK Server")
+    if (st['streak'] < _TAK_STUCK_MASS_CHECKS or now - tak_start < _TAK_STUCK_MASS_DEADLINE_S
+            or _console_update_in_progress()):
+        return None
+    done = _tak_stuck_mass_escalate(plog, len(stuck), len(sessions),
+                                    max(1, int((now - st['since']) // 60)), int((now - tak_start) // 60))
+    if done == 'restart':
+        _reset()
+        st['tak_start'] = None
+    return done
+
+
+def _tak_stuck_mass_loop():
+    log = lambda m: print(f"[tak-stuck-check] {m}", flush=True)
+    while True:
+        time.sleep(_TAK_STUCK_MASS_TICK_S)
+        try:
+            _tak_stuck_mass_check(log)
+        except Exception as e:
+            log(f"error (non-fatal): {str(e)[:200]}")
+
+
+def _tak_stuck_mass_escalate(plog, n_stuck, n_total, minutes, tak_up_min):
+    """GH #616: most of TAK's connections have had no user and no groups for `minutes` while
+    LDAP answers. Restart TAK once (through the LDAP recycle, which checks LDAP again first) and
+    send the Guard Dog alert email. At most one restart per `_TAK_STUCK_MASS_RESTART_GAP_S`;
+    inside that gap send the alert only (at most once per `_TAK_STUCK_MASS_ALERT_GAP_S`), so a
+    TAK that comes back stuck is never restarted in a loop. Returns 'restart', 'alert' or None
+    (alert already sent this hour)."""
+    tag = 'TAK stuck-phones check'
     try:
-        s = load_settings()
-        s['tak_stuck_mass'] = {'restart_epoch': time.time(), 'stuck': n_stuck, 'total': n_total}
-        save_settings(s)
+        state = dict(load_settings().get('tak_stuck_mass') or {})
     except Exception:
-        pass
+        state = {}
+    now = time.time()
+    last = float(state.get('restart_epoch') or 0)
     detail = (f"{n_stuck} of {n_total} TAK client connections had no user and no groups for "
-              f"{minutes}+ min while LDAP gave users their groups")
-    plog(f"  ✗ {tag}: {detail}. Dropping them does not help (they come back the same way): TAK "
-         f"Server's own LDAP lookups are broken — restarting TAK Server once")
+              f"{minutes}+ min while LDAP gave users their groups (TAK Server up {tak_up_min} min)")
+
+    def _save(**kw):
+        try:
+            s = load_settings()
+            cur = dict(s.get('tak_stuck_mass') or {})
+            cur.update(kw, stuck=n_stuck, total=n_total)
+            s['tak_stuck_mass'] = cur
+            save_settings(s)
+        except Exception:
+            pass
+
+    if now - last < _TAK_STUCK_MASS_RESTART_GAP_S:
+        ago = int((now - last) // 60)
+        if now - float(state.get('alert_epoch') or 0) < _TAK_STUCK_MASS_ALERT_GAP_S:
+            return None
+        _save(alert_epoch=now)
+        plog(f"  ✗ {tag}: {detail}. TAK Server was already restarted for this {ago} min ago; at most "
+             f"one restart per {_TAK_STUCK_MASS_RESTART_GAP_S // 3600} h — NOT restarting again, alert sent")
+        _tak_stuck_clients_alert(plog, 'TAK Server NOT restarted again', detail, restarted_min_ago=ago)
+        return 'alert'
+    _save(restart_epoch=now)   # the restart mail does not hold back a "still stuck" mail
+    plog(f"  ✗ {tag}: {detail}. TAK Server's own LDAP lookups are broken — restarting TAK Server once")
     _tak_ldap_recycle_request(f'most TAK clients stuck with no groups ({n_stuck} of {n_total})', restart=True)
     try:
         restarted = _tak_recycle_after_ldap_outage(plog, tag, check_outpost=False)
@@ -78686,35 +78770,46 @@ def _tak_stuck_mass_escalate(plog, n_stuck, n_total, minutes):
         restarted = False
     outcome = ('TAK Server restarted' if restarted else
                'TAK Server restart asked for; the console does it within 10 min once LDAP answers')
-    _tak_stuck_clients_alert(plog, outcome, detail)
-    return True
+    _tak_stuck_clients_alert(plog, outcome, detail, after_boot=tak_up_min < 30)
+    return 'restart'
 
 
-def _tak_stuck_clients_alert(plog, outcome, detail):
-    """GH #616: Guard Dog says the console restarted (or will restart) TAK Server because most
-    clients had no groups. Activity log line always, email when a recipient is set. Never raises."""
+def _tak_stuck_clients_alert(plog, outcome, detail, after_boot=False, restarted_min_ago=None):
+    """GH #616: Guard Dog email: TAK Server was restarted (or, inside the 6-h gap, was NOT
+    restarted again) because most phones had no groups. Activity log line always, email when a
+    recipient is set. Never raises."""
     when = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     try:
         _write_priv('/var/log/takguard/restarts.log',
                     ' '.join(f"{when} | tak-stuck-clients | {outcome} | {detail}".split()) + '\n', mode='a')
     except Exception as e:
-        plog(f"  TAK stuck-client check: Guard Dog activity line not written: {str(e)[:120]}")
+        plog(f"  TAK stuck-phones check: Guard Dog activity line not written: {str(e)[:120]}")
     try:
         settings = load_settings()
         to_addr = (settings.get('guarddog_alert_email') or '').strip()
         if not to_addr:
-            plog("  TAK stuck-client check: Guard Dog alert email SUPPRESSED (no recipient configured)")
+            plog("  TAK stuck-phones check: Guard Dog alert email SUPPRESSED (no recipient configured)")
             return
         ident = _guarddog_server_identifier(settings) or socket.gethostname()
-        subj = f"⚠ TAK Server restart: most clients had no groups ({ident})"
-        body = (f"Most ATAK/iTAK/WinTAK clients were connected to TAK Server but had no groups, so "
-                f"they could not see each other. Dropping their connections did not help: they came "
-                f"back the same way.\n\nThe console restarts TAK Server once to fix it. Clients reconnect "
-                f"by themselves.\n\nResult: {outcome}\nDetail: {detail}\n\nIf clients still see nobody, "
-                f"open the TAK Server page and restart TAK Server.\n\nConsole: {ident}\n\n— Guard Dog")
+        if restarted_min_ago is None:
+            subj = f"⚠ TAK Server restarted: phones had no groups ({ident})"
+            body = (f"Phones had no groups{' after a reboot' if after_boot else ''}. Guard Dog restarted "
+                    f"TAK Server.\n\nPhones (ATAK, iTAK, WinTAK) were connected but had no groups, so they "
+                    f"could not see each other. Login (LDAP) was working. Phones reconnect by themselves "
+                    f"after the restart.\n\nResult: {outcome}\nDetail: {detail}\n\nIf phones still see "
+                    f"nobody in 5 minutes, open the TAK Server page and restart TAK Server."
+                    f"\n\nConsole: {ident}\n\n— Guard Dog")
+        else:
+            subj = f"⚠ Phones have no groups again: TAK Server NOT restarted ({ident})"
+            body = (f"Phones have no groups again. Guard Dog restarted TAK Server {restarted_min_ago} min "
+                    f"ago for the same problem and restarts it at most once every "
+                    f"{_TAK_STUCK_MASS_RESTART_GAP_S // 3600} hours, so it did not restart it again.\n\n"
+                    f"Open the TAK Server page and restart TAK Server. If phones still have no groups "
+                    f"after that, open the Authentik page and check the LDAP outpost.\n\n"
+                    f"Detail: {detail}\n\nConsole: {ident}\n\n— Guard Dog")
         _guarddog_send_alert_email_via_relay(to_addr, subj, body)
     except Exception as e:
-        plog(f"  TAK stuck-client check: Guard Dog alert email failed: {str(e)[:120]}")
+        plog(f"  TAK stuck-phones check: Guard Dog alert email failed: {str(e)[:120]}")
 
 
 # New-user enrollment race (root cause of ops #565, nuc 2026-11-09). The LDAP provider runs
@@ -122085,6 +122180,12 @@ try:
     threading.Thread(target=_ak_directory_watch_loop, daemon=True, name='ak-directory-watch').start()
 except Exception as _e:
     print(f"[startup] failed to start Authentik directory watch (non-fatal): {_e}", flush=True)
+
+# GH #616: most phones stuck with no groups while LDAP answers → one TAK restart, checked every minute.
+try:
+    threading.Thread(target=_tak_stuck_mass_loop, daemon=True, name='tak-stuck-check').start()
+except Exception as _e:
+    print(f"[startup] failed to start TAK stuck-phones check (non-fatal): {_e}", flush=True)
 
 # v10.0.6: in-process scheduled TAK snapshots (replaces the never-functional systemd
 # timer). Reads tak_snapshot_schedule live each tick — no-op while disabled or when

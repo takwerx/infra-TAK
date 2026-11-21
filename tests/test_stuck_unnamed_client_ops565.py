@@ -42,15 +42,6 @@ def monitor(box):
     for c in ('_TAK_STUCK_UNNAMED_MIN_S', '_TAK_STUCK_UNNAMED_COOLDOWN_S'):
         ns[c] = _const(c)
     ns['_tak_stuck_unnamed_seen'], ns['_tak_stuck_unnamed_dropped'] = {}, {}
-    # GH #616: most clients stuck → one TAK restart and a Guard Dog alert (absent before the fix)
-    for c in ('_TAK_STUCK_MASS_MIN', '_TAK_STUCK_MASS_PCT', '_TAK_STUCK_MASS_ESCALATE_S',
-              '_TAK_STUCK_MASS_RESTART_GAP_S'):
-        if re.search(r'^%s = \d+' % c, APP, re.M):
-            ns[c] = _const(c)
-    ns['_tak_stuck_mass'] = {'since': 0.0}
-    if re.search(r'^def _tak_stuck_mass_escalate\(', APP, re.M):
-        exec(compile(_src('_tak_stuck_mass_escalate'), 'app.py:_tak_stuck_mass_escalate', 'exec'), ns)
-    ns['_tak_stuck_clients_alert'] = lambda plog, outcome, detail: box.alerts.append((box.t, outcome, detail))
     exec(compile(_src('_tak_drop_stuck_unnamed_sessions'), 'app.py:_tak_drop_stuck_unnamed_sessions', 'exec'), ns)
 
     def tick(dt=TICK):
