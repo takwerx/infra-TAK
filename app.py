@@ -74734,6 +74734,19 @@ def _local_authentik_http_ok():
         return False
 
 
+def _local_ldap_outpost_listening():
+    """ops #1017: True when the Authentik LDAP outpost accepts a connection on this box (port 389).
+    A remote Authentik cannot be judged from here, so that counts as listening."""
+    try:
+        cfg = _get_module_deployment_config(load_settings(), 'authentik_deployment')
+        if cfg.get('target_mode') == 'remote':
+            return True
+        with socket.create_connection(('127.0.0.1', 389), timeout=5):
+            return True
+    except Exception:
+        return False
+
+
 def _guarddog_authentik_update_end_when_healthy(max_s=_GD_AUTHENTIK_UPDATE_MAX_S, every_s=5):
     """Remove the marker once Authentik answers again, i.e. after its migrations. Gives up
     at the marker's own timeout (the watcher ignores it from then on anyway)."""
@@ -107515,6 +107528,215 @@ def _startup_os_upgrade_verify():
     return True
 
 
+# ops #1017 (AJ, Fri Nov 20, 2026): "when a server is restarted, everything comes up and everything
+# still works". After a reboot the boot order is: dockerd restarts every `restart: unless-stopped`
+# container in parallel, Guard Dog's boot sequencer STOPS Authentik, TAK Portal, CloudTAK, Node-RED
+# and MediaMTX before TAK starts, and tak-post-start.service (one shot, TimeoutStartSec=1200) starts
+# them again once TAK answers. If that one shot is slow, killed or fails (a sequencer `docker stop`
+# keeps `unless-stopped` from restarting them), nothing on the box ever starts them again (ops #438).
+# This is the independent check: once per boot, 10+ min after boot, verify what must be running,
+# start what is not, check again, and tell the operator in plain words.
+_BOOT_RECOVERY_FIRST_CHECK_S = 600          # box uptime of the first check (the issue's 10 minutes)
+_BOOT_RECOVERY_POSTSTART_WAIT_MAX_S = 1260  # tak-post-start still running: wait for it, but no longer than this
+_BOOT_RECOVERY_MAX_BOOT_AGE_S = 1800        # a console that starts later than this after boot is not a reboot
+_BOOT_RECOVERY_RECHECK_S = (120, 300)       # pause after each repair round (2 rounds)
+_BOOT_RECOVERY_UNITS = ('docker', 'takserver', 'postgresql', 'caddy', 'mediamtx', 'mediamtx-webeditor',
+                        'fail2ban', 'takwerx-broker', 'tak-health')
+_BOOT_RECOVERY_CONTAINER_PREFIXES = ('authentik-', 'tak-portal', 'cloudtak-', 'nodered')
+_BOOT_RECOVERY_LABELS = (('authentik-', 'Authentik (login and LDAP)'), ('tak-portal', 'TAK Portal'),
+                         ('cloudtak-', 'CloudTAK'), ('nodered', 'Node-RED'), ('docker', 'Docker'),
+                         ('takserver', 'TAK Server'), ('postgresql', 'PostgreSQL'), ('caddy', 'Caddy (web addresses)'),
+                         ('mediamtx', 'MediaMTX (video)'), ('fail2ban', 'fail2ban'),
+                         ('takwerx-broker', 'the console helper'), ('tak-health', 'the health endpoint'))
+
+
+def _boot_uptime_s():
+    try:
+        with open('/proc/uptime') as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return None
+
+
+def _boot_recovery_label(name):
+    for prefix, label in _BOOT_RECOVERY_LABELS:
+        if name == prefix or name.startswith(prefix):
+            return label
+    return name
+
+
+def _boot_recovery_probe(run=None):
+    """What is down right now: [{'kind': 'unit'|'container', 'name', 'detail', 'repair': bool}].
+    Units: only the ones this box has enabled (so a module that is not installed, or that the
+    operator turned off for good, is never judged). Containers: only infra-TAK's own stacks, and
+    only ones Docker should keep running (restart policy always / unless-stopped)."""
+    run = run or subprocess.run
+    down = []
+    for unit in _BOOT_RECOVERY_UNITS:
+        try:
+            en = (run(['systemctl', 'is-enabled', unit], capture_output=True, text=True, timeout=8).stdout or '').strip()
+            if en not in ('enabled', 'enabled-runtime'):
+                continue
+            act = (run(['systemctl', 'is-active', unit], capture_output=True, text=True, timeout=8).stdout or '').strip()
+        except Exception:
+            continue
+        if act != 'active':
+            down.append({'kind': 'unit', 'name': unit, 'detail': act or 'unknown',
+                         'repair': act not in ('activating', 'reloading')})
+    try:
+        r = run(_sudo_wrap(['docker', 'ps', '-a', '--format', '{{.Names}}']), capture_output=True, text=True, timeout=20)
+        names = [n.strip() for n in (r.stdout or '').splitlines() if n.strip().startswith(_BOOT_RECOVERY_CONTAINER_PREFIXES)]
+        if names:
+            r = run(_sudo_wrap(['docker', 'inspect', '-f',
+                                '{{.Name}}\t{{.HostConfig.RestartPolicy.Name}}\t{{.State.Status}}'] + names),
+                    capture_output=True, text=True, timeout=30)
+            for line in (r.stdout or '').splitlines():
+                parts = line.strip().split('\t')
+                if len(parts) < 3:
+                    continue
+                name, policy, state = parts[0].lstrip('/'), parts[1], parts[2]
+                if policy not in ('always', 'unless-stopped'):
+                    continue
+                if state in ('exited', 'created', 'dead', 'paused'):
+                    down.append({'kind': 'container', 'name': name, 'detail': state, 'repair': True})
+                elif state == 'restarting':
+                    down.append({'kind': 'container', 'name': name, 'detail': 'restarting', 'repair': False})
+    except Exception:
+        pass
+    return down
+
+
+def _boot_recovery_start_order(item):
+    """Docker first, databases before apps, the LDAP outpost last (it needs the Authentik server)."""
+    n = item['name']
+    if item['kind'] == 'unit':
+        return (0, 0 if n == 'docker' else 1, n)
+    if any(k in n for k in ('postgres', 'redis', 'pgbouncer', '-db', 'store')):
+        return (1, 0, n)
+    return (1, 2 if n.endswith('ldap-1') or n.endswith('-ldap') else 1, n)
+
+
+def _boot_recovery_repair(item, run=None):
+    """Start one thing the way its own Start button does. True when the command succeeded."""
+    run = run or subprocess.run
+    cmd = (['systemctl', 'start', item['name']] if item['kind'] == 'unit' else ['docker', 'start', item['name']])
+    try:
+        r = run(_sudo_wrap(cmd), capture_output=True, text=True, timeout=180)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _boot_recovery_alert(plog, repaired, remaining):
+    """Guard Dog tells the operator, in plain words, what did not come back after the reboot.
+    Activity line always, email when a recipient is set. Never raises."""
+    fixed = sorted({_boot_recovery_label(i['name']) for i in repaired})
+    still = sorted({_boot_recovery_label(i['name']) for i in remaining})
+    when = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    outcome = 'still down: ' + ', '.join(still) if still else 'repaired'
+    detail = '; '.join(filter(None, ['started again: ' + ', '.join(fixed) if fixed else '',
+                                     'still down: ' + ', '.join(still) if still else '']))
+    try:
+        _write_priv('/var/log/takguard/restarts.log',
+                    ' '.join(f"{when} | boot-recovery | {outcome} | {detail}".split()) + '\n', mode='a')
+    except Exception as e:
+        plog(f"  Boot check: Guard Dog activity line not written: {str(e)[:120]}")
+    try:
+        settings = load_settings()
+        to_addr = (settings.get('guarddog_alert_email') or '').strip()
+        if not to_addr:
+            plog("  Boot check: Guard Dog alert email SUPPRESSED (no recipient configured)")
+            return
+        ident = _guarddog_server_identifier(settings) or socket.gethostname()
+        if still:
+            subj = f"⚠ After the restart, {still[0]}{' and more' if len(still) > 1 else ''} did not come back ({ident})"
+            body = (f"The server restarted. Guard Dog checked that everything came back and some of it did not.\n\n"
+                    f"Still down: {', '.join(still)}\n"
+                    + (f"Guard Dog started again by itself: {', '.join(fixed)}\n" if fixed else '')
+                    + f"\nGuard Dog tried to start them and they are still not running. Open the console, check "
+                      f"the page of each module, and press its Start button.\n\nConsole: {ident}\n\n— Guard Dog")
+        else:
+            subj = f"✓ After the restart, Guard Dog started {', '.join(fixed)} ({ident})"
+            body = (f"The server restarted. Guard Dog checked that everything came back. These did not start "
+                    f"by themselves, so Guard Dog started them: {', '.join(fixed)}.\n\nEverything is running "
+                    f"now. You do not need to do anything.\n\nConsole: {ident}\n\n— Guard Dog")
+        _guarddog_send_alert_email_via_relay(to_addr, subj, body)
+    except Exception as e:
+        plog(f"  Boot check: Guard Dog alert email failed: {str(e)[:120]}")
+
+
+def _boot_recovery_run(plog, probe=None, repair=None, alert=None, sleep=None, uptime=None,
+                       poststart_busy=None, update_busy=None):
+    """The check itself (runs in a thread). Returns 'ok', 'repaired' or 'down'."""
+    probe = probe or _boot_recovery_probe
+    repair = repair or _boot_recovery_repair
+    alert = alert or _boot_recovery_alert
+    sleep = sleep or time.sleep
+    uptime = uptime or _boot_uptime_s
+    poststart_busy = poststart_busy or (lambda: _kernel_patch_unit_state('tak-post-start.service')[1] == 'activating')
+    update_busy = update_busy or _console_update_in_progress
+    up = uptime()
+    while up is not None and up < _BOOT_RECOVERY_FIRST_CHECK_S:
+        sleep(min(15, _BOOT_RECOVERY_FIRST_CHECK_S - up))
+        up = uptime()
+    # The boot sequence is still starting things: judge after it, not under it.
+    while up is not None and up < _BOOT_RECOVERY_POSTSTART_WAIT_MAX_S and (poststart_busy() or update_busy()):
+        sleep(15)
+        up = uptime()
+    repaired = []
+    remaining = probe()
+    if not remaining:
+        plog("  Boot check: every module is up")
+        return 'ok'
+    for pause in _BOOT_RECOVERY_RECHECK_S:
+        for item in sorted(remaining, key=_boot_recovery_start_order):
+            if not item.get('repair'):
+                continue
+            ok = repair(item)
+            plog(f"  Boot check: {item['name']} was {item['detail']} after the restart — started it "
+                 f"({'ok' if ok else 'FAILED'})")
+            if ok and item not in repaired:
+                repaired.append(item)
+        sleep(pause)
+        remaining = probe()
+        if not remaining:
+            break
+    if remaining:
+        plog("  ✗ Boot check: still down after the repairs: " + ', '.join(i['name'] for i in remaining))
+    alert(plog, repaired, remaining)
+    return 'down' if remaining else 'repaired'
+
+
+def _startup_boot_recovery_check():
+    """Console startup: when this console started within 30 min of the box booting, run the
+    once-per-boot check in a thread. A console restart later in a long uptime is not a reboot."""
+    up = _boot_uptime_s()
+    if up is None or up > _BOOT_RECOVERY_MAX_BOOT_AGE_S:
+        return False
+    try:
+        with open('/proc/sys/kernel/random/boot_id') as f:
+            boot_id = f.read().strip()
+    except Exception:
+        return False
+    try:
+        if (load_settings().get('boot_recovery') or {}).get('boot_id') == boot_id:
+            return False
+
+        def _go():
+            try:
+                result = _boot_recovery_run(lambda m: print(m, flush=True))
+                s = load_settings()
+                s['boot_recovery'] = {'boot_id': boot_id, 'result': result, 'at': time.time()}
+                save_settings(s)
+            except Exception as e:
+                print(f"  Boot check error (non-fatal): {e}", flush=True)
+
+        threading.Thread(target=_go, daemon=True, name='boot-recovery-check').start()
+        return True
+    except Exception:
+        return False
+
+
 # ops #284 (field, 2026-10-27): boxes that v10.3.0 stopped at `reassert` over the 5.8
 # migration's stopped PG 15 are on 24.04 with the rebuilt venv, but the job's cleanup and
 # console restart never ran. Updating the console is the restart; this does the rest, once,
@@ -115047,6 +115269,17 @@ def _startup_resync_ldap_service_account():
                 print(f"Startup migration: Authentik not answering after {_STARTUP_LDAP_AK_WAIT_S}s — "
                       f"leaving the LDAP service account to the 5-min watchdog")
                 return
+            # ops #1017 (test12 and a cloud box, real reboots, Nov 20): Authentik's web side answers
+            # before the LDAP outpost is back (post-start starts the outpost last). ldapsearch then
+            # says "Can't contact LDAP server", which the verdict reads as a failed bind, so every
+            # reboot ran a needless password set plus an outpost recreate. Wait until the outpost
+            # listens, then judge the bind.
+            while not _local_ldap_outpost_listening() and time.time() < ak_deadline:
+                time.sleep(10)
+            if not _local_ldap_outpost_listening():
+                print(f"Startup migration: LDAP outpost not listening after {_STARTUP_LDAP_AK_WAIT_S}s — "
+                      f"leaving the LDAP service account to the 5-min watchdog")
+                return
 
         # Probe: does the bind work today? If yes, idempotent no-op (unless the
         # reputation policy was just patched — in that case TAK Server has been
@@ -119382,6 +119615,13 @@ def _startup_migrations():
                 print("Startup migration: OS upgrade post-reboot verify started", flush=True)
         except Exception as _ou_err:
             print(f"Startup migration: OS upgrade verify start error (non-fatal): {_ou_err}")
+        # ops #1017: a console that starts within 30 min of the box booting runs the once-per-boot
+        # check: everything that must run is running (start what is not, tell the operator).
+        try:
+            if _startup_boot_recovery_check():
+                print("Startup migration: after-boot module check started", flush=True)
+        except Exception as _br_err:
+            print(f"Startup migration: after-boot module check start error (non-fatal): {_br_err}")
         # ops #284: a box v10.3.0 stopped at `reassert` (5.8's stopped PG 15) finishes here.
         try:
             if _startup_os_upgrade_finish_reassert():
