@@ -157,6 +157,17 @@ Official: [docs.netbird.io](https://docs.netbird.io/)
 
 - **The `netbirdio/netbird-server` images (0.80.0, 0.82.0, 0.82.1) carry the `org.opencontainers.image.version` label of their Ubuntu base image (`24.04`), not the NetBird version.** The dashboard image's label is right. To read the running server version, use the tag in `docker inspect --format '{{.Config.Image}}'`, which compose pins. The label is a fallback only when it starts with `0.`. ✅ verified 2026-11-16, Ubuntu 22.04 fresh-install box (ops #853).
 
+## Reboots: what starts what, and in which order
+
+Official: [Docker restart policies](https://docs.docker.com/engine/containers/start-containers-automatically/), [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
+
+- **`restart: unless-stopped` does not restart a container that was stopped on purpose before the reboot or the daemon restart, and `docker stop` counts as on purpose.** Guard Dog's boot sequencer stops Authentik, TAK Portal, CloudTAK and Node-RED (and MediaMTX) before TAK starts, so after a reboot only `tak-post-start.service` brings them back. 📖 documented (Docker); 👁 observed 2026-11-02 (ops #438: TAK Portal and CloudTAK stayed stopped after a 24.04 reboot while TAK, Authentik and Caddy ran).
+- **`docker compose` `depends_on` is not honoured when dockerd restarts containers after a reboot.** dockerd starts them all at once, so the LDAP outpost can start before the Authentik server has published its providers and bind without resolving groups. 👁 observed 2026-08-31 (GH #64).
+- **`tak-post-start.service` is one shot with `TimeoutStartSec=1200`, and its own waits add up to more than that** (Authentik healthy up to 300 s, LDAP group probe up to 120 s plus a 30 s recreate, TAK 8089 up to 900 s, TAK API up to 300 s, then the CloudTAK, Node-RED and MediaMTX staggers). On a slow boot systemd kills it before it has started the last modules, and nothing starts them again. 📖 read from the unit and the script, not yet reproduced on a box. The console's once-per-boot check (ops #1017) starts what is still stopped 10 to 21 minutes after boot.
+- **Boot timings seen.** TAK Server opens 8089 about 110 to 170 s after start, and its API a few seconds to half a minute later. The Authentik LDAP outpost can take about 100 s after its own start before it resolves groups, so a bind probe in the first two minutes is not proof of anything. 👁 observed 2026-08-22 and 2026-11-20 (test6, test12, a field box).
+- **A unit that is `activating` is not down.** `systemctl is-active` says `activating` while a unit starts; judge it only after the start has finished. 📖 documented (systemd).
+- **A host can answer ping and refuse every TCP port after a reboot.** test6 (Ubuntu 24.04, VPS) did so for 25+ minutes after a real reboot on 2026-11-20 while test12 on the same code came back. Cause not yet known. 👁 observed 2026-11-20 (ops #1017); open question.
+
 ## Shell scripts and systemd units that are rewritten while they run
 
 Official: [bash manual, shell scripts](https://www.gnu.org/software/bash/manual/html_node/Shell-Scripts.html), [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
