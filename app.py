@@ -57794,6 +57794,50 @@ def _cloudtak_plugin_owning_route(route_filename, cloudtak_dir=None):
     return None
 
 
+def _cloudtak_lint_files_from_plugins(lint_files, cloudtak_dir):
+    """GH #628: which api lint findings sit in files CloudTAK itself does not ship.
+
+    OXLint prints api-relative paths (stateless/lib/retention/replay.ts). A file that is on
+    disk but not tracked by the CloudTAK checkout was put there by a plugin. Since TAK Portal
+    2.0.38 the Marketplace no longer lets such files skip the lint (it strips @ts-nocheck and
+    our ignore entries), so one plugin that fails CloudTAK's lint stops every CloudTAK Update,
+    and the operator only saw a list of file names. Returns (files, plugin folder names); a
+    plugin is named when the file name starts with its folder's first word (replay ->
+    replay-player.ts, retention/replay.ts; livewx-radar -> plugin-livewx.ts). Never raises."""
+    try:
+        if not cloudtak_dir or not lint_files:
+            return [], []
+        api = os.path.join(cloudtak_dir, 'api')
+        cand = [f for f in lint_files
+                if not f.startswith('/') and '..' not in f.split('/')
+                and os.path.isfile(os.path.join(api, f))]
+        if not cand:
+            return [], []
+        r = subprocess.run(['git', '-c', f'safe.directory={cloudtak_dir}', '-C', cloudtak_dir,
+                            'ls-files', '--'] + ['api/' + f for f in cand],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return [], []
+        tracked = set(r.stdout.splitlines())
+        files = [f for f in cand if 'api/' + f not in tracked]
+        try:
+            base = _cloudtak_plugins_dir(cloudtak_dir)
+            dirs = sorted(n for n in os.listdir(base)
+                          if not n.startswith('.') and os.path.isdir(os.path.join(base, n)))
+        except Exception:
+            dirs = []
+        names = []
+        for f in files:
+            stem = re.sub(r'^plugin-', '', re.sub(r'\.[cm]?[jt]s$', '', f.rsplit('/', 1)[-1]))
+            word = stem.split('-', 1)[0].lower()
+            for d in dirs:
+                if word and d.split('-', 1)[0].lower() == word and d not in names:
+                    names.append(d)
+        return files, names
+    except Exception:
+        return [], []
+
+
 def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
     """Turn captured CloudTAK build output into one operator-facing "Likely cause" block.
 
@@ -57935,6 +57979,23 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             if lint_files:
                 out.append('  Files with findings: %s%s' % (', '.join(lint_files[:6]),
                                                            ' ...' if len(lint_files) > 6 else ''))
+            # GH #628: say which of them a plugin added, and where to update or remove it
+            _pf, _pn = (_cloudtak_lint_files_from_plugins(lint_files, cloudtak_dir)
+                        if lint_files and cloudtak_dir else ([], []))
+            if _pf:
+                ours = {p.get('install_dir') for p in CLOUDTAK_PLUGINS}
+                out.append('  %s not part of CloudTAK: a plugin added %s%s.'
+                           % ('This file is' if len(_pf) == 1 else 'These %d files are' % len(_pf),
+                              'it' if len(_pf) == 1 else 'them',
+                              ' (%s: %s)' % ('plugin' if len(_pn) == 1 else 'plugins',
+                                             ', '.join(_pn)) if _pn else ''))
+                if _pn and all(n in ours for n in _pn):
+                    out.append('  CloudTAK itself is not the problem. Update or remove that plugin on '
+                               'the CloudTAK page, then run Update again.')
+                else:
+                    out.append('  CloudTAK itself is not the problem. In TAK Portal, open the CloudTAK '
+                               'Marketplace and update that plugin, or uninstall it until it supports '
+                               'this CloudTAK. Then run Update again.')
             if lint_plugins:
                 out.append('  Errors are in CloudTAK plugin folder(s): %s (app/plugins/)'
                            % ', '.join(lint_plugins))
