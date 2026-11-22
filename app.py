@@ -3662,13 +3662,18 @@ def _patch_tak_dockerfile_cacerts(build_ctx, app_dockerfile, log_fn=None):
 # (verified in takserver-docker-hardened-5.8-RELEASE-75.zip, 2026-11-19). `docker build --pull`
 # refreshes a MUTABLE tag, but a pin to one exact Temurin build never moves, so a TAK Server built
 # from this bundle stays on Java 17.0.19 (April 2026) with nothing on the box to say so.
-# This constant is the newest Temurin 17 jdk-ubi10-minimal tag on Docker Hub. 17.0.21_9 is the
-# October 2026 release (Adoptium 2026-10-22). Adoptium's November 18 build, 17.0.21.1+2, has no
-# eclipse-temurin tag yet (checked 2026-11-19): bump this one constant to its
-# 17.0.21.1_2-jdk-ubi10-minimal tag when Docker Hub lists it. A test pins the value.
+# _TEMURIN17_FIXED_TAG is the newest Temurin 17 jdk-ubi10-minimal tag on Docker Hub: Adoptium's
+# November 18 build, 17.0.21.1+2 (Oracle's November fixes in JSSE/JGSS, the TLS code behind the
+# client ports). Docker Hub listed it on 2026-11-20. Its manifest has amd64, ppc64le and s390x but
+# NO arm64 image (checked 2026-11-22), so an ARM host cannot pull it: `docker build` would stop at
+# "no matching manifest for linux/arm64". _TEMURIN17_FIXED_TAG_ARM64 is the newest tag that does
+# have arm64, the October build 17.0.21+9 (Adoptium 2026-10-22). _temurin17_fixed_tag() picks by the
+# host's architecture. When Docker Hub lists arm64 on the 17.0.21.1_2 tag, delete the ARM64
+# constant and the branch. A test pins both values.
 # https://hub.docker.com/_/eclipse-temurin/tags?name=17.0.21
 # https://adoptium.net/temurin/release-notes/?version=jdk-17.0.21.1+2
-_TEMURIN17_FIXED_TAG = '17.0.21_9-jdk-ubi10-minimal'
+_TEMURIN17_FIXED_TAG = '17.0.21.1_2-jdk-ubi10-minimal'
+_TEMURIN17_FIXED_TAG_ARM64 = '17.0.21_9-jdk-ubi10-minimal'
 _TEMURIN_JDK_TAG_RE = re.compile(r'(\d+(?:\.\d+){1,3})_(\d+)-jdk-ubi10-minimal')
 _TEMURIN_PIN_LINE_RE = re.compile(
     r'(?m)^(?P<pre>ARG[ \t]+BASE_DEPLOY_TAG=)(?P<tag>\d+(?:\.\d+){1,3}_\d+-jdk-ubi10-minimal)[ \t]*$')
@@ -3685,8 +3690,18 @@ def _temurin_tag_key(tag):
     return tuple(parts) + (int(m.group(2)),)
 
 
+def _temurin17_fixed_tag():
+    """The Temurin 17 tag this host can pull: the newest one, or on an arm64 host the newest one
+    that has an arm64 image. One answer per architecture, never per customer."""
+    try:
+        arm = _host_arch() == 'arm64'
+    except Exception:
+        arm = False
+    return _TEMURIN17_FIXED_TAG_ARM64 if arm else _TEMURIN17_FIXED_TAG
+
+
 def _patch_tak_hardened_java_pin(build_ctx, app_dockerfile, log_fn=None):
-    """Move the bundle's pinned Temurin 17 base up to _TEMURIN17_FIXED_TAG. Idempotent.
+    """Move the bundle's pinned Temurin 17 base up to _temurin17_fixed_tag(). Idempotent.
 
     Touches only an `ARG BASE_DEPLOY_TAG=<Temurin 17 jdk-ubi10-minimal tag>` line whose build is
     OLDER than the fixed one. A newer pin, another major, a JRE or non-UBI tag, an ARG we cannot
@@ -3702,7 +3717,8 @@ def _patch_tak_hardened_java_pin(build_ctx, app_dockerfile, log_fn=None):
     except Exception as e:
         _log(f"  (could not read {os.path.basename(app_dockerfile)}: {str(e)[:120]} — building as shipped)")
         return False
-    fixed = _temurin_tag_key(_TEMURIN17_FIXED_TAG)
+    fixed_tag = _temurin17_fixed_tag()
+    fixed = _temurin_tag_key(fixed_tag)
     old_tags = []
 
     def _bump(m):
@@ -3710,7 +3726,7 @@ def _patch_tak_hardened_java_pin(build_ctx, app_dockerfile, log_fn=None):
         if key is None or key[0] != fixed[0] or key >= fixed:
             return m.group(0)
         old_tags.append(m.group('tag'))
-        return m.group('pre') + _TEMURIN17_FIXED_TAG
+        return m.group('pre') + fixed_tag
 
     new = _TEMURIN_PIN_LINE_RE.sub(_bump, src)
     if new == src:
@@ -3721,7 +3737,7 @@ def _patch_tak_hardened_java_pin(build_ctx, app_dockerfile, log_fn=None):
     except Exception as e:
         _log(f"  (could not patch {os.path.basename(app_dockerfile)}: {str(e)[:120]} — building as shipped)")
         return False
-    _log(f"  Patched {os.path.basename(app_dockerfile)}: Java base {old_tags[0]} → {_TEMURIN17_FIXED_TAG} "
+    _log(f"  Patched {os.path.basename(app_dockerfile)}: Java base {old_tags[0]} → {fixed_tag} "
          "(TAK pins an exact Temurin build, so a newer Java would never arrive on its own).")
     return True
 
@@ -30151,8 +30167,8 @@ def _java_restart_items(unknown):
 # the restart check above never see it. The image is built from the takserver-docker zip when
 # TAK Server is installed or updated; _patch_tak_hardened_java_pin / `docker build --pull` (ops
 # #963) make a rebuild take the newest Java we know, but nothing said that a rebuild was due.
-# This compares the Java the RUNNING container reports with that same pin (_TEMURIN17_FIXED_TAG,
-# the one constant that moves when Docker Hub lists a newer Temurin 17 tag). Read only: one
+# This compares the Java the RUNNING container reports with that same pin (_temurin17_fixed_tag(),
+# fed by the constants that move when Docker Hub lists a newer Temurin 17 tag). Read only: one
 # `docker exec takserver java -version`, no restart, no change. A runtime we cannot read as
 # Temurin 17, or a container that is not running, claims nothing.
 _JAVA_RUNTIME_RE = re.compile(r'Temurin-(\d+(?:\.\d+){1,3})\+(\d+)')
@@ -30202,8 +30218,9 @@ def _tak_container_java_facts():
             f['why'] = 'could not ask the container for its Java'
             return f
         running, rkey = _temurin_runtime_build(out)
-        newest = _temurin_tag_build(_TEMURIN17_FIXED_TAG)
-        fkey = _temurin_tag_key(_TEMURIN17_FIXED_TAG)
+        fixed_tag = _temurin17_fixed_tag()
+        newest = _temurin_tag_build(fixed_tag)
+        fkey = _temurin_tag_key(fixed_tag)
         if not running or not newest or not fkey:
             f['why'] = 'the container does not run a Temurin Java we can compare'
             return f
