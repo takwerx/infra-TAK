@@ -17,6 +17,7 @@ Pins, each red on the code before this change and green with it:
 """
 import ast
 import base64
+import datetime
 import json
 import os
 import pathlib
@@ -66,9 +67,16 @@ def _sign(raw, key, d):
     return base64.b64encode(s.read_bytes()).decode() + '\n'
 
 
-def _doc(serial, tag, commit=GOOD, held=()):
-    d = {'schema': 1, 'serial': serial, 'tag': tag, 'commit': commit, 'gate': 1043,
+def _future(days=60):
+    return (datetime.datetime.now(datetime.timezone.utc).date() + datetime.timedelta(days=days)).isoformat()
+
+
+def _doc(serial, tag, commit=GOOD, held=(), **over):
+    d = {'schema': 1, 'kind': 'takportal-verified', 'serial': serial, 'tag': tag, 'commit': commit,
+         'gate': 1043, 'expires': _future(),
          'held': [{'tag': h, 'reason': 'failed the Marketplace gate'} for h in held]}
+    d.update(over)
+    d = {k: v for k, v in d.items() if v is not None}       # over={'kind': None} drops the field
     return (json.dumps(d, indent=2) + '\n').encode()
 
 
@@ -290,16 +298,19 @@ def test_the_floor_has_no_commit_to_check(box):
 
 # ------------------------------------------------------------ the file's own shape
 
+OK = {'kind': 'takportal-verified', 'expires': '2099-01-01'}
+
+
 @pytest.mark.parametrize('doc', [
-    {'schema': 2, 'serial': 1, 'tag': '2.0.37', 'commit': GOOD},
-    {'schema': 1, 'tag': '2.0.37', 'commit': GOOD},
-    {'schema': 1, 'serial': True, 'tag': '2.0.37', 'commit': GOOD},
-    {'schema': 1, 'serial': 1, 'tag': '2.0.37; rm -rf /', 'commit': GOOD},
-    {'schema': 1, 'serial': 1, 'tag': '--upload-pack=x', 'commit': GOOD},
-    {'schema': 1, 'serial': 1, 'tag': '2.0.37', 'commit': 'abc'},
-    {'schema': 1, 'serial': 1, 'tag': '2.0.37', 'commit': 'C' * 40},
-    {'schema': 1, 'serial': 1, 'tag': '2.0.37', 'commit': GOOD, 'held': 'x'},
-    {'schema': 1, 'serial': 1, 'tag': '2.0.37', 'commit': GOOD, 'held': [{'tag': '$(id)'}]},
+    {**OK, 'schema': 2, 'serial': 1, 'tag': '2.0.37', 'commit': GOOD},
+    {**OK, 'schema': 1, 'tag': '2.0.37', 'commit': GOOD},
+    {**OK, 'schema': 1, 'serial': True, 'tag': '2.0.37', 'commit': GOOD},
+    {**OK, 'schema': 1, 'serial': 1, 'tag': '2.0.37; rm -rf /', 'commit': GOOD},
+    {**OK, 'schema': 1, 'serial': 1, 'tag': '--upload-pack=x', 'commit': GOOD},
+    {**OK, 'schema': 1, 'serial': 1, 'tag': '2.0.37', 'commit': 'abc'},
+    {**OK, 'schema': 1, 'serial': 1, 'tag': '2.0.37', 'commit': 'C' * 40},
+    {**OK, 'schema': 1, 'serial': 1, 'tag': '2.0.37', 'commit': GOOD, 'held': 'x'},
+    {**OK, 'schema': 1, 'serial': 1, 'tag': '2.0.37', 'commit': GOOD, 'held': [{'tag': '$(id)'}]},
 ])
 def test_bad_shapes_are_refused_before_the_signature_is_even_looked_at(doc):
     with pytest.raises(ValueError):
@@ -311,6 +322,81 @@ def test_not_json_and_too_large_are_refused():
         _tpv().parse(b'\xff\xfe not json')
     with pytest.raises(ValueError):
         _tpv().parse(b'{' + b' ' * _tpv().VERIFIED_MAX_BYTES + b'}')
+
+
+# ----------------------------------------------- kind and expires (Security's hardening, ops #1042)
+
+def _past(days=1):
+    return _future(-days)
+
+
+def test_a_file_of_another_kind_is_not_used_even_with_a_good_signature(box, keys):
+    """The ETL catalog is signed with the same key. A signed file that is not marked takportal-verified
+    must never pick the TAK Portal release, whatever else it carries."""
+    for over in ({'kind': None}, {'kind': 'etl-catalog'}, {'kind': 'TAKPORTAL-VERIFIED'}, {'kind': 1}):
+        raw = _doc(9, '2.0.38', **over)
+        box.serve(raw, _sign(raw, keys['key'], keys['dir']))
+        box.ns['_takportal_verified_attempt']['ts'] = 0.0
+        assert box.deploy_tag() == FLOOR, over
+        assert box.update_tag() is None and not (box.cache / 'takportal-verified.json').exists()
+
+
+def test_a_cached_file_of_another_kind_is_not_trusted(box, keys):
+    raw = _doc(7, '2.0.37', kind=None)
+    box.cache_file(raw, _sign(raw, keys['key'], keys['dir']))
+    assert box.deploy_tag() == FLOOR
+
+
+def test_an_old_signed_file_replayed_to_a_new_box_is_refused_once_it_has_expired(box, keys):
+    """A brand-new box has serial floor 0 and no cache, so a real older file replayed to it would
+    otherwise be taken. Its expires date makes it stale."""
+    raw = _doc(7, '2.0.36', expires=_past())
+    box.serve(raw, _sign(raw, keys['key'], keys['dir']))
+    assert box.deploy_tag() == FLOOR
+    assert box.update_tag() is None and not (box.cache / 'takportal-verified.json').exists()
+    assert box.settings.get('takportal_verified_serial', 0) == 0
+
+
+def test_a_file_a_box_already_accepted_keeps_working_after_its_date(box, keys):
+    """A missed renewal must not push every box back to the floor: the date gates what a box newly
+    accepts, not what it holds. A newer file past its date is still refused and the cache stays."""
+    raw = _doc(7, '2.0.37', expires=_past(30))
+    box.cache_file(raw, _sign(raw, keys['key'], keys['dir']))
+    assert box.deploy_tag() == '2.0.37' and box.update_tag() == '2.0.37'
+    stale = _doc(8, '2.0.39', commit='d' * 40, expires=_past())
+    box.serve(stale, _sign(stale, keys['key'], keys['dir']))
+    assert box.deploy_tag() == '2.0.37'
+
+
+def test_a_file_is_good_all_through_its_last_day():
+    d = datetime.date(2026, 12, 31)
+    rec = _tpv().parse(_doc(1, '2.0.37', expires='2026-12-31'))
+    assert not _tpv().is_expired(rec, today=d)
+    assert _tpv().is_expired(rec, today=d + datetime.timedelta(days=1))
+    assert not _tpv().is_expired(rec, today=d - datetime.timedelta(days=400))
+
+
+@pytest.mark.parametrize('expires', [
+    '2026-13-01', '2026-02-30', 'tomorrow', '2026-12-31T00:00:00Z', '20261231', '2026-1-5', 20261231, True, [], '',
+])
+def test_a_missing_or_malformed_expires_is_refused(expires):
+    with pytest.raises(ValueError):
+        _tpv().parse(_doc(1, '2.0.37', expires=expires))
+    with pytest.raises(ValueError):
+        _tpv().parse(_doc(1, '2.0.37', expires=None))
+    assert _tpv().is_expired({'expires': expires}) is True        # never "fresh" by accident
+
+
+def test_the_etl_catalog_refuses_a_file_signed_for_something_else():
+    """The other direction of the same replay: takportal-verified.json is not an ETL catalog (its
+    shape already fails, and a declared kind that is not etl-catalog fails first)."""
+    from modules import etlrunner
+    with pytest.raises(ValueError):
+        etlrunner.parse_catalog(_doc(1, '2.0.37', entries=[]))
+    etlrunner.parse_catalog(json.dumps({'schema': 1, 'serial': 1, 'entries': []}).encode())
+    etlrunner.parse_catalog(json.dumps({'schema': 1, 'kind': 'etl-catalog', 'serial': 1, 'entries': []}).encode())
+    with pytest.raises(ValueError):
+        etlrunner.parse_catalog(json.dumps({'schema': 1, 'kind': 'x', 'serial': 1, 'entries': []}).encode())
 
 
 def test_held_list_names_what_failed_the_gate():
