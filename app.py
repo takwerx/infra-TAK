@@ -14967,6 +14967,90 @@ def _harden_sensitive_permissions(plog=None):
     return fixed
 
 
+# ops #1049 — module compose files the console writes directly (as itself, no broker
+# call: PyYAML round trips, token injection, network patches). A root-era or
+# hand-made root copy of one of these is unwritable for the non-root console, so a
+# redeploy stops at "Patching Docker Compose" with
+#   FATAL ERROR: [Errno 13] Permission denied: '/home/takwerx/authentik/docker-compose.yml'
+# (test12, 2026-11-21: root:root 644 since Oct 24, the rest of the dir takwerx).
+# _harden_sensitive_permissions re-owns the module `.env` files only.
+_COMPOSE_HEAL_MODULE_DIRS = (
+    'authentik', 'CloudTAK', 'TAK-Portal', 'node-red', 'nodered', 'netbird',
+    'eud-remote-assist', 'webodm', 'emailrelay', 'tak-video-restreamer',
+    'cesium-tiles', 'atlas',
+)
+_COMPOSE_HEAL_FILE_GLOBS = (
+    'docker-compose*.yml', 'docker-compose*.yaml', 'compose.yml', 'compose.yaml',
+)
+
+
+def _heal_module_compose_ownership(plog=None, only_dirs=None):
+    """ops #1049 — give back to the console user any module compose file (and
+    override) in the console's OWN home that something else, usually root, owns.
+
+    Same rule as the `.env` heal in _harden_sensitive_permissions: a file inside
+    the console user's home must be owned by that user, or the console cannot
+    write it. Scoped to THIS console's home only. /root/<mod>/ copies on a flipped
+    box are stale leftovers the migration deliberately left alone; this never
+    touches them. On a root console the home is /root and everything is already
+    owned by root, so it does nothing.
+
+    Only regular files are touched: a symlink is skipped (chown would follow it
+    out of the module dir). Never changes the mode, only the owner. Idempotent,
+    non-fatal, returns the list of paths it re-owned.
+
+    only_dirs: limit to these module dirs (the deploy passes its own dir so a
+    redeploy heals right before it writes, without waiting for a console restart).
+    """
+    import glob as _glob
+    import pwd as _pwd3
+    import stat as stat_mod
+
+    def _say(m):
+        (plog or (lambda x: print(f"Compose ownership heal: {x}", flush=True)))(m)
+
+    fixed = []
+    try:
+        me = _pwd3.getpwuid(os.getuid())
+        my_home = os.path.realpath(me.pw_dir)
+        if my_home in ('/', '/nonexistent') or os.getuid() == 0:
+            return fixed
+        if only_dirs:
+            mod_dirs = [os.path.realpath(d) for d in only_dirs]
+        else:
+            mod_dirs = [os.path.join(my_home, m) for m in _COMPOSE_HEAL_MODULE_DIRS]
+        candidates = []
+        for d in mod_dirs:
+            if not (d + os.sep).startswith(my_home + os.sep):
+                continue
+            # one level of nesting covers atlas/<deployment>/ (one dir per agency)
+            for base in (d, os.path.join(d, '*')):
+                for pat in _COMPOSE_HEAL_FILE_GLOBS:
+                    candidates.extend(sorted(_glob.glob(os.path.join(base, pat))))
+        for path in dict.fromkeys(candidates):
+            try:
+                st = os.lstat(path)
+                if not stat_mod.S_ISREG(st.st_mode) or st.st_uid == me.pw_uid:
+                    continue
+                if not os.path.realpath(path).startswith(my_home + os.sep):
+                    continue
+                r = subprocess.run(_sudo_wrap(['chown', f'{me.pw_name}:{me.pw_name}', path]),
+                                   capture_output=True, timeout=15)
+                if r.returncode == 0:
+                    fixed.append(path)
+                else:
+                    _say(f'⚠ could not re-own {path} (chown refused); a redeploy will '
+                         f'fail until it is owned by {me.pw_name}')
+            except Exception:
+                continue
+    except Exception as e:
+        _say(f'error (non-fatal): {e}')
+    if fixed:
+        _say(f're-owned {len(fixed)} compose file(s) to the console user: '
+             + '; '.join(fixed[:8]) + (f' (+{len(fixed) - 8} more)' if len(fixed) > 8 else ''))
+    return fixed
+
+
 def _heal_nodered_cert_read_access(plog=None):
     """v10.1.16 — heal leftover W7 damage on the one cert pair Node-RED must read.
 
@@ -83435,6 +83519,12 @@ def run_authentik_deploy(reconfigure=False):
         env_path = os.path.join(ak_dir, '.env')
         compose_path = os.path.join(ak_dir, 'docker-compose.yml')
         ldap_svc_pass = None
+        # ops #1049: a root-owned docker-compose.yml (root-era leftover) stops this deploy at
+        # "Patching Docker Compose" with Permission denied. Re-own it before anything writes it.
+        try:
+            _heal_module_compose_ownership(plog=plog, only_dirs=[ak_dir])
+        except Exception as _chk_e:
+            plog(f"  (compose ownership check skipped: {_chk_e})")
 
         deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
         if deploy_cfg.get('target_mode') == 'remote':
@@ -118304,6 +118394,13 @@ def _startup_migrations():
             _harden_sensitive_permissions()
         except Exception as _hp_e:
             print(f"Startup migration: permissions hardening error (non-fatal): {_hp_e}", flush=True)
+
+        # ops #1049 — module compose files the console writes itself must be owned by it.
+        # The step above re-owns `.env` files only.
+        try:
+            _heal_module_compose_ownership(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _cho_e:
+            print(f"Startup migration: compose ownership heal error (non-fatal): {_cho_e}", flush=True)
 
         # v10.1.16 — restore Node-RED's read on admin.pem/admin.key if the W7-era
         # blanket chmod (or anything since) left them owner-only. Loud-failure
