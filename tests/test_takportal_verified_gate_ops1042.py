@@ -40,6 +40,11 @@ _FNS = {n.name: n for n in ast.parse(APP).body if isinstance(n, ast.FunctionDef)
 
 pytestmark = pytest.mark.skipif(shutil.which('openssl') is None, reason='needs the openssl CLI')
 
+_AVAILABLE_URL = re.search(r"^_TAKPORTAL_AVAILABLE_URL = '([^']+)'", APP, re.M)
+_AVAILABLE_URL = _AVAILABLE_URL.group(1) if _AVAILABLE_URL else ''     # absent before ops #1065
+_TAG_PREFIX = re.search(r"^_TAKPORTAL_RELEASE_TAG_PREFIX = '([^']+)'", APP, re.M)
+_TAG_PREFIX = _TAG_PREFIX.group(1) if _TAG_PREFIX else ''               # PR 639: the pinned final address
+
 GOOD = 'c' * 40
 FLOOR = re.search(r'^TAKPORTAL_REF_FALLBACK\s*=\s*"([\d.]+)"', APP, re.M).group(1)   # the shipped floor
 
@@ -148,15 +153,19 @@ class Box:
         self.urls.append(url)
         assert url.endswith('/TAK-Portal/releases/latest'), f'unexpected network call {url}'
         body = json.dumps({'tag_name': self.github_latest}).encode()
+        final = f'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/tag/{self.github_latest}'   # ops #1065: the web redirect
 
         class Resp:                        # a real context manager: `with urlopen(...) as r`
+            def geturl(_):
+                return final
+
             def __enter__(_):
                 return _
 
             def __exit__(_, *a):
                 return False
 
-            def read(_):
+            def read(_, n=-1):
                 return body
         return Resp()
 
@@ -484,6 +493,10 @@ def test_no_code_asks_githubs_releases_or_tags_api_about_tak_portal():
         else:
             texts = [ln for ln in f.read_text(encoding='utf-8').splitlines() if not ln.lstrip().startswith('#')]
         hits += [f'{f.relative_to(ROOT)}: {t[:100]}' for t in texts if pat.search(t)]
+    # ops #1065: ONE display-only reader of the newest release is allowed (Vetted vs Available on the
+    # TAK Portal page). tests/test_takportal_vetted_available_ops1065.py pins that nothing else
+    # calls it: not deploy, not Update, not the badge, not Guard Dog.
+    hits = [h for h in hits if h not in ('app.py: ' + _AVAILABLE_URL[:100], 'app.py: ' + _TAG_PREFIX[:100])]
     assert not hits, hits
 
 
