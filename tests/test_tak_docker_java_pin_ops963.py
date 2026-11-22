@@ -43,17 +43,18 @@ def _grab(name):
 
 def _consts():
     ns = {'re': re}
-    for name in ('_TEMURIN17_FIXED_TAG', '_TEMURIN_JDK_TAG_RE', '_TEMURIN_PIN_LINE_RE'):
+    for name in ('_TEMURIN17_FIXED_TAG', '_TEMURIN17_FIXED_TAG_ARM64', '_TEMURIN_JDK_TAG_RE', '_TEMURIN_PIN_LINE_RE'):
         m = re.search(r'^%s = .*?(?=^\S)' % name, APP, re.S | re.M)
         assert m, name + ' is not defined in app.py'
         exec(compile(m.group(0), 'app.py', 'exec'), ns)
     return ns
 
 
-def _patcher():
+def _patcher(arch='amd64'):
     import os
-    ns = {'os': os, 're': re, 'print': lambda *a, **k: None, **_consts()}
+    ns = {'os': os, 're': re, 'print': lambda *a, **k: None, '_host_arch': lambda: arch, **_consts()}
     exec(compile(_grab('_temurin_tag_key'), 'app.py', 'exec'), ns)
+    exec(compile(_grab('_temurin17_fixed_tag'), 'app.py', 'exec'), ns)
     exec(compile(_grab('_patch_tak_hardened_java_pin'), 'app.py', 'exec'), ns)
     return ns['_patch_tak_hardened_java_pin'], ns
 
@@ -93,9 +94,54 @@ def test_second_run_is_a_noop(tmp_path):
 def test_fixed_tag_is_the_newest_known_build_and_newer_than_shipped():
     ns = _consts()
     key = _patcher()[1]['_temurin_tag_key']
-    # Bump with the one constant when Docker Hub lists 17.0.21.1_2-jdk-ubi10-minimal (Adoptium's Nov 18 build).
-    assert ns['_TEMURIN17_FIXED_TAG'] == '17.0.21_9-jdk-ubi10-minimal'
-    assert key(ns['_TEMURIN17_FIXED_TAG']) > key('17.0.20.1_1-jdk-ubi10-minimal') > key('17.0.19_10-jdk-ubi10-minimal')
+    # Adoptium's Nov 18 build 17.0.21.1+2 (the Oracle November fixes in JSSE/JGSS). Docker Hub listed
+    # its tag on Nov 20 (checked Nov 22). Bump with the one constant when a newer Temurin 17 tag appears.
+    assert ns['_TEMURIN17_FIXED_TAG'] == '17.0.21.1_2-jdk-ubi10-minimal'
+    assert key(ns['_TEMURIN17_FIXED_TAG']) > key('17.0.21_9-jdk-ubi10-minimal') \
+        > key('17.0.20.1_1-jdk-ubi10-minimal') > key('17.0.19_10-jdk-ubi10-minimal')
+
+
+def test_the_interim_october_pin_moves_to_the_november_build(tmp_path):
+    # PR 586 shipped the interim 17.0.21_9 pin. A bundle already patched to it (or a TAK release that
+    # pins it) must move on to the November security build, and the Guard Dog / console notice compares
+    # a running 17.0.21+9 with this same constant, so it reads stale until the image is rebuilt.
+    patch, ns = _patcher()
+    text = SHIPPED.replace('17.0.19_10', '17.0.21_9')
+    assert patch(_ctx(tmp_path, text), DF) is True
+    out = _read(tmp_path)
+    assert 'ARG BASE_DEPLOY_TAG=17.0.21.1_2-jdk-ubi10-minimal\n' in out
+    assert '17.0.21_9' not in out
+
+
+def test_an_arm64_host_gets_the_newest_tag_that_has_an_arm64_image(tmp_path):
+    # Docker Hub's 17.0.21.1_2-jdk-ubi10-minimal has amd64/ppc64le/s390x and NO arm64 (checked
+    # 2026-11-22), so patching an ARM host to it would end the image build at "no matching manifest".
+    patch, ns = _patcher('arm64')
+    arm = ns['_TEMURIN17_FIXED_TAG_ARM64']
+    assert arm == '17.0.21_9-jdk-ubi10-minimal'
+    assert ns['_temurin17_fixed_tag']() == arm != ns['_TEMURIN17_FIXED_TAG']
+    assert patch(_ctx(tmp_path), DF) is True
+    out = _read(tmp_path)
+    assert 'ARG BASE_DEPLOY_TAG=' + arm + '\n' in out and '17.0.21.1' not in out
+    # and it is still a step up from what TAK ships, and never newer than the amd64 pin
+    key = ns['_temurin_tag_key']
+    assert key(arm) > key('17.0.19_10-jdk-ubi10-minimal')
+    assert key(arm) <= key(ns['_TEMURIN17_FIXED_TAG'])
+
+
+def test_an_arm64_pin_already_on_the_arm_tag_is_left_alone(tmp_path):
+    patch, ns = _patcher('arm64')
+    text = SHIPPED.replace('17.0.19_10-jdk-ubi10-minimal', ns['_TEMURIN17_FIXED_TAG_ARM64'])
+    assert patch(_ctx(tmp_path, text), DF) is False
+    assert _read(tmp_path) == text
+
+
+def test_an_unreadable_host_arch_takes_the_amd64_path():
+    ns = _patcher()[1]
+    def boom():
+        raise RuntimeError('settings unreadable')
+    ns['_host_arch'] = boom
+    assert ns['_temurin17_fixed_tag']() == ns['_TEMURIN17_FIXED_TAG']
 
 
 def test_tag_order_reads_update_numbers_not_text():

@@ -75,7 +75,8 @@ OpenJDK 64-Bit Server VM (build 17.0.18+8-Debian-1, mixed mode, sharing)
 FIXED_TAG = '17.0.21_9-jdk-ubi10-minimal'
 
 
-def _facts_ns(java_text='', *, container=True, running=True, rc=0, fixed_tag=FIXED_TAG, boom=None):
+def _facts_ns(java_text='', *, container=True, running=True, rc=0, fixed_tag=FIXED_TAG, boom=None,
+              arch='amd64', arm_tag=FIXED_TAG):
     calls = []
 
     def run(argv, **kw):
@@ -90,10 +91,11 @@ def _facts_ns(java_text='', *, container=True, running=True, rc=0, fixed_tag=FIX
          '_tak_container_running': lambda name: running,
          '_sudo_wrap': lambda argv: list(argv),
          'TAK_CONTAINER': 'takserver',
-         '_TEMURIN17_FIXED_TAG': fixed_tag,
+         '_TEMURIN17_FIXED_TAG': fixed_tag, '_TEMURIN17_FIXED_TAG_ARM64': arm_tag,
+         '_host_arch': lambda: arch,
          '_JAVA_RUNTIME_RE': None, '_TEMURIN_JDK_TAG_RE': None, '_tak_java_img_cache': {'at': 0.0, 'data': None}}
     src = '\n'.join([_const('_TEMURIN_JDK_TAG_RE'), _const('_JAVA_RUNTIME_RE'),
-                     _cut('_temurin_tag_key'), _cut('_temurin_runtime_build'), _cut('_temurin_tag_build'),
+                     _cut('_temurin_tag_key'), _cut('_temurin17_fixed_tag'), _cut('_temurin_runtime_build'), _cut('_temurin_tag_build'),
                      _cut('_tak_container_java_facts'), _cut('_tak_container_java_facts_cached'),
                      _const('_JAVA_IMAGE_HOW'), _cut('_java_image_items')])
     exec(compile(src, 'app.py', 'exec'), n)
@@ -141,6 +143,21 @@ def test_the_pin_moving_makes_the_notice_appear_without_other_changes():
     new_tag = '17.0.21.1_2-jdk-ubi10-minimal'
     f = _facts_ns(JAVA_17_0_21, fixed_tag=new_tag)['_tak_container_java_facts']()
     assert f['stale'] and f['newest'] == '17.0.21.1+2'
+
+
+def test_an_arm64_box_is_compared_with_the_arm64_pin_not_a_tag_it_cannot_pull():
+    # amd64 pin 17.0.21.1_2 has no arm64 image; an ARM box on 17.0.21+9 is as new as it can get,
+    # so it must NOT be told to rebuild for a Java it cannot receive (a notice it could never clear).
+    new_tag = '17.0.21.1_2-jdk-ubi10-minimal'
+    arm = _facts_ns(JAVA_17_0_21, fixed_tag=new_tag, arch='arm64', arm_tag=FIXED_TAG)
+    f = arm['_tak_container_java_facts']()
+    assert f['applicable'] and not f['stale'] and f['newest'] == '17.0.21+9'
+    assert arm['_java_image_items'](set()) == []
+    # an ARM box still on the shipped Java is told to rebuild, naming the build it can get
+    f = _facts_ns(JAVA_17_0_19, fixed_tag=new_tag, arch='arm64', arm_tag=FIXED_TAG)['_tak_container_java_facts']()
+    assert f['stale'] and f['newest'] == '17.0.21+9'
+    # the same Java on an amd64 box is behind the amd64 pin
+    assert _facts_ns(JAVA_17_0_21, fixed_tag=new_tag)['_tak_container_java_facts']()['stale']
 
 
 def test_another_java_line_or_vendor_claims_nothing():
