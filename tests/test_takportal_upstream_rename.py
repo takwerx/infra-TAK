@@ -110,9 +110,12 @@ def test_update_repoints_before_any_fetch_from_origin():
 
 
 def test_redeploy_over_existing_checkout_repoints_before_fetch():
-    i = DEPLOY.index('_takportal_repoint_origin(portal_dir')
-    f = DEPLOY.index("'fetch', '--tags', '--force', 'origin'")
-    assert DEPLOY.index('if os.path.exists(portal_dir):') < i < f
+    # ops #1042: the existing-checkout branch is _takportal_checkout_existing (it never goes back
+    # to an older release); the deploy must call it from the exists-branch, and inside it the
+    # origin is repointed before the fetch.
+    assert DEPLOY.index('if os.path.exists(portal_dir):') < DEPLOY.index('_takportal_checkout_existing(portal_dir')
+    fn = APP[APP.index('def _takportal_checkout_existing('):APP.index('def _remote_assist_write_env(')]
+    assert fn.index('_takportal_repoint_origin(portal_dir') < fn.index("'fetch', '--tags', '--force', 'origin'")
 
 
 def test_fresh_install_clones_the_constant():

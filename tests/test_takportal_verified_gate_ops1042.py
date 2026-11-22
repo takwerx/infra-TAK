@@ -41,7 +41,7 @@ _FNS = {n.name: n for n in ast.parse(APP).body if isinstance(n, ast.FunctionDef)
 pytestmark = pytest.mark.skipif(shutil.which('openssl') is None, reason='needs the openssl CLI')
 
 GOOD = 'c' * 40
-FLOOR = '2.0.30'
+FLOOR = re.search(r'^TAKPORTAL_REF_FALLBACK\s*=\s*"([\d.]+)"', APP, re.M).group(1)   # the shipped floor
 
 
 def _tpv():
