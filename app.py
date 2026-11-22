@@ -1673,7 +1673,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.4.4-alpha"
+VERSION = "10.4.5-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -48288,8 +48288,8 @@ def takportal_ssh_status():
                 'CloudTAK marketplace helper not granted: ' + (_h.get('reason') or 'not installed') + '.')
             # A TAK Portal that ships a helper infra-TAK has not pinned. It runs as root, so
             # infra-TAK keeps the pinned one it has until the new bytes are reviewed. Pinned
-            # so far: 2.0.19-2.0.22 and 2.0.29-2.0.36 (apply-caddyfile validates as the caddy user,
-            # ops #340; 2.0.31/2.0.32 ops #538; 2.0.33-2.0.36 ops #848); the 2.0.23-2.0.28 helpers (checked 2.0.24, 2.0.26, 2.0.28) are not, and on those Deploy To Caddy cannot write a
+            # so far: 2.0.19-2.0.22 and 2.0.29-2.0.39 (apply-caddyfile validates as the caddy user,
+            # ops #340; 2.0.31/2.0.32 ops #538; 2.0.33-2.0.38 ops #848; 2.0.39 ops #1043); the 2.0.23-2.0.28 helpers (checked 2.0.24, 2.0.26, 2.0.28) are not, and on those Deploy To Caddy cannot write a
             # root-owned Caddyfile. A Portal NEWER than the last pinned one waits for the next infra-TAK update.
             if _h.get('unreviewed') or 'not reviewed' in (_h.get('reason') or ''):
                 row('Marketplace helper', 'na', 'newer version not reviewed yet',
@@ -48297,7 +48297,7 @@ def takportal_ssh_status():
                     'so infra-TAK keeps the older one. Marketplace steps that need the newer helper '
                     '(for example "Deploy To Caddy", which may fail with "Could not back up '
                     '/etc/caddy/Caddyfile") stay off. On TAK Portal 2.0.23 to 2.0.28, update TAK Portal '
-                    'to 2.0.29 or newer. On a Portal newer than 2.0.36 they wait for the next infra-TAK '
+                    'to 2.0.29 or newer. On a Portal newer than 2.0.39 they wait for the next infra-TAK '
                     'update, which adds the new helper after review. Repair will not change this.')
         elif grant.get('present'):
             row('Sudo grant', 'warn', '/etc/sudoers.d/tak-portal (does not match this release)',
@@ -57838,6 +57838,50 @@ def _cloudtak_plugin_owning_route(route_filename, cloudtak_dir=None):
     return None
 
 
+def _cloudtak_lint_files_from_plugins(lint_files, cloudtak_dir):
+    """GH #628: which api lint findings sit in files CloudTAK itself does not ship.
+
+    OXLint prints api-relative paths (stateless/lib/retention/replay.ts). A file that is on
+    disk but not tracked by the CloudTAK checkout was put there by a plugin. Since TAK Portal
+    2.0.38 the Marketplace no longer lets such files skip the lint (it strips @ts-nocheck and
+    our ignore entries), so one plugin that fails CloudTAK's lint stops every CloudTAK Update,
+    and the operator only saw a list of file names. Returns (files, plugin folder names); a
+    plugin is named when the file name starts with its folder's first word (replay ->
+    replay-player.ts, retention/replay.ts; livewx-radar -> plugin-livewx.ts). Never raises."""
+    try:
+        if not cloudtak_dir or not lint_files:
+            return [], []
+        api = os.path.join(cloudtak_dir, 'api')
+        cand = [f for f in lint_files
+                if not f.startswith('/') and '..' not in f.split('/')
+                and os.path.isfile(os.path.join(api, f))]
+        if not cand:
+            return [], []
+        r = subprocess.run(['git', '-c', f'safe.directory={cloudtak_dir}', '-C', cloudtak_dir,
+                            'ls-files', '--'] + ['api/' + f for f in cand],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return [], []
+        tracked = set(r.stdout.splitlines())
+        files = [f for f in cand if 'api/' + f not in tracked]
+        try:
+            base = _cloudtak_plugins_dir(cloudtak_dir)
+            dirs = sorted(n for n in os.listdir(base)
+                          if not n.startswith('.') and os.path.isdir(os.path.join(base, n)))
+        except Exception:
+            dirs = []
+        names = []
+        for f in files:
+            stem = re.sub(r'^plugin-', '', re.sub(r'\.[cm]?[jt]s$', '', f.rsplit('/', 1)[-1]))
+            word = stem.split('-', 1)[0].lower()
+            for d in dirs:
+                if word and d.split('-', 1)[0].lower() == word and d not in names:
+                    names.append(d)
+        return files, names
+    except Exception:
+        return [], []
+
+
 def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
     """Turn captured CloudTAK build output into one operator-facing "Likely cause" block.
 
@@ -57979,6 +58023,23 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             if lint_files:
                 out.append('  Files with findings: %s%s' % (', '.join(lint_files[:6]),
                                                            ' ...' if len(lint_files) > 6 else ''))
+            # GH #628: say which of them a plugin added, and where to update or remove it
+            _pf, _pn = (_cloudtak_lint_files_from_plugins(lint_files, cloudtak_dir)
+                        if lint_files and cloudtak_dir else ([], []))
+            if _pf:
+                ours = {p.get('install_dir') for p in CLOUDTAK_PLUGINS}
+                out.append('  %s not part of CloudTAK: a plugin added %s%s.'
+                           % ('This file is' if len(_pf) == 1 else 'These %d files are' % len(_pf),
+                              'it' if len(_pf) == 1 else 'them',
+                              ' (%s: %s)' % ('plugin' if len(_pn) == 1 else 'plugins',
+                                             ', '.join(_pn)) if _pn else ''))
+                if _pn and all(n in ours for n in _pn):
+                    out.append('  CloudTAK itself is not the problem. Update or remove that plugin on '
+                               'the CloudTAK page, then run Update again.')
+                else:
+                    out.append('  CloudTAK itself is not the problem. In TAK Portal, open the CloudTAK '
+                               'Marketplace and update that plugin, or uninstall it until it supports '
+                               'this CloudTAK. Then run Update again.')
             if lint_plugins:
                 out.append('  Errors are in CloudTAK plugin folder(s): %s (app/plugins/)'
                            % ', '.join(lint_plugins))

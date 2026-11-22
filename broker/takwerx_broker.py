@@ -5202,10 +5202,19 @@ TAKPORTAL_DOCKER_FEATURE_FILE = os.path.join('services', 'takServerMode.service.
 #   d6e9238b… 2.0.33: 5996839d… plus one more phrase ("received unexpected HTTP status") in the
 #             pattern that decides whether a failed `docker compose` output is a dropped layer worth
 #             a retry. One regex word in a log check; no new command, path or input (ops #848).
-#   4dfeacd0… 2.0.34, 2.0.35, 2.0.36 (the same file): d6e9238b… plus a skip of any log line that
+#   4dfeacd0… 2.0.34 to 2.0.38 (the same file): d6e9238b… plus a skip of any log line that
 #             names npmjs.org, so npm noise during an image build is not counted as a Docker Hub
 #             pull failure. Again only the log check changed; no new command, path or input
 #             (ops #848). Diff read by the ops worker Mon Nov 16, 2026; Security review: see ops #848.
+#   11b953ad… 2.0.39 (prints version 5): 4dfeacd0… plus require_checkout_package_json(), which
+#             replaces the four `[ -d "$ct" ]` checks and dies unless `$ct/api/package.json`
+#             exists, so a fabricated leftover tree is refused. It only refuses more: no new
+#             command, path, privilege or caller input (8 changed lines, diff read by the ops
+#             worker Sat Nov 21, 2026; ops #1043). Reviewed by Security Sat Nov 21, 2026 (ops #1043):
+#             safe to pin. Two old risks it still carries (also in v3 and v4, tracked by Security
+#             separately, not blockers): `reclaim` does `mkdir -p` and `chown -R` below a checkout
+#             the portal user owns (accepted in ops #295), and `rebuild` lets the portal user build
+#             from compose files it owns.
 TAKPORTAL_HELPER_SHA256 = frozenset({
     'c240a12aa8978e106c94c0303a0e116f3e08dff0ba7c6a9273c0422ad92e3bb4',
     '4d093f4b834bda8ad712c5df4155929dd9b40f4d14ecded0cdd01b84d14c4559',
@@ -5213,6 +5222,7 @@ TAKPORTAL_HELPER_SHA256 = frozenset({
     '5996839d6d663e3f1c6230a7d64c8f2580e8776b6be1ee708e9f02eec8b86d58',
     'd6e9238bbc09f6dda594f5e365b3daaf32a225a42f1bf0ad46201a4dc794ac04',
     '4dfeacd03abfb6c3b41add51936255e48fdf370988891d0b65f66ac5db4234e3',
+    '11b953ada3cfe5dad8c37ec599fa759449841e8afef9ff7de7aeef025e00bd30',
 })
 # 'status' is read-only and exists because the console CANNOT read the grant
 # itself: /etc/sudoers.d/ is deny-listed for reads as well as writes, and on a
