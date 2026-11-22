@@ -5172,6 +5172,14 @@ TAKPORTAL_WRAPPED = ('cat', 'tee')
 TAKPORTAL_HELPER = '/usr/local/libexec/tak-portal/marketplace-helper'
 TAKPORTAL_LEFTOVER_SUDOERS = '/etc/sudoers.d/tak-portal-marketplace'
 TAKPORTAL_HARDENED_MIN_VERSION = (2, 0, 19)
+# Docker TAK Server (ops #987, TAK Portal PR 115): the portal reaches TAK Server through
+# `docker exec` / `docker restart` on the host instead of /opt/tak and systemctl. infra-TAK
+# names its container 'takserver' (app.py TAK_CONTAINER), a fleet constant, so the grant
+# names exactly that container and never one read from a file the console user can write.
+# A portal checkout carries the Docker support when it ships this file; the grant is only
+# written for a Docker TAK Server when it does, so an older portal gets no new rules.
+TAKPORTAL_DOCKER_CONTAINER = 'takserver'
+TAKPORTAL_DOCKER_FEATURE_FILE = os.path.join('services', 'takServerMode.service.js')
 # sha256 of host-helpers/marketplace-helper in TAK Portal releases
 # (ValleyTacticalSolutions/TAK-Portal). The helper is granted as root, so we only
 # ever install bytes we have reviewed; a portal that ships a different helper gets
@@ -5194,10 +5202,19 @@ TAKPORTAL_HARDENED_MIN_VERSION = (2, 0, 19)
 #   d6e9238b… 2.0.33: 5996839d… plus one more phrase ("received unexpected HTTP status") in the
 #             pattern that decides whether a failed `docker compose` output is a dropped layer worth
 #             a retry. One regex word in a log check; no new command, path or input (ops #848).
-#   4dfeacd0… 2.0.34, 2.0.35, 2.0.36 (the same file): d6e9238b… plus a skip of any log line that
+#   4dfeacd0… 2.0.34 to 2.0.38 (the same file): d6e9238b… plus a skip of any log line that
 #             names npmjs.org, so npm noise during an image build is not counted as a Docker Hub
 #             pull failure. Again only the log check changed; no new command, path or input
 #             (ops #848). Diff read by the ops worker Mon Nov 16, 2026; Security review: see ops #848.
+#   11b953ad… 2.0.39 (prints version 5): 4dfeacd0… plus require_checkout_package_json(), which
+#             replaces the four `[ -d "$ct" ]` checks and dies unless `$ct/api/package.json`
+#             exists, so a fabricated leftover tree is refused. It only refuses more: no new
+#             command, path, privilege or caller input (8 changed lines, diff read by the ops
+#             worker Sat Nov 21, 2026; ops #1043). Reviewed by Security Sat Nov 21, 2026 (ops #1043):
+#             safe to pin. Two old risks it still carries (also in v3 and v4, tracked by Security
+#             separately, not blockers): `reclaim` does `mkdir -p` and `chown -R` below a checkout
+#             the portal user owns (accepted in ops #295), and `rebuild` lets the portal user build
+#             from compose files it owns.
 TAKPORTAL_HELPER_SHA256 = frozenset({
     'c240a12aa8978e106c94c0303a0e116f3e08dff0ba7c6a9273c0422ad92e3bb4',
     '4d093f4b834bda8ad712c5df4155929dd9b40f4d14ecded0cdd01b84d14c4559',
@@ -5205,6 +5222,7 @@ TAKPORTAL_HELPER_SHA256 = frozenset({
     '5996839d6d663e3f1c6230a7d64c8f2580e8776b6be1ee708e9f02eec8b86d58',
     'd6e9238bbc09f6dda594f5e365b3daaf32a225a42f1bf0ad46201a4dc794ac04',
     '4dfeacd03abfb6c3b41add51936255e48fdf370988891d0b65f66ac5db4234e3',
+    '11b953ada3cfe5dad8c37ec599fa759449841e8afef9ff7de7aeef025e00bd30',
 })
 # 'status' is read-only and exists because the console CANNOT read the grant
 # itself: /etc/sudoers.d/ is deny-listed for reads as well as writes, and on a
@@ -5274,6 +5292,8 @@ def _takportal_sudoers_text(user=BROKER_USER, variant='hardened', helper=False):
     binaries)."""
     if not re.fullmatch(r'^[a-z_][a-z0-9_-]{0,31}$', str(user or '')):
         raise Denied(f'takportal_sudoers: refusing unsafe user name {user!r}')
+    if variant == 'docker':
+        return _takportal_docker_text(user, helper)
     if variant != 'hardened':
         raise Denied(f'takportal_sudoers: unknown grant variant {variant!r}')
     return _takportal_hardened_text(user, helper)
@@ -5301,6 +5321,40 @@ def _takportal_hardened_text(user, helper):
         lines.append(f'{user} ALL=(root) NOPASSWD: {p} restart takserver')
     # Cert issuance: makeCert.sh must run AS the tak user, which owns /opt/tak.
     lines.append(f'{user} ALL=({TAKPORTAL_TAK_USER}) NOPASSWD: ALL')
+    if helper:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {TAKPORTAL_HELPER}')
+    return '\n'.join(lines) + '\n'
+
+
+def _takportal_docker_text(user, helper):
+    """The grant for a Docker TAK Server (ops #987, TAK Portal 2.0.36+).
+
+    Three rules per root-owned docker binary, all naming ONE fixed container:
+      docker exec -i takserver *          commands inside the container (default user)
+      docker exec -i -u tak takserver *   the same as the container's `tak` user (makeCert)
+      docker restart takserver            what `systemctl restart takserver` is on native
+    Everything the caller controls comes AFTER the container name, and `docker exec`
+    stops reading options at the container name, so the caller cannot add --privileged,
+    -u root, -v or --env. It can only choose the command to run inside that container,
+    which is the same reach the native grant gives with `ALL=(tak) NOPASSWD: ALL`.
+    No wrappers and no secure_path: nothing here resolves a command name on the host.
+    The marketplace helper is the same pinned file as the native grant; it drives
+    CloudTAK on the host, not TAK Server."""
+    dockers = _sudoers_safe_binaries('docker')
+    if not dockers:
+        raise Denied(f'takportal_sudoers: cannot resolve a root-owned docker in {_SUDOERS_BIN_DIRS}')
+    c = TAKPORTAL_DOCKER_CONTAINER
+    lines = [
+        '# Managed by infra-TAK (ops #987). Do not edit by hand.',
+        '#',
+        '# TAK Server runs in Docker. TAK Portal 2.0.36+ reaches it through the container:',
+        f'# only `docker exec` into, and `docker restart` of, the container named {c}.',
+        f'Defaults:{user} !requiretty',
+    ]
+    for d in dockers:
+        lines.append(f'{user} ALL=(root) NOPASSWD: {d} exec -i {c} *')
+        lines.append(f'{user} ALL=(root) NOPASSWD: {d} exec -i -u {TAKPORTAL_TAK_USER} {c} *')
+        lines.append(f'{user} ALL=(root) NOPASSWD: {d} restart {c}')
     if helper:
         lines.append(f'{user} ALL=(root) NOPASSWD: {TAKPORTAL_HELPER}')
     return '\n'.join(lines) + '\n'
@@ -5444,7 +5498,8 @@ def _takportal_decide(user=BROKER_USER):
     grant and what the status row says; the variant is always 'hardened' (ops #644
     removed the legacy text). portal_old: TAK Portal is older than
     2.0.19, so its marketplace and cert repair need a TAK Portal update."""
-    out = {'variant': 'hardened', 'reason': 'no TAK Portal checkout found', 'portal_version': '',
+    out = {'variant': 'docker' if _takportal_layout() == 'docker' else 'hardened',
+           'reason': 'no TAK Portal checkout found', 'portal_version': '',
            'portal_old': False,
            'helper_bytes': None, 'helper_reason': 'no TAK Portal checkout found',
            'helper_unreviewed': False}
@@ -5516,21 +5571,55 @@ def _takportal_remove_leftover():
     return True
 
 
+def _takportal_layout():
+    """'native' (/opt/tak is a real directory), 'docker' (/opt/tak is the symlink into the
+    console user's docker bundle) or '' (no TAK Server on this host)."""
+    if not os.path.isdir('/opt/tak'):
+        return ''
+    return 'docker' if os.path.islink('/opt/tak') else 'native'
+
+
+def _takportal_portal_supports_docker(user=BROKER_USER):
+    """True when the TAK Portal checkout ships Docker TAK Server support (it has
+    services/takServerMode.service.js). Same care as _takportal_decide: the checkout is a
+    directory the console user controls, so no symlinks and only a regular file count. This
+    only decides whether a grant is OFFERED; the rules themselves never depend on its content."""
+    try:
+        portal = os.path.join(pwd.getpwnam(user).pw_dir, 'TAK-Portal')
+    except KeyError:
+        return False
+    if os.path.islink(portal) or not os.path.isdir(portal):
+        return False
+    try:
+        data = _read_small_nofollow(os.path.join(portal, TAKPORTAL_DOCKER_FEATURE_FILE), 262144)
+    except OSError:
+        return False
+    return bool(data)
+
+
 def _takportal_sudoers_supported():
     """(ok, reason) — whether this box can carry the grant at all.
 
-    Native TAK only. On a containerized/ARM install /opt/tak is a SYMLINK into the
-    console user's docker bundle, there is no host `tak` user and no
-    takserver.service, so every line of the grant would be meaningless. Skipping
-    is the correct outcome there, and the console says so rather than warning."""
-    if not os.path.isdir('/opt/tak'):
+    Native TAK, or Docker TAK with a portal that supports it (ops #987). On a
+    containerized/ARM install /opt/tak is a SYMLINK into the console user's docker
+    bundle, there is no host `tak` user and no takserver.service, so the native
+    grant would be meaningless there. A portal that predates Docker support has
+    nothing to run through `docker exec`, so skipping is still the correct outcome
+    for it, and the console says so rather than warning."""
+    layout = _takportal_layout()
+    if not layout:
         return False, 'TAK Server is not installed on this host (/opt/tak missing)'
-    if os.path.islink('/opt/tak'):
-        return False, 'containerized TAK Server (/opt/tak is a symlink) — no host tak user to grant'
-    try:
-        pwd.getpwnam(TAKPORTAL_TAK_USER)
-    except KeyError:
-        return False, f'no `{TAKPORTAL_TAK_USER}` user on this host'
+    if layout == 'docker':
+        if not _takportal_portal_supports_docker():
+            return False, ('containerized TAK Server (/opt/tak is a symlink) — this TAK Portal '
+                           'has no Docker TAK Server support yet, so there is nothing to grant')
+        if not _sudoers_safe_binaries('docker'):
+            return False, f'cannot resolve a root-owned docker in {_SUDOERS_BIN_DIRS}'
+    else:
+        try:
+            pwd.getpwnam(TAKPORTAL_TAK_USER)
+        except KeyError:
+            return False, f'no `{TAKPORTAL_TAK_USER}` user on this host'
     try:
         if pwd.getpwnam(BROKER_USER).pw_uid == 0:
             return False, f'console user {BROKER_USER} resolves to uid 0 — grant is meaningless'
@@ -5569,8 +5658,8 @@ def _do_takportal_sudoers(req):
         decision = _takportal_decide()
         variant = decision['variant']
         helper_ok = _takportal_helper_ok()
-        hardened = (variant == 'hardened')
-        wrappers_ok = _takportal_wrappers_ok() if hardened else True
+        hardened = variant in ('hardened', 'docker')    # both carry the pinned marketplace helper
+        wrappers_ok = _takportal_wrappers_ok() if variant == 'hardened' else True
         # An install would still have to put the helper in place.
         helper_pending = hardened and decision['helper_bytes'] is not None and not _takportal_helper_current(decision)
         if present:
@@ -5618,11 +5707,13 @@ def _do_takportal_sudoers(req):
     decision = _takportal_decide()
     variant = decision['variant']
     helper_granted = False
-    if variant == 'hardened':
+    if variant in ('hardened', 'docker'):
         # Root-owned, tak-unwritable files FIRST; the grant only goes in once
         # they verify, so a half-installed hardened grant can never exist.
+        # (The Docker grant has no wrappers: only the pinned helper.)
         try:
-            _takportal_install_wrappers()
+            if variant == 'hardened':
+                _takportal_install_wrappers()
             if decision['helper_bytes'] is not None:
                 if not _takportal_helper_current(decision):
                     _write_root_file(TAKPORTAL_HELPER, decision['helper_bytes'], 0o755)
@@ -5652,7 +5743,7 @@ def _do_takportal_sudoers(req):
         os.replace(tmp, TAKPORTAL_SUDOERS_PATH)
         tmp = None
         removed = False
-        if variant == 'hardened':
+        if variant in ('hardened', 'docker'):
             # TAK Portal <2.0.19 wrote a NOPASSWD: ALL drop-in here; the
             # hardened grant must not sit beside it.
             try:
