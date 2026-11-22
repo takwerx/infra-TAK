@@ -91,8 +91,10 @@ def test_unreviewed_older_helpers_stay_unpinned(b):
     assert 'ba749885c92e9ea097012438a98cc0b45f3fabf4d46252d1bac54ef1720123cd' not in b.TAKPORTAL_HELPER_SHA256
 
 
-def test_nothing_else_got_pinned(b):
-    assert set(b.TAKPORTAL_HELPER_SHA256) == set(OLDER_PINNED) | {SHA[v] for v in NEW}
+def test_all_reviewed_hashes_stay_pinned(b):
+    # The exact-set check ("nothing else got pinned") moved to tests/test_takportal_helper_pins_ops1043.py,
+    # which knows the newest pin (2.0.39).
+    assert set(OLDER_PINNED) | {SHA[v] for v in NEW} <= set(b.TAKPORTAL_HELPER_SHA256)
 
 
 # 2.0.35 and 2.0.36 ship the 2.0.34 file byte for byte (hash checked above), so one fixture stands for all three.
@@ -137,4 +139,5 @@ def test_installed_older_helper_is_replaced_by_the_portals_new_one(b, monkeypatc
 def test_console_note_does_not_say_2_0_32_is_the_newest():
     src = (REPO / 'app.py').read_text()
     assert 'On a Portal newer than 2.0.32 they wait' not in src
-    assert 'On a Portal newer than 2.0.36 they wait' in src
+    # The newest pinned Portal moves with each review; ops #1043 moved it to 2.0.39.
+    assert 'On a Portal newer than 2.0.39 they wait' in src
