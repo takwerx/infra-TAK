@@ -87,7 +87,8 @@ def _update_fn(beta=True):
     exec(compile(HELPERS, 'app.py', 'exec'), n)
     n.update(_takportal_beta_mode=lambda: beta,
              _module_checkout_ownership_selfheal=lambda d, plog=None: (False, ''),
-             _takportal_release_tag_strict=lambda d, plog=None: '2.0.14')
+             _takportal_release_tag_strict=lambda d, plog=None: '2.0.14',
+             _takportal_expected_commit=lambda tag: '')   # ops #1042: no signed commit to check here
     exec(compile(GIT, 'app.py', 'exec'), n)
     return n['_takportal_update_git']
 

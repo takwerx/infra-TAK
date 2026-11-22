@@ -120,5 +120,8 @@ def test_fresh_install_clones_the_constant():
 
 
 def test_release_lookups_use_the_new_owner():
-    apis = re.findall(r"https://api\.github\.com/repos/([^/]+)/TAK-Portal/releases/latest", APP)
-    assert apis and set(apis) == {'ValleyTacticalSolutions'}
+    # ops #1042: no code asks GitHub's releases API any more (the verified-version file decides),
+    # so the owner lives in the repo constant that deploy clones and the update path repoints to.
+    assert 'TAKPORTAL_REPO = "https://github.com/ValleyTacticalSolutions/TAK-Portal.git"' in APP
+    owners = re.findall(r"https://(?:api\.)?github\.com/(?:repos/)?([^/]+)/TAK-Portal", APP)
+    assert owners and set(owners) == {'ValleyTacticalSolutions'}
