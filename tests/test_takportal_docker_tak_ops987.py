@@ -287,6 +287,66 @@ def test_setup_ssh_keeps_the_limitation_note_only_for_a_portal_without_docker_su
     assert 'not _takportal_portal_supports_docker()' in src[i:i + 120]
 
 
+# Security's condition on PR 608 (ops #1029): the grant may only ever name `takserver`, and
+# no rule may carry a flag between the verb and the container name.
+_DOCKER_BINS = ('/usr/bin/docker', '/bin/docker')
+_ALLOWED_AFTER_BINARY = (
+    ['exec', '-i', 'takserver', '*'],
+    ['exec', '-i', '-u', 'tak', 'takserver', '*'],
+    ['restart', 'takserver'],
+)
+
+
+def _docker_rule_problems(rules):
+    """Why a rule set is not the fixed three-rule shape on the container `takserver`
+    (empty list = fine). Any other container, any flag before the name, any other verb or
+    user, a bare `*`, or a flag after `-i`/`-u tak` all show up here."""
+    problems = []
+    for line in rules:
+        if 'NOPASSWD:' not in line or 'marketplace-helper' in line:
+            continue
+        words = line.split('NOPASSWD:', 1)[1].split()
+        if words[0] not in _DOCKER_BINS:
+            problems.append(f'not a root-owned docker path: {line}')
+        elif words[1:] not in _ALLOWED_AFTER_BINARY:
+            problems.append(f'not one of the three allowed rules: {line}')
+    return problems
+
+
+def test_docker_grant_names_only_takserver_and_no_flag_comes_before_the_name(b):
+    rules = _grant(b._takportal_sudoers_text(user='takwerx', variant='docker', helper=True))
+    assert _docker_rule_problems(rules) == []
+    docker_rules = [r for r in rules if 'NOPASSWD:' in r and 'marketplace-helper' not in r]
+    assert len(docker_rules) == 3 * len(_DOCKER_BINS)          # three rules per docker path, no more
+    # The container name is the only non-flag word before the caller's `*`; the flags are
+    # fixed text (`-i`, `-u tak`) written by the broker, never taken from a file or request.
+    for r in docker_rules:
+        words = r.split('NOPASSWD:', 1)[1].split()[1:]
+        names = [w for w in words if w not in ('exec', 'restart', '-i', '-u', 'tak', '*')]
+        assert names == ['takserver'], r
+    assert b.TAKPORTAL_DOCKER_CONTAINER == 'takserver'
+
+
+def test_docker_rule_check_catches_a_different_name_or_a_flag_before_it():
+    # The check above must itself fail on the shapes Security named, so it cannot pass by
+    # looking at nothing.
+    good = ['takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i takserver *']
+    assert _docker_rule_problems(good) == []
+    for bad in (
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i authentik-server-1 *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i --privileged takserver *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i -u root takserver *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i -e X=1 takserver *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i takserver-db *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker restart *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker restart other',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker run -i takserver *',
+        'takwerx ALL=(root) NOPASSWD: /home/takwerx/docker exec -i takserver *',
+    ):
+        assert _docker_rule_problems([bad]), bad
+
+
 def test_container_name_matches_the_fleet_constant():
     broker = (REPO / 'broker' / 'takwerx_broker.py').read_text(encoding='utf-8')
     assert "TAKPORTAL_DOCKER_CONTAINER = 'takserver'" in broker
