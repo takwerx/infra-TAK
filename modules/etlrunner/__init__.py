@@ -290,6 +290,9 @@ def parse_catalog(raw):
         raise ValueError('catalog is not JSON')
     if not isinstance(d, dict) or d.get('schema') != CATALOG_SCHEMA:
         raise ValueError('catalog schema is not supported')
+    if d.get('kind') not in (None, 'etl-catalog'):
+        # another file signed with the same key (takportal-verified.json) is not the catalog
+        raise ValueError('catalog is a signed file of another kind')
     serial = d.get('serial')
     if not isinstance(serial, int) or isinstance(serial, bool) or serial <= 0:
         raise ValueError('catalog has no serial')
