@@ -94,6 +94,7 @@ Official: [dfpc-coe/CloudTAK](https://github.com/dfpc-coe/CloudTAK), [dfpc-coe/n
 - Plugins reach CloudTAK only when the plugin install action in the console copies their source in and CloudTAK's API is rebuilt. Editing a plugin repo alone changes nothing. Plugins are a catalog entry (`CLOUDTAK_PLUGINS`) pointing at a repo with `plugin/` and optionally `server/`.
 - Cert login needs the TAK Server certificate in the browser's trust store. API calls to TAK Server use `TAKAPI.init()` with `APIAuthCertificate`. 📖 node-tak.
 - `docker-compose.custom.yml` is the supported place for the operator's own CloudTAK services.
+- **A server-wide ETL layer (connection 0, the only kind infra-TAK's ETL card makes) cannot save its login or schedule, and its ETL cannot keep a session, on CloudTAK 13.124.0.** CloudTAK's UI saves with `PATCH /api/connection/0/layer/ID/incoming` (and `/outgoing`), and the `@tak-ps/etl` library (11.4.0) stores a session with `PUT /api/connection/<layer.connection>/layer/ID/incoming/ephemeral`, which for a server-wide layer is the word `null` in the URL. All four routes (`connection-layer.ts`, `connection-layer-ephemeral.ts`) declare `connectionid` as an integer of 1 or more and have no connection-0 branch, while Create, List, Get and Delete Layer have one. Answers: the PATCH gives `Validation Error PATCH /connection/:connectionid/layer/:layerid/incoming`; the PUT gives `Validation Error ... ephemeral` and the ETL logs "Failed to put ephemeral values to ETL", then repeats its login every run. Reported upstream: dfpc-coe/CloudTAK#2042 and #2047. ✅ verified 2026-11-19, Ubuntu 22.04 (cloud box and test12), CloudTAK 13.124.0, etl-active911 4.13.0. A layer created under a TAK connection works (connection id in the URL). Side facts proved on the same box: the api checks route parameters with ajv (`coerceTypes`), so a numeric string becomes a number and `null` stays a string only when the schema allows that word; and `Auth.is_auth` matches a resource entry with a falsy id (0) against any token of that kind, so a route that lists `{ access: CONNECTION, id: 0 }` lets any connection token through (infra-TAK's fix lists only the layer resource for connection 0 and `null`).
 - **The `tiles` container loads every basemap from the API at `API_URL`** (`tasks/pmtiles/lib/basemap.ts`: `process.env.API_URL || 'http://localhost:5001'`), so a wrong `API_URL` makes every tile 500. 13.117.0's compose never passed it to `tiles`; 13.117.1 passes `API_URL=${API_URL}` from `.env`. infra-TAK writes that `.env` value as the public address (`https://map.<domain>`), or `http://172.20.0.1:5000` on an install with no domain. ✅ verified 2026-11-01 on test12 (Ubuntu 22.04, 13.117.1): with no override, tiles are 200 because the container can reach the public name; the same container cannot reach the Docker gateway on port 5000, because the API is published on `127.0.0.1:5000` only. So an install with no domain still needs infra-TAK's `API_URL: "http://api:5000"` override for `tiles`. Check after any update: fetch one tile from `/tiles/basemap/<id>/tiles/1/0/0?token=...` on the tiles container (200, not 500).
 
 - **Video: how a stream gets from MediaMTX to CloudTAK's player, and what "Failed to generate proxy stream" means.** Read from CloudTAK's API source (`api/stateless/lib/control/video-service.ts`, `routes/profile-videos.ts`, `routes/video-lease.ts`, 13.116.0) 📖. Everything marked ✅ was also observed against 13.117.1.
@@ -155,6 +156,67 @@ Official: [docs.docker.com](https://docs.docker.com/)
 Official: [docs.netbird.io](https://docs.netbird.io/)
 
 - **The `netbirdio/netbird-server` images (0.80.0, 0.82.0, 0.82.1) carry the `org.opencontainers.image.version` label of their Ubuntu base image (`24.04`), not the NetBird version.** The dashboard image's label is right. To read the running server version, use the tag in `docker inspect --format '{{.Config.Image}}'`, which compose pins. The label is a fallback only when it starts with `0.`. ✅ verified 2026-11-16, Ubuntu 22.04 fresh-install box (ops #853).
+
+## Reboots: what starts what, and in which order
+
+Official: [Docker restart policies](https://docs.docker.com/engine/containers/start-containers-automatically/), [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html)
+
+- **`restart: unless-stopped` does not restart a container that was stopped on purpose before the reboot or the daemon restart, and `docker stop` counts as on purpose.** Guard Dog's boot sequencer stops Authentik, TAK Portal, CloudTAK and Node-RED (and MediaMTX) before TAK starts, so after a reboot only `tak-post-start.service` brings them back. 📖 documented (Docker); 👁 observed 2026-11-02 (ops #438: TAK Portal and CloudTAK stayed stopped after a 24.04 reboot while TAK, Authentik and Caddy ran).
+- **`docker compose` `depends_on` is not honoured when dockerd restarts containers after a reboot.** dockerd starts them all at once, so the LDAP outpost can start before the Authentik server has published its providers and bind without resolving groups. 👁 observed 2026-08-31 (GH #64).
+- **`tak-post-start.service` is one shot with `TimeoutStartSec=1200`, and its own waits add up to more than that** (Authentik healthy up to 300 s, LDAP group probe up to 120 s plus a 30 s recreate, TAK 8089 up to 900 s, TAK API up to 300 s, then the CloudTAK, Node-RED and MediaMTX staggers). On a slow boot systemd kills it before it has started the last modules, and nothing starts them again. 📖 read from the unit and the script, not yet reproduced on a box. The console's once-per-boot check (ops #1017) starts what is still stopped 10 to 21 minutes after boot.
+- **Boot timings seen.** TAK Server opens 8089 about 110 to 170 s after start, and its API a few seconds to half a minute later. The Authentik LDAP outpost can take about 100 s after its own start before it resolves groups, so a bind probe in the first two minutes is not proof of anything. 👁 observed 2026-08-22 and 2026-11-20 (test6, test12, a field box).
+- **A unit that is `activating` is not down.** `systemctl is-active` says `activating` while a unit starts; judge it only after the start has finished. 📖 documented (systemd).
+- **A host can answer ping and refuse every TCP port after a reboot.** test6 (Ubuntu 24.04, VPS) did so for 25+ minutes after a real reboot on 2026-11-20 while test12 on the same code came back. Cause not yet known. 👁 observed 2026-11-20 (ops #1017); open question.
+
+### Start-order map (ops #1017, read from the units and scripts of a full-module box, 2026-11-20)
+
+"Enforced" = a unit dependency, a compose `service_healthy` wait or a health wait in code. "Timer-only" = nothing orders it; a per-minute Guard Dog timer or restart policy heals it later. "Nothing" = no order and no heal.
+
+| Service | Needs first | Where the order is kept today | Mark |
+|---|---|---|---|
+| Docker | network-online, containerd, docker.socket, time-set | `docker.service` `After=`/`Requires=`, `Restart=always` | enforced |
+| PostgreSQL (TAK) | disk, network | `takserver.service` `After=postgresql*.service`; Guard Dog `takdbguard` per minute | enforced (TAK side); heal timer-only |
+| TAK Server | PostgreSQL, network | `After=postgresql*.service`, `soft-start.conf`; `tak-boot-sequencer.sh` (ExecStartPre) stops the heavy modules first so TAK gets the CPU | enforced |
+| Authentik DB, Redis, pgbouncer | Docker | compose `depends_on: service_healthy` inside the stack; dockerd ignores `depends_on` after a reboot (GH #64) | timer-only after reboot (post-start + `takauthentikguard`) |
+| Authentik server, worker | Authentik DB, pgbouncer, Docker | sequencer stops them, `tak-post-start` starts them after TAK answers; `takauthentikguard` per minute | enforced (post-start), heal timer-only |
+| LDAP outpost | Authentik server answering | `tak-post-start` waits for it ("resolving groups"); the console boot heal waits for Authentik and (since 06c007e) for the outpost to listen | enforced |
+| TAK clients with groups | LDAP outpost, TAK API | `tak-client-gate` holds 8089 until the API answers; #1015 stuck-phones check | enforced |
+| TAK Portal | TAK Server, Authentik | `tak-post-start` starts it after the session recycle; `taktakportalguard` per minute | enforced + timer |
+| CloudTAK (8 containers) | TAK Server, its own PostGIS | `tak-post-start`, 30 s stagger after TAK Portal; `takcloudtakguard` per minute | enforced + timer |
+| Node-RED | TAK Server | `tak-post-start`, 30 s stagger; `taknoderedguard` per minute | enforced + timer |
+| MediaMTX, web editor | network (editor: MediaMTX) | `tak-post-start` starts it last; `takmediamtxguard`; unit `Restart=always` | enforced + timer |
+| Caddy | network-online, DNS for certificate renewals | `After=network-online.target`, `Requires=`; certificates are kept on disk; `Restart=on-failure` | enforced |
+| Console and broker | network-online | `After=network-online.target`, `Restart=always`; boot heals wait for Authentik; ops #1017 boot check at 10 min | enforced; heal added |
+| Guard Dog timers | none | systemd timers, per minute to daily | timer-only (by design) |
+| fail2ban, tak-health | network, TAK (health) | unit `After=`, `Restart=` | enforced |
+| Any module stopped by the sequencer and not started by `tak-post-start` | | ops #1017 boot check (10+ min after boot, 2 repair rounds, plain-words email) | added in PR 622 |
+
+Gaps this map shows (not yet fixed here): the 30 s gaps in `tak-post-start` put the full stack at about 4.5 to 5.5 minutes on a small cloud box (a design choice: they keep CloudTAK and Node-RED from reaching TAK together); a clock that is wrong at boot and a full disk at boot have no own check.
+
+### Reboot scenarios (ops #1017)
+
+Boxes: C = cloud Ubuntu 22.04 with every module (fresh-install), T12 = test12 (Ubuntu 22.04, TAK with 10 clients). Times are seconds after boot.
+
+| Scenario | Result | Evidence |
+|---|---|---|
+| Plain reboot | pass | C: whole stack OK at 328 s. T12: 273 to 315 s. |
+| Boot script (`tak-post-start`) cut off, as if systemd killed it | pass | C: whole stack OK at 391 s, started by Guard Dog's per-minute guards; the boot check at 10 min found nothing to start. |
+| Modules stopped and their guards off at 9 min | pass | C: boot check at 10 min started mediamtx, authentik server and worker, cloudtak-api, nodered, tak-portal and its worker; every row OK 25 s later; plain-words activity line written. |
+| LDAP outpost late (Authentik up, outpost not listening) | fail on dev, pass here | Dev: every reboot on C and T12 ran a password set plus an outpost recreate. With 06c007e: T12 `password_set` 0, outpost not recreated, TAK started once. |
+| Real reboot with an ATAK client | partly | T12 after reboot: 11 clients, 0 without groups (the emulator joined when ATAK was opened after the reboot; it was not connected during the reboot). |
+| Power loss (no clean shutdown) | code-only | The same units and boot path run; a cloud hard stop was not done. Reason: no box left in time. |
+| Reboot right after Update Now | code-only here | `_boot_recovery_run` waits for a running console update; the update path was covered by #438 and #1015. |
+| Authentik late (45 s, 3 min, never) | code-only here | #1015 `latecore` covers 45 s; "never" leaves it to the 5-min watchdog (tested by unit test). |
+| PostgreSQL or pgbouncer late | code-only | `takserver.service` waits for PostgreSQL; pgbouncer is in the compose wait chain. |
+| Docker daemon late | code-only | The boot check starts `docker` first, then the rest (unit test). |
+| DNS or network late | code-only | `network-online` ordering on Caddy and the console; not forced on a box. |
+| Disk full or clock wrong at boot | code-only, no check exists | Marked "nothing" in the map above. |
+| Caddy certificate not yet issued | code-only | Certificates are kept on disk; Caddy serves the old one. |
+| Interrupted update then reboot | code-only | Covered by #438 (OS upgrade) tests. |
+| Split server (database on another host) | code-only | Not built; needs two cloud boxes. |
+| ARM box | not run | aws-arm was off. |
+| Module installed but disabled | pass (unit test) | A disabled unit or a container without a restart policy is never judged or started. |
+| test6 (VPS) real reboot | fail, cause unknown | Ping answers, every TCP port filtered for 25+ min; needs the provider console. |
 
 ## Shell scripts and systemd units that are rewritten while they run
 

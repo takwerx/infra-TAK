@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.4.3-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.3-alpha)**
+**Current release: [v10.4.4-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.4-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -458,6 +458,31 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.4.4-alpha — 2026-11-21 — Servers recover on their own after a reboot; phones keep their groups
+
+**Headline: after a reboot every module comes back on its own and ATAK phones keep their groups. Phones that connect with no groups are caught and fixed within 5 minutes. The CloudTAK database gets a PostgreSQL security update. Update from the Console page, Update Now.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.4-alpha))
+
+**Reboot and phones (the main fix).**
+- After a reboot the console starts every module in the right order and waits for what each one needs. Authentik, TAK Server, Caddy, CloudTAK and the rest come back with no manual step, also when Authentik is slow to start.
+- Guard Dog writes a "Boot check: every module is up" line in the console log once the server is whole again.
+- Phones that connect with no groups while the login server answers are found within 5 minutes and reconnected. If many phones are stuck at once, TAK Server restarts one time and you get an email. If it happens again within 6 hours, you get an email that says TAK Server was not restarted, so you can look.
+
+**Security.**
+- CloudTAK database moves to PostgreSQL 17.12. CloudTAK keeps its data, and rollback works.
+
+**Fixes.**
+- TAK Portal Update works with Beta Features on.
+- Identity Bridge shows TAK Portal as reachable while it runs, and lists agencies and templates.
+- Fail2ban installs from the console on Rocky 9 with no EPEL.
+- Rotate Intermediate CA after a half-finished rotation ends with the new CA in place, or fails with a clear message. It never says COMPLETE with the old CA.
+- ATLAS on a Hardened server: a new agency gets the MFA requirement, and Update Now moves every ATLAS deployment to its one access policy.
+- CloudTAK: an ETL on a server-wide layer keeps its session between runs, and CloudTAK repairs its own ETL files and restarts the api when one is edited.
+- CloudTAK Update stops early with a plain message when the disk is too full, and CloudTAK keeps running.
+- CloudTAK media container no longer restarts in a loop right after a MediaMTX deploy.
+
+**Good to know.**
+- If CloudTAK Marketplace installs or CloudTAK Update fail with a lint error and the Replay plugin is installed, uninstall Replay first, then try again.
 
 ### v10.4.3-alpha — 2026-11-20 — ATLAS agency admins can sign in on Hardened servers
 

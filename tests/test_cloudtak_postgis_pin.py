@@ -17,9 +17,14 @@
 """CloudTAK postgis pin (ops #110).
 
 Upstream CloudTAK pins postgis/postgis:17-3.4-alpine, which Docker Hub stopped rebuilding on
-2024-10-14 (PostgreSQL 17.0). The override pins 17-3.6-alpine — same PG major, so no dump or
-pg_upgrade — and the PostGIS extensions are updated 3.4 → 3.6 once the new container is up.
-arm64 runs the imresamu/postgis mirror of the same tag (amd64 + arm64, Docker Hub 2026-10-20).
+2024-10-14 (PostgreSQL 17.0). The override pins a newer tag — same PG major, so no dump or
+pg_upgrade — and the PostGIS extensions are updated once the new container is up.
+arm64 runs the imresamu/postgis mirror (amd64 + arm64, Docker Hub 2026-10-20).
+
+ops #1013 (2026-11-20): postgis/postgis stopped rebuilding 17-3.6 on 2026-10-26 (PostGIS 3.7 shipped),
+so amd64 17-3.6-alpine stayed at PostgreSQL 17.11 (Alpine krb5-libs 1.22.2) after the Nov 12 minor
+(17.12, about 60 fixes). amd64 is pinned to 17-3.7-alpine (PostgreSQL 17.12, krb5 1.22.3). imresamu has
+no 17-3.7 tag, so arm64 stays on its 17-3.6 build, which it rebuilt on 2026-11-16 (PostgreSQL 17.12).
 """
 
 import ast
@@ -43,9 +48,58 @@ def _load(name, ns):
 
 
 def test_pins():
-    assert "POSTGIS_IMAGE = 'postgis/postgis:17-3.6-alpine'" in APP
+    assert "POSTGIS_IMAGE = 'postgis/postgis:17-3.7-alpine'" in APP
     assert "POSTGIS_IMAGE_ARM64 = 'imresamu/postgis:17-3.6-alpine'" in APP
     assert APP.index('POSTGIS_IMAGE = ') < APP.index('def _cloudtak_build_override_yml(')
+
+
+def _pin(name):
+    m = re.search(rf"^{name} = '([^']+)'", APP, re.M)
+    assert m, f'{name} is gone: re-point this test'
+    return m.group(1)
+
+
+def _tag(image):
+    m = re.fullmatch(r'(postgis/postgis|imresamu/postgis):(\d+)-(\d+)\.(\d+)-alpine', image)
+    assert m, f'{image!r} is not a PG-PostGIS-alpine floating tag the converge can follow'
+    return m.group(1), int(m.group(2)), (int(m.group(3)), int(m.group(4)))
+
+
+# Tags a publisher no longer rebuilds, so the image never gets a PostgreSQL minor again. Each is
+# frozen at the PostgreSQL minor named, read from the image itself on Docker Hub.
+FROZEN_AMD64_TAGS = {
+    'postgis/postgis:17-3.4-alpine': '17.0 (stopped 2024-10-14)',
+    'postgis/postgis:17-3.5-alpine': 'below 17.11',
+    'postgis/postgis:17-3.6-alpine': '17.11 (stopped 2026-10-26, ops #1013)',
+}
+
+
+def test_amd64_pin_is_a_tag_the_publisher_still_rebuilds():
+    # ops #1013: 17-3.6-alpine on amd64 held PostgreSQL 17.11 after 17.12 (Nov 12) shipped.
+    image = _pin('POSTGIS_IMAGE')
+    assert image not in FROZEN_AMD64_TAGS, f'{image} is frozen at PostgreSQL {FROZEN_AMD64_TAGS[image]}'
+    repo, major, postgis = _tag(image)
+    assert repo == 'postgis/postgis' and major == 17
+    assert postgis >= (3, 7)
+
+
+def test_arm64_pin_is_the_mirror_on_the_same_postgresql_major():
+    # the data volume is shared by both arches' images, so the PG major must match; imresamu has
+    # no 17-3.7 tag yet (Docker Hub 2026-11-20), so PostGIS may trail amd64 by one minor
+    a_repo, a_major, a_gis = _tag(_pin('POSTGIS_IMAGE'))
+    b_repo, b_major, b_gis = _tag(_pin('POSTGIS_IMAGE_ARM64'))
+    assert b_repo == 'imresamu/postgis' and b_major == a_major
+    assert b_gis >= (3, 6) and b_gis <= a_gis
+
+
+def test_pinned_postgresql_major_is_one_the_security_table_checks():
+    # the converge and the update email judge the running database against POSTGRES_SECURITY_RELEASES;
+    # a major the table does not list claims nothing, so the pin must stay on a listed one
+    _, major, _ = _tag(_pin('POSTGIS_IMAGE'))
+    ns = {}
+    exec(compile(re.search(r'^POSTGRES_SECURITY_RELEASES = \(.*?^\)', APP, re.S | re.M).group(0),
+                 'app.py', 'exec'), ns)
+    assert all(major in rel['fixed'] for rel in ns['POSTGRES_SECURITY_RELEASES'])
 
 
 def test_override_pins_postgis_image():

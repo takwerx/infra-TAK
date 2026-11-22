@@ -1,0 +1,53 @@
+name: OpenSSF Scorecard
+
+# ops #1014: OpenSSF Scorecard (https://scorecard.dev) grades the repo on supply-chain practice:
+# pinned actions, token permissions, branch protection, signed releases, SECURITY.md, and more.
+# Agencies look at the number. The result is published to the public Scorecard API (that is what
+# the badge reads) and uploaded to code scanning.
+#
+# Scorecard only publishes from the default branch (main), so this runs on pushes to main, weekly,
+# and when branch protection changes. It is NOT a pull_request check and NOT a required check.
+#
+# Scorecard's publish step refuses a workflow with a top-level env or defaults block, extra
+# permissions, or steps other than the ones below. Keep it exactly this shape.
+#
+# Public repo, GitHub-hosted runner, no secrets (the default token, read-only), no cost.
+# Run it by hand: Actions tab, OpenSSF Scorecard, Run workflow (use branch main).
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: '41 14 * * 3'   # Wednesdays, 6:41 AM PT (7:41 AM in summer)
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      security-events: write   # uploads the SARIF file to code scanning
+      id-token: write          # publishes the result to the Scorecard API (OIDC)
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ossf/scorecard-action@23f22cd43608bae7a1f1fa2603d7314dee9538a5 # v2.6.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scorecard-sarif
+          path: results.sarif
+          retention-days: 5
+      - uses: github/codeql-action/upload-sarif@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v4.39.4
+        with:
+          sarif_file: results.sarif
+          category: scorecard
