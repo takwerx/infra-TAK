@@ -15007,7 +15007,7 @@ def _heal_module_compose_ownership(plog=None, only_dirs=None):
     import stat as stat_mod
 
     def _say(m):
-        (plog or (lambda x: print(f"Compose ownership heal: {x}", flush=True)))(m)
+        (plog or (lambda x: print(x, flush=True)))(m)
 
     fixed = []
     try:
@@ -15039,14 +15039,14 @@ def _heal_module_compose_ownership(plog=None, only_dirs=None):
                 if r.returncode == 0:
                     fixed.append(path)
                 else:
-                    _say(f'⚠ could not re-own {path} (chown refused); a redeploy will '
+                    _say(f'⚠ compose ownership heal: could not re-own {path} (chown refused); a redeploy will '
                          f'fail until it is owned by {me.pw_name}')
             except Exception:
                 continue
     except Exception as e:
-        _say(f'error (non-fatal): {e}')
+        _say(f'compose ownership heal error (non-fatal): {e}')
     if fixed:
-        _say(f're-owned {len(fixed)} compose file(s) to the console user: '
+        _say(f'compose ownership heal: re-owned {len(fixed)} compose file(s) to the console user: '
              + '; '.join(fixed[:8]) + (f' (+{len(fixed) - 8} more)' if len(fixed) > 8 else ''))
     return fixed
 
