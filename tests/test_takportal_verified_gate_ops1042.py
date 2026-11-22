@@ -151,8 +151,12 @@ class Box:
         self.urls.append(url)
         assert url.endswith('/TAK-Portal/releases/latest'), f'unexpected network call {url}'
         body = json.dumps({'tag_name': self.github_latest}).encode()
+        final = f'https://github.com/x/TAK-Portal/releases/tag/{self.github_latest}'   # ops #1065: the web redirect
 
         class Resp:                        # a real context manager: `with urlopen(...) as r`
+            def geturl(_):
+                return final
+
             def __enter__(_):
                 return _
 

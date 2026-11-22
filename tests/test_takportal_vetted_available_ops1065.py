@@ -123,10 +123,12 @@ class Page(Box):
         super().__init__(*a, **k)
         self.ns['_takportal_available_cache'] = {'tag': None, 'ts': 0}
         self.ns['urllib'] = __import__('urllib')
+        self.ns['time'] = __import__('time')
+        self.ns['re'] = __import__('re')
         for n in ('_takportal_available_release', '_takportal_channel_info'):
             if n in _FNS:
                 exec(compile(_src(n), 'app.py', 'exec'), self.ns)
-        self.ns['_TAKPORTAL_AVAILABLE_URL'] = 'https://api.github.com/repos/x/TAK-Portal/releases/latest'
+        self.ns['_TAKPORTAL_AVAILABLE_URL'] = 'https://github.com/x/TAK-Portal/releases/latest'
 
     def info(self, installed='2.0.39', fresh=True):
         return self.ns['_takportal_channel_info'](fresh=fresh, installed=installed)
@@ -177,18 +179,36 @@ def test_page_data_with_no_signed_file_has_no_vetted_and_offers_nothing(page):
     assert i['vetted'] == '' and i['state'] == 'unknown' and i['newer'] is False
 
 
-def test_a_prerelease_draft_or_odd_tag_is_never_available(page, keys, monkeypatch):
+def test_an_odd_redirect_target_is_never_available(page, keys, monkeypatch):
+    """/releases/latest redirects to /releases/tag/<tag>. Anything that is not a plain release version
+    (a branch name, an injected string, no release at all) gives no Available."""
     _pass(page, keys, 5, '2.0.39')
     import urllib.request
-    for body in ({'tag_name': '2.0.40', 'prerelease': True}, {'tag_name': '2.0.40', 'draft': True},
-                 {'tag_name': 'main'}, {'tag_name': '2.0.40; id'}, ['2.0.40']):
+    for final in ('https://github.com/x/TAK-Portal/releases/tag/main',
+                  'https://github.com/x/TAK-Portal/releases/tag/2.0.40%3Bid',
+                  'https://github.com/x/TAK-Portal/releases/tag/2.0.40-rc1',
+                  'https://github.com/x/TAK-Portal/releases',
+                  'https://github.com/x/TAK-Portal/releases/tag/'):
         class R:
             def __enter__(s): return s
             def __exit__(s, *a): return False
-            def read(s, n=-1): return json.dumps(body).encode()
+            def geturl(s, final=final): return final
         monkeypatch.setattr(urllib.request, 'urlopen', lambda req, timeout=None, R=R: R())
         page.ns['_takportal_available_cache'].update(tag=None, ts=0)
-        assert page.info()['available'] == '', body
+        assert page.info()['available'] == '', final
+
+
+def test_available_is_read_from_the_web_redirect_not_the_rate_limited_api(page, keys):
+    """test12 box test: api.github.com answered 403 (60 requests an hour per address) while the web
+    redirect kept working, so Available stayed empty. The reader must use the redirect."""
+    _pass(page, keys, 5, '2.0.39')
+    page.github_latest = 'v2.0.40'
+    i = page.info()
+    assert i['available'] == '2.0.40' and i['available_tag'] == 'v2.0.40'      # the tag as published
+    assert page.ns['_TAKPORTAL_AVAILABLE_URL'].startswith('https://github.com/')
+    m = re.search(r"^_TAKPORTAL_AVAILABLE_URL = '([^']+)'", APP, re.M)
+    assert m and m.group(1).startswith('https://github.com/') and 'api.github.com' not in m.group(1)
+    assert 'method=\'HEAD\'' in _src('_takportal_available_release')
 
 
 def test_a_box_on_a_newer_release_than_vetted_is_flagged(page, keys):

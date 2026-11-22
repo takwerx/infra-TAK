@@ -44887,29 +44887,33 @@ def _fetch_takportal_latest(*, fresh=False):
 # release TAK Portal's maintainers call the newest, so the page can show "Available" next to
 # "Vetted" and an admin can choose to install it before we have tested it. Deploy, Update, the
 # badge and Guard Dog never call it (tests/test_takportal_vetted_available_ops1065.py).
-_TAKPORTAL_AVAILABLE_URL = 'https://api.github.com/repos/ValleyTacticalSolutions/TAK-Portal/releases/latest'
+# The web address, not api.github.com: the API allows 60 requests an hour per IP address and a box
+# that shares its address (or runs other checks) gets HTTP 403 from it (test12, ops #1065 box test),
+# while this redirect to the newest release's page is not rate limited that way. GitHub sends
+# /releases/latest to /releases/tag/<tag> and never to a draft or a pre-release.
+_TAKPORTAL_AVAILABLE_URL = 'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/latest'
 _takportal_available_cache = {'tag': None, 'ts': 0}
 
 
 def _takportal_available_release(*, fresh=False):
     """The tag of TAK Portal's newest published GitHub release, as published (a 'v' stays), or None.
     Cached like the badge: `ts` is the last attempt, so an offline box waits a full interval and a
-    stale answer is served meanwhile. A draft, a pre-release or a tag that is not a plain release
-    version is never returned. Never raises."""
+    stale answer is served meanwhile. Only a plain release version is ever returned. Never raises."""
     import urllib.request as _ur
+    import urllib.parse as _up
     now = time.time()
     c = _takportal_available_cache
     if not fresh and c.get('ts') and now - c['ts'] < TAKPORTAL_UPSTREAM_CACHE_TTL:
         return c.get('tag')
     c['ts'] = now
     try:
-        req = _ur.Request(_TAKPORTAL_AVAILABLE_URL, headers={'User-Agent': 'infra-TAK-takportal-available',
-                                                             'Accept': 'application/vnd.github+json'})
+        req = _ur.Request(_TAKPORTAL_AVAILABLE_URL, method='HEAD',
+                          headers={'User-Agent': 'infra-TAK-takportal-available'})
         with _ur.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read(262144).decode('utf-8', 'replace'))
-        tag = data.get('tag_name') if isinstance(data, dict) else None
-        if isinstance(tag, str) and _tpv.TAG_RE.fullmatch(tag) and not data.get('draft') \
-                and not data.get('prerelease'):
+            final = str(r.geturl() or '')
+        m = re.search(r'/releases/tag/([^/?#]+)$', final)
+        tag = _up.unquote(m.group(1)) if m else ''
+        if _tpv.TAG_RE.fullmatch(tag):
             c['tag'] = tag
     except Exception as e:
         print(f"[takportal-available] check failed (non-fatal): {str(e)[:160]}", flush=True)
