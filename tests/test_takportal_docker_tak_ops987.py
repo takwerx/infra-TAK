@@ -1,0 +1,353 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# infra-TAK — TAK Infrastructure Platform
+# Copyright (C) 2026 Andreas Johansson (TAKWERX)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""TAK Portal with a Docker TAK Server (ops #987, TAK-Portal PR 115).
+
+Before: the broker refused every grant when /opt/tak is a symlink (Docker TAK), so a portal
+that can drive the container had no sudo rule to do it with. Now a Docker TAK box gets a
+grant of exactly `docker exec` into / `docker restart` of the one container `takserver`,
+and only when the portal checkout ships Docker support. A portal without it, and every
+native box, behave as before.
+"""
+
+import ast
+import importlib.util
+import os
+import pathlib
+import subprocess
+import types
+
+import pytest
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+APP = (REPO / 'app.py').read_text(encoding='utf-8')
+TREE = ast.parse(APP)
+
+
+@pytest.fixture()
+def b(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location('takwerx_broker_t987', REPO / 'broker' / 'takwerx_broker.py')
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m._sudoers_safe_binaries = lambda name: {
+        'cat': ['/usr/bin/cat'], 'tee': ['/usr/bin/tee'], 'setpriv': ['/usr/bin/setpriv'],
+        'systemctl': ['/usr/bin/systemctl'], 'visudo': ['/usr/sbin/visudo'],
+        'docker': ['/usr/bin/docker', '/bin/docker'],
+    }.get(name, [])
+    home = tmp_path / 'home'
+    (home / 'TAK-Portal' / 'services').mkdir(parents=True)
+    m._home = home
+    fake_pw = types.SimpleNamespace(pw_uid=1000, pw_dir=str(home))
+    monkeypatch.setattr(m.pwd, 'getpwnam', lambda n: fake_pw)
+    return m
+
+
+def _grant(text):
+    return [l for l in text.splitlines() if l and not l.startswith('#')]
+
+
+def _portal_with_docker(b):
+    (b._home / 'TAK-Portal' / 'services' / 'takServerMode.service.js').write_text('module.exports = {};\n')
+
+
+# ----------------------------------------------------------------------------- the grant
+def test_docker_grant_is_exactly_exec_and_restart_of_one_container(b):
+    t = b._takportal_sudoers_text(user='takwerx', variant='docker', helper=True)
+    assert _grant(t) == [
+        'Defaults:takwerx !requiretty',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i takserver *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i -u tak takserver *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker restart takserver',
+        'takwerx ALL=(root) NOPASSWD: /bin/docker exec -i takserver *',
+        'takwerx ALL=(root) NOPASSWD: /bin/docker exec -i -u tak takserver *',
+        'takwerx ALL=(root) NOPASSWD: /bin/docker restart takserver',
+        'takwerx ALL=(root) NOPASSWD: /usr/local/libexec/tak-portal/marketplace-helper',
+    ]
+
+
+def test_docker_grant_gives_the_caller_nothing_before_the_container_name(b):
+    # `docker exec` stops reading options at the container name. Everything a caller picks is
+    # after it, so --privileged, -u root, -v and --env can never be added.
+    body = '\n'.join(_grant(b._takportal_sudoers_text(user='takwerx', variant='docker')))
+    for line in body.splitlines():
+        if ' exec ' in line:
+            assert line.endswith('takserver *'), line
+    for bad in ('(ALL)', '(root) NOPASSWD: ALL', 'NOPASSWD: ALL', 'docker *', 'docker run', 'docker cp',
+                'docker compose', 'systemctl', 'secure_path', '/usr/bin/cat', '/usr/bin/tee', '-u root'):
+        assert bad not in body, bad
+    assert 'marketplace-helper' not in body        # not granted until the helper is in place
+
+
+def test_docker_grant_refused_without_a_root_owned_docker(b):
+    orig = b._sudoers_safe_binaries
+    b._sudoers_safe_binaries = lambda n: [] if n == 'docker' else orig(n)
+    with pytest.raises(b.Denied):
+        b._takportal_sudoers_text(user='takwerx', variant='docker')
+
+
+def _sudo_allows(grant_lines, command):
+    """sudo matches the whole command line against each rule's text, `*` standing for any
+    arguments (sudoers(5), "Wildcards"). Same rule here, nothing smarter."""
+    import re
+    for line in grant_lines:
+        if 'NOPASSWD:' not in line:
+            continue
+        rule = line.split('NOPASSWD:', 1)[1].strip()
+        if re.fullmatch(re.escape(rule).replace(r'\*', '.*'), command):
+            return True
+    return False
+
+
+def test_grant_matches_the_portals_final_docker_commands(b):
+    # The exact strings TAK Portal main (775020d, the 2.0.39 code) builds in
+    # services/takServerMode.service.js and takSsh.service.js, run through `sudo -n`.
+    # Box-tested on a Docker TAK Server 5.8: every one of these ran (ops #987).
+    # Before 36f9d00 -> 665c820 the portal put `--` after the container name, and Docker ran
+    # `--` as the command; the rules fit both forms, so this test pins the current one.
+    rules = _grant(b._takportal_sudoers_text(user='takwerx', variant='docker'))
+    for cmd in (
+        '/usr/bin/docker exec -i takserver cat /opt/tak/CoreConfig.xml',
+        "/usr/bin/docker exec -i takserver tee '/opt/tak/conf/CoreConfig.xml'",
+        '/usr/bin/docker exec -i -u tak takserver id',
+        '/usr/bin/docker exec -i -u tak takserver bash -lc "cd /opt/tak/certs && ./makeCert.sh client x"',
+        '/usr/bin/docker restart takserver',
+        '/bin/docker exec -i takserver ls -l /opt/tak/certs/files',
+    ):
+        assert _sudo_allows(rules, cmd), cmd
+    # What the grant must keep refusing: another container, a different user, another verb,
+    # an option placed before the container name.
+    for cmd in (
+        '/usr/bin/docker exec -i other cat /etc/shadow',
+        '/usr/bin/docker exec -i -u root takserver id',
+        '/usr/bin/docker exec -i --privileged takserver id',
+        '/usr/bin/docker exec -u tak takserver id',
+        '/usr/bin/docker restart authentik-server-1',
+        '/usr/bin/docker run --rm -v /:/h alpine sh',
+        '/usr/bin/docker cp takserver:/opt/tak/CoreConfig.xml /tmp/x',
+    ):
+        assert not _sudo_allows(rules, cmd), cmd
+
+
+def test_native_grant_is_unchanged(b):
+    t = b._takportal_sudoers_text(user='takwerx', variant='hardened', helper=False)
+    assert 'docker' not in t and 'ALL=(tak) NOPASSWD: ALL' in t and 'restart takserver' in t
+
+
+# ------------------------------------------------------------------------- when it is offered
+def test_docker_tak_with_a_portal_that_supports_it_is_supported(b, monkeypatch):
+    monkeypatch.setattr(b, '_takportal_layout', lambda: 'docker')
+    _portal_with_docker(b)
+    assert b._takportal_sudoers_supported() == (True, '')
+    assert b._takportal_decide()['variant'] == 'docker'
+
+
+def test_docker_tak_with_an_older_portal_still_gets_no_grant(b, monkeypatch):
+    monkeypatch.setattr(b, '_takportal_layout', lambda: 'docker')
+    ok, why = b._takportal_sudoers_supported()          # no takServerMode.service.js
+    assert ok is False and 'no Docker TAK Server support' in why
+    with pytest.raises(b.Denied):
+        b._check_takportal_sudoers({'action': 'install'})
+    # status and remove stay allowed on a box that cannot receive a grant
+    b._check_takportal_sudoers({'action': 'status'})
+    b._check_takportal_sudoers({'action': 'remove'})
+
+
+def test_docker_tak_needs_a_root_owned_docker_binary(b, monkeypatch):
+    monkeypatch.setattr(b, '_takportal_layout', lambda: 'docker')
+    _portal_with_docker(b)
+    orig = b._sudoers_safe_binaries
+    monkeypatch.setattr(b, '_sudoers_safe_binaries', lambda n: [] if n == 'docker' else orig(n))
+    ok, why = b._takportal_sudoers_supported()
+    assert ok is False and 'docker' in why
+
+
+def test_docker_install_check_passes_and_builds_no_native_wrappers(b, monkeypatch):
+    monkeypatch.setattr(b, '_takportal_layout', lambda: 'docker')
+    _portal_with_docker(b)
+    monkeypatch.setattr(b, '_takportal_wrapper_text',
+                        lambda n: (_ for _ in ()).throw(AssertionError('wrapper built for Docker TAK')))
+    b._check_takportal_sudoers({'action': 'install'})
+
+
+def test_feature_file_is_not_followed_through_a_symlinked_checkout(b, tmp_path):
+    real = tmp_path / 'elsewhere'
+    (real / 'services').mkdir(parents=True)
+    (real / 'services' / 'takServerMode.service.js').write_text('x')
+    portal = b._home / 'TAK-Portal'
+    for p in (portal / 'services').iterdir():
+        p.unlink()
+    (portal / 'services').rmdir()
+    portal.rmdir()
+    portal.symlink_to(real)
+    assert b._takportal_portal_supports_docker() is False
+
+
+def test_feature_file_must_be_a_regular_nonempty_file(b):
+    f = b._home / 'TAK-Portal' / 'services' / 'takServerMode.service.js'
+    assert b._takportal_portal_supports_docker() is False        # missing
+    f.write_text('')
+    assert b._takportal_portal_supports_docker() is False        # empty
+    f.write_text('module.exports = {};\n')
+    assert b._takportal_portal_supports_docker() is True
+    f.unlink()
+    f.symlink_to('/etc/hostname')
+    assert b._takportal_portal_supports_docker() is False        # symlink
+
+
+def test_native_box_still_needs_the_tak_user(b, monkeypatch):
+    monkeypatch.setattr(b, '_takportal_layout', lambda: 'native')
+
+    def _gone(name):
+        if name == b.TAKPORTAL_TAK_USER:
+            raise KeyError(name)
+        return types.SimpleNamespace(pw_uid=1000, pw_dir=str(b._home))
+    monkeypatch.setattr(b.pwd, 'getpwnam', _gone)
+    ok, why = b._takportal_sudoers_supported()
+    assert ok is False and 'no `tak` user' in why
+
+
+def test_layout_reads_the_opt_tak_symlink(tmp_path):
+    real = tmp_path / 'tak'
+    real.mkdir()
+    link = tmp_path / 'optlink'
+    link.symlink_to(real)
+    body = (REPO / 'broker' / 'takwerx_broker.py').read_text(encoding='utf-8')
+    fn = next(n for n in ast.parse(body).body if isinstance(n, ast.FunctionDef) and n.name == '_takportal_layout')
+    code = ast.get_source_segment(body, fn)
+    assert code.count("'/opt/tak'") == 2
+    for path, want in ((real, 'native'), (link, 'docker'), (tmp_path / 'none', '')):
+        ns = {'os': os}
+        exec(compile(code.replace("'/opt/tak'", repr(str(path))), 'broker', 'exec'), ns)
+        assert ns['_takportal_layout']() == want, path
+
+
+# ------------------------------------------------------------------------------ console side
+def _app_func(name):
+    for n in TREE.body:
+        if isinstance(n, ast.FunctionDef) and n.name == name:
+            return ast.get_source_segment(APP, n)
+    raise AssertionError(f'{name} was renamed or removed')
+
+
+def test_probe_in_docker_mode_checks_through_the_container(monkeypatch, tmp_path):
+    home = tmp_path / 'home'
+    key = home / 'TAK-Portal' / 'data' / 'ssh'
+    key.mkdir(parents=True)
+    (key / 'tak_ssh_ed25519').write_text('k')
+    monkeypatch.setenv('HOME', str(home))
+    seen = {}
+
+    def _run(args, **kw):
+        seen['probe'] = args[-1]
+        return types.SimpleNamespace(returncode=0, stdout='nopasswd\n', stderr='')
+    for container, want_docker in ((True, True), (False, False)):
+        ns = {'os': os, 'subprocess': types.SimpleNamespace(run=_run), '_tak_is_container': lambda c=container: c,
+              'TAK_CONTAINER': 'takserver'}
+        exec(compile(_app_func('_takportal_ssh_probe'), 'app.py', 'exec'), ns)
+        assert ns['_takportal_ssh_probe']() == ('nopasswd', '')
+        p = seen['probe']
+        assert ('docker exec -i takserver cat /opt/tak/CoreConfig.xml' in p) is want_docker
+        assert ('docker exec -i -u tak takserver id' in p) is want_docker
+        if want_docker:
+            assert '-r /opt/tak/CoreConfig.xml' not in p, 'a host read of the symlink proves nothing'
+            assert 'echo direct' not in p
+        else:
+            assert 'echo direct' in p
+
+
+def test_docker_keys_are_seed_only_and_only_for_container_tak():
+    src = _app_func('_takportal_build_settings_dict')
+    i = src.index('_built["TAK_SERVER_MODE"]')
+    guard = src[:i].rsplit('\n', 2)[-2]
+    assert 'tak_local and _tak_is_container()' in guard, guard
+    assert '_built["TAK_DOCKER_CONTAINER"] = TAK_CONTAINER' in src
+    auth = next(ast.get_source_segment(APP, n) for n in TREE.body
+                if isinstance(n, ast.Assign) and any(getattr(t, 'id', None) == 'TAKPORTAL_AUTHORITATIVE_KEYS' for t in n.targets))
+    for k in ('TAK_SERVER_MODE', 'TAK_DOCKER_CONTAINER', 'TAK_ENROLL_HOST'):
+        assert k not in auth, f'{k} must stay seed-only (operator-owned after the first write)'
+    assert '"TAK_ENROLL_HOST"' not in src, 'the external host is the operator\'s; infra-TAK does not guess it'
+
+
+def test_setup_ssh_keeps_the_limitation_note_only_for_a_portal_without_docker_support():
+    src = _app_func('_takportal_setup_ssh')
+    i = src.index('_tak_is_container()')
+    assert 'not _takportal_portal_supports_docker()' in src[i:i + 120]
+
+
+# Security's condition on PR 608 (ops #1029): the grant may only ever name `takserver`, and
+# no rule may carry a flag between the verb and the container name.
+_DOCKER_BINS = ('/usr/bin/docker', '/bin/docker')
+_ALLOWED_AFTER_BINARY = (
+    ['exec', '-i', 'takserver', '*'],
+    ['exec', '-i', '-u', 'tak', 'takserver', '*'],
+    ['restart', 'takserver'],
+)
+
+
+def _docker_rule_problems(rules):
+    """Why a rule set is not the fixed three-rule shape on the container `takserver`
+    (empty list = fine). Any other container, any flag before the name, any other verb or
+    user, a bare `*`, or a flag after `-i`/`-u tak` all show up here."""
+    problems = []
+    for line in rules:
+        if 'NOPASSWD:' not in line or 'marketplace-helper' in line:
+            continue
+        words = line.split('NOPASSWD:', 1)[1].split()
+        if words[0] not in _DOCKER_BINS:
+            problems.append(f'not a root-owned docker path: {line}')
+        elif words[1:] not in _ALLOWED_AFTER_BINARY:
+            problems.append(f'not one of the three allowed rules: {line}')
+    return problems
+
+
+def test_docker_grant_names_only_takserver_and_no_flag_comes_before_the_name(b):
+    rules = _grant(b._takportal_sudoers_text(user='takwerx', variant='docker', helper=True))
+    assert _docker_rule_problems(rules) == []
+    docker_rules = [r for r in rules if 'NOPASSWD:' in r and 'marketplace-helper' not in r]
+    assert len(docker_rules) == 3 * len(_DOCKER_BINS)          # three rules per docker path, no more
+    # The container name is the only non-flag word before the caller's `*`; the flags are
+    # fixed text (`-i`, `-u tak`) written by the broker, never taken from a file or request.
+    for r in docker_rules:
+        words = r.split('NOPASSWD:', 1)[1].split()[1:]
+        names = [w for w in words if w not in ('exec', 'restart', '-i', '-u', 'tak', '*')]
+        assert names == ['takserver'], r
+    assert b.TAKPORTAL_DOCKER_CONTAINER == 'takserver'
+
+
+def test_docker_rule_check_catches_a_different_name_or_a_flag_before_it():
+    # The check above must itself fail on the shapes Security named, so it cannot pass by
+    # looking at nothing.
+    good = ['takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i takserver *']
+    assert _docker_rule_problems(good) == []
+    for bad in (
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i authentik-server-1 *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i --privileged takserver *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i -u root takserver *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i -e X=1 takserver *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec -i takserver-db *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker exec *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker restart *',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker restart other',
+        'takwerx ALL=(root) NOPASSWD: /usr/bin/docker run -i takserver *',
+        'takwerx ALL=(root) NOPASSWD: /home/takwerx/docker exec -i takserver *',
+    ):
+        assert _docker_rule_problems([bad]), bad
+
+
+def test_container_name_matches_the_fleet_constant():
+    broker = (REPO / 'broker' / 'takwerx_broker.py').read_text(encoding='utf-8')
+    assert "TAKPORTAL_DOCKER_CONTAINER = 'takserver'" in broker
+    assert "TAK_CONTAINER = 'takserver'" in APP
