@@ -128,7 +128,8 @@ class Page(Box):
         for n in ('_takportal_available_release', '_takportal_channel_info'):
             if n in _FNS:
                 exec(compile(_src(n), 'app.py', 'exec'), self.ns)
-        self.ns['_TAKPORTAL_AVAILABLE_URL'] = 'https://github.com/x/TAK-Portal/releases/latest'
+        self.ns['_TAKPORTAL_AVAILABLE_URL'] = 'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/latest'
+        self.ns['_TAKPORTAL_RELEASE_TAG_PREFIX'] = 'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/tag/'
 
     def info(self, installed='2.0.39', fresh=True):
         return self.ns['_takportal_channel_info'](fresh=fresh, installed=installed)
@@ -184,11 +185,11 @@ def test_an_odd_redirect_target_is_never_available(page, keys, monkeypatch):
     (a branch name, an injected string, no release at all) gives no Available."""
     _pass(page, keys, 5, '2.0.39')
     import urllib.request
-    for final in ('https://github.com/x/TAK-Portal/releases/tag/main',
-                  'https://github.com/x/TAK-Portal/releases/tag/2.0.40%3Bid',
-                  'https://github.com/x/TAK-Portal/releases/tag/2.0.40-rc1',
-                  'https://github.com/x/TAK-Portal/releases',
-                  'https://github.com/x/TAK-Portal/releases/tag/'):
+    for final in ('https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/tag/main',
+                  'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/tag/2.0.40%3Bid',
+                  'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/tag/2.0.40-rc1',
+                  'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases',
+                  'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/tag/'):
         class R:
             def __enter__(s): return s
             def __exit__(s, *a): return False
@@ -196,6 +197,35 @@ def test_an_odd_redirect_target_is_never_available(page, keys, monkeypatch):
         monkeypatch.setattr(urllib.request, 'urlopen', lambda req, timeout=None, R=R: R())
         page.ns['_takportal_available_cache'].update(tag=None, ts=0)
         assert page.info()['available'] == '', final
+
+
+def test_a_redirect_that_leaves_the_real_repo_is_never_available(page, keys, monkeypatch):
+    """Security (PR 639): a renamed or moved repo, or any other address, must show no Available,
+    even when the last part of the address looks like a good release tag."""
+    _pass(page, keys, 5, '2.0.39')
+    import urllib.request
+    for final in ('https://github.com/Somebody/TAK-Portal/releases/tag/2.0.40',
+                  'https://github.com/ValleyTacticalSolutions/Other-Repo/releases/tag/2.0.40',
+                  'https://github.com/ValleyTacticalSolutions/TAK-Portal-fork/releases/tag/2.0.40',
+                  'https://evil.example/ValleyTacticalSolutions/TAK-Portal/releases/tag/2.0.40',
+                  'http://github.com/ValleyTacticalSolutions/TAK-Portal/releases/tag/2.0.40'):
+        class R:
+            def __enter__(s): return s
+            def __exit__(s, *a): return False
+            def geturl(s, final=final): return final
+        monkeypatch.setattr(urllib.request, 'urlopen', lambda req, timeout=None, R=R: R())
+        page.ns['_takportal_available_cache'].update(tag=None, ts=0)
+        assert page.info()['available'] == '', final
+    good = 'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/tag/2.0.40'
+    class G:
+        def __enter__(s): return s
+        def __exit__(s, *a): return False
+        def geturl(s): return good
+    monkeypatch.setattr(urllib.request, 'urlopen', lambda req, timeout=None: G())
+    page.ns['_takportal_available_cache'].update(tag=None, ts=0)
+    assert page.info()['available'] == '2.0.40'
+    m = re.search(r"^_TAKPORTAL_RELEASE_TAG_PREFIX = '([^']+)'", APP, re.M)
+    assert m and m.group(1) == 'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/tag/'
 
 
 def test_available_is_read_from_the_web_redirect_not_the_rate_limited_api(page, keys):
@@ -443,7 +473,8 @@ def test_page_shows_both_versions_and_the_not_vetted_button():
     assert 'id="portal-available">2.0.40<' in html and 'in our test queue' in html
     assert 'Install 2.0.40 (not vetted yet)' in html and 'id="unvetted-btn"' in html
     assert 'id="portal-unvetted-modal"' in html and 'id="portal-unvetted-password"' in html
-    assert 'takwerx has not tested TAK Portal 2.0.40 yet' in html
+    assert 'takwerx has not tested or security-reviewed TAK Portal 2.0.40. It runs with access to this server.' in html
+    assert 'may fail to install' not in html
     assert 'go back to 2.0.39' in html
     assert 'Update installs the TAK Portal release takwerx tested' in html
 

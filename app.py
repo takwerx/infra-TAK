@@ -44892,6 +44892,9 @@ def _fetch_takportal_latest(*, fresh=False):
 # while this redirect to the newest release's page is not rate limited that way. GitHub sends
 # /releases/latest to /releases/tag/<tag> and never to a draft or a pre-release.
 _TAKPORTAL_AVAILABLE_URL = 'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/latest'
+# The redirect must END on this repo's own release pages. A renamed or moved repo (or any other
+# address GitHub sends us to) shows no Available instead of a tag from somewhere else.
+_TAKPORTAL_RELEASE_TAG_PREFIX = 'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/tag/'
 _takportal_available_cache = {'tag': None, 'ts': 0}
 
 
@@ -44912,7 +44915,7 @@ def _takportal_available_release(*, fresh=False):
         with _ur.urlopen(req, timeout=8) as r:
             final = str(r.geturl() or '')
         m = re.search(r'/releases/tag/([^/?#]+)$', final)
-        tag = _up.unquote(m.group(1)) if m else ''
+        tag = _up.unquote(m.group(1)) if m and final.startswith(_TAKPORTAL_RELEASE_TAG_PREFIX) else ''
         if _tpv.TAG_RE.fullmatch(tag):
             c['tag'] = tag
     except Exception as e:

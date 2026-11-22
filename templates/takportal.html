@@ -196,7 +196,7 @@ Features: User creation with auto-cert generation, group management, mutual aid 
 {% if can_install_unvetted %}<div class="modal-overlay" id="portal-unvetted-modal">
 <div class="modal">
 <h3>Install {{ channel_info.available }} before it is vetted?</h3>
-<p>takwerx has not tested TAK Portal {{ channel_info.available }} yet. CloudTAK Marketplace plugins may fail to install with it.</p>
+<p>takwerx has not tested or security-reviewed TAK Portal {{ channel_info.available }}. It runs with access to this server.</p>
 {% if channel_info.state == 'held' %}<p style="color:var(--yellow)">takwerx held this release{% if channel_info.reason %}: <span id="portal-unvetted-reason">{{ channel_info.reason }}</span>{% endif %}.</p>{% endif %}
 <p>You can go back to {{ channel_info.vetted }}, the tested version, at any time with the Update button.</p>
 <label class="form-label">Admin Password</label>
