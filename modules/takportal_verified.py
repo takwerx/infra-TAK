@@ -168,3 +168,82 @@ def is_held(record, tag):
         return False
     want = str(tag or '').lstrip('vV')
     return any(str(h.get('tag', '')).lstrip('vV') == want for h in record.get('held', []))
+
+
+# --- Vetted vs Available (ops #1065) -----------------------------------------
+# The gate decides what Update installs (Vetted). It must not hide that TAK Portal's maintainers
+# shipped something newer: the console shows both, and an admin who accepts the risk can install the
+# newer one by hand. Nothing below changes what Update, deploy, the badge or Guard Dog use.
+REASON_MAX = 160
+
+
+def version_tuple(tag):
+    """(2, 0, 40) for '2.0.40' or 'v2.0.40'; None for anything that is not a plain release tag."""
+    t = str(tag or '')
+    if not TAG_RE.fullmatch(t):
+        return None
+    return tuple(int(p) for p in t.lstrip('vV').split('.'))
+
+
+def clean_reason(text):
+    """A held reason as one short plain line. It comes from a signed file, but it ends up in a dialog,
+    so control characters and long text never reach the page."""
+    s = ' '.join(''.join(ch if ch.isprintable() else ' ' for ch in str(text or '')).split())
+    return s[:REASON_MAX]
+
+
+def held_reason(record, tag):
+    """The reason the signed file gives for holding `tag`, or '' (not held, or no reason given)."""
+    if not isinstance(record, dict):
+        return ''
+    want = str(tag or '').lstrip('vV')
+    for h in record.get('held', []):
+        if str(h.get('tag', '')).lstrip('vV') == want:
+            return clean_reason(h.get('reason'))
+    return ''
+
+
+def channel_state(vetted_tag, available_tag, record):
+    """What the TAK Portal page shows next to the installed version.
+
+    {vetted, available, state, reason, newer}
+      state 'none'    Available is not newer than Vetted (or equal): nothing to say.
+      state 'testing' Available is newer, we have not signed it and have not held it: it is in our
+                      test queue (the daily sweep opens a gate issue for every new release).
+      state 'held'    Available is newer and failed our gate; `reason` says why in a few words.
+      state 'unknown' Vetted or Available could not be read (offline, no signed file yet).
+    `newer` is True for 'testing' and 'held': the two states that offer the not-vetted install."""
+    out = {'vetted': str(vetted_tag or '').lstrip('vV'), 'available': str(available_tag or '').lstrip('vV'),
+           'state': 'unknown', 'reason': '', 'newer': False}
+    v, a = version_tuple(vetted_tag), version_tuple(available_tag)
+    if v is None or a is None:
+        return out
+    if a <= v:
+        out['state'] = 'none'
+        return out
+    out['newer'] = True
+    if is_held(record, available_tag):
+        out['state'] = 'held'
+        out['reason'] = held_reason(record, available_tag)
+    else:
+        out['state'] = 'testing'
+    return out
+
+
+def may_install_unvetted(requested_tag, available_tag, vetted_tag, installed=''):
+    """(ok, why not). The not-vetted install takes only the release GitHub calls the newest one right
+    now, only when it is newer than what we vetted, and never one the box already runs. A branch, a
+    commit, an older release or any other tag is refused whatever the caller sends."""
+    r, a, v = version_tuple(requested_tag), version_tuple(available_tag), version_tuple(vetted_tag)
+    if r is None:
+        return False, 'That is not a TAK Portal release tag.'
+    if a is None or r != a:
+        return False, 'That is not the newest TAK Portal release any more. Reload the page.'
+    if v is None:
+        return False, 'The console could not read which release we vetted, so it cannot say this one is newer.'
+    if r <= v:
+        return False, 'That release is not newer than the vetted one. Use Update.'
+    cur = version_tuple(installed)
+    if cur is not None and cur >= r:
+        return False, 'TAK Portal already runs that release or a newer one.'
+    return True, ''

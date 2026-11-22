@@ -44882,6 +44882,62 @@ def _fetch_takportal_latest(*, fresh=False):
     return c.get('latest')   # stale cache beats nothing
 
 
+# --- Vetted vs Available (ops #1065) -----------------------------------------
+# The gate (ops #1042) decides what Update installs. This is the one place that asks GitHub which
+# release TAK Portal's maintainers call the newest, so the page can show "Available" next to
+# "Vetted" and an admin can choose to install it before we have tested it. Deploy, Update, the
+# badge and Guard Dog never call it (tests/test_takportal_vetted_available_ops1065.py).
+_TAKPORTAL_AVAILABLE_URL = 'https://api.github.com/repos/ValleyTacticalSolutions/TAK-Portal/releases/latest'
+_takportal_available_cache = {'tag': None, 'ts': 0}
+
+
+def _takportal_available_release(*, fresh=False):
+    """The tag of TAK Portal's newest published GitHub release, as published (a 'v' stays), or None.
+    Cached like the badge: `ts` is the last attempt, so an offline box waits a full interval and a
+    stale answer is served meanwhile. A draft, a pre-release or a tag that is not a plain release
+    version is never returned. Never raises."""
+    import urllib.request as _ur
+    now = time.time()
+    c = _takportal_available_cache
+    if not fresh and c.get('ts') and now - c['ts'] < TAKPORTAL_UPSTREAM_CACHE_TTL:
+        return c.get('tag')
+    c['ts'] = now
+    try:
+        req = _ur.Request(_TAKPORTAL_AVAILABLE_URL, headers={'User-Agent': 'infra-TAK-takportal-available',
+                                                             'Accept': 'application/vnd.github+json'})
+        with _ur.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read(262144).decode('utf-8', 'replace'))
+        tag = data.get('tag_name') if isinstance(data, dict) else None
+        if isinstance(tag, str) and _tpv.TAG_RE.fullmatch(tag) and not data.get('draft') \
+                and not data.get('prerelease'):
+            c['tag'] = tag
+    except Exception as e:
+        print(f"[takportal-available] check failed (non-fatal): {str(e)[:160]}", flush=True)
+    return c.get('tag')
+
+
+def _takportal_channel_info(*, fresh=False, installed=''):
+    """Everything the TAK Portal page and /api/takportal/version show about Vetted and Available.
+
+    {vetted, available, state, reason, newer, vetted_tag, available_tag, installed, on_unvetted}
+    `vetted` is the release that passed our gate, or '' when no signed file could be read (the
+    pinned floor is not an observation, same rule as _fetch_takportal_latest). `on_unvetted` is true
+    when the box runs something newer than Vetted, so the badge and Update button can say so.
+    Never raises."""
+    try:
+        tag, _commit, src = _takportal_verified_release(fresh=fresh)
+        vetted = tag if src == 'signed' else ''
+        rec = _tpv.cached(_TAKPORTAL_VERIFIED_CACHE) if vetted else None
+    except Exception:
+        vetted, rec = '', None
+    avail = _takportal_available_release(fresh=fresh) or ''
+    info = _tpv.channel_state(vetted, avail, rec)
+    info.update({'vetted_tag': vetted, 'available_tag': avail, 'installed': str(installed or '')})
+    cur, vt = _tpv.version_tuple(installed), _tpv.version_tuple(vetted)
+    info['on_unvetted'] = bool(cur and vt and cur > vt)
+    return info
+
+
 def _get_takportal_version_info(fresh=False):
     """Return {version, beta_version, channel, update_available, latest} for TAK Portal.
 
@@ -46194,6 +46250,14 @@ def api_modules_version():
 def takportal_version_api():
     """Return TAK Portal version and update-available for module/card UI."""
     info = _get_takportal_version_info(fresh=True)
+    # ops #1065: Vetted vs Available is shown beside the badge, never instead of it. update_available
+    # and latest (what Guard Dog reads) stay the vetted answer.
+    try:
+        ch = _takportal_channel_info(fresh=True, installed=info.get('version') or '')
+        info = dict(info, vetted=ch['vetted'], available=ch['available'], available_state=ch['state'],
+                    available_reason=ch['reason'], on_unvetted=ch['on_unvetted'])
+    except Exception as _e:
+        print(f"version-info: vetted/available lookup failed (non-fatal): {_e}", flush=True)
     return jsonify(info)
 
 
@@ -46251,7 +46315,14 @@ def takportal_page():
     # "release". See _takportal_beta_channel_state.
     portal_channel = vinfo.get('channel') or 'unknown'
     takportal_deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
+    # ops #1065: Vetted (what Update installs) next to Available (TAK Portal's newest release).
+    channel_info = _takportal_channel_info(installed=portal_version)
+    can_install_unvetted = bool(
+        portal.get('installed') and channel_info['newer'] and not portal_beta_mode
+        and _tpv.may_install_unvetted(channel_info['available_tag'], channel_info['available_tag'],
+                                      channel_info['vetted_tag'], portal_version)[0])
     return render_template('takportal.html',
+        channel_info=channel_info, can_install_unvetted=can_install_unvetted,
         settings=settings, portal=portal, container_info=container_info,
         portal_port=portal_port, portal_version=portal_version,
         portal_update_available=portal_update_available, portal_latest=portal_latest,
@@ -46693,7 +46764,18 @@ def _takportal_update_git(portal_dir, plog=None):
         _log(f"  {out['message']}")
         return out
 
-    tag = _takportal_release_tag_strict(portal_dir, plog=_log)
+    # ops #1065: an admin may install the newest upstream release before we vetted it (see
+    # takportal_install_unvetted). The worker thread names that one release; anything else follows
+    # the signed file as before. Only a plain release tag gets through, never a branch or a commit.
+    _picked = str(getattr(globals().get('_takportal_update_ctx'), 'target_tag', '') or '')
+    if _picked:
+        tag = _picked if _tpv.TAG_RE.fullmatch(_picked) else None
+        if not tag:
+            out['error'] = 'The release to install is not a plain TAK Portal release tag. Nothing was changed.'
+            return out
+        _log(f"  Installing {tag} as chosen by the admin (not vetted by takwerx yet)")
+    else:
+        tag = _takportal_release_tag_strict(portal_dir, plog=_log)
     if not tag:
         out['error'] = ('Could not read which TAK Portal release has passed our tests. '
                         'Nothing was changed — the update deliberately did NOT fall back to '
@@ -46762,8 +46844,12 @@ def _takportal_update_git(portal_dir, plog=None):
     # Beta Mode on and then turned it off converges DOWN to the newest release.
     if from_version and _takportal_version_tuple(from_version) > _takportal_version_tuple(tag):
         out['rolled_back'] = True
-        out['message'] = (f'Rolling back from {from_version} to release {tag} because '
-                          f'Beta Mode is off. Portal data is not reverted.')
+        # ops #1065: after a not-vetted install this button is the way back, so say that it is one.
+        out['message'] = (f'Moving back from {from_version} to release {tag}, the version takwerx '
+                          f'tested. Portal data is not reverted.')
+    elif _picked:
+        out['message'] = (f'Installed release {tag}. takwerx has not tested it yet: if a Marketplace '
+                          f'plugin fails to install, press Update to go back to the tested version.')
     elif from_version and _takportal_version_tuple(from_version) < _takportal_version_tuple(tag):
         out['message'] = f'Updated from {from_version} to GitHub Release {tag}.'
     else:
@@ -48087,14 +48173,64 @@ def takportal_control():
     return jsonify({'success': True, 'running': running, 'action': action})
 
 
+@app.route('/api/takportal/install-unvetted', methods=['POST'])
+@login_required
+def takportal_install_unvetted():
+    """Install TAK Portal's newest release before we have vetted it (ops #1065).
+
+    Update installs only the release that passed our Marketplace gate. When TAK Portal's maintainers
+    ship an urgent fix, console users, who do not use SSH, would otherwise wait for the gate. This is
+    the deliberate way around it: admin password, one real upstream release tag (the one GitHub calls
+    the newest right now, re-read here, never a value the page sends), newer than Vetted, never on
+    Beta Mode, and audited. The Update button goes back to Vetted.
+    """
+    data = request.get_json(silent=True) or {}
+    denied = _require_admin_password(data)
+    if denied:
+        return denied
+    portal_dir = os.path.expanduser('~/TAK-Portal')
+    if not os.path.isdir(os.path.join(portal_dir, '.git')):
+        return jsonify({'success': False, 'error': 'TAK Portal is not installed from a git checkout. '
+                                                   'Redeploy it instead.'}), 400
+    if _takportal_beta_mode():
+        return jsonify({'success': False, 'error': 'Beta Mode is ON in TAK Portal, so Update already '
+                        'follows the development tip. Turn it off in TAK Portal first.'}), 409
+    installed = _takportal_installed_version(portal_dir)
+    info = _takportal_channel_info(fresh=True, installed=installed)
+    ok, why = _tpv.may_install_unvetted(str(data.get('tag') or ''), info['available_tag'],
+                                        info['vetted_tag'], installed)
+    if not ok:
+        return jsonify({'success': False, 'error': why}), 409
+    tag = info['available_tag']
+    with _TAKPORTAL_UPDATE_LOCK:
+        if _takportal_update_job.get('running'):
+            return jsonify({'success': False, 'running': True, 'job': _takportal_update_job.get('id'),
+                            'error': 'A TAK Portal update is already running. Wait for it to finish.'}), 409
+        job_id = secrets.token_hex(6)
+        _takportal_update_job.update({'running': True, 'id': job_id, 'result': None, 'code': None})
+    # Who, from, to, and that it was not vetted: the audit trail an operator can show later.
+    _detail = (f"TAK Portal {installed or '?'} -> {tag.lstrip('vV')} NOT VETTED "
+               f"(vetted {info['vetted'] or '?'}, state {info['state']})")
+    audit('takportal:install-unvetted', _detail, force=True)
+    print(f"[takportal] install-unvetted: {_detail}", flush=True)
+    threading.Thread(target=_takportal_update_worker, args=(portal_dir, job_id, tag), daemon=True).start()
+    return jsonify({'success': True, 'started': True, 'job': job_id, 'action': 'install-unvetted',
+                    'tag': tag}), 202
+
+
 # ops #72: TAK Portal Update as a background job (see the 'update' branch of takportal_control()).
 # One job at a time; its response stays here for the page to read until the next update starts.
 _TAKPORTAL_UPDATE_LOCK = threading.Lock()
+# ops #1065: the not-vetted install hands _takportal_update_git the one release to install through
+# this (per worker thread, so a normal Update on another thread never sees it).
+_takportal_update_ctx = threading.local()
 _takportal_update_job = {'running': False, 'id': '', 'result': None, 'code': None}
 
 
-def _takportal_update_worker(portal_dir, job_id):
+def _takportal_update_worker(portal_dir, job_id, target_tag=''):
     """Thread target: run the update, then publish its response for /api/takportal/update/status."""
+    # ops #1065: a not-vetted install names its release for this thread only.
+    _takportal_update_ctx.target_tag = str(target_tag or '')
     try:
         result, code = _takportal_run_update(portal_dir)
     except Exception as e:
