@@ -251,9 +251,12 @@ for a in (os.environ.get("PEER_ADDRS") or "").split():
     host, _, port = a.rpartition(":")
     if host and port.isdigit():
         peer_addrs.add(_norm_host(host) + ":" + port)
+LOCAL_PEER = re.compile(r"^(127\.|::1$|172\.(1[6-9]|2[0-9]|3[01])\.)")
 def row_addr(r):
     ip, port = _norm_host(r.get("ipAddress") or ""), str(r.get("port") or "").strip()
     return ip + ":" + port if ip and port.isdigit() else ""
+def row_is_local(r):    # our own containers and loopback: ss on the host does not show them as peers
+    return bool(LOCAL_PEER.match(_norm_host(r.get("ipAddress") or "")))
 sock_proven = False    # ss and the API agree on at least one channel-holding client: the match works here
 gl_named = 0           # channel-less device rows TAK knows by user name or DN
 left = []              # ...of which the socket is gone and the row is silent: leftovers
@@ -300,7 +303,8 @@ for r in rows:
                     except (TypeError, ValueError):
                         silent = -1     # no number: never call it silent
                     a = row_addr(r)
-                    if sid.startswith(("tls:", "ssl:")) and a and a not in peer_addrs and silent >= LEFT_SILENT_MS:
+                    if (sid.startswith(("tls:", "ssl:")) and a and not row_is_local(r)
+                            and a not in peer_addrs and silent >= LEFT_SILENT_MS):
                         left.append(sid)
     else:
         unknown += 1              # not the pinned shape at all

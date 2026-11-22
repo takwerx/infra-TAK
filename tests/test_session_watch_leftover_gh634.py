@@ -180,3 +180,13 @@ def test_gh634_state_change_to_leftover_restarts_the_back_off(box):
     assert 'LEFTOVER' not in first
     second = box([ADMIN, LIVE, LEAKED], [IP + ':57833'], ticks=3)
     assert '1 of them are LEFTOVERS' in second
+
+
+def test_gh634_container_row_is_never_a_leftover(box):
+    # test12, Nov 21: two channel-holding rows from our own containers (172.x) match no socket in
+    # the host's ss. They must never be called leftovers, whatever their silence.
+    for local in ('172.18.0.5', '127.0.0.1', '172.31.9.9'):
+        row = dict(LEAKED, ipAddress=local, port='41000')
+        mail = box([ADMIN, LIVE, row], [IP + ':57833'])
+        assert 'LEFTOVER' not in mail, local
+        assert 'leftover=0' in _check_line(box.log())
