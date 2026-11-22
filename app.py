@@ -115009,6 +115009,8 @@ CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR = 3
 CLOUDTAK_AUTOREPAIR_SETTLE_S = 90       # api up this long: TAK Portal waits for it, then prunes
 CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S = 900   # a failed repair is reported, not retried straight away
 CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S = 900  # ops #889: the recreate outlasted the console's 240 s: wait for it this long
+CLOUDTAK_AUTOREPAIR_PASSES = 3          # ops #1018: a repair that a TAK Portal job undid is repeated once that job ends, this many passes at most
+CLOUDTAK_AUTOREPAIR_RECHECK_S = 20      # ops #1018: after a pass that still shows drift, the stack must stay quiet this long before it counts as a real failure
 _CLOUDTAK_AUTOREPAIR_RECORD = os.path.join(CONFIG_DIR, 'cloudtak-autorepair.json')
 # Any compose step that changes the stack, or an image build (TAK Portal builds --no-cache first).
 _CLOUDTAK_COMPOSE_BUSY_RE = re.compile(
@@ -115228,6 +115230,36 @@ def _cloudtak_autorepair_request(settle_s=None):
         return {'state': 'repairing', 'detail': detail}
 
 
+def _cloudtak_autorepair_await_quiet(log, look_s=None, wait_s=None):
+    """ops #1018: a repair ended and CloudTAK still shows drift. Was that because someone else (a TAK
+    Portal Marketplace job: its Uninstall and Install jobs follow each other at once) changed the stack
+    while we repaired it? Look until the stack has been quiet for look_s. Returns True when a compose/build
+    run or TAK Portal's helper was seen and has ended (the drift is then theirs: repair again), False when
+    nothing else ever touched the stack (a real failure), when it was still busy after wait_s, or when the
+    process list could not be read (never read as idle)."""
+    look_s = CLOUDTAK_AUTOREPAIR_RECHECK_S if look_s is None else look_s
+    wait_s = CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S if wait_s is None else wait_s
+    t0 = time.time()
+    quiet_since, seen = t0, False
+    while True:
+        now = time.time()
+        busy = _cloudtak_stack_busy_procs()
+        if busy is None or busy:
+            if busy and not seen:
+                log(f'another job is changing CloudTAK ({busy[0][:100]}): waiting for it to end')
+            seen = seen or bool(busy)
+            quiet_since = None
+            if now - t0 >= wait_s:
+                log(f'the stack was still busy after {int(wait_s // 60)} min')
+                return False
+        else:
+            if quiet_since is None:
+                quiet_since = now
+            if now - quiet_since >= look_s:
+                return seen
+        time.sleep(CLOUDTAK_JOBEND_POLL_S)
+
+
 def _cloudtak_autorepair_run(ct_dir, drift):
     """The repair itself (background thread). 'recreate': exactly what a console restart does
     to CloudTAK — rewrite the override, keep COMPOSE_FILE current (TAK Portal's file and the
@@ -115241,42 +115273,53 @@ def _cloudtak_autorepair_run(ct_dir, drift):
         print(f"[cloudtak-autorepair] {str(m).strip()}", flush=True)
     result, why = 'failed', ''
     try:
-        if drift['kind'] == 'recreate':
-            _p = _ct_recreate_pending()
-            _ct_recreate_arm(tries=int((_p or {}).get('tries') or 0) + 1)   # ops #175: survives a kill
-            if _cloudtak_write_override_file(ct_dir):
-                _log('CloudTAK override rewritten from settings')
-            _cloudtak_ensure_custom_compose(ct_dir, _log)
-            _patch_cloudtak_minio_registry(ct_dir)
-            _patch_cloudtak_compose_ports(ct_dir)
-            stage = _cloudtak_recreate_and_heal(ct_dir, _log, pull=True, wait_s=CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S)
-            why = {'recreate': 'docker compose up --force-recreate failed',
-                   'heal': 'the HLS profile did not re-apply'}.get(stage, '')
-        elif drift['kind'] == 'media' or drift.get('hls') is False:
-            why = '' if _cloudtak_media_hls_heal(plog=_log, wait=True) else 'the HLS profile did not re-apply'
-        # ops #502: the 'recreate' kind got the upload rule back through _cloudtak_recreate_and_heal;
-        # every other kind that found it gone puts it back here. Check-before-apply, so a no-op if present.
-        if not why and drift['kind'] != 'recreate' and drift.get('upload') is False:
-            if not _cloudtak_upload_limit_heal(plog=_log, wait=True):
-                why = 'the tileset upload limit did not re-apply'
-        # ops #969: the ETL layer fix. After a recreate it already ran inside _cloudtak_recreate_and_heal.
-        # It restarts the api, so it re-applies the upload limit itself.
-        if not why and drift['kind'] != 'recreate' and drift.get('etl') is False:
-            if not _cloudtak_etl_layer_heal(plog=_log, wait=True):
-                why = 'the ETL layer save fix did not re-apply'
-        # ops #222: every repair ends with Print set up — the recreate above leaves cloudtak-print
-        # alone (it isn't in COMPOSE_FILE), and TAK Portal starts it without our overlay.
-        if not why and _cloudtak_print_converge(ct_dir, _log) == 'failed':
-            why = "Print (cloudtak-print) could not be restarted with infra-TAK's settings"
-        after = _cloudtak_drift(ct_dir)
-        if not why and after['kind']:
-            why = f'still drifted after the repair: {_cloudtak_drift_summary(after)}'
+        first = drift
+        for _pass in range(CLOUDTAK_AUTOREPAIR_PASSES):
+            if drift['kind'] == 'recreate':
+                _p = _ct_recreate_pending()
+                _ct_recreate_arm(tries=int((_p or {}).get('tries') or 0) + 1)   # ops #175: survives a kill
+                if _cloudtak_write_override_file(ct_dir):
+                    _log('CloudTAK override rewritten from settings')
+                _cloudtak_ensure_custom_compose(ct_dir, _log)
+                _patch_cloudtak_minio_registry(ct_dir)
+                _patch_cloudtak_compose_ports(ct_dir)
+                stage = _cloudtak_recreate_and_heal(ct_dir, _log, pull=True, wait_s=CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S)
+                why = {'recreate': 'docker compose up --force-recreate failed',
+                       'heal': 'the HLS profile did not re-apply'}.get(stage, '')
+            elif drift['kind'] == 'media' or drift.get('hls') is False:
+                why = '' if _cloudtak_media_hls_heal(plog=_log, wait=True) else 'the HLS profile did not re-apply'
+            # ops #502: the 'recreate' kind got the upload rule back through _cloudtak_recreate_and_heal;
+            # every other kind that found it gone puts it back here. Check-before-apply, so a no-op if present.
+            if not why and drift['kind'] != 'recreate' and drift.get('upload') is False:
+                if not _cloudtak_upload_limit_heal(plog=_log, wait=True):
+                    why = 'the tileset upload limit did not re-apply'
+            # ops #969: the ETL layer fix. After a recreate it already ran inside _cloudtak_recreate_and_heal.
+            # It restarts the api, so it re-applies the upload limit itself.
+            if not why and drift['kind'] != 'recreate' and drift.get('etl') is False:
+                if not _cloudtak_etl_layer_heal(plog=_log, wait=True):
+                    why = 'the ETL layer save fix did not re-apply'
+            # ops #222: every repair ends with Print set up — the recreate above leaves cloudtak-print
+            # alone (it isn't in COMPOSE_FILE), and TAK Portal starts it without our overlay.
+            if not why and _cloudtak_print_converge(ct_dir, _log) == 'failed':
+                why = "Print (cloudtak-print) could not be restarted with infra-TAK's settings"
+            after = _cloudtak_drift(ct_dir)
+            if not why and after['kind']:
+                why = f'still drifted after the repair: {_cloudtak_drift_summary(after)}'
+            # ops #1018: TAK Portal's Install job can follow its Uninstall job at once and recreate the stack
+            # again while (or just after) we repair it. A drift left by someone else's job is not a failed
+            # repair: wait for that job to end, then repair what it left. One that no job explains stays failed.
+            if not why or not after['kind'] or _pass + 1 >= CLOUDTAK_AUTOREPAIR_PASSES:
+                break
+            if not _cloudtak_autorepair_await_quiet(_log):
+                break
+            _log(f'another job changed CloudTAK during the repair — repairing again (pass {_pass + 2})')
+            drift, why = after, ''
         if not why:
             result = 'repaired'
-            if drift['kind'] == 'recreate':
+            if first['kind'] == 'recreate' or drift['kind'] == 'recreate':
                 _ct_recreate_clear()
             _log(f"repaired — now: {_cloudtak_drift_summary(after)}")
-            _cloudtak_autorepair_notify(drift, after)
+            _cloudtak_autorepair_notify(first, after)
         else:
             _log(f'⚠ repair failed: {why}')
     except Exception as e:
