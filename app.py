@@ -31069,8 +31069,10 @@ _PN_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$')
 _PN_PKG_RE = re.compile(r'^[a-z0-9][a-z0-9.+_-]{0,99}$')
 _PN_VER_RE = re.compile(r'^[A-Za-z0-9.+~^:_-]{1,64}$')
 # os_type as _read_os_release() writes it (ubuntu-22.04, rocky-9), optionally /<kernel
-# flavour> (ubuntu-22.04/aws) for kernel rows, or '*' for every OS.
-_PN_OS_RE = re.compile(r'^(\*|[a-z]+-[0-9.]+(/[a-z][a-z0-9-]*)?)$')
+# flavour> (ubuntu-22.04/aws) and @<kernel series> (ubuntu-22.04/aws@6.8: a 22.04 box on the
+# 6.8 HWE kernel, which numbers its releases apart from 5.15) for kernel rows, or '*' for
+# every OS.
+_PN_OS_RE = re.compile(r'^(\*|[a-z]+-[0-9.]+(/[a-z][a-z0-9-]*)?(@[0-9]+\.[0-9]+)?)$')
 
 # Third-party packages whose upstream publishes GitHub advisories: package (same name on
 # apt and dnf) -> (repo, advisory package names that follow its releases or None for all,
@@ -31311,7 +31313,8 @@ def _patch_now_feed_items(advisories, installed, os_type, rb, pkg_mgr):
                 m = re.search(r'-([a-z][a-z0-9]*)$', run)
                 flavour = m.group(1) if m else ''
                 key = f'{os_type}/{flavour}' if flavour and flavour != 'generic' else os_type
-                fixed = per.get(key)
+                sm = re.match(r'(\d+\.\d+)\.', run)
+                fixed = (per.get(f'{key}@{sm.group(1)}') if sm else None) or per.get(key)
                 if not (fixed and run and _kernel_version_key(run) < _kernel_version_key(fixed)):
                     continue
                 kernel = True
@@ -106185,6 +106188,26 @@ _KERNEL_CVE_FIXES = {
     'CVE-2026-53266': {
         'jammy': (5, 15, 0, 198),
     },
+    # ops #1084: IPv4 TCP connection setup, remote, no login (CVSS 9.8).
+    # https://ubuntu.com/security/CVE-2026-98432 — `linux` package rows. Cloud kernels
+    # (-aws, -azure) number their releases on their own scale (5.15.0-1120 vs 5.15.0-203),
+    # so they get their own `<codename>/<flavour>` key; a flavour with no key is skipped.
+    'CVE-2026-98432': {
+        'jammy': (5, 15, 0, 203),
+        'noble': (6, 8, 0, 149),
+        'jammy/aws': (5, 15, 0, 1120),
+        'jammy/azure': (5, 15, 0, 1126),
+        'noble/aws': (6, 8, 0, 1069),
+        'noble/azure': (6, 8, 0, 1073),
+        'jammy/lowlatency': (5, 15, 0, 198),   # linux-lowlatency 5.15.0-198.208
+        'noble/lowlatency': (6, 8, 0, 149),    # linux-lowlatency 6.8.0-149.149.1
+        # 22.04 on the 6.8 HWE kernels (linux-hwe-6.8, linux-aws-6.8, linux-azure-6.8,
+        # linux-lowlatency-hwe-6.8): the same numbers as noble's
+        'jammy@6.8': (6, 8, 0, 149),
+        'jammy/aws@6.8': (6, 8, 0, 1069),
+        'jammy/azure@6.8': (6, 8, 0, 1073),
+        'jammy/lowlatency@6.8': (6, 8, 0, 149),
+    },
 }
 
 
@@ -106209,8 +106232,20 @@ def _kernel_cve_banner(running_kernel):
     running = _running_kernel_tuple(running_kernel)
     if not codename or not running:
         return None
+    # ops #1084: a cloud kernel (5.15.0-1120-aws) is looked up as "<codename>/aws", never
+    # against the generic number: 1120 is not "newer" than 203, it is a different scale.
+    # -generic is the plain codename. -lowlatency has its own `<codename>/lowlatency` fix
+    # number when a row lists one, else it is judged by the plain codename as it always
+    # was. Any other flavour with no key (gcp, oem, fde) never matches.
+    m = re.search(r'-([a-z][a-z0-9]*)$', running_kernel or '')
+    flavour = m.group(1) if m else ''
+    keys = [codename] if flavour in ('', 'generic') else [f'{codename}/{flavour}']
+    if flavour == 'lowlatency':
+        keys.append(codename)
+    # a 22.04 box on the 6.8 HWE kernel: "<key>@6.8" first (its own numbers), else as before
+    keys = [f'{k}@{running[0]}.{running[1]}' for k in keys] + keys
     for cve, fixed_by in _KERNEL_CVE_FIXES.items():
-        fixed = fixed_by.get(codename)
+        fixed = next((fixed_by[k] for k in keys if fixed_by.get(k)), None)
         if fixed and running < fixed:
             return cve
     return None
