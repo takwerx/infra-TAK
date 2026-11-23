@@ -54,6 +54,15 @@ MAX_WAIT_TAK=900
 MAX_WAIT_AK=300
 INTERVAL=10
 AK_LOCK_WAIT=180            # app.py _AK_COMPOSE_LOCK_WAIT_S
+# ops #1122: how long after the failed post-recreate check the outpost may keep trying
+# before the "cannot resolve groups" alert email goes out. The script runs under
+# TimeoutStartSec=1200 (app.py), so the late check also stops at LDAP_LATE_CAP seconds
+# of script run time; a kill by systemd would lose the alert altogether.
+LDAP_LATE_WINDOW=600
+LDAP_LATE_CAP=1080
+_ldap_late=0
+_ldap_late_since=0
+_now() { echo "$SECONDS"; }   # seconds since this script started (the tests swap in a fake clock)
 
 _log() {
   echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') post-start: $1"
@@ -186,13 +195,15 @@ if [ -n "$AK_DIR" ]; then
     if gd_ldap_groups_ok "$AK_DIR"; then
       _log "LDAP outpost recovered after recreate — groups resolving"
     else
-      # Do NOT report this as fine. An outpost that binds without resolving groups is
-      # the failure mode that hides behind every green indicator on the box.
-      _log "ALERT | LDAP outpost still cannot resolve groups after recreate — LDAP users will be placed in NO GROUP and will be invisible to all other clients. Check: docker logs authentik-ldap-1, and the TAK Client Dashboard for a Total-Clients vs rows-displayed mismatch."
-      if [ -x /opt/tak-guarddog/send-alert-email.sh ]; then
-        printf '%s\n' "The Authentik LDAP outpost on $(hostname) is bound but cannot resolve groups after a recreate at boot. Every LDAP-authenticated client will connect, receive a callsign, and then see nobody and be seen by nobody, while all services report healthy. Investigate: docker logs authentik-ldap-1; TAK Client Dashboard Total Clients vs rows displayed." \
-          | /opt/tak-guarddog/send-alert-email.sh "Guard Dog: LDAP outpost cannot resolve groups on $(hostname)" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null || true
-      fi
+      # ops #1122: 150 s after Authentik came up is too early to call this an outage on a
+      # slow VPS (test6: 18 ms disk commits, load 10 to 20, so Authentik's provider tree
+      # takes minutes). The old code sent the alert email right here, so a box that
+      # healed itself 3 minutes later still mailed "clients see nobody", on every reboot.
+      # Do NOT report this as fine, and do NOT drop it either: remember it and judge it
+      # again at the end of this script (step 8), with the window below.
+      _ldap_late=1
+      _ldap_late_since=$(_now)
+      _log "WARN | LDAP outpost still cannot resolve groups 30s after the recreate ($(_now)s into this script) — will check again for up to ${LDAP_LATE_WINDOW}s before alerting (a slow box is not an outage)"
     fi
   fi
 else
@@ -386,6 +397,36 @@ if systemctl list-unit-files mediamtx.service &>/dev/null; then
   fi
 else
   _log "MediaMTX not installed, skipping"
+fi
+
+# ── 8. Late LDAP group check (ops #1122) ──
+# Step 1 could not confirm group resolution 30 s after its recreate. TAK Server, the
+# 8089 wait and every module start above took minutes since then. Ask again now, and
+# keep asking until LDAP_LATE_WINDOW seconds have passed since that failed check. Only a
+# box that is STILL broken then gets the email; one that healed gets a log line.
+# (The 8089 client gate keeps phones out while groups do not resolve, so waiting here
+# does not let anyone connect blind; and Guard Dog's Authentik watcher keeps judging
+# the outpost after this script ends.)
+if [ "$_ldap_late" -eq 1 ]; then
+  _lrc=1
+  while :; do
+    gd_ldap_groups_ok "$AK_DIR"; _lrc=$?
+    [ "$_lrc" -eq 0 ] && break
+    [ $(( $(_now) - _ldap_late_since )) -ge "$LDAP_LATE_WINDOW" ] && break
+    [ "$(_now)" -ge "$LDAP_LATE_CAP" ] && break
+    sleep $INTERVAL
+  done
+  if [ "$_lrc" -eq 0 ]; then
+    _log "LDAP outpost recovered on its own — groups resolving $(( $(_now) - _ldap_late_since ))s after the failed check, no alert needed"
+  else
+    # Do NOT report this as fine. An outpost that binds without resolving groups is
+    # the failure mode that hides behind every green indicator on the box.
+    _log "ALERT | LDAP outpost still cannot resolve groups $(( $(_now) - _ldap_late_since ))s after the recreate — LDAP users will be placed in NO GROUP and will be invisible to all other clients. Check: docker logs authentik-ldap-1, and the TAK Client Dashboard for a Total-Clients vs rows-displayed mismatch."
+    if [ -x /opt/tak-guarddog/send-alert-email.sh ]; then
+      printf '%s\n' "The Authentik LDAP outpost on $(hostname) is bound but still cannot resolve groups, $(( ( $(_now) - _ldap_late_since ) / 60 )) minutes after it was recreated at boot. Every LDAP-authenticated client will connect, receive a callsign, and then see nobody and be seen by nobody, while all services report healthy. Investigate: docker logs authentik-ldap-1; TAK Client Dashboard Total Clients vs rows displayed." \
+        | /opt/tak-guarddog/send-alert-email.sh "Guard Dog: LDAP outpost cannot resolve groups on $(hostname)" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null || true
+    fi
+  fi
 fi
 
 _log "Boot sequence complete — all services started"

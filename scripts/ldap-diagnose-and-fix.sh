@@ -15,7 +15,8 @@ echo ""
 echo "=== 2. Flow bindings (should show 3 stages: order 10, 15, 20) ==="
 if [ -n "$FLOW_PK" ]; then
   # Fetch all bindings and filter by target (API filter varies by version)
-  curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:9090/api/v3/flows/bindings/?ordering=order&page_size=500" | \
+  LDAP_DIAG_JSON=$(curl -s -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:9090/api/v3/flows/bindings/?ordering=order&page_size=500" || true)
+  echo "$LDAP_DIAG_JSON" | \
     python3 -c "
 import sys,json
 data=json.loads(sys.stdin.read())
@@ -35,17 +36,20 @@ fi
 
 echo ""
 echo "=== 3. LDAP application + provider ==="
-curl -s -H "Authorization: Bearer $TOKEN" 'http://127.0.0.1:9090/api/v3/core/applications/?search=LDAP' | \
+LDAP_DIAG_JSON=$(curl -s -H "Authorization: Bearer $TOKEN" 'http://127.0.0.1:9090/api/v3/core/applications/?search=LDAP' || true)
+echo "$LDAP_DIAG_JSON" | \
   python3 -c "import sys,json; r=json.loads(sys.stdin.read())['results']; [print(f'  name={a[\"name\"]} provider={a.get(\"provider\")} slug={a[\"slug\"]}') for a in r]" 2>/dev/null || true
 
 echo ""
 echo "=== 4. LDAP provider details ==="
-curl -s -H "Authorization: Bearer $TOKEN" 'http://127.0.0.1:9090/api/v3/providers/ldap/?search=LDAP' | \
+LDAP_DIAG_JSON=$(curl -s -H "Authorization: Bearer $TOKEN" 'http://127.0.0.1:9090/api/v3/providers/ldap/?search=LDAP' || true)
+echo "$LDAP_DIAG_JSON" | \
   python3 -c "import sys,json; r=json.loads(sys.stdin.read())['results']; [print(f'  pk={p[\"pk\"]} name={p[\"name\"]} auth_flow={p.get(\"authorization_flow\")} bind_mode={p.get(\"bind_mode\")}') for p in r]" 2>/dev/null || true
 
 echo ""
 echo "=== 5. User adm_ldapservice (pk=54) ==="
-curl -s -H "Authorization: Bearer $TOKEN" 'http://127.0.0.1:9090/api/v3/core/users/54/' | \
+LDAP_DIAG_JSON=$(curl -s -H "Authorization: Bearer $TOKEN" 'http://127.0.0.1:9090/api/v3/core/users/54/' || true)
+echo "$LDAP_DIAG_JSON" | \
   python3 -c "import sys,json; u=json.loads(sys.stdin.read()); print(f'  pk={u[\"pk\"]} username={u[\"username\"]} active={u[\"is_active\"]} groups={[g[\"name\"] for g in u.get(\"groups_obj\",[])]}')" 2>/dev/null || echo "  User 54 not found"
 
 echo ""

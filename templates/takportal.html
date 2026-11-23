@@ -83,9 +83,15 @@
 {% if portal.installed %}
 <div class="section-title" style="margin-top:20px">Controls</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:16px 20px;margin-bottom:24px">
-<div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-{% if portal.running %}<button class="control-btn" onclick="portalControl('restart')">↻ Restart</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn" onclick="syncPortalCA()" id="sync-portal-ca-btn" title="Copy TAK Server CA to portal and restart. Use when enrollment succeeds but ATAK says host not trusted.">🔄 Sync TAK Server CA</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()" title="{% if portal_beta_mode %}Beta Mode is ON in TAK Portal — Update follows the main branch.{% else %}Update follows the latest TAK Portal GitHub Release. Turn on Enable Beta Features inside TAK Portal to track main instead.{% endif %}"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-stop" onclick="portalControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button><span id="sync-portal-ca-msg" style="margin-left:8px;font-size:12px"></span>{% else %}<button class="control-btn btn-start" onclick="portalControl('start')">▶ Start</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn" onclick="syncPortalCA()" id="sync-portal-ca-btn" title="Copy TAK Server CA to portal and restart. Use when enrollment succeeds but ATAK says host not trusted.">🔄 Sync TAK Server CA</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdate()" title="{% if portal_beta_mode %}Beta Mode is ON in TAK Portal — Update follows the main branch.{% else %}Update follows the latest TAK Portal GitHub Release. Turn on Enable Beta Features inside TAK Portal to track main instead.{% endif %}"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>⬆ Update{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button><span id="sync-portal-ca-msg" style="margin-left:8px;font-size:12px"></span>{% endif %}
+<div id="portal-channel" style="margin-bottom:14px;font-size:13px;line-height:1.7">
+<div><span style="color:var(--text-dim)">Installed:</span> <strong>{{ portal_version or 'unknown' }}</strong></div>
+<div><span style="color:var(--text-dim)">Vetted:</span> {% if channel_info.vetted %}<strong id="portal-vetted">{{ channel_info.vetted }}</strong> <span style="color:var(--green)">— tested by takwerx with the CloudTAK Marketplace</span>{% else %}<span style="color:var(--text-dim)">not known (this console could not read our tested-version list)</span>{% endif %}</div>
+{% if channel_info.state == 'testing' or channel_info.state == 'held' %}<div><span style="color:var(--text-dim)">Available:</span> <strong id="portal-available">{{ channel_info.available }}</strong> {% if channel_info.state == 'held' %}<span style="color:var(--yellow)" id="portal-available-state">— held{% if channel_info.reason %}: {{ channel_info.reason }}{% endif %}</span>{% else %}<span style="color:var(--cyan)" id="portal-available-state">— in our test queue, not vetted yet</span>{% endif %}</div>{% endif %}
 </div>
+<div class="controls" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+{% if portal.running %}<button class="control-btn" onclick="portalControl('restart')">↻ Restart</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn" onclick="syncPortalCA()" id="sync-portal-ca-btn" title="Copy TAK Server CA to portal and restart. Use when enrollment succeeds but ATAK says host not trusted.">🔄 Sync TAK Server CA</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdateClick()" title="{% if portal_beta_mode %}Beta Mode is ON in TAK Portal — Update follows the main branch.{% elif channel_info.on_unvetted %}This TAK Portal is newer than the release takwerx tested. Update moves it back to {{ channel_info.vetted }}.{% else %}Update installs the TAK Portal release takwerx tested with the CloudTAK Marketplace. Turn on Enable Beta Features inside TAK Portal to track main instead.{% endif %}"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>{% if channel_info.on_unvetted and not portal_beta_mode %}⬇ Back to {{ channel_info.vetted }}{% else %}⬆ Update{% endif %}{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-stop" onclick="portalControl('stop')">■ Stop</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button><span id="sync-portal-ca-msg" style="margin-left:8px;font-size:12px"></span>{% else %}<button class="control-btn btn-start" onclick="portalControl('start')">▶ Start</button><button class="control-btn" onclick="portalReconfigure()" title="Refresh Authentik/TAK Server settings and restart container">🔄 Update config</button><button class="control-btn" onclick="syncPortalCA()" id="sync-portal-ca-btn" title="Copy TAK Server CA to portal and restart. Use when enrollment succeeds but ATAK says host not trusted.">🔄 Sync TAK Server CA</button><button class="control-btn btn-update" id="update-btn" onclick="portalUpdateClick()" title="{% if portal_beta_mode %}Beta Mode is ON in TAK Portal — Update follows the main branch.{% elif channel_info.on_unvetted %}This TAK Portal is newer than the release takwerx tested. Update moves it back to {{ channel_info.vetted }}.{% else %}Update installs the TAK Portal release takwerx tested with the CloudTAK Marketplace. Turn on Enable Beta Features inside TAK Portal to track main instead.{% endif %}"{% if portal_update_available %} style="border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan)"{% endif %}>{% if channel_info.on_unvetted and not portal_beta_mode %}⬇ Back to {{ channel_info.vetted }}{% else %}⬆ Update{% endif %}{% if portal_update_available %} <span style="color:var(--cyan)" title="Update available: v{{ portal_latest }}">●</span>{% endif %}</button><button class="control-btn btn-remove" onclick="document.getElementById('portal-uninstall-modal').classList.add('open')">🗑 Remove</button><span id="sync-portal-ca-msg" style="margin-left:8px;font-size:12px"></span>{% endif %}
+</div>
+{% if can_install_unvetted %}<div style="margin-top:12px"><button class="control-btn" id="unvetted-btn" onclick="portalUnvettedOpen()" title="Admin only. Installs TAK Portal {{ channel_info.available }} before takwerx has tested it.">Install {{ channel_info.available }} (not vetted yet)</button></div>{% endif %}
 <div id="update-status" style="display:none;margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary)"></div>
 {% from '_module_result.html' import last_update_result %}{{ last_update_result('takportal') }}
 </div>
@@ -187,6 +193,21 @@ Features: User creation with auto-cert generation, group management, mutual aid 
 </div>
 {% endif %}
 </div>
+{% if can_install_unvetted %}<div class="modal-overlay" id="portal-unvetted-modal">
+<div class="modal">
+<h3>Install {{ channel_info.available }} before it is vetted?</h3>
+<p>takwerx has not tested or security-reviewed TAK Portal {{ channel_info.available }}. It runs with access to this server.</p>
+{% if channel_info.state == 'held' %}<p style="color:var(--yellow)">takwerx held this release{% if channel_info.reason %}: <span id="portal-unvetted-reason">{{ channel_info.reason }}</span>{% endif %}.</p>{% endif %}
+<p>You can go back to {{ channel_info.vetted }}, the tested version, at any time with the Update button.</p>
+<label class="form-label">Admin Password</label>
+<input class="form-input" id="portal-unvetted-password" type="password" placeholder="Confirm your password">
+<div class="modal-actions">
+<button type="button" class="control-btn" id="portal-unvetted-cancel" onclick="document.getElementById('portal-unvetted-modal').classList.remove('open')">Cancel</button>
+<button type="button" class="control-btn btn-update" id="portal-unvetted-confirm" onclick="portalUnvettedInstall()">Install {{ channel_info.available }}</button>
+</div>
+<div id="portal-unvetted-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
+</div>
+</div>{% endif %}
 <div class="modal-overlay" id="portal-uninstall-modal">
 <div class="modal">
 <h3>⚠ Uninstall TAK Portal?</h3>
@@ -353,6 +374,72 @@ async function syncPortalCA(){
 // console setting, and the update BADGE ignores it: the badge only lights when a newer
 // GitHub *Release* exists, whether or not this box is riding main.
 var PORTAL_BETA_MODE={{ 'true' if portal_beta_mode else 'false' }};
+// ops #1065: Update installs the release takwerx tested (Vetted). A box that runs something newer
+// (installed by hand with "Install ... (not vetted yet)") is moved BACK by Update, so say so first.
+var PORTAL_ON_UNVETTED={{ 'true' if channel_info.on_unvetted else 'false' }};
+var PORTAL_VETTED={{ (channel_info.vetted or '')|tojson }};
+var PORTAL_AVAILABLE_TAG={{ (channel_info.available_tag or '')|tojson }};
+function portalUpdateClick(){
+    if(PORTAL_ON_UNVETTED&&!PORTAL_BETA_MODE&&!confirm('This TAK Portal is newer than '+PORTAL_VETTED+', the release takwerx tested.\n\nUpdate moves it BACK to '+PORTAL_VETTED+'. Portal data is not reverted.\n\nMove back now?')){ return; }
+    portalUpdate();
+}
+function portalUnvettedOpen(){
+    var m=document.getElementById('portal-unvetted-modal'); if(!m){return;}
+    document.getElementById('portal-unvetted-password').value='';
+    document.getElementById('portal-unvetted-msg').textContent='';
+    m.classList.add('open');
+}
+async function portalUnvettedInstall(){
+    var pw=document.getElementById('portal-unvetted-password').value;
+    var msg=document.getElementById('portal-unvetted-msg');
+    var confirmBtn=document.getElementById('portal-unvetted-confirm');
+    var cancelBtn=document.getElementById('portal-unvetted-cancel');
+    var status=document.getElementById('update-status');
+    if(!pw){msg.textContent='Please enter your password';return;}
+    msg.textContent=''; confirmBtn.disabled=true; cancelBtn.disabled=true;
+    var d=null, httpStatus=0;
+    try{
+        var r=await fetch('/api/takportal/install-unvetted',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({tag:PORTAL_AVAILABLE_TAG,password:pw})});
+        httpStatus=r.status;
+        try{ d=await r.json(); }catch(_pe){}
+    }catch(e){ msg.textContent='Request failed: '+e.message; confirmBtn.disabled=false; cancelBtn.disabled=false; return; }
+    if(!(d&&d.started&&d.job)){
+        msg.textContent=(d&&d.error)?String(d.error):(httpStatus===401?'Session expired. Reload the page and try again.':'The install did not start ('+httpStatus+')');
+        confirmBtn.disabled=false; cancelBtn.disabled=false; return;
+    }
+    document.getElementById('portal-unvetted-modal').classList.remove('open');
+    confirmBtn.disabled=false; cancelBtn.disabled=false;
+    document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=true;b.style.opacity='0.5'});
+    status.style.display='block'; status.style.color='var(--text-secondary)';
+    status.textContent='Installing TAK Portal '+PORTAL_AVAILABLE_TAG.replace(/^[vV]/,'')+' (not vetted yet) and rebuilding container...';
+    var started=Date.now(), job=d.job;
+    function done(ok,text){
+        status.style.color=ok?'var(--yellow)':'var(--red)'; status.textContent=text;
+        if(ok){ setTimeout(function(){window.location.href='/takportal'},4000); }
+        else{ document.querySelectorAll('.control-btn').forEach(function(b){b.disabled=false;b.style.opacity='1'}); }
+    }
+    function poll(){
+        fetch('/api/takportal/update/status',{credentials:'same-origin'}).then(function(x){return x.json();}).then(function(j){
+            j=j||{};
+            if(j.job===job&&!j.running&&j.result){
+                var res=j.result;
+                if(res.success){ done(true,'✓ '+(res.pull||'Installed')+(res.version?' ('+res.version+')':'')); }
+                else{ done(false,'✗ '+(res.error?String(res.error):'Install failed')); }
+                return;
+            }
+            if(!j.job){
+                var last=j.last||{};
+                if(last.outcome==='ok'){ done(true,'✓ Installed ('+(last.to||'')+')'); return; }
+                if(last.outcome==='failed'||last.outcome==='interrupted'){ done(false,'✗ Install failed: '+(last.error||'unknown error')); return; }
+            }
+            again();
+        }).catch(again);
+    }
+    function again(){
+        if(Date.now()-started<1200000){setTimeout(poll,5000);}else{window.location.href='/takportal';}
+    }
+    poll();
+}
 async function portalUpdate(){
     var btn=document.getElementById('update-btn');
     var status=document.getElementById('update-status');
@@ -364,7 +451,7 @@ async function portalUpdate(){
     status.style.display='block';status.style.color='var(--text-secondary)';
     status.textContent=PORTAL_BETA_MODE
         ?'Beta Mode is ON in TAK Portal, so this follows the development tip (main), not a published release. Rebuilding container...'
-        :'Updating to the latest GitHub Release and rebuilding container...';
+        :'Updating to the release takwerx tested and rebuilding container...';
     document.querySelectorAll('.control-btn').forEach(function(b){if(b!==btn){b.disabled=true;b.style.opacity='0.5'}});
     function _portalUpdateDone(){
         btn.disabled=false;btn.innerHTML='⬆ Update';
