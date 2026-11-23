@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.4.4-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.4-alpha)**
+**Current release: [v10.4.5-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.5-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -458,6 +458,37 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.4.5-alpha — 2026-11-23 — Emergency security update: Linux kernel CVE-2026-98432 warning; TAK Portal and CloudTAK stay on tested versions
+
+**Headline: your server now tells you when its Linux kernel needs the fix for CVE-2026-98432 (critical). Install the OS updates and restart. TAK Portal and CloudTAK update only to versions that passed our tests. Update from the Console page, Update Now.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.5-alpha))
+
+**Security.**
+- Linux kernel CVE-2026-98432 (critical): the fix comes from your operating system and works only after a restart. A server that still runs an older kernel gets a Guard Dog email and a console banner that name the CVE, until it restarts onto the fixed kernel. Ubuntu 22.04 and 24.04 (generic, aws, azure, lowlatency and the 6.8 HWE kernels) and Rocky/RHEL 9.8 and 9.9 are covered.
+- Sign-in roles: a security update for how the console and the stream site read Authentik groups. The Authentik page shows a red "Group names that need a look" box if a group name needs attention.
+
+**TAK Portal.**
+- TAK Portal updates only to versions that passed our Marketplace plugin test. The lowest version is 2.0.39, and a redeploy never moves a server back to an older version.
+- The TAK Portal page shows the vetted version and the newest available version. An admin can install the newest version before it is vetted, after a clear warning.
+- TAK Portal works with TAK Server in Docker: client certificates, QR enrollment, TAK Server restart and Marketplace installs.
+
+**CloudTAK.**
+- CloudTAK stays on tested 13.x versions (13.128.0 now). Version 14 is held back until it passes our tests. The offline fallback is 13.127.0.
+- When CloudTAK Update stops on a plugin file that fails the check, the message names the plugin.
+- A TAK Portal Marketplace install that runs at the same time as CloudTAK auto-repair no longer undoes the repair.
+
+**Fixes.**
+- Guard Dog names the device behind a leftover TAK Server subscription and no longer says it heals on its own. The server's own containers are never reported.
+- On a non-root console, an Authentik or other module redeploy works when an old docker-compose file is owned by root.
+- PulsePoint: when PulsePoint blocks automated access, the feed says so and waits before it tries again, in place of "Unexpected end of JSON input".
+- Docker TAK Server (hardened): x86 moves to the Temurin Java 17.0.21.1 build. ARM64 stays on 17.0.21.
+
+**Known issues.**
+- If your server got CloudTAK 14.0.0 from 10.4.4, the CloudTAK Update button shows an error that it will not go back to 13.128.0. Nothing changes and CloudTAK keeps working. Clearer wording comes in the next update.
+- On Rocky/RHEL, the console banner is the general restart panel. The Guard Dog email names the CVE.
+- On a very slow server, a reboot can leave phones without groups for up to about 20 minutes, until the console restarts TAK Server once. A fix is in progress.
+
+**Upgrading:** use **Update Now** on the Console page. For the kernel fix, also install the OS updates and restart the server (Console page, Reboot now).
 
 ### v10.4.4-alpha — 2026-11-21 — Servers recover on their own after a reboot; phones keep their groups
 
