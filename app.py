@@ -1761,7 +1761,7 @@ CLOUDTAK_VETTED_RELEASE = "13.127.0"    # OFFLINE FALLBACK ONLY since v10.1.17 â
 # images. Every channel installs "upstream latest", so without a cap one press of Update (or a fresh
 # Deploy) would put an untested major on a customer's box. The cap offers the newest 13.x until a
 # test passes; raise it (and the fallback pin) only after one does. tests/test_cloudtak_major_cap_ops1074.py
-CLOUDTAK_MAX_MAJOR = 13
+CLOUDTAK_MAX_MAJOR = 14
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Caddy's certificate store, and the issuer subdirectory Let's Encrypt lands in.
 # Caddy namespaces the store by the ACME directory URL, so the issuer name is NOT a
