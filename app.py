@@ -63841,7 +63841,28 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
                         _req.urlopen(r, timeout=15)
             except urllib.error.HTTPError:
                 pass
-        return True, 'Recovery flow created and linked; "Forgot password?" is on the login page.', recovery_flow_slug
+
+        # 7) Link the recovery flow to the brand(s) too. This is a SEPARATE setting from the
+        #    identification stage above: the stage's recovery_flow drives the login page's
+        #    "Forgot password?" link, but the brand's flow_recovery is what the Admin
+        #    interface's per-user "Create/Email recovery link" actions need. Without it
+        #    Authentik shows "This brand does not have a recovery flow" on every user
+        #    (test12 2026-11-23 — no release ever set it). Seed only when EMPTY: a recovery
+        #    flow the operator picked on the brand is theirs.
+        brand_msg = ''
+        try:
+            _linked = 0
+            for br in _api_get('core/brands/?page_size=100').get('results', []):
+                if br.get('flow_recovery'):
+                    continue
+                _api_patch(f'core/brands/{br["brand_uuid"]}/', {'flow_recovery': recovery_flow_pk})
+                _linked += 1
+            if _linked:
+                brand_msg = f' Linked to {_linked} brand(s) for admin recovery links.'
+        except Exception as e:
+            brand_msg = f' (Brand recovery link not set: {str(e)[:80]})'
+        return True, ('Recovery flow created and linked; "Forgot password?" is on the login page.'
+                      + brand_msg), recovery_flow_slug
     except urllib.error.HTTPError as e:
         return False, _err(e), None
     except Exception as e:
@@ -84302,6 +84323,8 @@ def run_authentik_deploy(reconfigure=False):
             # password?" missing) on their next console update.
             plog("  Ensuring password-recovery flow...")
             _ensure_recovery_flow_standalone(env_path, plog)
+            for _n in _ak_admin_recovery_email_notes():
+                plog(_n)
             _sync_webadmin_after_authentik_reconfigure(plog)
             # ops #184: last, after every step above that takes LDAP down under TAK
             _authentik_reconfigure_heal_tak_clients(plog, before=ldap_path_before)
@@ -85765,6 +85788,8 @@ entries:
         else:
             plog("  2. Email Relay: SMTP is already configured — this deploy applied or will apply Authentik email when that step succeeded above.")
         plog("  3. TAK Server: deploy only after this log shows the LDAP SA bind verified (above).")
+        plog("  4. Set a real recovery email for akadmin (and webadmin, once TAK Server is deployed) on this page")
+        plog("     \u2192 Protected admin accounts. Without it, 'Forgot password?' cannot reach you.")
         plog("=" * 50)
         # v0.8.5: Proactive routing migration — if TAK Server is already installed when
         # Authentik is deployed (re-deploy / reconfigure path), migrate outpost to FQDN
@@ -89220,6 +89245,218 @@ def _read_authentik_admin_accounts_via_ak_shell():
     return accounts, None
 
 
+# ── Admin recovery email (2026-11-23) ─────────────────────────────────────────────
+# akadmin and webadmin are born with addresses nobody reads: akadmin gets
+# AUTHENTIK_BOOTSTRAP_EMAIL=admin@takwerx.local, webadmin gets webadmin@<fqdn> (a
+# synthetic address so WebODM's OIDC email claim is non-empty). "Forgot password?"
+# mails the reset link to that address, so neither admin could ever recover its own
+# password. And Authentik's user page refuses self-service email changes by default
+# (brand setting "Allow users to change email" = off — correct, it protects recovery),
+# so the operator also could not fix it from the account itself. The Authentik page now
+# flags a placeholder and sets a real address through the admin API.
+_AK_ADMIN_PLACEHOLDER_EMAILS = ('admin@takwerx.local',)
+_AK_ADMIN_EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?'
+                                r'(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*\.[A-Za-z]{2,63}$')
+
+
+def _ak_admin_email_is_placeholder(username, email, settings=None):
+    """True when a protected admin's email is one infra-TAK made up (or empty) — i.e. a
+    password-reset email to it reaches nobody."""
+    e = (email or '').strip().lower()
+    if not e or '@' not in e:
+        return True
+    if e in _AK_ADMIN_PLACEHOLDER_EMAILS:
+        return True
+    dom = e.rsplit('@', 1)[1]
+    if dom in ('localhost', 'tak.local') or dom.endswith('.local') or dom.endswith('.localhost'):
+        return True
+    if username == 'webadmin' and e.split('@', 1)[0] == 'webadmin':
+        fq = ((settings or load_settings()).get('fqdn') or '').strip().split(':')[0].lower()
+        if fq and dom == fq:
+            return True
+    return False
+
+
+def _ak_admin_recovery_email_notes():
+    """Deploy/update-log notes (tagged AK_ACTION_NEEDED) for each protected admin whose
+    recovery email is a placeholder. Never raises; [] when Authentik can't be read."""
+    out = []
+    try:
+        ak_url, ak_headers, settings = _w1_ak_ctx()
+        if not ak_url:
+            return out
+        for username in _AUTHENTIK_RECOVERABLE_USERS:
+            res = _w1_ak_get(ak_url, f'core/users/?username={username}', ak_headers).get('results', [])
+            u = next((x for x in res if x.get('username') == username), None)
+            if u and _ak_admin_email_is_placeholder(username, u.get('email'), settings):
+                out.append(f"  \u26a0 {AK_ACTION_NEEDED} {username} has no real recovery email "
+                           f"({u.get('email') or 'empty'}) \u2014 a password reset cannot reach you. "
+                           f"Set one on the Authentik page \u2192 Protected admin accounts.")
+    except Exception:
+        pass
+    return out
+
+
+@app.route('/api/authentik/admin-email', methods=['POST'])
+@login_required
+def authentik_admin_email_api():
+    """Set the recovery email of a protected admin account (akadmin / webadmin) through
+    the Authentik admin API. Only that one field is written."""
+    data = request.get_json(silent=True) or {}
+    username = (data.get('user') or '').strip()
+    email = (data.get('email') or '').strip()
+    if username not in _AUTHENTIK_RECOVERABLE_USERS:
+        return jsonify({'success': False, 'message': 'Only akadmin or webadmin.'}), 400
+    if len(email) > 254 or not _AK_ADMIN_EMAIL_RE.fullmatch(email):
+        return jsonify({'success': False, 'message': 'That is not a valid email address.'}), 400
+    if _ak_admin_email_is_placeholder(username, email):
+        return jsonify({'success': False, 'message': 'Use an address that receives mail — this one is a placeholder.'}), 400
+    ak_url, ak_headers, _settings = _w1_ak_ctx()
+    if not ak_url:
+        return jsonify({'success': False, 'message': 'Authentik is not deployed or has no API token.'}), 400
+    try:
+        res = _w1_ak_get(ak_url, f'core/users/?username={username}', ak_headers).get('results', [])
+        u = next((x for x in res if x.get('username') == username), None)
+        if not u:
+            return jsonify({'success': False, 'message': f'{username} does not exist in Authentik.'}), 404
+        _ak_api_call(f"{ak_url}/api/v3/core/users/{u['pk']}/", headers=ak_headers,
+                     data=json.dumps({'email': email}).encode(), method='PATCH')
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Authentik API error: {str(e)[:160]}'}), 502
+    audit('authentik:admin-recovery-email', f'{username} recovery email changed', force=True)
+    if username == 'webadmin':
+        _webadmin_email_status(force=True)
+    print(f"[authentik] {username} recovery email set by operator", flush=True)
+    return jsonify({'success': True, 'message': f'{username} recovery email saved.'})
+
+
+# ── webadmin recovery-email banner + Guard Dog reminder (2026-11-23) ──────────────
+# webadmin is the account operators sign in to the console with when it sits behind
+# Authentik SSO. With a made-up email it cannot recover its own password, and a lockout
+# locks the operator out of the console too (test12, 2026-11-23). So until its email is
+# real, every console page shows a banner with the steps, and Guard Dog mails the alert
+# address. The banner clears when Authentik shows a real address — checked live, never
+# a click that only claims it — or when the operator says the current address does
+# receive mail (stored with that address, so a later change re-arms the check).
+WEBADMIN_EMAIL_CACHE_S = 300
+WEBADMIN_EMAIL_REMIND_S = 72 * 3600
+_webadmin_email_lock = threading.Lock()
+_webadmin_email_state = {'at': 0.0, 'result': None}
+
+
+def _webadmin_email_status(force=False):
+    """{'needs_action': bool, 'email': str, 'authentik_url': str}. needs_action is False
+    whenever it cannot be read (no Authentik, no webadmin, API down) — no false alarms."""
+    now = time.time()
+    with _webadmin_email_lock:
+        cached = _webadmin_email_state['result']
+        if cached and not force and now - _webadmin_email_state['at'] < WEBADMIN_EMAIL_CACHE_S:
+            return cached
+    result = {'needs_action': False, 'email': '', 'authentik_url': ''}
+    try:
+        ak_url, ak_headers, settings = _w1_ak_ctx()
+        if ak_url and os.path.exists('/opt/tak'):
+            res = _w1_ak_get(ak_url, 'core/users/?username=webadmin', ak_headers).get('results', [])
+            u = next((x for x in res if x.get('username') == 'webadmin'), None)
+            if u:
+                email = (u.get('email') or '').strip()
+                acked = (settings.get('webadmin_email_ack') or '') == email and bool(email)
+                result = {'needs_action': _ak_admin_email_is_placeholder('webadmin', email, settings) and not acked,
+                          'email': email, 'authentik_url': _get_authentik_base_url(settings)}
+    except Exception:
+        pass
+    with _webadmin_email_lock:
+        _webadmin_email_state.update(at=now, result=result)
+    return result
+
+
+def _webadmin_email_remind_tick():
+    """Mail the Guard Dog alert address while webadmin's email is a placeholder: at once,
+    then every WEBADMIN_EMAIL_REMIND_S until it is fixed. Never raises."""
+    try:
+        st = _webadmin_email_status(force=True)
+        if not st.get('needs_action'):
+            return
+        settings = load_settings()
+        to_addr = (settings.get('guarddog_alert_email') or '').strip()
+        last = float(settings.get('webadmin_email_reminder_last') or 0)
+        if not to_addr or time.time() - last < WEBADMIN_EMAIL_REMIND_S:
+            return
+        host = (settings.get('fqdn') or settings.get('server_ip') or 'this server')
+        body = '\n'.join([
+            f'ACTION NEEDED on {host}: give the webadmin account a real email address.',
+            '',
+            f"webadmin's email in Authentik is {st.get('email') or '(empty)'}. infra-TAK made",
+            'this address up, and nobody receives mail there. If you forget the webadmin',
+            'password, "Forgot password?" cannot reach you, and you can be locked out of the',
+            'infra-TAK console.',
+            '',
+            'How to fix it (2 minutes):',
+            f"1. Open Authentik: {st.get('authentik_url') or 'the Authentik link on the console'}",
+            '   and sign in as webadmin (or akadmin).',
+            '2. Click "Admin interface" (top right). Do NOT use the user Settings page:',
+            '   it says "Not allowed to change email address".',
+            '3. Go to Directory -> Users -> webadmin -> Edit User.',
+            '4. In Email, type an address you read. Click Save Changes.',
+            '5. In the infra-TAK console, type "I have changed email" in the box on the',
+            '   yellow banner, then click Confirm. The banner and these emails stop.',
+            '',
+            'Password reset email also needs Email Relay to be set up.',
+            '',
+            'Guard Dog sends this reminder every 3 days until the email is changed.',
+        ])
+        if _guarddog_send_alert_email_via_relay(to_addr, f'[{host}] Action needed: set a real email for webadmin', body):
+            settings = load_settings()
+            settings['webadmin_email_reminder_last'] = int(time.time())
+            save_settings(settings)
+            print('[guarddog] webadmin recovery-email reminder sent', flush=True)
+    except Exception as e:
+        print(f'[guarddog] webadmin recovery-email reminder error (non-fatal): {str(e)[:120]}', flush=True)
+
+
+def _webadmin_email_watch():
+    """Background: first check a few minutes after start, then hourly."""
+    time.sleep(240)
+    while True:
+        _webadmin_email_remind_tick()
+        time.sleep(3600)
+
+
+@app.route('/api/authentik/webadmin-email-status')
+@login_required
+def authentik_webadmin_email_status_api():
+    """Drives the webadmin recovery-email banner on the console pages."""
+    return jsonify(_webadmin_email_status())
+
+
+@app.route('/api/authentik/webadmin-email-confirm', methods=['POST'])
+@login_required
+def authentik_webadmin_email_confirm_api():
+    """"I have changed the email": re-read Authentik now. Clears only when Authentik shows a
+    real address, or when keep=true (the operator says the current address receives mail)."""
+    data = request.get_json(silent=True) or {}
+    # Deliberate on purpose (operator decision 2026-11-23): the operator types the phrase,
+    # it is not a one-click dismiss. The keep path has its own confirm dialog.
+    if data.get('keep') is not True:
+        _phrase = ' '.join(str(data.get('phrase') or '').split()).lower()
+        if _phrase != 'i have changed email':
+            return jsonify({'success': False, 'message': 'Type "I have changed email" in the box first.'}), 400
+    st = _webadmin_email_status(force=True)
+    if not st.get('needs_action'):
+        return jsonify({'success': True, 'message': 'Thanks — webadmin has a real recovery email now.'})
+    if data.get('keep') is True and st.get('email'):
+        settings = load_settings()
+        settings['webadmin_email_ack'] = st['email']
+        save_settings(settings)
+        audit('authentik:webadmin-email-ack', f"operator kept {st['email']}", force=True)
+        _webadmin_email_status(force=True)
+        return jsonify({'success': True, 'message': f"OK — keeping {st['email']}."})
+    return jsonify({'success': False,
+                    'message': (f"Authentik still shows {st.get('email') or 'no email'} for webadmin. "
+                                "Save the new address in Authentik (Admin interface → Directory → Users → "
+                                "webadmin → Edit User), then click this again.")})
+
+
 def _get_authentik_admin_accounts_status():
     """Return is_active/is_superuser for the protected admin accounts (akadmin, webadmin).
 
@@ -89261,6 +89498,9 @@ def _get_authentik_admin_accounts_status():
                     entry['exists'] = True
                     entry['is_active'] = bool(user_obj.get('is_active'))
                     entry['is_superuser'] = bool(user_obj.get('is_superuser'))
+                    entry['email'] = user_obj.get('email') or ''
+                    entry['email_placeholder'] = _ak_admin_email_is_placeholder(
+                        username, entry['email'], settings)
             except _err.HTTPError as e:
                 entry['error'] = f'Authentik API {e.code}'
                 if e.code in (401, 403):
@@ -89272,7 +89512,12 @@ def _get_authentik_admin_accounts_status():
 
     # If every API result is clean (no error), trust it.
     if api_attempted and not any(a.get('error') for a in api_accounts):
-        return {'available': True, 'source': 'api', 'accounts': api_accounts}
+        try:
+            _smtp = _authentik_smtp_configured()
+        except Exception:
+            _smtp = None
+        return {'available': True, 'source': 'api', 'accounts': api_accounts,
+                'smtp_configured': _smtp}
 
     # API failed (or token missing). Try ak shell fallback. This is the path
     # that recovers the panel when akadmin is deactivated.
@@ -121580,6 +121825,12 @@ def _startup_migrations():
                              name='authentik-group-names').start()
         except Exception as _gn_err:
             print(f"Startup: Authentik group name watch start error (non-fatal): {_gn_err}")
+        # webadmin recovery email: Guard Dog reminder until it is a real address.
+        try:
+            threading.Thread(target=_webadmin_email_watch, daemon=True,
+                             name='webadmin-email-watch').start()
+        except Exception as _we_err:
+            print(f"Startup: webadmin email watch start error (non-fatal): {_we_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
