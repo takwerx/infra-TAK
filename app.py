@@ -42126,7 +42126,9 @@ def _caddy_forward_auth_lines(ak_up, indent, copy_headers='', matcher='', app=''
     copy_headers: the X-Authentik-* names handed on to the backend ('' for none).
     matcher: a named matcher such as '@needs_sso' ('' for every request).
     app: the Authentik application slug of this site ('' when it is not known). With it, a
-    request passes only when the outpost answered for that application (ops #1108)."""
+    request passes only when the outpost answered for that application (ops #1108). Give an
+    application only where the lines land in a `route` (written order); in a `handle` Caddy
+    sorts directives and the compare would run before the check."""
     locked = isinstance(app, str) and bool(_CADDY_APP_SLUG_RE.fullmatch(app))
     # With an application the backend still gets only the headers it got before, unless it
     # asked for this one (TAK Portal does).
@@ -42160,21 +42162,25 @@ def _caddy_forward_auth_lines(ak_up, indent, copy_headers='', matcher='', app=''
 def _caddy_app_lock_map(providers):
     """{site host[:port]: application slug} from Authentik's proxy provider list (ops #1108).
     Only a forward_single provider with an application counts: only there is the site of a
-    request the provider's own external_host. A host that two providers name gets no entry,
-    because nobody can say which application the outpost answers for."""
-    found, twice = {}, set()
+    request the provider's own external_host. No entry for:
+    - a host that two providers of any kind name (nobody can say which one answers),
+    - a provider with unauthenticated paths (skip_path_regex): the outpost passes those
+      with no application named, and the compare would refuse them."""
+    found, named = {}, {}
     for p in providers or []:
-        if not isinstance(p, dict) or p.get('mode') != 'forward_single':
+        if not isinstance(p, dict):
             continue
-        slug = p.get('assigned_application_slug') or ''
         m = re.fullmatch(r'https?://([^/\s]+)/?', (p.get('external_host') or '').strip())
-        if not m or not isinstance(slug, str) or not _CADDY_APP_SLUG_RE.fullmatch(slug):
+        if not m:
             continue
         host = m.group(1).lower()
-        if host in found:
-            twice.add(host)
-        found[host] = slug
-    return {h: s for h, s in found.items() if h not in twice}
+        named[host] = named.get(host, 0) + 1
+        slug = p.get('assigned_application_slug') or ''
+        if (p.get('mode') == 'forward_single' and isinstance(slug, str)
+                and _CADDY_APP_SLUG_RE.fullmatch(slug)
+                and not str(p.get('skip_path_regex') or '').strip()):
+            found[host] = slug
+    return {h: s for h, s in found.items() if named[h] == 1}
 
 
 def _caddy_app_lock_saved():
@@ -42237,12 +42243,13 @@ def _caddy_app_lock_refresh(plog=None, timeout=20, retries=2):
 
 def _caddy_app_lock_apps():
     """The {site: application slug} map for generate_caddyfile(). It asks Authentik at most
-    once in 5 minutes (one short try), so a module deploy that made a new application gets
-    its compare with the Caddyfile that the deploy writes. Otherwise the saved map."""
+    once in 5 minutes (one short try; again after 30 seconds when there was no answer), and
+    at once after a deploy put a provider on the outpost (_outpost_add_providers_safe).
+    Otherwise the saved map. A site made in between gets its compare at the next build."""
     now = time.time()
     if now - _caddy_app_lock_cache['ts'] >= 300:
-        _caddy_app_lock_cache['ts'] = now
         apps = _caddy_app_lock_refresh(timeout=5, retries=1)
+        _caddy_app_lock_cache['ts'] = now if apps is not None else now - 270
         if apps is not None:
             return apps
     return _caddy_app_lock_saved()
@@ -42273,25 +42280,32 @@ def _caddy_app_lock_converge(plog=None):
         if not os.path.exists(CADDYFILE_PATH):
             return
         before = _caddy_app_lock_saved()
-        apps = _caddy_app_lock_refresh(log)
+        # An earlier Caddyfile build of this console start can have saved the names and
+        # written the compares already, with no reload: then Caddy still gets the file below.
+        built_before = _caddy_app_lock_cache['ts'] > 0
+        apps = _caddy_app_lock_refresh(log, timeout=10)
         if apps is None:
             return
         _caddy_app_lock_cache['ts'] = time.time()
         s = load_settings()
         if not (s.get('fqdn') or '').strip():
             return
-        if apps == before and (not apps or _caddyfile_app_locks(_read_priv(CADDYFILE_PATH))):
+        build = apps != before or bool(apps and not _caddyfile_app_locks(_read_priv(CADDYFILE_PATH)))
+        if not build and not built_before:
             return
-        generate_caddyfile(s)
+        if build:
+            generate_caddyfile(s)
         if not _CADDY_REGISTRY_READY.is_set():
-            log('sign-in application compare queued: written with the post-registry '
-                'Caddyfile regen (ops #1108).')
+            if build:
+                log('sign-in application compare queued: written with the post-registry '
+                    'Caddyfile regen (ops #1108).')
             return
-        now = _caddyfile_app_locks(_read_priv(CADDYFILE_PATH))
         _ok, _detail = _caddy_reload_if_changed(timeout=60)
-        log('sign-in application compare: %d site(s) (%s), Caddy %s (ops #1108).'
-            % (len(now), ', '.join(now) or 'none',
-               'reloaded' if _ok else 'reload FAILED: ' + _detail[:120]))
+        if build or not _ok:
+            now = _caddyfile_app_locks(_read_priv(CADDYFILE_PATH))
+            log('sign-in application compare: %d site(s) (%s), Caddy %s (ops #1108).'
+                % (len(now), ', '.join(now) or 'none',
+                   'reloaded' if _ok else 'reload FAILED: ' + _detail[:120]))
     except Exception as e:
         log('sign-in application compare: converge error (non-fatal): %s' % str(e)[:160])
 
@@ -43552,8 +43566,10 @@ def generate_caddyfile(settings=None):
                 lines.append(f"        handle {{")
                 _emit_outpost_callback_rescue(f"{_pub_url(fh_host, settings)}/")
                 lines.append(f"            reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-                lines.extend(_caddy_forward_auth_lines(ak_up, "            ", _CADDY_AK_COPY_HEADERS,
-                                                       app=_fa_app(fh_host)))
+                # No application compare here (ops #1108): this check sits in a `handle`,
+                # where Caddy sorts the directives, and the compare needs the written order
+                # of a `route`. Federation Hub has its own sign-in behind this one.
+                lines.extend(_caddy_forward_auth_lines(ak_up, "            ", _CADDY_AK_COPY_HEADERS))
                 for rp_line in fh_rp_block:
                     lines.append(f"            {rp_line}")
                 lines.append(f"        }}")
@@ -66673,6 +66689,10 @@ def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=No
     new host (it won't hot-reload on its own — Authentik 'Not Found' otherwise)."""
     if not provider_pks_to_add:
         return False
+    try:
+        _caddy_app_lock_cache['ts'] = 0.0      # ops #1108: the next Caddyfile build asks again
+    except Exception:
+        pass
     import urllib.request as _req
     _log = plog or (lambda m: None)
     try:
@@ -120041,7 +120061,8 @@ def _startup_migrations():
                         # if it is emitted, the secret injection must be too. The
                         # client strip must be present in every posture.
                         _pa_ok = bool(_cf) and 'request_header -X-Infratak-Proxy-Auth' in _cf and \
-                            ('forward_auth @needs_sso' not in _cf
+                            (('forward_auth @needs_sso' not in _cf
+                              and 'route @needs_sso' not in _cf)    # ops #1108 form
                              or 'request_header @needs_sso X-Infratak-Proxy-Auth' in _cf) and \
                             'route /api/console/restart-safe*' in _cf  # S2 edge block rides the same regen
                         if _pa_ok:

@@ -199,12 +199,18 @@ def test_a_name_that_is_not_a_slug_writes_no_compare():
 
 def test_generate_caddyfile_gives_every_site_its_own_application():
     src = _func_src('generate_caddyfile')
-    for host in ('infratak_host', 'nodered_host', 'portal_host', 'mtx_host', 'fh_host',
-                 'wo_host', 'at_host'):
+    for host in ('infratak_host', 'nodered_host', 'portal_host', 'mtx_host', 'wo_host', 'at_host'):
         assert src.count(f'app=_fa_app({host})') == 1, host
-    # five direct calls of the writer, each with an application
-    calls = re.findall(r'_caddy_forward_auth_lines\((.*?)\)\)', src, re.S)
-    assert len(calls) == 5 and all('app=_fa_app(' in c for c in calls), calls
+    # five direct calls of the writer. Four give an application. The Federation Hub one does
+    # not: its check sits in a `handle`, where Caddy sorts the directives, so the compare
+    # would run before the check and refuse every request.
+    calls = re.findall(r'_caddy_forward_auth_lines\((.*?)\)\)\n', src, re.S)
+    assert len(calls) == 5, calls
+    assert [('app=_fa_app(' in c) for c in calls] == [True, True, False, True, True], calls
+    assert 'app=_fa_app(fh_host)' not in src
+    # every check that gets an application is a direct line of the site's `route` block
+    # (8 spaces); the Federation Hub one is one level deeper, in its `handle`
+    assert [c.split(',')[1].strip() for c in calls] == ['"        "'] * 2 + ['"            "'] + ['"        "'] * 2
     # a failed lookup never stops the Caddyfile build
     look = src[src.index('_fa_apps = _caddy_app_lock_apps()') - 40:src.index('def _fa_app(host):')]
     assert 'try:' in look and 'except Exception:' in look
@@ -232,6 +238,15 @@ def test_the_map_is_built_from_authentik_provider_list_only():
     # two providers on one host: nobody knows which one answers, so no compare there
     assert build([_prov('https://a.example.com', 'one'), _prov('https://A.example.com', 'two'),
                   _prov('https://b.example.com', 'b')]) == {'b.example.com': 'b'}
+    # also when the second one is of another kind or has no application
+    assert build([_prov('https://a.example.com', 'one'),
+                  _prov('https://a.example.com', 'dom', 'forward_domain')]) == {}
+    assert build([_prov('https://a.example.com', 'one'), _prov('https://a.example.com', '', 'proxy')]) == {}
+    # a provider with unauthenticated paths: the outpost passes those with no application
+    # named, so a compare would refuse them
+    skip = dict(_prov('https://hook.example.com', 'hook'), skip_path_regex='^/webhook/.*')
+    assert build([skip, _prov('https://b.example.com', 'b')]) == {'b.example.com': 'b'}
+    assert build([dict(skip, skip_path_regex='  ')]) == {'hook.example.com': 'hook'}
     assert build(None) == {} and build([]) == {}
 
 
@@ -326,6 +341,19 @@ def test_the_caddyfile_build_asks_authentik_at_most_once_in_five_minutes(tmp_pat
     answer['v'] = OSError('down')
     clock['t'] += 301
     assert apps() == {'nodered.example.com': 'renamed'} and len(calls) == 3
+    # no answer: it asks again after 30 seconds, not 5 minutes
+    clock['t'] += 29
+    assert apps() == {'nodered.example.com': 'renamed'} and len(calls) == 3
+    clock['t'] += 2
+    assert apps() == {'nodered.example.com': 'renamed'} and len(calls) == 4
+
+
+def test_a_deploy_that_puts_a_provider_on_the_outpost_makes_the_next_build_ask_again():
+    src = _func_src('_outpost_add_providers_safe')
+    assert "_caddy_app_lock_cache['ts'] = 0.0" in src
+    # a missing name in a cut-out copy of the function (other tests) must not stop it
+    head = src[:src.index("_caddy_app_lock_cache['ts'] = 0.0") + 60]
+    assert 'try:' in head and 'except Exception:' in src[len(head) - 60:len(head) + 60]
 
 
 # --- existing boxes ---------------------------------------------------------------------------
@@ -368,9 +396,19 @@ def test_an_existing_box_gets_the_compare_when_authentik_answers(tmp_path, monke
     assert did['generate'] == 1 and did['reload'] == 1
     assert ns['_caddyfile_app_locks'](cf.read_text()) == ['node-red']
     assert any('1 site(s) (node-red)' in m for m in did['log']), did['log']
-    # nothing changed: the next start writes nothing and reloads nothing
+    # nothing changed: the next run writes nothing
     ns['_caddy_app_lock_converge'](log)
-    assert did['generate'] == 1 and did['reload'] == 1
+    assert did['generate'] == 1
+    # a fresh console start with nothing changed writes nothing and reloads nothing
+    ns['_caddy_app_lock_cache']['ts'] = 0.0
+    reloads = did['reload']
+    ns['_caddy_app_lock_converge'](log)
+    assert did['generate'] == 1 and did['reload'] == reloads
+    # an earlier Caddyfile build of this start already wrote the compares, with no reload:
+    # the converge writes nothing more and still hands the file to Caddy
+    ns['_caddy_app_lock_cache']['ts'] = time.time()
+    ns['_caddy_app_lock_converge'](log)
+    assert did['generate'] == 1 and did['reload'] == reloads + 1
     # Authentik gives no answer: nothing is written, the compare stays
     answer['v'] = OSError('down')
     ns['_caddy_app_lock_converge'](log)
@@ -406,6 +444,22 @@ def test_the_converge_runs_at_console_start_and_after_an_update():
     post = APP[APP.index('def _post_update_auto_deploy():'):]
     heal = post.index('_heal_authentik_proxy_chain_all_services(')
     assert heal < post.index('_caddy_app_lock_converge(', heal) < heal + 1200
+
+
+def test_the_proxy_auth_gate_check_reads_both_forms_of_the_console_check():
+    """The startup step that arms the console's proxy-auth secret looks for the console's
+    sign-in check in the built Caddyfile. With an application the check is written as
+    `route @needs_sso {`, so the step must know that form too, or it arms with no secret."""
+    mig = APP[APP.index('def _startup_migrations():'):]
+    gate = mig[mig.index("'request_header -X-Infratak-Proxy-Auth' in _cf"):][:600]
+    assert "'forward_auth @needs_sso' not in _cf" in gate
+    assert "'route @needs_sso' not in _cf" in gate
+    assert "or 'request_header @needs_sso X-Infratak-Proxy-Auth' in _cf" in gate
+    # and the two forms are what the writer really emits
+    ns = _ns()
+    fa = _need(ns, '_caddy_forward_auth_lines')
+    assert any(l.startswith('forward_auth @needs_sso ') for l in fa(AK, '', COPY5, '@needs_sso'))
+    assert 'route @needs_sso {' in _with_app(fa, AK, '', COPY5, '@needs_sso', app='infratak')
 
 
 # --- what Caddy does with it --------------------------------------------------------------------
