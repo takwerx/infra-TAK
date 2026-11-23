@@ -4872,19 +4872,20 @@ def _proxy_auth_state(create=False):
 # an Authentik superuser, who can join that group at will). The Authentik application
 # policy says the same thing; the console checks it too, so neither depends on the other.
 #
-# Two sources, in this order:
-#   1. Authentik's user API, asked with the box's own token. It is the live answer, so a
-#      session also ends after the person is removed from the group or deactivated.
-#      (The outpost keeps the group list from sign-in time, and /api/* does not pass
-#      forward_auth, see generate_caddyfile.)
-#   2. When the API gives no answer (Authentik restarting, token unusable): the
-#      X-Authentik-Groups header on a request that passed forward_auth, and for a session
-#      that already exists, a short time limit since Authentik last confirmed it.
-# A clear "no" from the API always wins. No answer never lets a new person in without the
-# group header, and never keeps a session past SSO_UNCONFIRMED_MAX_SECONDS.
+# One source: Authentik's user API, asked with the box's own token. It is the live
+# answer, so a session also ends after the person is removed from the group or
+# deactivated. (The outpost keeps the group list from sign-in time, and /api/* does not
+# pass forward_auth, see generate_caddyfile.)
 #
-# Header format: https://docs.goauthentik.io/add-secure-apps/providers/proxy/
-# ("X-authentik-groups: foo|bar|baz ... separated by a pipe").
+# When the API gives no answer (Authentik restarting, token unusable), only a person the
+# API confirmed in the last SSO_UNCONFIRMED_MAX_SECONDS is let in or kept. Nobody else
+# gets a session from Authentik sign-in until it answers; the console password still
+# works.
+#
+# ops #1082: the X-Authentik-Groups header is not read here. The outpost joins the group
+# names with "|" into one value and a group name is free text that may hold "|" itself,
+# so a split of the header does not give back the exact names. Header format:
+# https://docs.goauthentik.io/add-secure-apps/providers/proxy/
 CONSOLE_SSO_ADMIN_GROUP = 'authentik Admins'
 SSO_RECHECK_SECONDS = 60            # ask Authentik again at most this often per user
 SSO_UNKNOWN_RETRY_SECONDS = 20      # after no answer, wait this long before the next try
@@ -4897,11 +4898,6 @@ _sso_dir_cache = {}       # username -> (verdict, time checked)
 _sso_dir_inflight = {}    # username -> Thread
 _sso_dir_last_admin = {}  # username -> time the API last said 'admin'
 _sso_dir_ctx = {'at': 0.0, 'url': None, 'headers': None}
-
-
-def _authentik_header_groups(raw):
-    """Group names from an X-Authentik-Groups header value (pipe separated)."""
-    return {p.strip() for p in str(raw or '').split('|') if p.strip()}
 
 
 def _sso_directory_ctx(drop=False):
@@ -5001,15 +4997,26 @@ def _sso_directory_verdict(uname):
     return 'unknown'
 
 
-def _sso_user_is_console_admin(uname, groups_header):
+def _sso_user_is_console_admin(uname):
     """May this Authentik user, on a request that passed forward_auth, have a console
-    session? The API answer decides; with no answer, the group header does."""
+    session? Authentik's API decides. Returns 'admin' (it says so now), 'held' (no answer
+    now, and it said so within SSO_UNCONFIRMED_MAX_SECONDS), 'denied' (a clear no) or ''
+    (no answer and nothing recent). Only the first two open the console."""
     verdict = _sso_directory_verdict(uname)
-    if verdict == 'admin':
-        return True
-    if verdict == 'denied':
-        return False
-    return CONSOLE_SSO_ADMIN_GROUP in _authentik_header_groups(groups_header)
+    if verdict in ('admin', 'denied'):
+        return verdict
+    try:
+        seen = 0
+        if (session.get('authenticated') and _session_made_by_sso()
+                and session.get('authentik_username') == uname):
+            seen = int(session.get('sso_ok_at') or 0)
+    except (TypeError, ValueError):
+        seen = 0
+    with _sso_dir_lock:
+        seen = max(seen, int(_sso_dir_last_admin.get(uname) or 0))
+    if seen and 0 <= int(time.time()) - seen <= SSO_UNCONFIRMED_MAX_SECONDS:
+        return 'held'
+    return ''
 
 
 def _session_made_by_sso():
@@ -5059,6 +5066,11 @@ def _sso_denied_message():
     uname = request.environ.get('infratak.sso_denied')
     if not uname:
         return None
+    if request.environ.get('infratak.sso_denied_reason') == 'no-answer':
+        return ('You are signed in to Authentik as %s, but Authentik did not answer when '
+                'the console asked if this account is an infra-TAK administrator, so the '
+                'console did not open. Try again in a minute. You can also sign in here '
+                'with the console password.' % uname)
     return ('You are signed in to Authentik as %s, but this account is not an infra-TAK '
             'administrator, so the console did not open. An administrator can add the '
             'account to the "%s" group in Authentik (Admin, Groups). If that was done '
@@ -5097,18 +5109,35 @@ def _apply_authentik_session():
     # ops #813: passing forward_auth proves who the person is, not that they may run the
     # console. Only a console administrator gets a session here.
     _had_password_session = bool(session.get('authenticated')) and not _session_made_by_sso()
-    if not _sso_user_is_console_admin(uname, request.headers.get('X-Authentik-Groups')):
+    _sso_verdict = _sso_user_is_console_admin(uname)
+    if _sso_verdict not in ('admin', 'held'):
         request.environ['infratak.sso_denied'] = uname
+        if not _sso_verdict:
+            request.environ['infratak.sso_denied_reason'] = 'no-answer'
         if session.get('authenticated') and not _had_password_session:
             session.clear()   # an Authentik-made session of someone who is no longer an administrator
-        audit('auth:sso-denied', '%s: not a console administrator in Authentik' % uname)
+        audit('auth:sso-denied', '%s: %s' % (
+            uname, 'not a console administrator in Authentik' if _sso_verdict
+            else 'Authentik gave no answer, and none in the last %d minutes'
+            % (SSO_UNCONFIRMED_MAX_SECONDS // 60)))
         return False
+    # 'held' keeps the time of the last real answer, so it cannot renew itself.
+    if _sso_verdict == 'admin':
+        _sso_ok_at = int(time.time())
+    else:
+        try:
+            _sso_ok_at = int(session.get('sso_ok_at') or 0) if (
+                not _had_password_session and session.get('authentik_username') == uname) else 0
+        except (TypeError, ValueError):
+            _sso_ok_at = 0
+        with _sso_dir_lock:
+            _sso_ok_at = max(_sso_ok_at, int(_sso_dir_last_admin.get(uname) or 0))
     session['authenticated'] = True
     session['authentik_username'] = uname
     # A session the console password made stays a password session: the password is its
     # own proof and does not depend on Authentik.
     session['auth_via'] = 'password' if _had_password_session else 'sso'
-    session['sso_ok_at'] = int(time.time())
+    session['sso_ok_at'] = _sso_ok_at
     _stamp_session_login()   # ops #634
     _stamp_notice_login(False)
     # v10.1.40: stamp the idle clock at the moment SSO authenticates.
@@ -89233,6 +89262,116 @@ def authentik_admin_accounts_api():
     return jsonify(_get_authentik_admin_accounts_status())
 
 
+# ops #1082: group names that another program can read as a different group.
+#
+# Authentik gives a signed-in person's groups to the app behind it as ONE header value,
+# the names joined with "|" (https://docs.goauthentik.io/add-secure-apps/providers/proxy/),
+# and an Authentik group name is free text. An app that splits that value (some also
+# split on ";" and ",") reads a group named "a|b" as the two groups "a" and "b". The
+# console and the stream site do not read the header for that reason (they ask Authentik
+# for the exact list), but other apps behind Authentik do. So the console looks for such
+# names, says so in its log and on the Authentik page, and leaves the group alone: a
+# rename by the console could break the TAK group it maps to.
+AK_GROUP_NAME_SEPARATORS = '|;,'
+AK_GROUP_NAME_SCAN_SECONDS = 1800     # the background check
+AK_GROUP_NAME_PAGE_SECONDS = 120      # the Authentik page asks again at most this often
+_ak_group_names_lock = threading.Lock()
+_ak_group_names_state = {'at': 0.0, 'result': None, 'logged': set()}
+
+
+def _ak_group_name_findings(names):
+    """Which of `names` can be read as other groups. A name is listed when it holds "|"
+    (the header's own separator), or when a part of it between "|", ";" or "," is the
+    name of ANOTHER group (compared without case and outer spaces, as such readers do).
+    Returns [{'name': ..., 'reads_as': [other group names]}], sorted by name."""
+    names = [n for n in names if isinstance(n, str) and n]
+    by_key = {}
+    for n in names:
+        by_key.setdefault(n.strip().lower(), n)
+    by_key.setdefault(CONSOLE_SSO_ADMIN_GROUP.lower(), CONSOLE_SSO_ADMIN_GROUP)
+    out = []
+    for n in sorted(set(names)):
+        if not any(c in n for c in AK_GROUP_NAME_SEPARATORS):
+            continue
+        parts = [n]
+        for sep in AK_GROUP_NAME_SEPARATORS:
+            parts = [q for part in parts for q in part.split(sep)]
+        own = n.strip().lower()
+        reads_as = []
+        for part in parts:
+            key = part.strip().lower()
+            if key and key != own and key in by_key and by_key[key] not in reads_as:
+                reads_as.append(by_key[key])
+        if '|' in n or reads_as:
+            out.append({'name': n, 'reads_as': reads_as})
+    return out
+
+
+def _ak_group_names_scan(force=False, max_age=AK_GROUP_NAME_SCAN_SECONDS):
+    """Read every Authentik group name and return
+    {'available': True, 'findings': [...], 'checked_at': epoch} or
+    {'available': False, 'error': ...}. Cached; each finding is logged and audited once
+    per console run. Never raises."""
+    now = time.time()
+    with _ak_group_names_lock:
+        cached = _ak_group_names_state['result']
+        if cached and not force and now - _ak_group_names_state['at'] < max_age:
+            return cached
+    try:
+        ak_url, ak_headers, _settings = _w1_ak_ctx()
+        if not ak_url:
+            return {'available': False, 'error': 'Authentik is not deployed or has no API token'}
+        names, page = [], 1
+        while page and page <= 200:
+            data = _w1_ak_get(
+                ak_url, 'core/groups/?include_users=false&page_size=100&page=%d' % page,
+                ak_headers)
+            for g in (data.get('results') or []):
+                if isinstance(g, dict) and isinstance(g.get('name'), str):
+                    names.append(g['name'])
+            page = (data.get('pagination') or {}).get('next') or 0
+        result = {'available': True, 'findings': _ak_group_name_findings(names),
+                  'groups_checked': len(names), 'checked_at': int(now)}
+    except Exception as e:
+        return {'available': False, 'error': f'Could not read the groups from Authentik: {str(e)[:120]}'}
+    with _ak_group_names_lock:
+        _ak_group_names_state.update(at=now, result=result)
+        fresh = [f for f in result['findings'] if f['name'] not in _ak_group_names_state['logged']]
+        _ak_group_names_state['logged'].update(f['name'] for f in fresh)
+    for f in fresh:
+        detail = ('%r can be read as %s' % (f['name'], ', '.join(repr(x) for x in f['reads_as']))
+                  if f['reads_as'] else '%r holds the separator "|"' % f['name'])
+        print('[authentik] \u26a0 GROUP NAME WARNING: the Authentik group %s by an app that '
+              'splits the group list. If you did not make this group on purpose, look at who '
+              'made it and who is in it (Authentik Admin, Directory, Groups), then rename or '
+              'delete it.' % detail, flush=True)
+        try:
+            audit('authentik:group-name-separator', detail, force=True)
+        except Exception:
+            pass
+    return result
+
+
+def _ak_group_names_watch():
+    """Background check: a first look soon after the console starts, then one every
+    AK_GROUP_NAME_SCAN_SECONDS."""
+    time.sleep(120)
+    while True:
+        try:
+            _ak_group_names_scan(force=True)
+        except Exception:
+            pass
+        time.sleep(AK_GROUP_NAME_SCAN_SECONDS)
+
+
+@app.route('/api/authentik/group-names')
+@login_required
+def authentik_group_names_api():
+    """ops #1082: Authentik groups whose name can be read as another group. Drives the
+    warning on /authentik, which shows only when there is one."""
+    return jsonify(_ak_group_names_scan(max_age=AK_GROUP_NAME_PAGE_SECONDS))
+
+
 @app.route('/api/authentik/audit-log')
 @login_required
 def authentik_audit_log_api():
@@ -120444,6 +120583,12 @@ def _startup_migrations():
                              name='coturn-converge').start()
         except Exception as _ct_err:
             print(f"Startup migration: CoTURN converge start error (non-fatal): {_ct_err}")
+        # ops #1082: watch Authentik for group names that read as another group.
+        try:
+            threading.Thread(target=_ak_group_names_watch, daemon=True,
+                             name='authentik-group-names').start()
+        except Exception as _gn_err:
+            print(f"Startup: Authentik group name watch start error (non-fatal): {_gn_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
