@@ -150,6 +150,11 @@
 <div id="admin-accounts-msg" style="margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:11px;display:none"></div>
 <div style="margin-top:6px;font-size:10px;color:var(--text-dim);line-height:1.5">If <strong>akadmin</strong> or <strong>webadmin</strong> shows <span style="color:var(--red)">DEACTIVATED</span> (e.g. someone clicked Deactivate in TAK Portal or the Authentik UI), click Reactivate to restore login. Tries Authentik API first, falls back to <code style="color:var(--cyan)">docker exec authentik-server-1 ak shell</code>.</div>
 </div>
+<div id="group-names-warning" style="display:none;margin-top:14px;padding:12px 14px;border:1px solid var(--red);border-radius:8px;background:rgba(239,68,68,.08)">
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:var(--red);margin-bottom:6px">⚠ Group names that need a look</div>
+<div id="group-names-rows" style="display:flex;flex-direction:column;gap:4px;font-family:'JetBrains Mono',monospace;font-size:11px"></div>
+<div style="margin-top:8px;font-size:11px;color:var(--text-secondary);line-height:1.5">Authentik gives a person's groups to each app as one list with a separator between the names. A group name that holds a separator can be read by an app as a different group, and that can give its members access they should not have. If you did not make this group on purpose, check who made it and who is in it (Authentik Admin → Directory → Groups), then rename or delete it. infra-TAK does not change it for you.</div>
+</div>
 </div>
 
 <div class="section-title" data-collapse="mfa-recovery">MFA Device Recovery</div>
@@ -467,6 +472,25 @@ async function refreshAdminAccounts(){
     }
 }
 
+async function refreshGroupNames(){
+    var box = document.getElementById('group-names-warning');
+    var rows = document.getElementById('group-names-rows');
+    if (!box || !rows) return;
+    try {
+        var r = await fetch('/api/authentik/group-names');
+        var d = await r.json();
+        var found = (d && d.available && d.findings) || [];
+        if (!found.length) { box.style.display = 'none'; return; }
+        rows.innerHTML = found.map(function(f){
+            var why = (f.reads_as && f.reads_as.length)
+                ? 'can be read as ' + f.reads_as.map(function(n){ return '<span style="color:var(--red);font-weight:600">' + escapeHtml(n) + '</span>'; }).join(', ')
+                : 'holds the separator |';
+            return '<div><span style="color:var(--cyan)">' + escapeHtml(f.name) + '</span> <span style="color:var(--text-dim)">' + why + '</span></div>';
+        }).join('');
+        box.style.display = 'block';
+    } catch(e) { box.style.display = 'none'; }
+}
+
 async function reactivateAdmin(username){
     var btn = document.getElementById('reactivate-' + username + '-btn');
     var msg = document.getElementById('admin-accounts-msg');
@@ -665,6 +689,7 @@ async function resetAdminMfa(username){
 
 document.addEventListener('DOMContentLoaded', function(){
     if (document.getElementById('admin-accounts-status')) { refreshAdminAccounts(); }
+    if (document.getElementById('group-names-warning')) { refreshGroupNames(); }
 });
 
 async function akUpdate(){

@@ -153,9 +153,13 @@ def test_parse_keeps_good_and_drops_bad_whole():
     assert _ns()['_patch_now_parse'](None) == [] and _ns()['_patch_now_parse']({'advisories': 'x'}) == []
 
 
-def test_repo_patch_now_file_is_valid_and_empty():
+def test_repo_patch_now_file_is_valid():
+    """The shipped list holds only entries the parser accepts whole (a malformed entry is
+    dropped silently by the box, so a typo here would warn nobody). ops #1084 put the first
+    real entry in it; tests/test_cve_2026_98432_ops1084.py covers what it says."""
     doc = json.loads((REPO / 'security' / 'patch-now.json').read_text())
-    assert doc == {'advisories': []}
+    assert isinstance(doc.get('advisories'), list)
+    assert len(_ns()['_patch_now_parse'](doc)) == len(doc['advisories'])
     assert _const('PATCH_NOW_FEED_URL').strip().endswith(
         "'https://raw.githubusercontent.com/takwerx/infra-TAK/main/security/patch-now.json'")
 
