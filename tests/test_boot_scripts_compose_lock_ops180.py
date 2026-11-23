@@ -92,7 +92,8 @@ def box(tmp_path):
                    .replace('/tmp/', str(tmp_path) + '/')
                    # gd_find_stack_dir's /home/*/ glob: macOS automounts /home and hangs.
                    .replace('/home/*/', str(tmp_path / 'nohome') + '/*/')
-                   .replace('/root/', str(tmp_path / 'noroot') + '/'))
+                   .replace('/root/', str(tmp_path / 'noroot') + '/')
+                   .replace('_now() { echo "$SECONDS"; }', '_now() { cat %s; }' % (tmp_path / 'clock')))
 
     (gd / '_gd-tak-lib.sh').write_text(sandbox(LIB))
     (stubs / 'docker').write_text(DOCKER_STUB % {'calls': calls})
@@ -101,8 +102,12 @@ def box(tmp_path):
     (stubs / 'id').write_text('#!/bin/sh\nexit 1\n')                 # no local postgres
     (stubs / 'systemctl').write_text('#!/bin/sh\nexit 1\n')          # no MediaMTX
     (stubs / 'timeout').write_text('#!/bin/sh\nexit 1\n')            # every TCP probe: down
-    for name in ('sleep', 'logger'):
-        (stubs / name).write_text('#!/bin/sh\nexit 0\n')
+    # sleep only moves a fake clock; tak-post-start.sh reads it through _now (ops #1122), so
+    # its late LDAP re-check sees ten minutes pass without the test waiting for them.
+    clock = tmp_path / 'clock'
+    clock.write_text('0\n')
+    (stubs / 'sleep').write_text('#!/bin/sh\nn=$(cat %s); echo $((n + ${1:-0})) > %s\n' % (clock, clock))
+    (stubs / 'logger').write_text('#!/bin/sh\nexit 0\n')
     for f in stubs.iterdir():
         f.chmod(0o755)
     (tmp_path / 'uptime').write_text('26.42 99.00\n')
