@@ -106185,6 +106185,18 @@ _KERNEL_CVE_FIXES = {
     'CVE-2026-53266': {
         'jammy': (5, 15, 0, 198),
     },
+    # ops #1084: IPv4 TCP connection setup, remote, no login (CVSS 9.8).
+    # https://ubuntu.com/security/CVE-2026-98432 — `linux` package rows. Cloud kernels
+    # (-aws, -azure) number their releases on their own scale (5.15.0-1120 vs 5.15.0-203),
+    # so they get their own `<codename>/<flavour>` key; a flavour with no key is skipped.
+    'CVE-2026-98432': {
+        'jammy': (5, 15, 0, 203),
+        'noble': (6, 8, 0, 149),
+        'jammy/aws': (5, 15, 0, 1120),
+        'jammy/azure': (5, 15, 0, 1126),
+        'noble/aws': (6, 8, 0, 1069),
+        'noble/azure': (6, 8, 0, 1073),
+    },
 }
 
 
@@ -106209,8 +106221,15 @@ def _kernel_cve_banner(running_kernel):
     running = _running_kernel_tuple(running_kernel)
     if not codename or not running:
         return None
+    # ops #1084: a cloud kernel (5.15.0-1120-aws) is looked up as "<codename>/aws", never
+    # against the generic number: 1120 is not "newer" than 203, it is a different scale.
+    # -generic and -lowlatency number like the plain codename (as before this change); any
+    # other flavour with no key (gcp, oem, fde) never matches.
+    m = re.search(r'-([a-z][a-z0-9]*)$', running_kernel or '')
+    flavour = m.group(1) if m else ''
+    key = codename if flavour in ('', 'generic', 'lowlatency') else f'{codename}/{flavour}'
     for cve, fixed_by in _KERNEL_CVE_FIXES.items():
-        fixed = fixed_by.get(codename)
+        fixed = fixed_by.get(key)
         if fixed and running < fixed:
             return cve
     return None
