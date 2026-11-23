@@ -56,8 +56,9 @@ def test_same_name_twice_or_blank_or_zero_gives_one_line():
 # ── deploy() end to end against fakes ───────────────────────────────────────
 
 class _Run:
-    def __init__(self, hostname_f=SHORT):
+    def __init__(self, hostname_f=SHORT, postconf=None):
         self.hostname_f = hostname_f
+        self.postconf = postconf or {}
         self.calls = []
 
     def __call__(self, cmd, *a, **kw):
@@ -67,16 +68,20 @@ class _Run:
             out = self.hostname_f + '\n'
         elif list(cmd) == ['hostname']:
             out = self.hostname_f.split('.')[0] + '\n'
+        elif list(cmd)[:2] == ['postconf', '-hx']:
+            out = self.postconf.get(cmd[2], '') + '\n'
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr='')
 
 
-def _deploy(monkeypatch, tmp_path, *, os_type, saved_fqdn, hostname_f, mailname=''):
-    runner = _Run(hostname_f)
+def _deploy(monkeypatch, tmp_path, *, os_type, saved_fqdn, hostname_f, postconf=None,
+            files=None):
+    runner = _Run(hostname_f, postconf)
     monkeypatch.setattr(er.subprocess, 'run', runner)
     monkeypatch.setenv('HOME', str(tmp_path))  # no ~/authentik, so no Authentik step
     # raising=False: the deploy-level tests must reach their assertions on the base branch
     # too (where this helper does not exist), so they fail for the right reason.
-    monkeypatch.setattr(er, '_read_mailname', lambda: mailname, raising=False)
+    monkeypatch.setattr(er, '_read_name_file', lambda path: (files or {}).get(path, ''),
+                        raising=False)
     written = {}
     ctx = {
         'load_settings': lambda: {'fqdn': saved_fqdn} if saved_fqdn else {},
@@ -109,17 +114,39 @@ def test_generic_map_is_keyed_on_the_saved_fqdn_when_hostname_f_differs(
     assert all(ln.split()[1] == FROM for ln in text.splitlines())
 
 
-def test_live_etc_mailname_is_keyed_too(monkeypatch, tmp_path):
-    """An OS upgrade or an earlier install can leave /etc/mailname on a third name."""
+def test_what_postfix_says_it_stamps_is_keyed_too_debian_mailname(monkeypatch, tmp_path):
+    """myorigin = /etc/mailname, and an OS upgrade or earlier install left it on a third name."""
     text, _ = _deploy(monkeypatch, tmp_path, os_type='debian', saved_fqdn=FQDN,
-                      hostname_f=SHORT, mailname='old.example.org')
+                      hostname_f=SHORT,
+                      postconf={'myorigin': '/etc/mailname', 'myhostname': SHORT},
+                      files={'/etc/mailname': 'old.example.org'})
     keys = [ln.split()[0] for ln in text.splitlines()]
     assert keys == [f'root@{FQDN}', 'root@old.example.org', f'root@{SHORT}']
 
 
+def test_rocky_myhostname_with_localdomain_is_keyed(monkeypatch, tmp_path):
+    """nuc (Rocky 9): hostname -f is `infratak`, but Postfix stamps `infratak.localdomain`
+    (myorigin = $myhostname), so a key from hostname -f alone never matched there either."""
+    text, _ = _deploy(monkeypatch, tmp_path, os_type='rhel', saved_fqdn='nuc.example.org',
+                      hostname_f='infratak',
+                      postconf={'myorigin': 'infratak.localdomain',
+                                'myhostname': 'infratak.localdomain'})
+    keys = [ln.split()[0] for ln in text.splitlines()]
+    assert keys == ['root@nuc.example.org', 'root@infratak.localdomain', 'root@infratak']
+
+
+def test_a_failing_postconf_still_writes_the_saved_fqdn_and_hostname(monkeypatch, tmp_path):
+    text, _ = _deploy(monkeypatch, tmp_path, os_type='debian', saved_fqdn=FQDN,
+                      hostname_f=SHORT, postconf={})
+    keys = [ln.split()[0] for ln in text.splitlines()]
+    assert keys == [f'root@{FQDN}', f'root@{SHORT}']
+
+
 def test_matching_names_still_give_a_single_line(monkeypatch, tmp_path):
     text, _ = _deploy(monkeypatch, tmp_path, os_type='debian', saved_fqdn=FQDN,
-                      hostname_f=FQDN, mailname=FQDN)
+                      hostname_f=FQDN,
+                      postconf={'myorigin': '/etc/mailname', 'myhostname': FQDN},
+                      files={'/etc/mailname': FQDN})
     assert text == f'root@{FQDN}    {FROM}\n'
 
 

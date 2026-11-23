@@ -120,13 +120,32 @@ def _generic_map_text(from_addr, *origins):
     return '\n'.join(lines) + '\n', sorted(seen)
 
 
-def _read_mailname():
-    """/etc/mailname (what Debian's myorigin points at); '' when absent."""
+def _read_name_file(path):
+    """First line of a name file such as /etc/mailname; '' when absent or unreadable."""
     try:
-        with open('/etc/mailname', encoding='utf-8') as f:
-            return f.read().strip()
+        with open(path, encoding='utf-8') as f:
+            return (f.readline() or '').strip()
     except OSError:
         return ''
+
+
+def _postfix_origins():
+    """The names Postfix itself will stamp on root's mail: `postconf -hx myorigin` (a file
+    path such as /etc/mailname is read) and `myhostname`. Asking Postfix beats guessing:
+    on Rocky `myhostname` is `<host>.localdomain`, which neither the saved FQDN nor
+    `hostname -f` ever equals. A failed query just returns fewer names."""
+    names = []
+    for param in ('myorigin', 'myhostname'):
+        try:
+            r = subprocess.run(['postconf', '-hx', param], capture_output=True,
+                               text=True, timeout=15)
+            val = (r.stdout or '').strip() if r.returncode == 0 else ''
+        except (OSError, subprocess.SubprocessError):
+            val = ''
+        if val.startswith('/'):
+            val = _read_name_file(val)
+        names.append(val)
+    return names
 
 
 def deploy_validate(data):
@@ -255,12 +274,12 @@ smtp_generic_maps = hash:/etc/postfix/generic
         subprocess.run(ctx['_sudo_wrap'](['chmod', '600', '/etc/postfix/sasl_passwd', '/etc/postfix/sasl_passwd.db']), capture_output=True)
 
         # Generic map for from address rewriting
-        # ops #1142 (GH #665): key it on the saved FQDN (what /etc/mailname holds on
-        # Debian/Ubuntu) AND on `hostname -f` / the live mailname when those differ, so the
-        # rewrite fires whichever name Postfix stamps.
+        # ops #1142 (GH #665): key it on the saved FQDN, on what Postfix says it stamps
+        # (myorigin, e.g. /etc/mailname, and myhostname) and on `hostname -f`, so the
+        # rewrite fires whichever name wins.
         map_fqdn, map_hostname_f = _resolve_fqdn(settings)
         generic_text, generic_names = _generic_map_text(
-            from_addr, map_fqdn, _read_mailname(), map_hostname_f)
+            from_addr, map_fqdn, *_postfix_origins(), map_hostname_f)
         if len(generic_names) > 1:
             plog(f"⚠ Host names disagree ({', '.join(generic_names)}); "
                  "sender rewrite covers each of them")
