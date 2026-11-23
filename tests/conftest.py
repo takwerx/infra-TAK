@@ -65,3 +65,10 @@ def _parse(source, filename='<unknown>', mode='exec', **kwargs):
 
 
 ast.parse = _parse
+
+
+# Memory guard (ops #1152): a runner out of memory froze 5 PR-check jobs for 35 minutes with no log.
+# These hooks make every pytest process (controller and xdist workers) end itself with a report that names
+# the running test. See tests/ci_guard.py.
+from ci_guard import (  # noqa: E402,F401
+    pytest_configure, pytest_collectstart, pytest_runtest_logstart, pytest_runtest_logfinish)
