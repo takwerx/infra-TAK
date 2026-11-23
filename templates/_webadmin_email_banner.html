@@ -12,10 +12,11 @@
 <li>Open <a id="wa-email-ak-link" href="#" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">Authentik</a> and click <strong>Admin interface</strong> (top right). Do not use the user Settings page: it says &quot;Not allowed to change email address&quot;.</li>
 <li>Go to <strong>Directory &rarr; Users &rarr; webadmin &rarr; Edit User</strong>.</li>
 <li>In <strong>Email</strong>, type an address you read. Click <strong>Save Changes</strong>.</li>
-<li>Come back here and click <strong>I have changed the email</strong>.</li>
+<li>Come back here and type <strong>I have changed email</strong> in the box below. When it turns green, click <strong>Confirm</strong>.</li>
 </ol>
 <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
-<button type="button" id="wa-email-done" onclick="waEmailConfirm(false)" style="padding:6px 14px;background:linear-gradient(135deg,#b45309,#d97706);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">I have changed the email</button>
+<input type="text" id="wa-email-phrase" placeholder="Type: I have changed email" autocomplete="off" spellcheck="false" oninput="waEmailPhrase()" style="min-width:240px;background:var(--bg-dark);border:2px solid rgba(245,158,11,0.5);color:var(--text-primary);padding:6px 10px;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:12px">
+<button type="button" id="wa-email-done" onclick="waEmailConfirm(false)" disabled style="padding:6px 14px;background:linear-gradient(135deg,#b45309,#d97706);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:not-allowed;opacity:.4">Confirm</button>
 <button type="button" id="wa-email-keep" onclick="waEmailConfirm(true)" style="padding:5px 12px;background:none;border:1px solid rgba(245,158,11,0.4);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">This address does receive mail</button>
 </div>
 <div id="wa-email-msg" style="font-size:11px;margin-top:6px;display:none"></div>
@@ -36,17 +37,27 @@
       box.style.display='block';
     }catch(e){}
   };
+  var PHRASE='i have changed email';
+  function phraseOk(){var v=(document.getElementById('wa-email-phrase').value||'').trim().replace(/\s+/g,' ').toLowerCase();return v===PHRASE;}
+  window.waEmailPhrase=function(){
+    var ok=phraseOk(), i=document.getElementById('wa-email-phrase'), b=document.getElementById('wa-email-done');
+    i.style.borderColor=ok?'var(--green)':'rgba(245,158,11,0.5)';
+    i.style.color=ok?'var(--green)':'var(--text-primary)';
+    b.disabled=!ok; b.style.opacity=ok?'1':'.4'; b.style.cursor=ok?'pointer':'not-allowed';
+    b.style.background=ok?'linear-gradient(135deg,#059669,#10b981)':'linear-gradient(135deg,#b45309,#d97706)';
+  };
   window.waEmailConfirm=async function(keep){
+    if(!keep && !phraseOk()) return;
     if(keep && !confirm('Keep the current webadmin email? Only do this if mail sent to that address reaches you.')) return;
     var m=document.getElementById('wa-email-msg'), b=document.getElementById('wa-email-done');
     m.style.display='block'; m.style.color='var(--text-dim)'; m.textContent='Checking Authentik...'; b.disabled=true;
     try{
-      var r=await fetch('/api/authentik/webadmin-email-confirm',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({keep:!!keep})});
+      var r=await fetch('/api/authentik/webadmin-email-confirm',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({keep:!!keep, phrase:keep?'':document.getElementById('wa-email-phrase').value})});
       var d=await r.json();
       m.style.color=d.success?'var(--green)':'var(--red)'; m.textContent=d.message||'';
       if(d.success) setTimeout(function(){box.style.display='none';},1500);
     }catch(e){m.style.color='var(--red)'; m.textContent='Could not check Authentik';}
-    finally{b.disabled=false;}
+    finally{window.waEmailPhrase();}
   };
   window.waEmailCheck(); setInterval(window.waEmailCheck,300000);
 })();

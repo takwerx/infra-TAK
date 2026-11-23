@@ -89189,8 +89189,8 @@ def _webadmin_email_remind_tick():
             '   it says "Not allowed to change email address".',
             '3. Go to Directory -> Users -> webadmin -> Edit User.',
             '4. In Email, type an address you read. Click Save Changes.',
-            '5. In the infra-TAK console, click "I have changed the email" on the yellow',
-            '   banner. The banner and these emails stop.',
+            '5. In the infra-TAK console, type "I have changed email" in the box on the',
+            '   yellow banner, then click Confirm. The banner and these emails stop.',
             '',
             'Password reset email also needs Email Relay to be set up.',
             '',
@@ -89226,6 +89226,12 @@ def authentik_webadmin_email_confirm_api():
     """"I have changed the email": re-read Authentik now. Clears only when Authentik shows a
     real address, or when keep=true (the operator says the current address receives mail)."""
     data = request.get_json(silent=True) or {}
+    # Deliberate on purpose (operator decision 2026-11-23): the operator types the phrase,
+    # it is not a one-click dismiss. The keep path has its own confirm dialog.
+    if data.get('keep') is not True:
+        _phrase = ' '.join(str(data.get('phrase') or '').split()).lower()
+        if _phrase != 'i have changed email':
+            return jsonify({'success': False, 'message': 'Type "I have changed email" in the box first.'}), 400
     st = _webadmin_email_status(force=True)
     if not st.get('needs_action'):
         return jsonify({'success': True, 'message': 'Thanks — webadmin has a real recovery email now.'})
