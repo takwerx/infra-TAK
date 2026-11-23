@@ -11,6 +11,7 @@ the same text (padded=True still goes to the original).
 """
 import ast
 import functools
+import pathlib
 import re
 
 _original_get_source_segment = ast.get_source_segment
@@ -65,6 +66,35 @@ def _parse(source, filename='<unknown>', mode='exec', **kwargs):
 
 
 ast.parse = _parse
+
+
+# One copy of each big file (ops #1152). app.py holds characters above U+FFFF, so Python stores it at four
+# bytes a character: 27 MB a copy. 320 test modules each read their own copy at import, so one pytest
+# process held 320 x 27 MB = 8.6 GB just collecting, and with `-n 2` each worker collects the whole suite.
+# A 16 GB runner then sits at the edge, and a run that also peaks in a test freezes it (five PR-check
+# jobs on Nov 23, 2026). Strings never change, so every reader of an unchanged big file gets the same
+# object. The key holds the file's mtime and size: a test that rewrites the file reads the new text.
+_original_read_text = pathlib.Path.read_text
+_read_text_cache = {}
+
+
+def _read_text(self, *args, **kwargs):
+    try:
+        st = self.stat()
+    except OSError:
+        return _original_read_text(self, *args, **kwargs)
+    if st.st_size < 1_000_000:
+        return _original_read_text(self, *args, **kwargs)
+    key = (str(self.resolve()), st.st_mtime_ns, st.st_size, args, tuple(sorted(kwargs.items())))
+    text = _read_text_cache.get(key)
+    if text is None:
+        if len(_read_text_cache) >= 8:
+            _read_text_cache.clear()
+        text = _read_text_cache[key] = _original_read_text(self, *args, **kwargs)
+    return text
+
+
+pathlib.Path.read_text = _read_text
 
 
 # Memory guard (ops #1152): a runner out of memory froze 5 PR-check jobs for 35 minutes with no log.

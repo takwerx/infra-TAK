@@ -87,3 +87,41 @@ def test_conftest_loads_the_guard_for_the_real_suite():
         text = f.read()
     for hook in ('pytest_configure', 'pytest_collectstart', 'pytest_runtest_logstart', 'pytest_runtest_logfinish'):
         assert hook in text.split('from ci_guard import', 1)[1], hook
+
+
+# --- one copy of app.py for the whole suite --------------------------------------------------------------
+# app.py has characters above U+FFFF, so each copy is 4 bytes a character (27 MB); 320 modules each read
+# their own and one pytest process held 8.6 GB just collecting. conftest.py now hands every reader of an
+# unchanged big file the same string.
+
+def _load(name):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('ops1152_probe_' + name, os.path.join(TESTS_DIR, name + '.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_two_real_test_modules_share_one_copy_of_app_py():
+    a = _load('test_authentik_pgbouncer_image')
+    b = _load('test_webodm_image_pins')
+    assert a.APP is b.APP, 'each module holds its own 27 MB copy of app.py again'
+
+
+def test_a_big_file_that_changes_is_read_again(tmp_path):
+    import pathlib
+    big = tmp_path / 'big.txt'
+    big.write_text('a' * 1_100_000, encoding='utf-8')
+    first = pathlib.Path(big).read_text(encoding='utf-8')
+    assert pathlib.Path(big).read_text(encoding='utf-8') is first
+    big.write_text('b' * 1_200_000, encoding='utf-8')
+    assert pathlib.Path(big).read_text(encoding='utf-8') == 'b' * 1_200_000
+
+
+def test_small_files_are_never_shared(tmp_path):
+    import pathlib
+    small = tmp_path / 'small.txt'
+    small.write_text('x', encoding='utf-8')
+    assert pathlib.Path(small).read_text(encoding='utf-8') == 'x'
+    small.write_text('y', encoding='utf-8')
+    assert pathlib.Path(small).read_text(encoding='utf-8') == 'y'
