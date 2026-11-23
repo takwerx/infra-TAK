@@ -102984,7 +102984,10 @@ def _apt_stalled(r):
     120 s no-data limit usually fires before the console's step limit, so both must count. Any
     other failure (a missing package, a held lock, a bad signature) is not a stall."""
     out = f"{getattr(r, 'stdout', '') or ''}{getattr(r, 'stderr', '') or ''}"
-    return r.returncode == 124 or 'timed out after' in out or _apt_failure_is_transient(out)
+    # `takwerx_broker: TIMEOUT: command timed out` is the non-root broker stopping apt-get at the
+    # deadline the console sent (_apt_broker_env); its exit code is 126, not 124.
+    return (r.returncode == 124 or 'timed out after' in out or 'TIMEOUT: command timed out' in out
+            or _apt_failure_is_transient(out))
 
 
 def _apt_broker_env(timeout, env=None):

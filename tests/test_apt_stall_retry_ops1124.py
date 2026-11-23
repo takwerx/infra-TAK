@@ -248,6 +248,17 @@ def test_apt_steps_ask_the_broker_to_stop_apt_before_the_console_gives_up():
         box.close()
 
 
+def test_the_brokers_own_timeout_message_is_a_stall_too():
+    # seen on the box: the broker kills apt-get at the deadline and brokerctl prints this with exit code 126
+    box = Box(installs=[(126, 'takwerx_broker: TIMEOUT: command timed out'), (0, '')],
+              speeds={'us.archive.ubuntu.com': 20_000_000})
+    try:
+        ok, _ = _install(box)
+        assert ok and box.events.count('install') == 2
+    finally:
+        box.close()
+
+
 def test_a_real_apt_error_is_not_retried():
     box = Box(installs=[(100, 'E: Unable to locate package ffmpeg')])
     try:
