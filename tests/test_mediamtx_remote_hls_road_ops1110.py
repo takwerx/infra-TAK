@@ -103,10 +103,9 @@ class FakeMediaMTX:
     for a stream that does not exist), 'tls' (HTTP 400: a plain request to a TLS listener),
     'password' (HTTP 401)."""
 
-    LIVE = ('cam1', 'secret')
-
     def __init__(self):
         self.mode = 'ok'
+        self.live = ('cam1', 'secret')
         self.paths = []
         fake = self
 
@@ -121,7 +120,7 @@ class FakeMediaMTX:
                     code, body = 400, b'Client sent an HTTP request to an HTTPS server.\n'
                 elif fake.mode == 'password':
                     code, body = 401, b''
-                elif name in fake.LIVE:
+                elif name in fake.live:
                     code, body = 200, b'#EXTM3U\n'
                 else:
                     code, body = 404, b''
@@ -427,6 +426,14 @@ def test_nothing_is_asked_while_the_file_on_the_host_is_not_current(tmp_path, ho
     assert host.runs == [] and console.site() == before and console.mark() is None
 
 
+def test_a_stream_with_the_checks_own_name_does_not_block_the_change(tmp_path, host):
+    # A publisher uses the very name the check asks for: MediaMTX answers 200, not 404.
+    host.mediamtx.live += ('infratak-road-check',)
+    console = Console(tmp_path, host)
+    assert _need(console, '_mediamtx_remote_hls_road_check')(console.deployment) == 'ok'
+    assert console.start() == 'switched' and DIRECT not in console.site()
+
+
 def test_second_console_start_changes_nothing(tmp_path, host):
     console = Console(tmp_path, host)
     assert console.start() == 'switched'
@@ -545,7 +552,12 @@ def test_remote_deploy_checks_the_host_before_it_writes_caddy():
     assert '_mediamtx_remote_hls_road(settings, cfg, plog)' in step7, (
         'a new remote deploy leaves video on the direct road until the next console start')
     assert step7.index('_mediamtx_remote_hls_road(settings, cfg, plog)') < step7.index('generate_caddyfile(settings)')
-    assert step7.index('if ak_installed:') < step7.index('_mediamtx_remote_hls_road(settings, cfg, plog)')
+    # Only when this same deploy put the current stream site file on the host.
+    assert step7.index('if ak_installed and _mtx_overlay_shipped:') < step7.index(
+        '_mediamtx_remote_hls_road(settings, cfg, plog)')
+    assert ("_mtx_overlay_shipped, _ = _module_run_root(deploy_cfg, "
+            "'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'") in deploy
+    assert deploy.index('_mtx_overlay_shipped = False') < deploy.index('_mtx_overlay_shipped, _ =')
     # After the editor on the host was started and checked.
     assert deploy.index('_mediamtx_remote_editor_check(deploy_cfg, plog)') < deploy.index(
         '_mediamtx_remote_hls_road(settings, cfg, plog)')

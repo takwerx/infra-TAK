@@ -50473,12 +50473,13 @@ paths:
     ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
     ldap_env_lines = ''
     remote_secret_env = ''
+    _mtx_overlay_shipped = False     # ops #1110: this deploy put the current stream site file on the host
     if ak_installed:
         overlay_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
         if os.path.exists(overlay_src):
             ok_ov, _ = _module_copy(deploy_cfg, overlay_src, '/tmp/mediamtx_ldap_overlay.py', log_fn=plog)
             if ok_ov:
-                _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
+                _mtx_overlay_shipped, _ = _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
                 patcher = (
                     "import sys\n"
                     "EDITOR = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
@@ -50630,8 +50631,10 @@ paths:
     # ops #649: never leave the remote editor on admin/admin. Before Caddy publishes it.
     _mediamtx_editor_secure_login(settings, log_fn=plog)
     # ops #1110: with Authentik, video goes through the sign-in to the editor on this host.
-    # The host is asked first; Caddy leaves the direct road out only when that editor serves it.
-    if ak_installed:
+    # The host is asked first; Caddy leaves the direct road out only when that editor serves
+    # it, and only when this deploy put the current stream site file there (a failed copy
+    # is left to the next console start, which ships the file and checks again).
+    if ak_installed and _mtx_overlay_shipped:
         try:
             _mediamtx_remote_hls_road(settings, cfg, plog)
         except Exception as _road_e:
@@ -114978,7 +114981,9 @@ def _mediamtx_remote_overlay_held(settings, host, url, word, tag):
 # console will use for video. The stream site (mediamtx_ldap_overlay.py hls_proxy) passes
 # MediaMTX's own answer on as 502 "HTTP Error <code>...". 404 from MediaMTX is the proof:
 # the route is loaded, it reached MediaMTX with the right protocol (plain http to a TLS
-# listener is 400) and MediaMTX let it in from loopback (401 when it did not). Prints one word.
+# listener is 400) and MediaMTX let it in from loopback (401 when it did not). 200 (a
+# publisher uses that very name) proves the same. An editor without the stream site code
+# has no such route (404 from the editor itself). Prints one word.
 _MEDIAMTX_REMOTE_HLS_ROAD_CHECK_PY = r'''import re, socket, urllib.error, urllib.request
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **k):
@@ -114997,6 +115002,8 @@ except Exception as e:
     if isinstance(why, ConnectionRefusedError):
         say('no-editor')
     say('timeout' if isinstance(why, (socket.timeout, TimeoutError)) else 'other')
+if code == 200:
+    say('ok')       # someone publishes a stream with this name: the road served it
 if code != 502:
     say('no-route')
 m = re.match(r'HTTP Error (\d{3})\b', body)
@@ -115034,8 +115041,9 @@ def _mediamtx_remote_hls_road(settings, cfg, log):
     site applies the rule) needs the current stream site file on that host, which a console
     start now keeps there (ops #1107). ORDER: the host is asked first. Only when its editor
     serves /hls-proxy/ is the host written to _MEDIAMTX_REMOTE_HLS_ROAD_FILE, which makes
-    generate_caddyfile leave the direct road out. Once written it stays: a later failed
-    check never puts the road around the sign-in back.
+    generate_caddyfile leave the direct road out. A later failed check never removes that
+    file, so it does not put the direct road back. (A console whose CONFIG_DIR lost the
+    file, or whose remote host changed, is back on the old road until the next check.)
 
     Does not touch Caddy (the caller regenerates). Returns 'switched' (just marked), 'on'
     (marked before, serves), 'kept' (marked before, does not serve now), 'direct' (not
@@ -115087,7 +115095,7 @@ def _startup_converge_mediamtx_remote_hls_road(after=None):
         live = _caddy_vhost_block(_read_priv(CADDYFILE_PATH) or '', _MEDIAMTX_VHOST_MARKER)
         if 'forward_auth' not in live or 'handle_path /hls-proxy/*' not in live:
             return road
-        generate_caddyfile(settings)
+        generate_caddyfile(load_settings())     # fresh: the check on the host took a while
         if not _CADDY_REGISTRY_READY.is_set():
             print(f"{tag} Caddy change queued: written with the Caddyfile after the modules load",
                   flush=True)
