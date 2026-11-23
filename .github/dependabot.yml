@@ -8,6 +8,12 @@
 # already ignores. Pins in requirements.txt
 # are exact on purpose (fleet uniformity): Dependabot proposes the bump, a test
 # on the fleet decides whether it merges.
+#
+# requirements.txt (and .github/ci/requirements-test.txt) carry their own hashes and transitive pins
+# and are the ONLY copy: CI installs those same files, so a Dependabot bump of a pin needs no hand
+# relock (ops #1113). The job console-deps in pr-checks.yml installs requirements.txt on Python 3.9,
+# 3.10 and 3.12, so a bump that needs a newer Python than RHEL/Rocky 9 has goes red there. If a bump
+# needs a new transitive pin, run tools/relock-console-requirements.sh on the PR branch.
 version: 2
 updates:
   - package-ecosystem: "pip"

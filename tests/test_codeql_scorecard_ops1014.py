@@ -143,14 +143,19 @@ def test_every_pip_install_in_a_workflow_is_by_hash():
     for f in sorted(WORKFLOWS.glob('*.yml')):
         for l in _code(_text(f)).splitlines():
             if re.search(r'\bpip3?\s+install\b', l):
-                if '--require-hashes' not in l or not re.search(r'-r\s+\.github/ci/\S+\.lock\b', l):
+                # ops #1113: the console's own requirements.txt and the test tools file carry hashes
+                # themselves, so they are installed directly; a .lock file is for the shellcheck tool.
+                targets = re.findall(r'-r\s+(\S+)', l)
+                ok = targets and all(re.fullmatch(r'requirements\.txt|\.github/ci/\S+\.(lock|txt)', x) for x in targets)
+                if '--require-hashes' not in l or not ok:
                     bad.append(f'{f.name}: {l.strip()}')
-    assert not bad, 'pip install without --require-hashes and a lock file: ' + '; '.join(bad)
+    assert not bad, 'pip install without --require-hashes and a hashed requirements file: ' + '; '.join(bad)
 
 
 def test_lock_files_carry_a_hash_for_every_pin():
-    for name in ('requirements-ci.lock', 'requirements-shellcheck.lock'):
-        t = _text(CI / name)
+    for path in (ROOT / 'requirements.txt', CI / 'requirements-test.txt', CI / 'requirements-shellcheck.lock'):
+        name = path.name
+        t = _text(path)
         pins = [l for l in t.splitlines() if re.match(r'^[A-Za-z0-9_.\-]+==', l)]
         assert pins, name
         # every pin is followed by at least one --hash line before the next pin
@@ -160,13 +165,8 @@ def test_lock_files_carry_a_hash_for_every_pin():
                 assert '--hash=sha256:' in b, f'{name}: no hash for {b.splitlines()[0]}'
 
 
-def test_ci_lock_matches_requirements_files():
-    lock = _lock_pins(CI / 'requirements-ci.lock')
-    for src in (ROOT / 'requirements.txt', CI / 'requirements-test.txt'):
-        for name, ver in _req_pins(src).items():
-            assert lock.get(name) == ver, (
-                f'{src.name} pins {name}=={ver} but requirements-ci.lock has {lock.get(name)}; '
-                f'regenerate the lock with the command in its header')
+def test_shellcheck_lock_matches_its_source():
+    # The console pins have ONE copy now (ops #1113, tests/test_requirements_one_copy_ops1113.py).
     sc = _lock_pins(CI / 'requirements-shellcheck.lock')
     assert sc.get('shellcheck-py') == '0.11.0.1'
     assert _req_pins(CI / 'requirements-shellcheck.in').get('shellcheck-py') == '0.11.0.1'

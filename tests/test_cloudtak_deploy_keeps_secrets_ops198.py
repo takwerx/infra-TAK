@@ -65,7 +65,7 @@ GARAGE_RPC_SECRET=%s
 """ % ('ab' * 32)
 
 HELPERS = ('_cloudtak_build_env_content', '_cloudtak_env_secrets', '_cloudtak_env_preserve_unknown',
-           '_cloudtak_store_endpoint', 'run_cloudtak_deploy')
+           '_cloudtak_store_endpoint', '_cloudtak_env_read', 'run_cloudtak_deploy')
 
 
 class _Stop(Exception):
@@ -94,6 +94,8 @@ def _ns(settings, **stubs):
         '_get_cloudtak_deployment_config': lambda s: s['cloudtak_deployment'],
         '_get_service_domain': lambda s, k: '',
         '_get_cloudtak_target_release_tag': lambda use_cache=True: 'v13.113.0',
+        '_cloudtak_tag_for_minio_store': lambda tag, store_present: (tag, False),   # ops #1074: not under test here
+        '_cloudtak_needs_minio_hop': lambda tag: False, '_cloudtak_minio_hop_tag': lambda: None,   # ops #1074
         '_cloudtak_release_cache': {'tag': None, 'ts': 0},
         '_REMOTE_DOCKER_GROUP_SH': 'true',   # row 5: remote step 2 joins the SSH user to docker
         '_docker_install_cmd': lambda sudo_fallback=False: 'true',   # ops #637: not under test here

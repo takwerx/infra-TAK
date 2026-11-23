@@ -38,6 +38,7 @@ import base64
 import importlib.util
 import json
 import pathlib
+import urllib.parse
 
 import pytest
 
@@ -85,8 +86,18 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(ov, 'VISIBILITY_FILE', str(vis))
     fetched = []
 
+    # ops #1082: the overlay reads a person's groups from Authentik's user API, not from
+    # the X-Authentik-Groups header. This is that API's answer for the three people below.
+    monkeypatch.setattr(ov, 'AK_TOKEN', 'box-token')
+    ak_groups = {'alice': ['vid_private'], 'bob': ['vid_public'], 'akadmin': ['authentik Admins']}
+
     def fake_urlopen(req, timeout=None, context=None):
         url = req.full_url
+        if '/api/v3/core/users/' in url:
+            name = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query).get('username', [''])[0]
+            rows = [{'pk': 1, 'username': name, 'is_active': True,
+                     'groups_obj': [{'name': g} for g in ak_groups[name]]}] if name in ak_groups else []
+            return _Resp(json.dumps({'results': rows}).encode(), 'application/json')
         if '/v3/paths/list' in url:
             r = _Resp(json.dumps({'items': [{'name': 'live/public', 'ready': True},
                                             {'name': 'live/secret', 'ready': True}]}).encode(),

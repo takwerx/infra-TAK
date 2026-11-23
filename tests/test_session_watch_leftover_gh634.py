@@ -112,8 +112,8 @@ def test_gh634_leftover_row_is_named_and_not_promised_to_self_heal(box):
     assert 'does NOT drop them, and they do not clear by themselves' in mail
     # the two causes that did not apply are not offered for a row nobody is connected on
     assert 'reconnects these by itself' not in mail and 'NO CHANNEL ASSIGNED' not in mail
-    # identity (callsign, user name, DN, device uid) stays out of the mail
-    for private in ('u1', 'ANDROID-a', 'CN=', IP):
+    # identity (user name, DN, address) stays out of the mail; the device id is named on purpose (ops #1052)
+    for private in ('u1', 'CN=', IP):
         assert private not in mail
     line = _check_line(box.log())
     assert 'groupless=1 ' in line and 'groupless_named=1 leftover=1' in line
