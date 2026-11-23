@@ -114423,9 +114423,12 @@ _MEDIAMTX_REMOTE_OVERLAY_PROBE_SH = (
 
 # Runs ON the remote host, as root, standard library only: the same call, the same token and
 # the same rule for a usable answer as the overlay's _authentik_groups_lookup(). Prints one
-# line (never the token) and exits 0 for an answer, 3 for none.
-_MEDIAMTX_REMOTE_AK_CHECK_PY = r'''import json, sys, urllib.request
+# word (ok, or why not: see _MEDIAMTX_REMOTE_AK_REASONS) and exits 0 for an answer, 3 for none.
+_MEDIAMTX_REMOTE_AK_CHECK_PY = r'''import json, socket, ssl, sys, urllib.error, urllib.request
 url, envfile = sys.argv[1], sys.argv[2]
+def no(word):
+    print(word)
+    sys.exit(3)
 tok = ''
 try:
     with open(envfile) as f:
@@ -114433,29 +114436,47 @@ try:
             if ln.startswith('AUTHENTIK_TOKEN='):
                 tok = ln.split('=', 1)[1].strip()
                 break
-except Exception as e:
-    print('cannot read the token file (%s)' % type(e).__name__)
-    sys.exit(3)
+except Exception:
+    no('token-file')
 if not tok:
-    print('no Authentik token on this host')
-    sys.exit(3)
+    no('no-token')
 try:
     r = urllib.request.Request(
         url + '/api/v3/core/users/?username=infratak-reach-check&include_groups=true',
         headers={'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'})
     d = json.loads(urllib.request.urlopen(r, timeout=8).read().decode())
+except urllib.error.HTTPError as e:
+    no('http-token' if e.code in (401, 403) else 'http-error')
 except Exception as e:
-    code = getattr(e, 'code', None)
-    if code:
-        print('HTTP %s' % code)
-    else:
-        print('%s: %s' % (type(e).__name__, str(getattr(e, 'reason', None) or e)[:120]))
-    sys.exit(3)
+    why = getattr(e, 'reason', e)
+    if isinstance(why, socket.gaierror):
+        no('dns')
+    if isinstance(why, ssl.SSLError):
+        no('tls')
+    if isinstance(why, ConnectionRefusedError):
+        no('refused')
+    if isinstance(why, (socket.timeout, TimeoutError)):
+        no('timeout')
+    no('not-authentik' if isinstance(e, ValueError) else 'other')
 if not isinstance(d, dict) or not isinstance(d.get('results'), list):
-    print('the answer is not a user list')
-    sys.exit(3)
+    no('not-authentik')
 print('ok')
 '''
+
+# What the host's check answered, in plain words. The log and the mail carry only these fixed
+# texts, never text that came back from the host.
+_MEDIAMTX_REMOTE_AK_REASONS = {
+    'token-file': "the editor's token file on that box cannot be read",
+    'no-token': 'the editor on that box has no Authentik token',
+    'http-token': 'Authentik refused the token',
+    'http-error': 'Authentik answered with an error',
+    'dns': 'that box cannot find the name (DNS)',
+    'tls': 'that box does not trust the certificate',
+    'refused': 'the connection was refused',
+    'timeout': 'no reply in time',
+    'not-authentik': 'the reply did not come from Authentik',
+    'bad-address': 'the Authentik address in the editor unit is not a web address',
+}
 
 
 def _mediamtx_remote_editor_ak_url(settings):
@@ -114549,7 +114570,7 @@ def _mediamtx_remote_overlay_apply_sh(stage, gate_url, restart):
         'trap \'rm -rf "$T"\' EXIT; '
         'if [ -f "$T/akcheck.py" ]; then EF="$E"; [ -f "$T/env" ] && EF="$T/env"; '
         f'if R=$(python3 "$T/akcheck.py" {q(gate_url)} "$EF" 2>&1); then echo INFRATAK_REACH=ok; '
-        'else echo "INFRATAK_REACH=fail $(printf %s "$R" | tail -n 1 | cut -c1-200)"; exit 0; fi; fi; '
+        'else echo "INFRATAK_REACH=fail $(printf %s "$R" | tail -n 1 | cut -c1-40)"; exit 0; fi; fi; '
         'set -e; '
         'if [ -f "$T/env" ]; then install -m 600 -o root -g root "$T/env" "$E.infratak-new"; '
         'mv -f "$E.infratak-new" "$E"; fi; '
@@ -114644,8 +114665,10 @@ def _startup_converge_mediamtx_overlay_remote(after=None):
             return 'current'
 
         gate_url = plan['api_url']
+        # For the log and the mail: the address as the console knows it, never text read from the host.
+        shown_url = api_url if (api_url and api_url == gate_url) else 'the address in its unit file'
         if plan['ldap'] and not _MEDIAMTX_EDITOR_AK_URL_RE.fullmatch(gate_url or ''):
-            return _mediamtx_remote_overlay_held(settings, host, gate_url, 'the Authentik address in the editor unit is not a web address', tag)
+            return _mediamtx_remote_overlay_held(settings, host, shown_url, 'bad-address', tag)
 
         # A private folder on the host for this pass (the SSH user's, 700): no fixed /tmp
         # name another account could take first, none a stopped deploy left behind as root.
@@ -114693,13 +114716,15 @@ def _startup_converge_mediamtx_overlay_remote(after=None):
         out = out or ''
         m = re.search(r'^INFRATAK_REACH=fail ?(.*)$', out, re.M)
         if m:
-            return _mediamtx_remote_overlay_held(settings, host, gate_url, m.group(1).strip(), tag)
+            return _mediamtx_remote_overlay_held(settings, host, shown_url, m.group(1).strip(), tag)
         got = re.search(r'^OVERLAY_SHA=([0-9a-f]{64})$', out, re.M)
         if (not ok or 'INFRATAK_APPLIED=1' not in out or not got
                 or got.group(1) != want_sha):
-            print(f"{tag} ✗ the update on {host} did not finish "
-                  f"({_mediamtx_remote_overlay_safe_tail(out)}). The next console start tries again.",
-                  flush=True)
+            steps = ('host reached' if ok else 'command failed on the host or the link dropped',
+                     'files in place' if 'INFRATAK_APPLIED=1' in out else 'files NOT all in place',
+                     'file checked' if got else 'file not checked')
+            print(f"{tag} ✗ the update on {host} did not finish ({', '.join(steps)}). "
+                  "The next console start tries again.", flush=True)
             return 'failed'
         if plan['overlay']:
             print(f"{tag} stream site code on {host} updated (Authentik sign-in + viewer roles)", flush=True)
@@ -114707,8 +114732,8 @@ def _startup_converge_mediamtx_overlay_remote(after=None):
             print(f"{tag} the editor's Authentik token on {host} was out of date; set to the current one",
                   flush=True)
         if plan['unit'] is not None:
-            print(f"{tag} the editor unit on {host} updated (Authentik API address {gate_url}, "
-                  "trusted header peers)", flush=True)
+            print(f"{tag} the editor unit on {host} updated (Authentik API address, trusted header peers)",
+                  flush=True)
         if plan['ldap'] and plan['active'] == 'active':
             # It ran before the restart: it must run after it. Says so in the log if not.
             if not _mediamtx_remote_editor_check(cfg, lambda ln: print(f"{tag} {ln}", flush=True)):
@@ -114730,8 +114755,10 @@ def _startup_converge_mediamtx_overlay_remote(after=None):
         return 'failed'
 
 
-def _mediamtx_remote_overlay_held(settings, host, url, why, tag):
-    """The remote host got no answer from Authentik: say so (log and mail). Returns 'held'."""
+def _mediamtx_remote_overlay_held(settings, host, url, word, tag):
+    """The remote host got no answer from Authentik: say so (log and mail). Returns 'held'.
+    `word` is what the host's check printed; only its fixed text is shown."""
+    why = _MEDIAMTX_REMOTE_AK_REASONS.get(word, 'no usable answer')
     print(f"{tag} ✗ {host} got no answer from Authentik at {url} ({why}). The stream site code "
           "there was NOT updated and nothing else changed: with the new code and no answer, every "
           "person on the stream site would be a viewer of public streams only. The next console "

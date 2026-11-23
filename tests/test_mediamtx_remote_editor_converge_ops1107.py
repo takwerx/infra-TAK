@@ -66,7 +66,7 @@ NAMES = (
     # this change
     '_MEDIAMTX_REMOTE_OVERLAY_ALERT_EVERY_S', '_MEDIAMTX_REMOTE_STAGE_RE',
     '_MEDIAMTX_REMOTE_EDITOR_AK_DEFAULT', '_MEDIAMTX_REMOTE_OVERLAY_PROBE_SH',
-    '_MEDIAMTX_REMOTE_AK_CHECK_PY', '_mediamtx_remote_editor_ak_url',
+    '_MEDIAMTX_REMOTE_AK_CHECK_PY', '_MEDIAMTX_REMOTE_AK_REASONS', '_mediamtx_remote_editor_ak_url',
     '_mediamtx_remote_overlay_safe_tail', '_mediamtx_remote_overlay_plan',
     '_mediamtx_remote_overlay_apply_sh', '_mediamtx_remote_overlay_alert',
     '_startup_converge_mediamtx_overlay_remote', '_mediamtx_remote_overlay_held',
@@ -496,9 +496,14 @@ def test_no_answer_from_authentik_changes_nothing_on_the_host(tmp_path, host, au
     assert len(console.mails) == 1
     to, subj, body = console.mails[0]
     assert to == 'ops@example.com' and HOST in subj and 'waiting' in subj
-    # the address the editor would use: the console's, or (no console token) the unit's own
-    asked = 'http://127.0.0.1:9090' if break_it == 'no_token_file' else authentik.url
+    # the address as the console knows it; with no console token, only that it is the unit's own
+    asked = 'the address in its unit file' if break_it == 'no_token_file' else authentik.url
     assert asked in body and 'restart the infra-TAK console' in body
+    # the reason in fixed plain words, never text that came back from the host
+    reason = {'error': 'Authentik answered with an error', 'html': 'the reply did not come from Authentik',
+              'wrong_token': 'Authentik refused the token', 'down': 'the connection was refused',
+              'no_token_file': "the editor's token file on that box cannot be read"}[break_it]
+    assert reason in body, body
     assert TOKEN not in body and OLD_TOKEN not in body
     assert console.start() == 'held'                  # the daily console restart
     assert len(console.mails) == 1                    # one mail a day per box
