@@ -1756,12 +1756,13 @@ CLOUDTAK_VETTED_RELEASE = "13.127.0"    # OFFLINE FALLBACK ONLY since v10.1.17 â
                                         # ops #826: 13.117.1 -> 13.127.0 (update, rollback and forward again tested on Ubuntu,
                                         # Rocky 9 and ARM). A box with the Replay plugin stays on its old build: see PLATFORM_REFERENCE.md.
                                         # tests/test_cloudtak_fallback_pin_ops392.py keeps it from going stale.
-# ops #1074: CloudTAK 14.0.0 (Nov 22, 2026) is a MAJOR release we have not tested: it refuses to start
-# while the old MinIO store folder exists, drops the basemap and font routes, and needs newer ETL
-# images. Every channel installs "upstream latest", so without a cap one press of Update (or a fresh
-# Deploy) would put an untested major on a customer's box. The cap offers the newest 13.x until a
-# test passes; raise it (and the fallback pin) only after one does. tests/test_cloudtak_major_cap_ops1074.py
-CLOUDTAK_MAX_MAJOR = 13
+# ops #1074: CloudTAK 14.0.0 (Nov 22, 2026) is a MAJOR release. Every channel installs "upstream latest",
+# so the cap keeps the next untested major (15) off a customer's box until a test passes. 14 was tested
+# (Ubuntu 22.04, Rocky 9, ARM: fresh Deploy, Update from 13.128.0, video, all 17 Marketplace plugins,
+# console rollback, a v11 ETL layer); raise it only after the same test passes for the next major.
+# A box that still has the old MinIO folder stops at the newest 13.x first: _cloudtak_tag_for_minio_store().
+# tests/test_cloudtak_major_cap_ops1074.py
+CLOUDTAK_MAX_MAJOR = 14
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Caddy's certificate store, and the issuer subdirectory Let's Encrypt lands in.
 # Caddy namespaces the store by the ACME directory URL, so the issuer name is NOT a

@@ -14,14 +14,14 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""infra-TAK never offers CloudTAK 14 until it is tested (ops #1074).
+"""infra-TAK never offers a CloudTAK major it has not tested (ops #1074).
 
-CloudTAK 14.0.0 came out Nov 22, 2026. It is a major release: it refuses to start while the old
-MinIO store folder exists, drops the basemap and font routes and needs newer ETL images. infra-TAK
-installs "upstream latest" on every channel, and GitHub's "latest" is 14.0.0, so one press of
-Update, or a fresh Deploy, would have put an untested major on a customer's box.
+CloudTAK 14.0.0 came out Nov 22, 2026 and was tested on Ubuntu 22.04, Rocky 9 and ARM, so the cap
+is 14. infra-TAK installs "upstream latest" on every channel, so without a cap the next major (15)
+would reach a customer's box the day it is released. CLOUDTAK_MAX_MAJOR caps the lookup.
 
-CLOUDTAK_MAX_MAJOR caps the lookup. These tests fail without it: the lookup returns v14.0.0.
+These tests fail without the cap: the lookup returns v15.0.0. (Until the 10.4.6 candidate the cap
+was 13 and held 14 back; the same tests then used v14 where this file uses v15.)
 
 app.py cannot be imported in a test, so the functions are cut out of it.
 """
@@ -78,17 +78,17 @@ class _Proc:
 
 # What GitHub says on Nov 22, 2026: 14.0.0 is the newest, 13.x follows. Newest first, as GitHub sends it.
 RELEASES = [
+    {'tag_name': 'v15.0.0', 'draft': False, 'prerelease': False},
     {'tag_name': 'v14.1.0-rc.1', 'draft': False, 'prerelease': True},
     {'tag_name': 'v14.0.0', 'draft': False, 'prerelease': False},
     {'tag_name': 'v13.128.0', 'draft': False, 'prerelease': False},
-    {'tag_name': 'v13.127.0', 'draft': False, 'prerelease': False},
-    {'tag_name': 'v13.129.0', 'draft': True, 'prerelease': False},
+    {'tag_name': 'v14.0.1', 'draft': True, 'prerelease': False},
 ]
 
 LS_REMOTE = '\n'.join([
     'aaa\trefs/tags/v13.127.0',
     'bbb\trefs/tags/v14.0.0',
-    'ccc\trefs/tags/v13.128.0',
+    'ccc\trefs/tags/v15.0.0',
     'ddd\trefs/tags/v14.0.1',
     'eee\trefs/tags/v14.1.0-rc.1',
     'fff\trefs/tags/nightly',
@@ -107,46 +107,46 @@ def _api_returns(monkeypatch, payload):
 
 def test_cap_is_the_last_tested_major():
     assert 'CLOUDTAK_MAX_MAJOR' in APP
-    assert _top_level('CLOUDTAK_MAX_MAJOR') == 13
+    assert _top_level('CLOUDTAK_MAX_MAJOR') == 14
     # the offline pin must sit under the cap, or a fresh offline Deploy would break it
     assert int(_top_level('CLOUDTAK_VETTED_RELEASE').split('.')[0]) <= _top_level('CLOUDTAK_MAX_MAJOR')
 
 
-def test_release_list_never_gives_14(monkeypatch):
+def test_release_list_never_gives_15(monkeypatch):
     ns = _ns()
     seen = _api_returns(monkeypatch, RELEASES)
-    assert ns['_get_cloudtak_latest_release_tag'](use_cache=False) == 'v13.128.0'
-    assert ns['_cloudtak_release_cache']['tag'] == 'v13.128.0'
+    assert ns['_get_cloudtak_latest_release_tag'](use_cache=False) == 'v14.0.0'
+    assert ns['_cloudtak_release_cache']['tag'] == 'v14.0.0'
     # it must read the list: GitHub's "latest" answers 14.0.0 and would be unusable
     assert seen and 'releases/latest' not in seen[0]
 
 
-def test_git_fallback_never_gives_14(monkeypatch):
+def test_git_fallback_never_gives_15(monkeypatch):
     ns = _ns()
 
     def boom(req, timeout=None):
         raise OSError('HTTP Error 403: rate limit exceeded')
     monkeypatch.setattr(urllib.request, 'urlopen', boom)
     monkeypatch.setattr(subprocess, 'run', lambda argv, **kw: _Proc(LS_REMOTE))
-    assert ns['_cloudtak_latest_tag_from_git']() == 'v13.128.0'
-    assert ns['_get_cloudtak_latest_release_tag'](use_cache=False) == 'v13.128.0'
+    assert ns['_cloudtak_latest_tag_from_git']() == 'v14.0.1'
+    assert ns['_get_cloudtak_latest_release_tag'](use_cache=False) == 'v14.0.1'
 
 
-def test_list_with_only_14_falls_through_to_git(monkeypatch):
+def test_list_with_only_15_falls_through_to_git(monkeypatch):
     ns = _ns()
-    _api_returns(monkeypatch, [r for r in RELEASES if r['tag_name'].startswith('v14')])
+    _api_returns(monkeypatch, [r for r in RELEASES if r['tag_name'].startswith('v15')])
     monkeypatch.setattr(subprocess, 'run', lambda argv, **kw: _Proc(LS_REMOTE))
-    assert ns['_get_cloudtak_latest_release_tag'](use_cache=False) == 'v13.128.0'
+    assert ns['_get_cloudtak_latest_release_tag'](use_cache=False) == 'v14.0.1'
 
 
-def test_update_and_deploy_targets_stay_on_13(monkeypatch):
+def test_update_and_deploy_targets_stay_on_14(monkeypatch):
     ns = _ns()
     _api_returns(monkeypatch, RELEASES)
-    assert ns['_get_cloudtak_target_release_tag'](use_cache=False, allow_fallback=False) == 'v13.128.0'
-    assert ns['_get_cloudtak_target_release_tag'](use_cache=False) == 'v13.128.0'
+    assert ns['_get_cloudtak_target_release_tag'](use_cache=False, allow_fallback=False) == 'v14.0.0'
+    assert ns['_get_cloudtak_target_release_tag'](use_cache=False) == 'v14.0.0'
 
 
-def test_offline_deploy_uses_the_13_pin(monkeypatch):
+def test_offline_deploy_uses_the_pin(monkeypatch):
     ns = _ns()
 
     def boom(req, timeout=None):
@@ -159,6 +159,6 @@ def test_offline_deploy_uses_the_13_pin(monkeypatch):
 def test_helper_skips_prereleases_and_odd_names():
     pick = _ns().get('_cloudtak_newest_allowed_tag')
     assert pick, '_cloudtak_newest_allowed_tag is missing from app.py'
-    assert pick(['v14.0.0', 'v13.9.0', 'v13.10.0', 'v13.9.0-rc.1', 'nightly', '', None]) == 'v13.10.0'
-    assert pick(['v14.0.0']) is None
+    assert pick(['v15.0.0', 'v14.0.0', 'v13.10.0', 'v14.1.0-rc.1', 'nightly', '', None]) == 'v14.0.0'
+    assert pick(['v15.0.0']) is None
     assert pick([]) is None
