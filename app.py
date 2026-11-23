@@ -3991,8 +3991,21 @@ def _pkg_install(pkgs, repo=None, log_fn=None, timeout=1800):
         # sets the same for non-root boxes, where this env does not reach apt).
         env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l',
                    DPKG_FORCE='confdef,confold')
+        # ops #1124: the broker stops a stuck apt-get shortly before this call times out
+        env['TAKWERX_BROKER_TIMEOUT'] = str(max(int(timeout) - 10, 30))
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        if pm == 'dnf':
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        else:
+            # ops #1124: a stalled download host timed this out with no second try. A timeout
+            # is run once more (on a host that delivers, on Ubuntu); other failures are unchanged.
+            def _apt_once():
+                try:
+                    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+                except subprocess.TimeoutExpired:
+                    return subprocess.CompletedProcess(
+                        cmd, 124, '', f"timed out after {timeout} seconds (slow package mirror or a stuck package manager)")
+            r = _apt_retry_stalled(_apt_once, log_fn)
     except Exception as e:
         if log_fn:
             log_fn(f"  pkg install error ({pm}): {str(e)[:200]}")
@@ -37136,13 +37149,19 @@ def _apt_wait_for_lock(max_wait=300, log_fn=None):
 def _apt_run_waiting(argv, timeout=300, max_wait=300, log_fn=None, **kw):
     """Run one privileged apt argv, waiting (bounded) for the apt lock first and retrying once
     if apt still lost the race for it. Returns the CompletedProcess. Extra kwargs (env=) pass on."""
-    _apt_wait_for_lock(max_wait, log_fn)
-    r = _run_priv_chain([argv], 'and', timeout=timeout, **kw)
-    out = (r.stdout or '') + (r.stderr or '')
-    if r.returncode != 0 and any(m in out for m in _APT_LOCK_MSGS):
+    def _once():
         _apt_wait_for_lock(max_wait, log_fn)
-        r = _run_priv_chain([argv], 'and', timeout=timeout, **kw)
-    return r
+        r = _apt_chain_run([argv], timeout, **kw)
+        out = (r.stdout or '') + (r.stderr or '')
+        if r.returncode != 0 and any(m in out for m in _APT_LOCK_MSGS):
+            _apt_wait_for_lock(max_wait, log_fn)
+            r = _apt_chain_run([argv], timeout, **kw)
+        return r
+    # ops #1124: only an INSTALL that timed out is run again (on another host on Ubuntu);
+    # `apt-get update` keeps its own handling.
+    if 'install' in argv:
+        return _apt_retry_stalled(_once, log_fn)
+    return _once()
 
 
 # ops #605: the Caddy deploy ran every apt line with a fixed timeout=120. On Ubuntu 22.04 the
@@ -50799,9 +50818,13 @@ def run_mediamtx_deploy():
                  "⚠ ffmpeg unavailable — MediaMTX streaming OK, but recording / MP4 download / test stream need ffmpeg (RPM Fusion repo unreachable?)")
         else:
             wait_for_apt_lock(plog, mediamtx_deploy_log)
-            r = _run_priv_chain([['apt-get', 'update', '-qq'], ['apt-get', 'install', '-y', 'wget', 'tar', 'curl', 'ffmpeg', 'openssl', 'python3', 'python3-pip']], 'and', timeout=300)
+            # ops #1124: a download host that stalls timed this step out on three fresh boxes with no
+            # second try; a timeout is now run once more, on a host that delivers (Ubuntu).
+            r = _apt_retry_stalled(
+                lambda: _apt_chain_run([['apt-get', 'update', '-qq'], ['apt-get', 'install', '-y', 'wget', 'tar', 'curl', 'ffmpeg', 'openssl', 'python3', 'python3-pip']], 300),
+                plog)
             if r.returncode != 0:
-                plog(f"✗ apt install failed: {r.stdout[-200:]}")
+                plog(f"✗ apt install failed: {((r.stdout or '') + (r.stderr or ''))[-300:]}")
                 mediamtx_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Dependencies installed (wget, ffmpeg, python3)")
@@ -102900,7 +102923,7 @@ def _apt_update_capture(timeout=600, log_fn=None):
 
     ok, out = _run()
     # v10.2.10 (Cloudsmith 402): a dead Caddy Cloudsmith repo fails the update the same way.
-    _healed = (not ok and 'cloudsmith.io' in out and _caddy_apt_repo_heal() == 'dead')
+    _healed = (not ok and re.search(r'cloudsmith\.io', out) is not None and _caddy_apt_repo_heal() == 'dead')
     if not ok and (_apt_disable_dead_local_sources() or _healed):
         ok2, out2 = _run()
         if ok2:
@@ -102908,6 +102931,270 @@ def _apt_update_capture(timeout=600, log_fn=None):
                                 'and retried — update succeeded.\n' + out2).strip()
         return ok2, out2
     return ok, out
+
+
+# ops #1124: three fresh Ubuntu 22.04 boxes (ops #1111, Mon Nov 23) stopped at "apt-get install ...
+# timed out after 300 seconds". The download host answered but then sent nothing (0 KB/s for a
+# real package). The console's apt steps ran once, waited their whole limit and failed, with no
+# retry and no other host, so a customer whose mirror stalls the same way gets a failed deploy.
+# Now: an apt step that TIMES OUT is run once more. On Ubuntu, before that second try, the box's
+# Ubuntu hosts are swapped for one that delivers a real package (the same rule the fresh-install
+# test tool uses, ops PR 1114: it serves the suite and its -security pocket and gives one real
+# updated package above 100 KB/s; a probe only rejects, a fast answer proves nothing, ops #934).
+# The swap lasts for the second try only: the operator's own source files are put back after it.
+# Packages stay signed by Ubuntu's own keys, so a mirror cannot add anything apt would trust.
+_APT_STALL_HOSTS = {
+    'amd64': ('us.archive.ubuntu.com', 'mirrors.edge.kernel.org'),
+    'arm64': ('ports.ubuntu.com',),
+}
+_APT_MIRROR_MIN_KBS = 100
+_APT_MIRROR_PROBE_S = 15
+_APT_UBUNTU_HOST_RE = re.compile(
+    r'(https?://)((?:[A-Za-z0-9-]+\.)*archive\.ubuntu\.com|security\.ubuntu\.com'
+    r'|(?:[A-Za-z0-9-]+\.)*ports\.ubuntu\.com)(?=[/\s]|$)')
+_APT_PROBE_FILE_RE = re.compile(r'pool/[A-Za-z0-9._+~/-]+')
+
+
+def _apt_is_ubuntu():
+    try:
+        with open('/etc/os-release') as f:
+            for line in f:
+                if line.startswith('ID='):
+                    return line.split('=', 1)[1].strip().strip('"').lower() == 'ubuntu'
+    except Exception:
+        pass
+    return False
+
+
+def _apt_ubuntu_source_files():
+    files = ['/etc/apt/sources.list']
+    try:
+        d = '/etc/apt/sources.list.d'
+        files += [os.path.join(d, f) for f in sorted(os.listdir(d))
+                  if f.endswith(('.list', '.sources'))]
+    except Exception:
+        pass
+    return files
+
+
+def _apt_current_host():
+    """The first Ubuntu host the apt source files name ('' when none)."""
+    for p in _apt_ubuntu_source_files():
+        try:
+            with open(p, 'r', errors='replace') as f:
+                m = _APT_UBUNTU_HOST_RE.search(f.read())
+        except Exception:
+            continue
+        if m:
+            return m.group(2)
+    return ''
+
+
+def _apt_rewrite_hosts(text, new_host, base):
+    """`text` with every Ubuntu host (archive, security, ports) swapped for new_host. ARM mirrors
+    serve /ubuntu-ports where the x86 ones serve /ubuntu."""
+    out = _APT_UBUNTU_HOST_RE.sub(lambda m: m.group(1) + new_host, text)
+    if base == 'ubuntu-ports':
+        out = re.sub(r'(https?://' + re.escape(new_host) + r')/ubuntu(?=[/\s]|$)',
+                     r'\1/ubuntu-ports', out)
+    return out
+
+
+def _apt_probe_file(gz_path):
+    """One 1.5 to 8 MB package path out of a mirror's -updates Packages.gz ('' when none)."""
+    import gzip
+    try:
+        with gzip.open(gz_path, 'rt', errors='replace') as f:
+            text = f.read()
+    except Exception:
+        return ''
+    for stanza in text.split('\n\n'):
+        fn, size = '', 0
+        for line in stanza.splitlines():
+            if line.startswith('Filename: '):
+                fn = line[10:].strip()
+            elif line.startswith('Size: '):
+                try:
+                    size = int(line[6:].strip())
+                except ValueError:
+                    size = 0
+        if fn and 1500000 <= size <= 8000000 and _APT_PROBE_FILE_RE.fullmatch(fn) and '..' not in fn:
+            return fn
+    return ''
+
+
+def _apt_probe_kbs(host, base, suite, arch, run=None):
+    """Speed in KB/s of one recently updated package from `host` (0 when nothing came). The
+    package comes from the -updates index, so a mirror that is quick for index files and
+    stalls on new packages is caught (ops #934)."""
+    run = run or subprocess.run
+    t = str(_APT_MIRROR_PROBE_S)
+    d = tempfile.mkdtemp(prefix='infratak-aptprobe-')
+    try:
+        gz = os.path.join(d, 'Packages.gz')
+        r = run(['curl', '-s', '--max-time', t, '-o', gz, '-w', '%{speed_download}',
+                 f'http://{host}/{base}/dists/{suite}-updates/main/binary-{arch}/Packages.gz'],
+                capture_output=True, text=True, timeout=_APT_MIRROR_PROBE_S + 10)
+        bps = r.stdout
+        fn = _apt_probe_file(gz)
+        if fn:
+            r = run(['curl', '-s', '--max-time', t, '-o', '/dev/null', '-w', '%{speed_download}',
+                     f'http://{host}/{base}/{fn}'],
+                    capture_output=True, text=True, timeout=_APT_MIRROR_PROBE_S + 10)
+            bps = r.stdout
+        return int(float((bps or '0').strip() or 0) / 1024)
+    except Exception:
+        return 0
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _apt_mirror_ok(host, base, suite, arch, run=None):
+    """True when `host` serves the suite AND its -security pocket and delivers one real package
+    above _APT_MIRROR_MIN_KBS. `host`, `base` and `suite` are fixed literals or a codename that
+    matched [a-z]+; they go to curl as arguments, never to a shell."""
+    run = run or subprocess.run
+    for pocket in (suite, suite + '-security'):
+        try:
+            r = run(['curl', '-fs', '--max-time', str(_APT_MIRROR_PROBE_S), '-o', '/dev/null',
+                     f'http://{host}/{base}/dists/{pocket}/Release'],
+                    capture_output=True, text=True, timeout=_APT_MIRROR_PROBE_S + 10)
+        except Exception:
+            return False
+        if r.returncode != 0:
+            return False
+    return _apt_probe_kbs(host, base, suite, arch, run=run) >= _APT_MIRROR_MIN_KBS
+
+
+def _apt_pick_mirror(log_fn=None, run=None):
+    """(host, base) of a mirror that delivers, other than the one the box already uses, or None."""
+    log = log_fn or (lambda m: None)
+    suite = _apt_codename()
+    if not re.fullmatch(r'[a-z]+', suite or ''):
+        return None
+    arch = _host_arch()
+    base = 'ubuntu-ports' if arch == 'arm64' else 'ubuntu'
+    current = _apt_current_host()
+    for cand in _APT_STALL_HOSTS.get(arch, ()):
+        if cand == current:
+            continue
+        if _apt_mirror_ok(cand, base, suite, arch, run=run):
+            return cand, base
+        log(f"  apt host {cand} did not deliver a real package, not used")
+    return None
+
+
+def _apt_switch_ubuntu_hosts(new_host, base, log_fn=None):
+    """Point every apt source file that names an Ubuntu host at new_host. Returns
+    {path: original text} for the files changed ({} when none, or when a write failed, in which
+    case the files already changed are put back first). Third-party repos (PGDG, Docker, Caddy)
+    never match the host pattern and are not touched."""
+    saved = {}
+    try:
+        for p in _apt_ubuntu_source_files():
+            try:
+                with open(p, 'r', errors='replace') as f:
+                    body = f.read()
+            except Exception:
+                continue
+            new = _apt_rewrite_hosts(body, new_host, base)
+            if new == body:
+                continue
+            saved[p] = body
+            _write_priv(p, new)
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ⚠ could not change the apt sources ({type(e).__name__}: {e}); keeping the box's own host")
+        _apt_restore_sources(saved, log_fn)
+        return {}
+    return saved
+
+
+def _apt_restore_sources(saved, log_fn=None):
+    """Put the operator's apt source files back exactly as they were."""
+    for p, body in saved.items():
+        try:
+            _write_priv(p, body)
+        except Exception as e:
+            if log_fn:
+                log_fn(f"  ⚠ could not restore {p}: {type(e).__name__}: {e}")
+
+
+def _apt_stalled(r):
+    """True when an apt step ran out of time (returncode 124, or the 'timed out after' text), or
+    when apt gave up on a download host that sent nothing, in its own words ("Connection timed
+    out", "Could not connect", "Temporary failure resolving", see _APT_TRANSIENT_RE). apt's own
+    120 s no-data limit usually fires before the console's step limit, so both must count. Any
+    other failure (a missing package, a held lock, a bad signature) is not a stall."""
+    out = f"{getattr(r, 'stdout', '') or ''}{getattr(r, 'stderr', '') or ''}"
+    # `takwerx_broker: TIMEOUT: command timed out` is the non-root broker stopping apt-get at the
+    # deadline the console sent (_apt_broker_env); its exit code is 126, not 124.
+    return (r.returncode == 124 or 'timed out after' in out or 'TIMEOUT: command timed out' in out
+            or _apt_failure_is_transient(out))
+
+
+def _apt_broker_env(timeout, env=None):
+    """`env` (default: the console's) with TAKWERX_BROKER_TIMEOUT a little under `timeout`. On a
+    non-root box the console runs apt through the broker; when the console gives up on a step it
+    only kills its own brokerctl, and the root apt-get kept running, holding the dpkg lock, so
+    the second try died with "Could not get lock" (ops #1124 box test: 5 minutes later it was
+    still there). This value rides the request, and the broker kills apt-get at that time."""
+    out = dict(env if env is not None else os.environ)
+    out['TAKWERX_BROKER_TIMEOUT'] = str(max(int(timeout) - 10, 30))
+    return out
+
+
+def _apt_chain_run(cmds, timeout, **kw):
+    """_run_priv_chain with a timeout turned into returncode 124, so the caller can retry it."""
+    kw['env'] = _apt_broker_env(timeout, kw.get('env'))
+    try:
+        return _run_priv_chain(cmds, 'and', timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmds, 124, '', f"timed out after {timeout} seconds (slow package mirror or a stuck package manager)")
+
+
+def _apt_retry_stalled(run_once, log_fn=None):
+    """Run one apt step; if it TIMES OUT, run it once more (ops #1124). `run_once()` returns a
+    CompletedProcess (returncode 124 for a timeout). Any other failure is returned as it is: it
+    keeps today's handling. On Ubuntu the second try runs on a download host that delivers a
+    real package, with the box's source files put back afterwards. When no other host
+    delivers, the second try runs on the box's own host and the log says so."""
+    r = run_once()
+    if r.returncode == 0 or not _apt_stalled(r):
+        return r
+    log = log_fn or (lambda m: None)
+    log("  ⚠ The package step stalled or timed out (a download host that answers but sends nothing?). Trying once more.")
+    _apt_wait_for_lock(150, log_fn)
+    saved, host = {}, ''
+    try:
+        if _apt_is_ubuntu():
+            pick = _apt_pick_mirror(log_fn)
+            if pick:
+                saved = _apt_switch_ubuntu_hosts(pick[0], pick[1], log_fn)
+            if saved:
+                host = pick[0]
+                log(f"  Second try uses {host} (it delivered a real package just now).")
+                try:
+                    _apt_chain_run([['apt-get', 'update', '-qq']], 300)
+                except Exception:
+                    pass
+            else:
+                log("  No other apt host delivered a real package. Second try uses the box's own host.")
+        r2 = run_once()
+    finally:
+        if saved:
+            _apt_restore_sources(saved, log_fn)
+            try:
+                _apt_chain_run([['apt-get', 'update', '-qq']], 180)
+            except Exception:
+                pass
+    if r2.returncode != 0:
+        note = ('[infra-TAK] The first try stalled or timed out. The second try ran on '
+                f"{host or 'the box own host'} and failed too. ")
+        return subprocess.CompletedProcess(r2.args, r2.returncode, r2.stdout,
+                                           note + (r2.stderr or ''))
+    return r2
 
 
 def _pgdg_gis_pin_ensure(log_fn=None):
