@@ -338,7 +338,8 @@ def test_every_path_that_regenerates_the_vhost_then_checks_the_switch():
     src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
     calls = src.count('_reconcile_signed_identity(')
     # definition + deploy + update + update with nothing to install
-    assert calls == 4, calls
+    # + the repair of a lost signing key (ops #1151, converge_signed_identity)
+    assert calls == 5, calls
     assert '_reconcile_signed_identity(\n                    ctx, inst, plog, regenerate=True)' in src
     assert 'atlas_signed_identity.remove(ctx, inst)' in src
 

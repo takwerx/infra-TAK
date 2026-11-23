@@ -245,6 +245,54 @@ def ensure(ctx, inst, dirpath, write_env_value, plog, host, opener=None,
         return {'env_changed': False, 'source': 'unchanged'}
 
 
+def env_source(dirpath):
+    """What the deployment's `.env` says today: 'jwt', 'headers', or '' when
+    the line or the file is not there. Never raises."""
+    try:
+        with open(os.path.join(dirpath, '.env'), encoding='utf-8') as handle:
+            for line in handle.read().splitlines():
+                if line.startswith(ENV_SOURCE + '='):
+                    return line.split('=', 1)[1].strip()
+    except OSError:
+        pass
+    return ''
+
+
+def key_lost(ctx, inst, opener=None):
+    """Is this deployment's provider without its signing key? (ops #1151)
+
+    📖 Authentik sets `signing_key` to None on **every** save through the proxy
+    provider API: `ProxyProviderSerializer.create` and `.update` call
+    `ProxyProvider.set_oauth_defaults()`, which has the line
+    `self.signing_key = None` (authentik/providers/proxy/api.py and models.py,
+    read at tag version/2026.8.5). A PATCH of `cookie_domain` or
+    `external_host`, and a save of the provider in Authentik's own admin page,
+    all take the key off. Authentik then signs with the client secret (HS256)
+    again, and ATLAS on `jwt` answers 401 to every administrator.
+
+    True only when Authentik answered and the key is not on the provider.
+    Never raises: "could not look" is False, so a timeout changes nothing.
+    """
+    try:
+        settings = ctx['load_settings']()
+        admin = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
+                 ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
+        if not admin:
+            return False
+        api = AuthentikAdmin(ctx['_get_authentik_api_url'](settings), admin, opener)
+        names = atlas_instances.authentik_names(inst)
+        provider = find_provider(api, names['provider'])
+        if provider is None:
+            return False
+        key = _find(api, 'crypto/certificatekeypairs/', 'name', key_name(names['provider']))
+        if key is None or not key.get('pk'):
+            return True
+        current = api.call('providers/oauth2/%s/' % provider['pk'])
+        return str(current.get('signing_key') or '') != str(key['pk'])
+    except Exception:
+        return False
+
+
 def remove(ctx, inst, opener=None):
     """Delete the deployment's signing key. Returns a note, or '' when nothing
     was there. Never raises.

@@ -13009,6 +13009,21 @@ def console_rollback_api():
                 return jsonify({'ok': False, 'error': (
                     'Rollback stopped: the MediaMTX web editor passwords could not be changed '
                     'for the older version. Nothing was changed.')}), 500
+        # ops #1151: an older release cannot keep ATLAS on Authentik's signed token (its
+        # Caddyfile does not pass the token and its Authentik reconfigure takes the signing
+        # key off). Put such a deployment back on the identity headers first, or it refuses
+        # every administrator after the rollback. A failure here does not stop the rollback.
+        atlas_reset = {}
+        try:
+            _atlas_rb = (mod_registry.MODULES.get('atlas') or {}).get('before_console_rollback')
+            if _atlas_rb:
+                atlas_reset = _atlas_rb(
+                    mod_registry.get_ctx(),
+                    lambda m: print(f'Rollback: ATLAS {m}', flush=True),
+                    _console_release_has_file(console_dir, prev_tag,
+                                              'modules/atlas_signed_identity.py')) or {}
+        except Exception as _arb:
+            print(f'Rollback: ATLAS sign-in step error (non-fatal): {str(_arb)[:160]}', flush=True)
         checkout_r = subprocess.run(
             git_cfg + ['checkout', '--force', prev_tag],
             cwd=console_dir, capture_output=True, text=True, timeout=30,
@@ -13027,6 +13042,9 @@ def console_rollback_api():
                         'format, so its accounts got new passwords. The admin password is on '
                         'the MediaMTX page. All of them are in '
                         '/opt/mediamtx-webeditor/initial_admin_password.txt on the editor box.')
+        if 'failed' in atlas_reset.values():
+            message += (' ATLAS could not be set back to the sign-in of that version. If the '
+                        'ATLAS console refuses administrators, press Update Now again.')
         return jsonify({
             'ok': True, 'tag': prev_tag,
             'message': message,
@@ -36527,6 +36545,8 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
             _log(f"✓ Proxy providers updated ({len(providers)} total)")
         except Exception as e:
             _log(f"⚠ Proxy providers: {str(e)[:120]}")
+        # ops #1151: every provider was just saved, so each lost its signing key.
+        _atlas_signed_identity_converge(_log)
 
     # 6. Restart Authentik if env changed (env changes require full down/up, not just restart)
     if env_changed:
@@ -39508,6 +39528,20 @@ def _console_release_editor_ref(console_dir, tag):
         return ''
     m = re.search(r'''MEDIAMTX_EDITOR_REF\s*=\s*["']([^"']+)["']''', r.stdout or '')
     return m.group(1) if m else ''
+
+
+def _console_release_has_file(console_dir, tag, path):
+    """Does console release `tag` hold `path`? False when git cannot say (ops #1151)."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', str(tag or '')):
+        return False   # never let a stored value reach git as an option
+    try:
+        r = subprocess.run(
+            ['git', '-c', f'safe.directory={console_dir}', 'cat-file', '-e', f'{tag}:{path}'],
+            cwd=console_dir, capture_output=True, text=True, timeout=30,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    except Exception:
+        return False
+    return r.returncode == 0
 
 
 def _mediamtx_editor_run_users_script(settings, script):
@@ -66663,6 +66697,13 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
             pk = prov.get('pk')
             if not pk:
                 continue
+            # ops #1151: no write when the value is already right. Every save through
+            # this API makes Authentik reset the provider's OAuth2 settings, and that
+            # takes an ATLAS provider's token signing key off (signing_key = None in
+            # ProxyProvider.set_oauth_defaults, authentik/providers/proxy/models.py at
+            # version/2026.8.5). This runs after every console update.
+            if (prov.get('cookie_domain') or '').strip() == cookie_domain:
+                continue
             try:
                 patch = _req.Request(f'{ak_url}/api/v3/providers/proxy/{pk}/',
                     data=json.dumps({'cookie_domain': cookie_domain}).encode(),
@@ -66673,6 +66714,24 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
         _log("  ✓ Proxy providers cookie_domain set for shared session")
     except Exception as e:
         _log(f"  ⚠ Proxy cookie_domain: {str(e)[:80]}")
+    # ops #1151: a provider that did get a write has lost its signing key.
+    _atlas_signed_identity_converge(_log)
+
+
+def _atlas_signed_identity_converge(log=None):
+    """ops #1151: ask the ATLAS module to put a lost token signing key back.
+
+    Call it after anything that saves Authentik proxy providers through the proxy
+    provider API: that save takes the key off, and an ATLAS deployment that reads the
+    signed token then refuses every administrator. The module also checks every five
+    minutes. Never raises; nothing happens on a box with no ATLAS."""
+    _say = log or (lambda m: None)
+    try:
+        _conv = (mod_registry.MODULES.get('atlas') or {}).get('converge_signed_identity')
+        if _conv:
+            _conv(mod_registry.get_ctx(), lambda m: _say(f'  {m}'))
+    except Exception as _e:
+        _say(f'  ⚠ ATLAS signed sign-in check: {str(_e)[:120]}')
 
 
 def _reload_embedded_outpost(plog=None):
@@ -118268,6 +118327,8 @@ def _startup_app_access_policy_converge(log=None):
                 _atlas_conv(mod_registry.get_ctx(), ak_url, ak_headers, _l)
         except Exception as _ace:
             _l(f'ATLAS access swap error (non-fatal): {str(_ace)[:160]}')
+        # ops #1151: at every console start too, so a restart repairs it at once.
+        _atlas_signed_identity_converge(_l)
     except Exception as _e:
         try:
             _l(f'error (non-fatal): {str(_e)[:200]}')
