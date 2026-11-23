@@ -70,6 +70,14 @@ def _assign(name):
         and any(isinstance(t, ast.Name) and t.id == name for t in n.targets)))
 
 
+def _present(*names):
+    """ops #1018: names the shipped app.py has (so the proof test can also run on the base commit,
+    which lacks the new ones, and fail there for the right reason)."""
+    src = {n.name for n in TREE.body if isinstance(n, ast.FunctionDef)}
+    src |= {t.id for n in TREE.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    return [n for n in names if n in src]
+
+
 def _iso(ts):
     return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(ts)) + '.123456789Z'
 
@@ -222,6 +230,7 @@ class Box:
                 '_CLOUDTAK_RECREATE_PENDING', 'CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR',
                 'CLOUDTAK_AUTOREPAIR_SETTLE_S', 'CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S',
                 'CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S', '_CLOUDTAK_COMPOSE_UP_RE',   # ops #889
+                'CLOUDTAK_JOBEND_POLL_S', *_present('CLOUDTAK_AUTOREPAIR_PASSES', 'CLOUDTAK_AUTOREPAIR_RECHECK_S'),   # ops #1018
                 '_CLOUDTAK_AUTOREPAIR_RECORD', '_CLOUDTAK_COMPOSE_BUSY_RE',
                 '_CLOUDTAK_PORTAL_JOB_RE',   # ops #850: TAK Portal's helper counts as a stack change
                 'cloudtak_autorepair_status', '_cloudtak_autorepair_lock')]
@@ -235,9 +244,11 @@ class Box:
                 '_cloudtak_drift', '_cloudtak_drift_summary', '_cloudtak_stack_busy_procs',
                 '_cloudtak_autorepair_wait_reason',
                 '_cloudtak_autorepair_record', '_cloudtak_autorepair_record_save',
-                '_cloudtak_autorepair_request', '_cloudtak_autorepair_run',
+                '_cloudtak_autorepair_request', *_present('_cloudtak_autorepair_await_quiet'), '_cloudtak_autorepair_run',
                 '_cloudtak_autorepair_notify')])
         exec(compile(src, 'app.py', 'exec'), ns)
+        ns['CLOUDTAK_AUTOREPAIR_RECHECK_S'] = 0     # ops #1018: no real waiting in a test (ignored on a commit without it)
+        ns['CLOUDTAK_JOBEND_POLL_S'] = 0
         return ns
 
     def request(self):

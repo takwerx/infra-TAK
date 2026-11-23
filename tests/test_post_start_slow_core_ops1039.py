@@ -88,6 +88,8 @@ def box(tmp_path):
         'AUTHENTIK_BOOTSTRAP_LDAP_BASEDN=dc=takldap\n')
     gd = tmp_path / 'gd'
     gd.mkdir()
+    clock = tmp_path / 'clock'
+    clock.write_text('0\n')
 
     def sandbox(src):
         return (src.replace('/opt/tak-guarddog/', str(gd) + '/')
@@ -97,8 +99,8 @@ def box(tmp_path):
                    .replace('/tmp/', str(tmp_path) + '/')
                    .replace('/home/*/', str(tmp_path / 'nohome') + '/*/')
                    .replace('/root/', str(tmp_path / 'noroot') + '/')
-                   # the wall-clock budget, short: the sleep stub does not sleep
-                   .replace('_CORE_WAIT=420', '_CORE_WAIT=3'))
+                   # sleep only moves a fake clock; the script reads it through _now (ops #1122)
+                   .replace('_now() { echo "$SECONDS"; }', '_now() { cat %s; }' % clock))
 
     (gd / '_gd-tak-lib.sh').write_text(sandbox(LIB))
     (gd / 'send-alert-email.sh').write_text('#!/bin/sh\necho "alert-mail $*" >> %s\ncat >/dev/null\n' % calls)
@@ -110,8 +112,8 @@ def box(tmp_path):
     (stubs / 'ss').write_text('#!/bin/sh\necho "LISTEN 0 4096 *:8089 *:*"\n')
     (stubs / 'id').write_text('#!/bin/sh\nexit 1\n')                 # no local postgres
     (stubs / 'systemctl').write_text('#!/bin/sh\nexit 1\n')          # no MediaMTX
-    for name in ('sleep', 'logger'):
-        (stubs / name).write_text('#!/bin/sh\nexit 0\n')
+    (stubs / 'sleep').write_text('#!/bin/sh\nn=$(cat %s); echo $((n + ${1:-0})) > %s\n' % (clock, clock))
+    (stubs / 'logger').write_text('#!/bin/sh\nexit 0\n')
     for f in list(stubs.iterdir()) + [gd / 'send-alert-email.sh']:
         f.chmod(0o755)
     (tmp_path / 'uptime').write_text('26.42 99.00\n')
@@ -120,6 +122,7 @@ def box(tmp_path):
         """core_ready_after: how many /-/health/ready/ asks answer 503 first (None = never ready).
         noport: the probe gets no answer at all; unhealthy: Docker does not call authentik-server healthy.
         hard_end: seconds after the script start past which the core wait never goes (default 960)."""
+        clock.write_text('0\n')
         (state / 'thresh').write_text(str(100000 if core_ready_after is None else core_ready_after))
         if groups_never:
             (state / 'groups-never').write_text('')

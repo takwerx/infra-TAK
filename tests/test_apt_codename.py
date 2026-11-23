@@ -144,12 +144,16 @@ def test_kernel_cve_table_noble_row():
     box = Box(NOBLE)
     banner = box.ns['_kernel_cve_banner']
     assert banner('6.8.0-116-generic') == 'CVE-2026-31431 (Copy Fail)'
-    assert banner('6.8.0-117-generic') is None
-    assert banner('6.8.0-124-generic') is None
+    # ops #1084: CVE-2026-98432 (fixed in 6.8.0-149) is named once Copy Fail is patched
+    assert banner('6.8.0-117-generic') == 'CVE-2026-98432'
+    assert banner('6.8.0-124-generic') == 'CVE-2026-98432'
+    assert banner('6.8.0-149-generic') is None
     jam = Box(JAMMY).ns['_kernel_cve_banner']
     assert jam('5.15.0-178-generic') == 'CVE-2026-31431 (Copy Fail)'
     # dev's CVE-2026-53266 row (jammy only) takes over once Copy Fail is patched
     assert jam('5.15.0-179-generic') == 'CVE-2026-53266'
-    assert jam('5.15.0-198-generic') is None
+    # ops #1084: CVE-2026-98432 (fixed in 5.15.0-203) is named after 53266 is patched
+    assert jam('5.15.0-198-generic') == 'CVE-2026-98432'
+    assert jam('5.15.0-203-generic') is None
     # unknown codename: never claim exposure
     assert Box(BOOKWORM).ns['_kernel_cve_banner']('6.1.0-10-amd64') is None

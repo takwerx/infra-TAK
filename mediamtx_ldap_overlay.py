@@ -28,6 +28,9 @@ Patches the vanilla MediaMTX config editor Flask app to:
 import os
 import re
 import json
+import threading
+import time
+import urllib.parse
 import urllib.request
 import urllib.error
 from html import escape as _html_escape
@@ -65,6 +68,120 @@ ADMIN_GROUPS = frozenset({'authentik Admins'})
 VIEWER_GROUPS = frozenset({'vid_private', 'vid_public'})
 
 VISIBILITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stream_visibility.json')
+
+# Which groups a signed-in person is in (ops #1082).
+#
+# Roles here come from group NAMES, so the names must be exact. The X-Authentik-Groups
+# header cannot give that: the outpost joins the names with "|" into one value, and an
+# Authentik group name is free text that may hold "|" itself, so splitting the header
+# does not give back the list that went in. The list is read from Authentik's user API
+# instead (a JSON list, one entry per group), with the token this editor already uses
+# for the Stream Access page. It is also the live answer: a person taken out of a group
+# loses the role within GROUPS_RECHECK_SECONDS, not at their next sign-in.
+#
+# No answer from Authentik (restarting, token unusable) never gives a role: the last
+# answer is kept for GROUPS_UNCONFIRMED_MAX_SECONDS, after that the person has no groups
+# (a viewer of public streams) until Authentik answers again.
+#
+# Header format: https://docs.goauthentik.io/add-secure-apps/providers/proxy/
+# ("X-authentik-groups ... separated by a pipe"). The header and the API's groups_obj
+# are the same list, the person's own groups: blueprints/system/providers-oauth2.yaml
+# (profile scope, request.user.groups) and authentik/core/api/users.py (instance.groups),
+# read at version/2026.8.5.
+GROUPS_RECHECK_SECONDS = 60            # ask Authentik again at most this often per user
+GROUPS_UNKNOWN_RETRY_SECONDS = 20      # after no answer, wait this long before the next try
+GROUPS_UNCONFIRMED_MAX_SECONDS = 900   # how long the last answer stands with no new one
+GROUPS_LOOKUP_TIMEOUT_SECONDS = 4      # one API call
+GROUPS_LOOKUP_WAIT_SECONDS = 9         # a request never waits longer than this (two calls)
+
+_groups_lock = threading.Lock()
+_groups_cache = {}      # username -> (tuple of names, or None for no answer; time checked)
+_groups_last = {}       # username -> (tuple of names, time of the last real answer)
+_groups_inflight = {}   # username -> Thread
+_groups_warned = {}     # username -> time of the last "no answer" log line
+
+
+def _authentik_groups_lookup(username):
+    """The exact names of the groups `username` is in, asked from Authentik now.
+    A tuple (empty for an unknown or deactivated account), or None for no usable answer.
+    Never raises."""
+    try:
+        if not AK_TOKEN:
+            return None
+
+        def _get(path):
+            r = urllib.request.Request(f'{AK_URL}/api/v3/{path}', headers=_ak_headers())
+            return json.loads(urllib.request.urlopen(
+                r, timeout=GROUPS_LOOKUP_TIMEOUT_SECONDS).read().decode())
+
+        # `username=` is an exact match; the row is still compared, because Authentik
+        # ignores a filter it does not know and would then return every user.
+        data = _get('core/users/?username=%s&include_groups=true'
+                    % urllib.parse.quote(username, safe=''))
+        results = data.get('results') if isinstance(data, dict) else None
+        if not isinstance(results, list):
+            return None
+        user = next((u for u in results
+                     if isinstance(u, dict) and u.get('username') == username), None)
+        if user is None or user.get('is_active') is not True:
+            return ()
+        groups = user.get('groups_obj')
+        if not isinstance(groups, list):
+            full = _get('core/users/%d/' % int(user['pk']))
+            groups = full.get('groups_obj') if isinstance(full, dict) else None
+            if not isinstance(groups, list):
+                return None
+        return tuple(g['name'] for g in groups
+                     if isinstance(g, dict) and isinstance(g.get('name'), str) and g['name'])
+    except Exception:
+        return None
+
+
+def _authentik_groups(username):
+    """Cached _authentik_groups_lookup(): the exact group names as a list, or None when
+    Authentik gave no answer and the last one is older than
+    GROUPS_UNCONFIRMED_MAX_SECONDS. One lookup per user at a time."""
+    if not username:
+        return None
+    started = time.time()
+
+    def _run():
+        names = _authentik_groups_lookup(username)
+        with _groups_lock:
+            if len(_groups_cache) > 2048:
+                _groups_cache.clear()
+                _groups_last.clear()
+                _groups_warned.clear()
+            _groups_cache[username] = (names, time.time())
+            if names is not None:
+                _groups_last[username] = (names, time.time())
+            _groups_inflight.pop(username, None)
+
+    def _answer(hit):
+        if hit[0] is not None:
+            return list(hit[0])
+        last = _groups_last.get(username)
+        if last and 0 <= time.time() - last[1] <= GROUPS_UNCONFIRMED_MAX_SECONDS:
+            return list(last[0])
+        return None
+
+    with _groups_lock:
+        hit = _groups_cache.get(username)
+        if hit:
+            ttl = GROUPS_UNKNOWN_RETRY_SECONDS if hit[0] is None else GROUPS_RECHECK_SECONDS
+            if 0 <= started - hit[1] < ttl:
+                return _answer(hit)
+        t = _groups_inflight.get(username)
+        if t is None:
+            t = threading.Thread(target=_run, daemon=True, name='authentik-groups-lookup')
+            _groups_inflight[username] = t
+            t.start()
+    t.join(GROUPS_LOOKUP_WAIT_SECONDS)
+    with _groups_lock:
+        hit = _groups_cache.get(username)
+        if hit and hit[1] >= started:
+            return _answer(hit)
+        return _answer((None, started))
 
 # v10.2.4 (GH #82): MediaMTX stream paths may be nested — OBS and DJI publish to
 # rtmp://host/live/<name>. One path segment: MediaMTX's path-name characters (plus ':').
@@ -146,7 +263,6 @@ def apply_ldap_overlay(app):
     @app.before_request
     def _authentik_auto_auth():
         ak_user = request.headers.get('X-Authentik-Username', '')
-        ak_groups_raw = request.headers.get('X-Authentik-Groups', '')
         if not ak_user:
             return
         # Peer pin (v10.1.48). Believe identity headers only from a peer that is
@@ -163,7 +279,18 @@ def apply_ldap_overlay(app):
                       'INFRATAK_TRUSTED_PROXIES in mediamtx-webeditor.service.'
                       % (peer or '<unknown>', ','.join(sorted(TRUSTED_PROXIES))), flush=True)
             return
-        groups = [g.strip() for g in ak_groups_raw.split('|') if g.strip()]
+        # ops #1082: the groups come from Authentik's own list, never from the groups
+        # header (see _authentik_groups). No answer means no groups and no admin role.
+        groups = _authentik_groups(ak_user)
+        if groups is None:
+            groups = []
+            now = time.time()
+            if now - _groups_warned.get(ak_user, 0) > 300:
+                _groups_warned[ak_user] = now
+                print('[infratak-overlay] Authentik did not say which groups %r is in '
+                      '(API %s). Until it does, this person is a viewer of public streams '
+                      'only. Check AUTHENTIK_TOKEN in the editor env file and that '
+                      'Authentik is up.' % (ak_user, AK_URL), flush=True)
         role = 'admin' if any(g in ADMIN_GROUPS for g in groups) else 'viewer'
         session['username'] = ak_user
         session['logged_in'] = True

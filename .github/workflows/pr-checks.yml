@@ -58,7 +58,8 @@ jobs:
         with:
           python-version: '3.12'
       # Pinned so the baseline means the same thing every run (the runner's own shellcheck moves with the image).
-      - run: pip install shellcheck-py==0.11.0.1 && shellcheck --version
+      # Installed by hash from a lock file, so a swapped package on PyPI cannot reach CI (ops #1014).
+      - run: pip install --require-hashes -r .github/ci/requirements-shellcheck.lock && shellcheck --version
       - run: bash .github/ci/shellcheck_gate.sh
 
   # 1c. Which later test tiers this change needs (tools/pick-tests.py, ops #242). Info only:
@@ -100,7 +101,10 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             .github/ci/requirements-test.txt
-      - run: pip install -r requirements.txt -r .github/ci/requirements-test.txt
+      # By hash (ops #1014), from the console's own requirements.txt plus the test tools (ops #1113).
+      # There is no second lock: a Dependabot bump of a pin in either file is the whole change, and these
+      # tests run on exactly the packages a customer box installs.
+      - run: pip install --require-hashes -r requirements.txt -r .github/ci/requirements-test.txt
       # --basetemp keeps pytest's temp dirs out of /tmp: some Guard Dog tests rewrite '/tmp/' in the
       # script under test to their own tmp_path, which mangles a tmp_path that is itself under /tmp.
       # INFRATAK_CI_BRANCH: on a push run (no PR base) the release-hygiene test holds the dev tip to
@@ -108,6 +112,30 @@ jobs:
       - env:
           INFRATAK_CI_BRANCH: ${{ github.base_ref || github.ref_name }}
         run: python -m pytest -q -n 2 --timeout 300 --durations=10 -p no:cacheprovider --basetemp "$RUNNER_TEMP/pytest" tests
+
+  # 2b. The console's requirements.txt installs by hash on every Python a customer box can have (ops #1113):
+  # 3.9 (RHEL/Rocky 9 python3), 3.10 (Ubuntu 22.04) and 3.12 (Ubuntu 24.04). A Dependabot bump to a
+  # release that needs a newer Python, or a missing transitive pin, goes red here instead of on a box.
+  console-deps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.9', '3.10', '3.12']
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m venv "$RUNNER_TEMP/console-venv"
+      # The same command start.sh runs on a customer box, in a fresh venv.
+      - run: |
+          "$RUNNER_TEMP/console-venv/bin/pip" install --require-hashes -r requirements.txt
+          "$RUNNER_TEMP/console-venv/bin/pip" check
+          "$RUNNER_TEMP/console-venv/bin/python" -c "import flask, werkzeug, gunicorn, psutil, yaml, stun"
 
   # 3. The private security/smoke scanners (redteam-selfaudit scan.py, pre-merge-check
   #    smoke.py and check-template-js.py). They live in the gitignored .claude/skills/
@@ -164,7 +192,7 @@ jobs:
   # passed; a failed or cancelled one does not.
   checks-ok:
     if: always()
-    needs: [compile, shellcheck, pytest, scanners]
+    needs: [compile, shellcheck, pytest, console-deps, scanners]
     runs-on: ubuntu-24.04
     steps:
       - env:

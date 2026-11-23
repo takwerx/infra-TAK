@@ -112,6 +112,20 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="status-info"><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Upload package files from tak.gov to deploy</div></div></div>
 {% endif %}
 </div>
+{# ops #1119: newest TAK Server version that passed our install and update tests (signed file). tak.gov needs a login, so we cannot show what tak.gov has; the line says so. #}
+{% if tak.installed and not deploying and tak_tested and tak_tested.tested %}
+<div id="tak-tested-row" data-state="{{ tak_tested.state }}" style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:12px 20px;margin:-12px 0 24px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.6;color:var(--text-secondary)">
+<div><strong style="color:var(--text-primary)">Latest we tested:</strong> {{ tak_tested.tested }}{% if tak_tested.tested_date %} <span style="color:var(--text-dim)">(tested {{ tak_tested.tested_date }}: fresh install and update both passed)</span>{% endif %}</div>
+{% if tak_tested.state == 'behind' %}
+<div style="color:var(--yellow,#eab308)">This server runs {{ tak_version }}, which is older. Download {{ tak_tested.tested }} from tak.gov, upload it in the update section below, then click Update TAK Server.</div>
+{% elif tak_tested.state == 'current' %}
+<div style="color:var(--green)">This server runs the version we tested.</div>
+{% elif tak_tested.state == 'newer' %}
+<div style="color:var(--text-dim)">This server runs {{ tak_version }}, which is newer than the one we tested. We have not tested it yet.</div>
+{% endif %}
+<div style="color:var(--text-dim)">tak.gov may have a newer version still. It needs a login, so this page cannot check it.</div>
+</div>
+{% endif %}
 {% if tak.installed and not deploying %}
 {# v10.2.26: does TAK Server's certificate carry this box's names? Filled by loadTakCertRow(). #}
 <div id="tak-cert-row" style="display:none;border-radius:12px;padding:14px 20px;margin-bottom:24px;font-family:'JetBrains Mono',monospace;font-size:13px;line-height:1.5"></div>
