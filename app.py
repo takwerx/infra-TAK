@@ -96,6 +96,7 @@ import modules as mod_registry
 from modules import atlas_access as _atlas_access
 from modules import etlrunner as _etl
 from modules import takportal_verified as _tpv
+from modules import takserver_tested as _tst
 
 # v10.2.23 (ops #109): a client that reset TCP before its TLS handshake killed the
 # whole gunicorn worker (gthread wraps TLS on its event loop with nothing catching),
@@ -13051,6 +13052,10 @@ def takserver_page():
     if tak.get('installed') and tak.get('running') and not deploy_status.get('running', False):
         deploy_status.update({'complete': False, 'error': False})
     tak_version = _get_takserver_version_info().get('version', '') if tak.get('installed') else ''
+    try:
+        _tak_tested = _takserver_tested_page_state(tak_version) if tak_version else None
+    except Exception:
+        _tak_tested = None
     _tak_jvm = _running_tak_jvm_version() if tak.get('installed') else ''
     _settings = load_settings()
     _tak_cfg = _get_tak_deployment_config(_settings)
@@ -13075,7 +13080,7 @@ def takserver_page():
     return render_template('takserver.html',
         tak58=_tak58, tak_db_refresh=_tak_dbr_page(tak.get('installed')),
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
-        tak_jvm=_tak_jvm,
+        tak_tested=_tak_tested, tak_jvm=_tak_jvm,
         tak_installed=tak.get('installed', False),
         show_connect_ldap=show_connect_ldap, ldap_connected=ldap_connected,
         authentik_base_url=_get_authentik_base_url(_settings),
@@ -19585,6 +19590,97 @@ def _takportal_expected_commit(tag):
     if isinstance(rec, dict) and str(rec.get('tag') or '') == str(tag or ''):
         return str(rec.get('commit') or '')
     return ''
+
+
+# --- Latest tested TAK Server (ops #1119) ---------------------------------------------------
+# tak.gov needs a login, so a box cannot ask which TAK Server is newest. We publish the newest
+# version that passed our fresh install AND our update test in a small signed file (modules/
+# takserver_tested.py has the rules). The TAK Server page shows it next to the installed version,
+# and Guard Dog mails it once per version to boxes that run an older one. It never decides what a
+# box installs: the package still comes from the operator's own tak.gov download.
+_TAKSERVER_TESTED_CACHE = os.path.join(CONFIG_DIR, 'takserver-tested')
+_TAKSERVER_TESTED_LOCK = threading.Lock()
+_takserver_tested_attempt = {'ts': 0.0}
+
+
+def _takserver_tested_refresh(fresh=False):
+    """Fetch the signed tested-version file at the current commit of the catalog repo's main branch
+    and cache it when it verifies. Never raises. Same rules as _takportal_verified_refresh: `ts` is
+    the last ATTEMPT, both files come from one commit sha, and the signature decides."""
+    now = time.time()
+    if not fresh and _takserver_tested_attempt['ts'] and \
+            now - _takserver_tested_attempt['ts'] < _tst.TESTED_CHECK_SEC:
+        return False
+    if not _TAKSERVER_TESTED_LOCK.acquire(blocking=False):
+        return False
+    try:
+        _takserver_tested_attempt['ts'] = now
+        try:
+            _ref = f'refs/heads/{_tst.TESTED_BRANCH}'
+            sha = str((_git_ls_remote(_ref, repo=_tst.TESTED_REPO) or {}).get(_ref) or '')
+            if not _tst.COMMIT_RE.fullmatch(sha):
+                raise ValueError('GitHub returned no commit for the tested-version file')
+            base = f'https://raw.githubusercontent.com/{_tst.TESTED_REPO}/{sha}/{_tst.TESTED_FILE}'
+            raw = _takportal_verified_http(base, _tst.TESTED_MAX_BYTES)
+            sig = _takportal_verified_http(base + '.sig', 4096)
+            have = _tst.cached(_TAKSERVER_TESTED_CACHE)
+            try:
+                seen = int((load_settings() or {}).get('takserver_tested_serial') or 0)
+            except Exception:
+                seen = 0
+            d, why = _tst.accept_fetched(raw, sig, max(_tst.serial_of(have), seen))
+            if d is None:
+                print(f"[takserver-tested] {sha[:12]} refused: {why}", flush=True)
+                return False
+            if have is not None and _tst.serial_of(d) == _tst.serial_of(have):
+                return False
+            # sig first: a cached file with no matching sig is never trusted
+            _etlcat_cache_write(_tst.TESTED_FILE + '.sig', sig, cache_dir=_TAKSERVER_TESTED_CACHE)
+            _etlcat_cache_write(_tst.TESTED_FILE, raw, cache_dir=_TAKSERVER_TESTED_CACHE)
+            s = load_settings()
+            s['takserver_tested_serial'] = max(seen, _tst.serial_of(d))
+            save_settings(s)
+            print(f"[takserver-tested] now {d.get('version')} (serial {_tst.serial_of(d)})", flush=True)
+            return True
+        except Exception as e:
+            print(f"[takserver-tested] check failed (non-fatal): {str(e)[:160]}", flush=True)
+            return False
+    finally:
+        _TAKSERVER_TESTED_LOCK.release()
+
+
+def _takserver_tested_record(fresh=False):
+    """The verified tested-version record, or None (no signed file yet, or offline). Never raises."""
+    try:
+        _takserver_tested_refresh(fresh=fresh)
+        return _tst.cached(_TAKSERVER_TESTED_CACHE)
+    except Exception:
+        return None
+
+
+def _takserver_tested_page_state(installed_version):
+    """What the TAK Server page shows: {tested, tested_date, state} (see takserver_tested.page_state)."""
+    return _tst.page_state(installed_version, _takserver_tested_record())
+
+
+def _takserver_tested_items(unknown):
+    """Guard Dog pending items (0 or 1): this box runs an older TAK Server than the one we tested.
+    A box with no TAK Server, or one whose version cannot be read, gets none; an unreadable source
+    goes in `unknown` so its dedup state is carried instead of dropped."""
+    try:
+        if not detect_modules().get('takserver', {}).get('installed'):
+            return []
+        installed = (_get_takserver_version_info() or {}).get('version') or ''
+        if not installed:
+            unknown.add('takserver-tested')
+            return []
+        item = _tst.pending_item(installed, _takserver_tested_record(),
+                                 'TAK Server page → Update TAK Server.')
+        return [item] if item else []
+    except Exception as e:
+        unknown.add('takserver-tested')
+        print(f"[update-notify] TAK Server tested-version check failed: {e}", flush=True)
+        return []
 
 
 def _takportal_latest_tag(plog=None):
@@ -31762,6 +31858,12 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
     except Exception as e:
         print(f"[update-notify] WebODM check failed: {e}", flush=True)
     try:
+        # ops #1119: a TAK Server version we tested and this box does not run yet
+        pending.extend(_takserver_tested_items(unknown))
+    except Exception as e:
+        unknown.add('takserver-tested')
+        print(f"[update-notify] TAK Server tested-version check failed: {e}", flush=True)
+    try:
         # ops #608: the other modules with a console Update button.
         pending.extend(_module_update_items(unknown))
     except Exception as e:
@@ -31961,6 +32063,8 @@ def _update_notify_check_once(fast=False):
                     + (' (reminder)' if reminder else ''))
         elif sec_items:
             subj = f"🔒 Security update pending on {server_id} — update this machine"
+        elif all(p.get('tested_new') for p in new_items):
+            subj = f"✅ TAK Server {new_items[0]['target']} tested: ready to update on {server_id}"
         elif all(p.get('etl_new') for p in new_items):
             subj = (f"🆕 New ETL available on {server_id}" if len(new_items) == 1
                     else f"🆕 {len(new_items)} new ETLs available on {server_id}")
