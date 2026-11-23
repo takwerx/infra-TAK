@@ -62,6 +62,119 @@ def detect(ctx):
     return {'installed': installed, 'running': running}
 
 
+# ---- Mail for root (GH #667) ----------------------------------------------------
+# The OS mails sudo denials, cron failures and unattended-upgrades reports to `root`.
+# Postfix writes that as root@<name>, where <name> is /etc/mailname, `hostname -f` or
+# $myhostname, depending on the sender. The relay is send-only (the FQDN is NOT in
+# mydestination, GH #48), so root@<FQDN> went to the smarthost and bounced, and the
+# generic map only knew `hostname -f`. A virtual alias is the one Postfix table that is
+# applied before both the "local" and the "smarthost" decision, so it works for every
+# name. Never add the FQDN to mydestination to get the same result: that is GH #48 again.
+ROOT_ALIAS_MAP = '/etc/postfix/virtual_root'
+MAIN_CF = '/etc/postfix/main.cf'
+_HOSTNAME_RE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$')
+
+
+def _read_mailname():
+    """/etc/mailname (world-readable). '' when absent. A function so tests can stub it."""
+    try:
+        with open('/etc/mailname', encoding='utf-8') as fh:
+            return fh.read().strip()
+    except OSError:
+        return ''
+
+
+def postfix_local_names(settings):
+    """Every name Postfix may put after `root@` for mail the host sends itself."""
+    names = []
+
+    def add(n):
+        n = (n or '').strip().lower()
+        if n and _HOSTNAME_RE.match(n) and n not in names:
+            names.append(n)
+
+    for argv in (['hostname', '-f'], ['postconf', '-h', 'myhostname']):
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                add(r.stdout)
+        except Exception:
+            pass
+    add(_read_mailname())
+    add((settings or {}).get('fqdn'))
+    return names
+
+
+def root_destination(ctx, settings, from_addr=''):
+    """Who reads the host's own mail: Guard Dog's alert address(es) when set (an
+    address somebody already monitors), else the relay From address (what the generic
+    map always used, so nothing changes for a box with no Guard Dog address)."""
+    safe = ctx['_safe_alert_emails']
+    gd = safe((settings or {}).get('guarddog_alert_email'))
+    if gd:
+        return gd
+    fa = from_addr or ((settings or {}).get('email_relay') or {}).get('from_addr') or ''
+    return safe(fa)[:1]
+
+
+def render_root_alias_map(names, dests):
+    """Body of /etc/postfix/virtual_root. With no destination it is comments only: the
+    file must always exist, because main.cf names it and Postfix defers mail when a
+    named table is missing."""
+    lines = ['# TAKWERX Email Relay: mail the host sends to root goes to a person (GH #667).',
+             '# Managed by TAK-infra. Rewritten on every relay deploy and Guard Dog address save.']
+    if dests:
+        lines += [f"root@{n}    {', '.join(dests)}" for n in names]
+    return '\n'.join(lines) + '\n'
+
+
+def with_root_alias_map(cf):
+    """main.cf text with our map in the effective virtual_alias_maps. An operator's own
+    maps stay (ours is added after them). Returns (text, changed)."""
+    ours = f'hash:{ROOT_ALIAS_MAP}'
+    hits = re.findall(r'(?m)^[ \t]*virtual_alias_maps[ \t]*=(.*)$', cf or '')
+    current = hits[-1].strip() if hits else ''
+    if ours in current.split():
+        return cf, False
+    merged = (current + ' ' + ours).strip()
+    return (cf or '').rstrip('\n') + f'\nvirtual_alias_maps = {merged}\n', True
+
+
+def sync_root_alias(ctx, settings, plog=None, from_addr='', reload=True):
+    """Write the root alias map and make main.cf use it. Safe to repeat. Never raises:
+    mail for root is a convenience and must not fail a deploy or a settings save.
+    Returns (ok, message)."""
+    plog = plog or (lambda m: None)
+    try:
+        names = postfix_local_names(settings)
+        dests = root_destination(ctx, settings, from_addr)
+        # Sender rewrite for every host name (a box deployed before GH #667 only had one).
+        sender = (from_addr or ((settings or {}).get('email_relay') or {}).get('from_addr') or '').strip()
+        if sender and ctx['_safe_alert_emails'](sender):
+            ctx['_write_priv']('/etc/postfix/generic',
+                               ''.join(f"root@{n}    {sender}\n" for n in names))
+            _postmap(ctx, '/etc/postfix/generic', plog)
+        # Map first, then main.cf: main.cf must never name a table that does not exist.
+        ctx['_write_priv'](ROOT_ALIAS_MAP, render_root_alias_map(names, dests))
+        if not _postmap(ctx, ROOT_ALIAS_MAP, plog):
+            return False, 'could not build the root alias map'
+        cf = ctx['_read_priv'](MAIN_CF)
+        new_cf, changed = with_root_alias_map(cf)
+        if changed:
+            ctx['_write_priv'](MAIN_CF, new_cf)
+            if reload:
+                subprocess.run(ctx['_sudo_wrap'](['systemctl', 'reload', 'postfix']),
+                               capture_output=True, text=True, timeout=60)
+        if dests:
+            plog(f"✓ Mail for root goes to {', '.join(dests)}")
+            return True, f"Mail for root goes to {', '.join(dests)}"
+        plog("⚠ No address for root's mail: set a Guard Dog alert address")
+        return True, 'no address for root mail'
+    except Exception as e:
+        plog(f"⚠ Could not set up mail for root: {e}")
+        return False, str(e)[:200]
+
+
 def _postmap(ctx, path, plog):
     """Rebuild a postfix lookup table, privileged, and SAY SO if it fails.
 
@@ -214,12 +327,15 @@ smtp_generic_maps = hash:/etc/postfix/generic
             return
         subprocess.run(ctx['_sudo_wrap'](['chmod', '600', '/etc/postfix/sasl_passwd', '/etc/postfix/sasl_passwd.db']), capture_output=True)
 
-        # Generic map for from address rewriting
+        # Generic map for from address rewriting. GH #667: the sender can be root@ any of the
+        # host's names, not only `hostname -f`; sync_root_alias writes it for all of them.
         hostname = subprocess.run(['hostname', '-f'], capture_output=True, text=True).stdout.strip()
-        generic_line = f"root@{hostname}    {from_addr}"
-        ctx['_write_priv']('/etc/postfix/generic', generic_line + '\n')
+        ctx['_write_priv']('/etc/postfix/generic', f"root@{hostname}    {from_addr}\n")
         _postmap(ctx, '/etc/postfix/generic', plog)
         plog("✓ Credentials written and hashed")
+        # GH #667: mail the host sends to root reaches a person. Postfix restarts in
+        # Step 4, so no reload here.
+        sync_root_alias(ctx, settings, plog, from_addr=from_addr, reload=False)
 
         plog("📧 Step 4/5 — Enabling and starting Postfix...")
         subprocess.run(ctx['_sudo_wrap'](['systemctl', 'enable', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -290,6 +406,9 @@ def uninstall(ctx, job, params):
     subprocess.run(ctx['_sudo_wrap'](['systemctl', 'disable', 'postfix']), capture_output=True, timeout=90)
     # v10.1.22 security fix: purge the plaintext SMTP creds — `apt-get remove`
     # (no purge) leaves /etc/postfix behind, credentials included.
+    # The root alias map stays on purpose: main.cf names it and survives `apt remove`, and
+    # Postfix defers mail (or fails to start on a reinstall) when a named table is missing.
+    # It holds addresses only, no secret.
     subprocess.run(ctx['_sudo_wrap'](['rm', '-f', '/etc/postfix/sasl_passwd', '/etc/postfix/sasl_passwd.db']), capture_output=True, timeout=15)
     ctx['_pkg_remove']('postfix', timeout=120)
     settings = ctx['load_settings']()
