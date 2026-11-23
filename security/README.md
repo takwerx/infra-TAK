@@ -37,4 +37,7 @@ ignore it either way.
 - `kernel` is compared with the kernel the box is running, so a box that installed the fix
   but has not restarted is told to reboot. Cloud kernels (`-aws`, `-azure`, `-gcp`) number
   their releases differently: give them their own key (`ubuntu-22.04/aws`), or they are skipped.
+  A kernel stream that numbers apart from the rest gets `@<series>`: `ubuntu-22.04@6.8` (22.04 on
+  the 6.8 HWE kernel), `rocky-9@9.9` (RHEL-family 9.9, kernel 741.x, while 9.8 is 687.x). A box
+  uses its `@` row when there is one, else the plain OS row.
 - An entry that does not match this shape is ignored whole.
