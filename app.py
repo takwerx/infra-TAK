@@ -45800,31 +45800,36 @@ def _get_nodered_version_info():
 
 _cloudtak_release_cache = {'tag': None, 'ts': 0}
 
-def _cloudtak_newest_allowed_tag(tags):
+def _cloudtak_newest_allowed_tag(tags, max_major=None):
     """Newest plain-version CloudTAK tag ('v13.128.0') whose major is at or under
-    CLOUDTAK_MAX_MAJOR, or None. Pre-releases ('v14.0.0-rc.1') and other names never match
-    (ops #1074)."""
+    CLOUDTAK_MAX_MAJOR (or the lower `max_major` when given), or None. Pre-releases
+    ('v14.0.0-rc.1') and other names never match (ops #1074)."""
+    _cap = CLOUDTAK_MAX_MAJOR if max_major is None else min(max_major, CLOUDTAK_MAX_MAJOR)
     best = None
     for t in tags or []:
         m = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', (t or '').strip())
         if not m:
             continue
         key = tuple(int(x) for x in m.groups())
-        if key[0] > CLOUDTAK_MAX_MAJOR:
+        if key[0] > _cap:
             continue
         if best is None or key > best[0]:
             best = (key, m.group(0))
     return best[1] if best else None
 
 
-def _get_cloudtak_latest_release_tag(use_cache=True):
+def _get_cloudtak_latest_release_tag(use_cache=True, max_major=None):
     """Newest stable release tag from GitHub that is allowed on this fleet (e.g. 'v13.128.0').
     Never above CLOUDTAK_MAX_MAJOR (ops #1074): GitHub's 'latest' is 14.0.0, which we have not
     tested, so the whole release list is read and filtered instead of asking for 'latest'.
     Cached for 4 hours to avoid hitting GitHub API on every page load.
     Pass use_cache=False during deploy to get a fresh result.
+    `max_major` asks for the newest tag at or under a lower major (ops #1074: the 13.x stop a box
+    with an old MinIO store must make before 14); that answer is never cached.
     Returns the tag string, or None if the API call fails."""
     import time as _time
+    if max_major is not None:
+        use_cache = False
     if use_cache and _cloudtak_release_cache['tag'] and (_time.time() - _cloudtak_release_cache['ts'] < 14400):
         return _cloudtak_release_cache['tag']
     try:
@@ -45837,27 +45842,32 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
             raise ValueError('GitHub did not return a release list')
         tag = _cloudtak_newest_allowed_tag(
             [r.get('tag_name') for r in data
-             if isinstance(r, dict) and not r.get('draft') and not r.get('prerelease')])
+             if isinstance(r, dict) and not r.get('draft') and not r.get('prerelease')],
+            max_major=max_major)
         if not tag:
             # The first page held no allowed release: ask git, which lists every tag.
             raise ValueError('no allowed release on the first page')
-        _cloudtak_release_cache['tag'] = tag
-        _cloudtak_release_cache['ts'] = _time.time()
+        if max_major is None:
+            _cloudtak_release_cache['tag'] = tag
+            _cloudtak_release_cache['ts'] = _time.time()
         return tag
     except Exception:
         # gh #365: the API answers 403 "rate limit exceeded" to shared home/CGNAT addresses.
         # git over https isn't rate limited that way, so ask it for the newest tag first.
-        tag = _cloudtak_latest_tag_from_git()
+        tag = _cloudtak_latest_tag_from_git(max_major=max_major)
         if tag:
-            _cloudtak_release_cache['tag'] = tag
-            _cloudtak_release_cache['ts'] = _time.time()
+            if max_major is None:
+                _cloudtak_release_cache['tag'] = tag
+                _cloudtak_release_cache['ts'] = _time.time()
             return tag
+        if max_major is not None:
+            return None
         # Stale cache is better than nothing — return it regardless of use_cache so that
         # a GitHub rate-limit or cold-start doesn't hard-block the update flow.
         return _cloudtak_release_cache.get('tag') or None
 
 
-def _cloudtak_latest_tag_from_git():
+def _cloudtak_latest_tag_from_git(max_major=None):
     """Newest allowed plain-version CloudTAK tag ('v13.117.0') via `git ls-remote`, or None.
     Second source for the release lookup when api.github.com refuses us (gh #365).
     Never above CLOUDTAK_MAX_MAJOR (ops #1074)."""
@@ -45874,7 +45884,44 @@ def _cloudtak_latest_tag_from_git():
         m = re.search(r'refs/tags/(v?\d+\.\d+\.\d+)$', line.strip())
         if m:
             tags.append(m.group(1))
-    return _cloudtak_newest_allowed_tag(tags)
+    return _cloudtak_newest_allowed_tag(tags, max_major=max_major)
+
+
+# ops #1074: CloudTAK 14.0.0 removed `cloudtak.sh migrate-store` and the MinIO services that
+# infra-TAK's MinIO -> Garage move runs from the checked-out tree. A box that still holds
+# ~/CloudTAK/.docker-store must therefore stop at the newest 13.x first (it moves the files into
+# Garage and archives the folder); the next Update then goes on to 14. Without this the update to
+# 14 builds for about 10 minutes, fails at "Garage store setup failed" and rolls back.
+CLOUDTAK_MINIO_HOP_MAJOR = 13
+
+
+def _cloudtak_tag_major(tag):
+    m = re.match(r'v?(\d+)\.\d+\.\d+', (tag or '').strip())
+    return int(m.group(1)) if m else None
+
+
+def _cloudtak_needs_minio_hop(release_tag):
+    """True when `release_tag` is a major the old-MinIO move cannot run from (14 and up)."""
+    major = _cloudtak_tag_major(release_tag)
+    return major is not None and major > CLOUDTAK_MINIO_HOP_MAJOR
+
+
+def _cloudtak_minio_hop_tag():
+    """The newest 13.x tag (a box with the old MinIO folder goes there first), or None when the
+    lookup fails. Never cached as the latest."""
+    return _get_cloudtak_latest_release_tag(use_cache=False, max_major=CLOUDTAK_MINIO_HOP_MAJOR)
+
+
+def _cloudtak_tag_for_minio_store(release_tag, store_present):
+    """Tag to install on a box whose target is `release_tag`.
+
+    Returns (tag, hopped). Same tag when the target is 13.x or lower or the box has no MinIO store.
+    On a box that still has .docker-store and a target of 14 or higher: the newest 13.x tag, hopped
+    True. (None, True) when that 13.x tag cannot be looked up (the caller stops before any change).
+    """
+    if not store_present or not _cloudtak_needs_minio_hop(release_tag):
+        return release_tag, False
+    return _cloudtak_minio_hop_tag(), True
 
 
 def _get_cloudtak_target_release_tag(settings=None, use_cache=True, allow_fallback=True):
@@ -45955,6 +46002,15 @@ def _get_cloudtak_version_info():
     _up = None
     try:
         _up = _get_cloudtak_latest_release_tag()
+    except Exception:
+        pass
+    # ops #1074: a box that still has the old MinIO folder goes to the newest 13.x first (the
+    # update would otherwise fail at the Garage step), so the card must name that version.
+    try:
+        _hop, _hopped = _cloudtak_tag_for_minio_store(
+            _up, bool(_up) and os.path.isdir(os.path.join(ct_dir, '.docker-store')))
+        if _hopped and _hop:
+            _up = _hop
     except Exception:
         pass
     out['latest'] = (_up or '').lstrip('vV') or CLOUDTAK_VETTED_RELEASE
@@ -58798,6 +58854,16 @@ def run_cloudtak_deploy(cfg=None):
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
+            # ops #1074: an old MinIO folder on the remote host stops at 13.x first (14 cannot move it).
+            _rs_ok, _ = _ssh_probe(remote_cfg, "test -d ~/CloudTAK/.docker-store", timeout=20)
+            if _rs_ok and _cloudtak_needs_minio_hop(remote_release_tag):
+                _rt = _cloudtak_minio_hop_tag()
+                if not _rt:
+                    plog("✗ The remote host still has the old MinIO folder and the newest 13.x release could not be looked up. Nothing was changed.")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
+                plog(f"  Old MinIO folder on the remote host: installing {_rt} first (CloudTAK 14 cannot move it into Garage).")
+                remote_release_tag = _rt
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
             else:
@@ -59001,6 +59067,17 @@ def run_cloudtak_deploy(cfg=None):
         plog("")
         plog("━━━ Step 2/7: Cloning CloudTAK ━━━")
         release_tag = _get_cloudtak_target_release_tag(use_cache=False)
+        # ops #1074: Deploy over an existing tree that still has the old MinIO folder stops at 13.x
+        # first (CloudTAK 14 cannot move it into Garage).
+        _dh_tag, _dh_hop = _cloudtak_tag_for_minio_store(
+            release_tag, os.path.isdir(os.path.join(cloudtak_dir, '.docker-store')))
+        if _dh_hop:
+            if not _dh_tag:
+                plog("✗ This box still has the old MinIO folder and the newest 13.x release could not be looked up. Nothing was changed.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            plog(f"  Old MinIO folder found: installing {_dh_tag} first (CloudTAK 14 cannot move it into Garage).")
+            release_tag = _dh_tag
         if os.path.exists(cloudtak_dir):
             # A real checkout needs a VALID repo, not merely a .git directory — a deleted or
             # interrupted CloudTAK can leave a HOLLOW .git (objects/ + info/ but no HEAD/config),
@@ -59259,13 +59336,12 @@ def run_cloudtak_deploy(cfg=None):
         except Exception as _me:
             plog(f"  WARNING: arm64 media-infra build step errored (media may be unavailable): {_me}")
 
-        api_url = ''
-        media_url = ''
-        for _line in env_content.splitlines():
-            if _line.startswith('API_URL='):
-                api_url = _line.split('=', 1)[1].strip()
-            elif _line.startswith('CLOUDTAK_Config_media_url='):
-                media_url = _line.split('=', 1)[1].strip()
+        # Read the two URLs back from the .env just written, not from env_content: env_content holds the
+        # generated secrets, and a value taken out of it is flagged by CodeQL as a secret in the log
+        # (alert #29, a false positive: only the API and media URLs are logged here).
+        _written_env = _cloudtak_env_read(env_path)
+        api_url = (_written_env.get('API_URL') or '').strip()
+        media_url = (_written_env.get('CLOUDTAK_Config_media_url') or '').strip()
         plog(f"✓ .env written")
         if api_url:
             plog(f"  API URL: {api_url}")
@@ -60774,6 +60850,24 @@ def run_cloudtak_update():
             plog("  Nothing was changed and CloudTAK is still running as before. Check this box's DNS/internet and try again in a few minutes.")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
+        # ops #1074: a box that still holds the old MinIO folder (.docker-store) stops at the newest
+        # 13.x before 14 (14 removed the MinIO -> Garage move). Decide BEFORE any build.
+        if is_remote:
+            _store_now = bool(remote_host) and bool(_ssh_probe(remote_cfg, "test -d ~/CloudTAK/.docker-store && echo yes", timeout=20)[0])
+        else:
+            _store_now = os.path.isdir(os.path.expanduser('~/CloudTAK/.docker-store'))
+        # (branches, not a returned value: the remote probe above carries SSH details, and a value that
+        # came out of it must not end up in the log line below)
+        if _store_now and _cloudtak_needs_minio_hop(release_tag):
+            _hop_tag = _cloudtak_minio_hop_tag()
+            if not _hop_tag:
+                plog(f"✗ {release_tag} needs your old MinIO files moved into Garage first, and the newest 13.x release could not be looked up.")
+                plog("  Nothing was changed and CloudTAK is still running as before. Try again in a few minutes.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            plog(f"  This box still has the old MinIO folder (~/CloudTAK/.docker-store). CloudTAK 14 cannot move it into Garage.")
+            plog(f"  Updating to {_hop_tag} first, which moves your files. Press Update again afterwards to go on to {release_tag}.")
+            release_tag = _hop_tag
         plog(f"  Target: {release_tag} (upstream latest — CloudTAK tracks dfpc-coe releases directly)")
         # ops #129: record from/to on the update result (the card and Diagnostics said "? -> ?").
         from_ver = ''
