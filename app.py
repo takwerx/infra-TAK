@@ -63739,7 +63739,28 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
                         _req.urlopen(r, timeout=15)
             except urllib.error.HTTPError:
                 pass
-        return True, 'Recovery flow created and linked; "Forgot password?" is on the login page.', recovery_flow_slug
+
+        # 7) Link the recovery flow to the brand(s) too. This is a SEPARATE setting from the
+        #    identification stage above: the stage's recovery_flow drives the login page's
+        #    "Forgot password?" link, but the brand's flow_recovery is what the Admin
+        #    interface's per-user "Create/Email recovery link" actions need. Without it
+        #    Authentik shows "This brand does not have a recovery flow" on every user
+        #    (test12 2026-11-23 — no release ever set it). Seed only when EMPTY: a recovery
+        #    flow the operator picked on the brand is theirs.
+        brand_msg = ''
+        try:
+            _linked = 0
+            for br in _api_get('core/brands/?page_size=100').get('results', []):
+                if br.get('flow_recovery'):
+                    continue
+                _api_patch(f'core/brands/{br["brand_uuid"]}/', {'flow_recovery': recovery_flow_pk})
+                _linked += 1
+            if _linked:
+                brand_msg = f' Linked to {_linked} brand(s) for admin recovery links.'
+        except Exception as e:
+            brand_msg = f' (Brand recovery link not set: {str(e)[:80]})'
+        return True, ('Recovery flow created and linked; "Forgot password?" is on the login page.'
+                      + brand_msg), recovery_flow_slug
     except urllib.error.HTTPError as e:
         return False, _err(e), None
     except Exception as e:
@@ -84132,6 +84153,8 @@ def run_authentik_deploy(reconfigure=False):
             # password?" missing) on their next console update.
             plog("  Ensuring password-recovery flow...")
             _ensure_recovery_flow_standalone(env_path, plog)
+            for _n in _ak_admin_recovery_email_notes():
+                plog(_n)
             _sync_webadmin_after_authentik_reconfigure(plog)
             # ops #184: last, after every step above that takes LDAP down under TAK
             _authentik_reconfigure_heal_tak_clients(plog, before=ldap_path_before)
@@ -85574,6 +85597,8 @@ entries:
         else:
             plog("  2. Email Relay: SMTP is already configured — this deploy applied or will apply Authentik email when that step succeeded above.")
         plog("  3. TAK Server: deploy only after this log shows the LDAP SA bind verified (above).")
+        plog("  4. Set a real recovery email for akadmin (and webadmin, once TAK Server is deployed) on this page")
+        plog("     \u2192 Protected admin accounts. Without it, 'Forgot password?' cannot reach you.")
         plog("=" * 50)
         # v0.8.5: Proactive routing migration — if TAK Server is already installed when
         # Authentik is deployed (re-deploy / reconfigure path), migrate outpost to FQDN
@@ -89011,6 +89036,89 @@ def _read_authentik_admin_accounts_via_ak_shell():
     return accounts, None
 
 
+# ── Admin recovery email (2026-11-23) ─────────────────────────────────────────────
+# akadmin and webadmin are born with addresses nobody reads: akadmin gets
+# AUTHENTIK_BOOTSTRAP_EMAIL=admin@takwerx.local, webadmin gets webadmin@<fqdn> (a
+# synthetic address so WebODM's OIDC email claim is non-empty). "Forgot password?"
+# mails the reset link to that address, so neither admin could ever recover its own
+# password. And Authentik's user page refuses self-service email changes by default
+# (brand setting "Allow users to change email" = off — correct, it protects recovery),
+# so the operator also could not fix it from the account itself. The Authentik page now
+# flags a placeholder and sets a real address through the admin API.
+_AK_ADMIN_PLACEHOLDER_EMAILS = ('admin@takwerx.local',)
+_AK_ADMIN_EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?'
+                                r'(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*\.[A-Za-z]{2,63}$')
+
+
+def _ak_admin_email_is_placeholder(username, email, settings=None):
+    """True when a protected admin's email is one infra-TAK made up (or empty) — i.e. a
+    password-reset email to it reaches nobody."""
+    e = (email or '').strip().lower()
+    if not e or '@' not in e:
+        return True
+    if e in _AK_ADMIN_PLACEHOLDER_EMAILS:
+        return True
+    dom = e.rsplit('@', 1)[1]
+    if dom in ('localhost', 'tak.local') or dom.endswith('.local') or dom.endswith('.localhost'):
+        return True
+    if username == 'webadmin' and e.split('@', 1)[0] == 'webadmin':
+        fq = ((settings or load_settings()).get('fqdn') or '').strip().split(':')[0].lower()
+        if fq and dom == fq:
+            return True
+    return False
+
+
+def _ak_admin_recovery_email_notes():
+    """Deploy/update-log notes (tagged AK_ACTION_NEEDED) for each protected admin whose
+    recovery email is a placeholder. Never raises; [] when Authentik can't be read."""
+    out = []
+    try:
+        ak_url, ak_headers, settings = _w1_ak_ctx()
+        if not ak_url:
+            return out
+        for username in _AUTHENTIK_RECOVERABLE_USERS:
+            res = _w1_ak_get(ak_url, f'core/users/?username={username}', ak_headers).get('results', [])
+            u = next((x for x in res if x.get('username') == username), None)
+            if u and _ak_admin_email_is_placeholder(username, u.get('email'), settings):
+                out.append(f"  \u26a0 {AK_ACTION_NEEDED} {username} has no real recovery email "
+                           f"({u.get('email') or 'empty'}) \u2014 a password reset cannot reach you. "
+                           f"Set one on the Authentik page \u2192 Protected admin accounts.")
+    except Exception:
+        pass
+    return out
+
+
+@app.route('/api/authentik/admin-email', methods=['POST'])
+@login_required
+def authentik_admin_email_api():
+    """Set the recovery email of a protected admin account (akadmin / webadmin) through
+    the Authentik admin API. Only that one field is written."""
+    data = request.get_json(silent=True) or {}
+    username = (data.get('user') or '').strip()
+    email = (data.get('email') or '').strip()
+    if username not in _AUTHENTIK_RECOVERABLE_USERS:
+        return jsonify({'success': False, 'message': 'Only akadmin or webadmin.'}), 400
+    if len(email) > 254 or not _AK_ADMIN_EMAIL_RE.fullmatch(email):
+        return jsonify({'success': False, 'message': 'That is not a valid email address.'}), 400
+    if _ak_admin_email_is_placeholder(username, email):
+        return jsonify({'success': False, 'message': 'Use an address that receives mail — this one is a placeholder.'}), 400
+    ak_url, ak_headers, _settings = _w1_ak_ctx()
+    if not ak_url:
+        return jsonify({'success': False, 'message': 'Authentik is not deployed or has no API token.'}), 400
+    try:
+        res = _w1_ak_get(ak_url, f'core/users/?username={username}', ak_headers).get('results', [])
+        u = next((x for x in res if x.get('username') == username), None)
+        if not u:
+            return jsonify({'success': False, 'message': f'{username} does not exist in Authentik.'}), 404
+        _ak_api_call(f"{ak_url}/api/v3/core/users/{u['pk']}/", headers=ak_headers,
+                     data=json.dumps({'email': email}).encode(), method='PATCH')
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Authentik API error: {str(e)[:160]}'}), 502
+    audit('authentik:admin-recovery-email', f'{username} recovery email changed', force=True)
+    print(f"[authentik] {username} recovery email set by operator", flush=True)
+    return jsonify({'success': True, 'message': f'{username} recovery email saved.'})
+
+
 def _get_authentik_admin_accounts_status():
     """Return is_active/is_superuser for the protected admin accounts (akadmin, webadmin).
 
@@ -89052,6 +89160,9 @@ def _get_authentik_admin_accounts_status():
                     entry['exists'] = True
                     entry['is_active'] = bool(user_obj.get('is_active'))
                     entry['is_superuser'] = bool(user_obj.get('is_superuser'))
+                    entry['email'] = user_obj.get('email') or ''
+                    entry['email_placeholder'] = _ak_admin_email_is_placeholder(
+                        username, entry['email'], settings)
             except _err.HTTPError as e:
                 entry['error'] = f'Authentik API {e.code}'
                 if e.code in (401, 403):
@@ -89063,7 +89174,12 @@ def _get_authentik_admin_accounts_status():
 
     # If every API result is clean (no error), trust it.
     if api_attempted and not any(a.get('error') for a in api_accounts):
-        return {'available': True, 'source': 'api', 'accounts': api_accounts}
+        try:
+            _smtp = _authentik_smtp_configured()
+        except Exception:
+            _smtp = None
+        return {'available': True, 'source': 'api', 'accounts': api_accounts,
+                'smtp_configured': _smtp}
 
     # API failed (or token missing). Try ak shell fallback. This is the path
     # that recovers the panel when akadmin is deactivated.
