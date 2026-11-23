@@ -41,7 +41,8 @@ CVE = 'CVE-2026-98432'
 DOC = json.loads((REPO / 'security' / 'patch-now.json').read_text())
 ADV = pn._ns()['_patch_now_parse'](DOC)
 
-# first fixed kernel per OS key, as published (Ubuntu `linux` rows, Rocky 9.8)
+# first fixed kernel per OS key, as published (Ubuntu `linux` rows; Rocky RLSA-2026:93412 for
+# 9.8 and RLSA-2026:97873 for 9.9, both naming CVE-2026-98432)
 FIXED = {
     'ubuntu-22.04': '5.15.0-203', 'ubuntu-22.04/aws': '5.15.0-1120', 'ubuntu-22.04/azure': '5.15.0-1126',
     'ubuntu-22.04/lowlatency': '5.15.0-198',
@@ -51,6 +52,9 @@ FIXED = {
     'ubuntu-24.04': '6.8.0-149', 'ubuntu-24.04/aws': '6.8.0-1069', 'ubuntu-24.04/azure': '6.8.0-1073',
     'ubuntu-24.04/lowlatency': '6.8.0-149',
     'rocky-9': '5.14.0-687.64.1',
+    # Rocky/RHEL 9.9 runs its own kernel stream (741.x, .el9_9): the 9.8 number above is
+    # LOWER than every 9.9 kernel, so without this row no 9.9 box is ever told (ops #1084)
+    'rocky-9@9.9': '5.14.0-741.20.1',
 }
 
 
@@ -94,6 +98,9 @@ def test_wording_is_plain_and_not_cut_short_by_the_parser():
     ('ubuntu-22.04', 'ubuntu-22.04/lowlatency@6.8', '6.8.0-148-lowlatency', '6.8.0-149-lowlatency'),
     ('rocky-9', 'rocky-9', '5.14.0-687.63.1.el9_8.x86_64', '5.14.0-687.64.1.el9_8.x86_64'),
     ('rocky-9', 'rocky-9', '5.14.0-611.5.1.el9_7.x86_64', '5.14.0-700.1.1.el9_8.x86_64'),
+    # Rocky/RHEL 9.9 (ops #1084 round 2): its own stream, the 741.x kernels
+    ('rocky-9', 'rocky-9@9.9', '5.14.0-741.19.1.el9_9.x86_64', '5.14.0-741.20.1.el9_9.x86_64'),
+    ('rocky-9', 'rocky-9@9.9', '5.14.0-741.19.1.el9_9.aarch64', '5.14.0-741.20.1.el9_9.aarch64'),
 ])
 def test_old_running_kernel_is_told_to_install_and_restart_fixed_one_is_not(os_type, fix_key, old, fixed_run):
     # no automatic updates: fix not installed yet -> install, then restart
@@ -166,6 +173,27 @@ def test_rocky_box_is_told_too():
     items = _collect('rocky-9', _rb('5.14.0-687.63.1.el9_8.x86_64'))
     assert [i['key'] for i in items] == ['pn:feed:' + CVE]
     assert _collect('rocky-9', _rb('5.14.0-687.64.1.el9_8.x86_64')) == []
+
+
+def test_rocky_9_9_stream_is_picked_from_the_box_kernel_and_9_8_keeps_its_own_number():
+    # the four cases the lead named: 741.19 told, 741.20.1 not, 687.63 told, 687.64.1 not
+    for running, told in [('5.14.0-741.19.1.el9_9.x86_64', True),
+                          ('5.14.0-741.20.1.el9_9.x86_64', False),
+                          ('5.14.0-687.63.1.el9_8.x86_64', True),
+                          ('5.14.0-687.64.1.el9_8.x86_64', False)]:
+        got = [i['key'] for i in _collect('rocky-9', _rb(running))]
+        assert got == (['pn:feed:' + CVE] if told else []), running
+    # a 9.9 box is judged by 741.20.1, never by the 9.8 number it is above
+    it, = _items('rocky-9', _rb('5.14.0-741.19.1.el9_9.x86_64'))
+    assert '(fixed in 5.14.0-741.20.1)' in it['security'][-1]
+    # a 9.8 box is judged by 687.64.1, never by the higher 9.9 number
+    it, = _items('rocky-9', _rb('5.14.0-687.63.1.el9_8.x86_64'))
+    assert '(fixed in 5.14.0-687.64.1)' in it['security'][-1]
+    # 9.9 box that installed the fix but has not restarted: only the restart is asked
+    it, = _items('rocky-9', _rb('5.14.0-741.19.1.el9_9.x86_64', staged='5.14.0-741.20.1.el9_9.x86_64'))
+    assert it['how'].startswith('The fix is already installed; reboot to finish')
+    # a later stream with no row of its own (9.10) falls back to the 9.8 number and is not told
+    assert _items('rocky-9', _rb('5.14.0-800.1.1.el9_10.x86_64')) == []
 
 
 # ── console banner ────────────────────────────────────────────────────────────

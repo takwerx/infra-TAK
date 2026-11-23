@@ -31105,8 +31105,8 @@ _PN_PKG_RE = re.compile(r'^[a-z0-9][a-z0-9.+_-]{0,99}$')
 _PN_VER_RE = re.compile(r'^[A-Za-z0-9.+~^:_-]{1,64}$')
 # os_type as _read_os_release() writes it (ubuntu-22.04, rocky-9), optionally /<kernel
 # flavour> (ubuntu-22.04/aws) and @<kernel series> (ubuntu-22.04/aws@6.8: a 22.04 box on the
-# 6.8 HWE kernel, which numbers its releases apart from 5.15) for kernel rows, or '*' for
-# every OS.
+# 6.8 HWE kernel, which numbers its releases apart from 5.15; rocky-9@9.9: a RHEL-family 9.9
+# box, kernel 741.x, apart from 9.8's 687.x) for kernel rows, or '*' for every OS.
 _PN_OS_RE = re.compile(r'^(\*|[a-z]+-[0-9.]+(/[a-z][a-z0-9-]*)?(@[0-9]+\.[0-9]+)?)$')
 
 # Third-party packages whose upstream publishes GitHub advisories: package (same name on
@@ -31348,8 +31348,15 @@ def _patch_now_feed_items(advisories, installed, os_type, rb, pkg_mgr):
                 m = re.search(r'-([a-z][a-z0-9]*)$', run)
                 flavour = m.group(1) if m else ''
                 key = f'{os_type}/{flavour}' if flavour and flavour != 'generic' else os_type
-                sm = re.match(r'(\d+\.\d+)\.', run)
-                fixed = (per.get(f'{key}@{sm.group(1)}') if sm else None) or per.get(key)
+                # kernel series: 6.8 for 6.8.0-149 (22.04 HWE); on EL the minor release the
+                # build belongs to (.el9_9 -> 9.9), because 9.8 (687.x) and 9.9 (741.x)
+                # number their kernels on separate scales (ops #1084)
+                sm = re.search(r'\.el(\d+)_(\d+)', run)
+                series = f'{sm.group(1)}.{sm.group(2)}' if sm else None
+                if not sm:
+                    sm = re.match(r'(\d+\.\d+)\.', run)
+                    series = sm.group(1) if sm else None
+                fixed = (per.get(f'{key}@{series}') if series else None) or per.get(key)
                 if not (fixed and run and _kernel_version_key(run) < _kernel_version_key(fixed)):
                     continue
                 kernel = True
