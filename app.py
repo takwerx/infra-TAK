@@ -83865,6 +83865,48 @@ def _ensure_recovery_flow_standalone(env_path, plog, wait_attempts=60):
         return False
 
 
+# ops #1109 — a fresh Authentik deploy ships the LDAP outpost on internal routing and later
+# moves it to https://<authentik name> through Caddy; on Authentik 2026.x internal routing
+# spirals every bind. The move needs the name to have a DNS A record. With none, the deploy
+# ran to the end and failed with "Final LDAP SA bind FAILED ... flow spiral", which names
+# nothing the operator can fix. The name is checked first, with a short wait for a record
+# that was just created and has not reached this box's resolver yet.
+_AK_DEPLOY_DNS_WAIT_S = 30
+_AK_DEPLOY_DNS_POLL_S = 5
+
+
+def _authentik_deploy_dns_gate(settings, plog, resolve=None, wait_s=None, poll_s=None,
+                               sleep=None, clock=None):
+    """True when the Authentik deploy may go on, False after it printed the one plain line
+    that stops it. Only a name with NO A record stops it: a lookup that fails on this box's
+    own resolver ('error: ...') says nothing about the record, and a box with no domain has
+    no name to check. Touches no container."""
+    host = _get_authentik_host(settings)
+    if not host:
+        return True
+    resolve = resolve or _dns_resolve_ipv4
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    wait_s = _AK_DEPLOY_DNS_WAIT_S if wait_s is None else wait_s
+    poll_s = _AK_DEPLOY_DNS_POLL_S if poll_s is None else poll_s
+    deadline = clock() + wait_s
+    waited = False
+    while True:
+        _ips, problem = resolve(host)
+        if problem != 'missing':
+            if waited:
+                plog(f"  ✓ DNS name {host} resolves now")
+            return True
+        if clock() >= deadline:
+            break
+        if not waited:
+            plog(f"  DNS name {host} has no A record yet — waiting up to {int(wait_s)}s for it...")
+            waited = True
+        sleep(poll_s)
+    plog(f"✗ DNS name {host} has no A record yet. Add it, then press Deploy again.")
+    return False
+
+
 def run_authentik_deploy(reconfigure=False):
     # Every ⚠/✗ line is a step that did not finish. Reconfigure collects them so it can
     # say so at the end instead of always printing "✓ Reconfigure complete."
@@ -83918,6 +83960,12 @@ def run_authentik_deploy(reconfigure=False):
             plog("  infra-TAK will not stop other software on your box. Free the port(s) and retry.")
             plog(f"  Find the holder: sudo ss -lptn 'sport = :{conflicts[0]['port']}'")
             plog("  If it is the host OpenLDAP (slapd), 'sudo systemctl disable --now slapd' frees 389/636.")
+            authentik_deploy_status.update({'running': False, 'error': True})
+            return
+
+        # ops #1109: the LDAP outpost needs the Authentik name to resolve. Stop here, before
+        # any container or file is touched, rather than at the end with a flow-spiral message.
+        if not reconfigure and not _authentik_deploy_dns_gate(settings, plog):
             authentik_deploy_status.update({'running': False, 'error': True})
             return
 
