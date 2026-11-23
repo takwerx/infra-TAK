@@ -104988,36 +104988,30 @@ def run_takserver_deploy(config):
             f'<nameEntry name="OU" value="{config["cert_ou"]}"/>\n</nameEntries>\n'
             f'</certificateConfig>\n{ca_cfg_line}\n'
             '</certificateSigning>\n<vbm enabled="false"/>')
+        # ops #1118: TAK Server holds CoreConfig in memory (loaded at the Step-5 first start,
+        # stock) and writes that copy back to disk when it shuts down — the same race the
+        # external-DB re-assert below measured (Azure 2026-09-19). Step 8 and the LDAP
+        # connect below used to edit the file while TAK ran, so the LDAP restart's
+        # shutdown put the stock config (plus serverId) back over them: no truststore-
+        # INTERMEDIATE-CA, no enrollment block, CloudTAK setup died UND_ERR_SOCKET
+        # (fresh Ubuntu 22.04, 10.4.4). Stop TAK FIRST so nothing can overwrite the edits,
+        # and so the next start loads them (its own shutdown write is then correct).
+        log_step("Stopping TAK Server so CoreConfig edits cannot be overwritten on its shutdown...")
+        run_cmd('systemctl stop takserver', check=False); time.sleep(10)
+        run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
         try:
             _cc = _read_priv('/opt/tak/CoreConfig.xml')
-            log_step("Enabling X.509 auth on 8089...")
-            # Pre-RELEASE43 5.7 artifacts ship an anonymous 8087 tcp input — flip it.
-            _cc = _cc.replace('<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>',
-                              '<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>')
-            # 5.7-RELEASE43+ stock CoreConfig ships the 8089 tls input directly (the 8087
-            # line survives only as a comment) — add auth="x509" to the live input. Both
-            # replaces no-op when their pattern is absent, so this is version-agnostic.
-            _cc = _cc.replace('<input _name="stdssl" protocol="tls" port="8089"',
-                              '<input auth="x509" _name="stdssl" protocol="tls" port="8089"')
-            log_step("Setting intermediate CA truststore...")
-            _cc = _cc.replace('truststoreFile="certs/files/truststore-root.jks',
-                              f'truststoreFile="certs/files/truststore-{int_ca}.jks')
-            log_step("Enabling certificate enrollment...")
-            # RELEASE43+ artifacts write `<vbm enabled="false" />` (space before the
-            # self-close); older ones have no space. Normalize so one replace serves
-            # both artifact generations. Guarded so a re-run over an already-patched
-            # file can't insert a duplicate certificateSigning block (cert_block
-            # re-appends the vbm anchor).
-            if ca_cfg_line not in _cc:
-                _cc = _cc.replace('<vbm enabled="false" />', '<vbm enabled="false"/>')
-                _cc = _cc.replace('<vbm enabled="false"/>', cert_block)
-            _cc = _cc.replace('<auth>', '<auth x509useGroupCache="true">')
-            if config.get('enable_admin_ui') or config.get('enable_webtak'):
-                admin_ui = str(config.get('enable_admin_ui', False)).lower()
-                webtak = str(config.get('enable_webtak', False)).lower()
-                log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}")
-                _cc = _cc.replace('"cert_https"/',
-                                  f'"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/')
+            if isinstance(_cc, (bytes, bytearray)):
+                _cc = _cc.decode('utf-8', 'replace')
+            log_step("Enabling X.509 auth on 8089, intermediate truststore and certificate enrollment...")
+            _wt = bool(config.get('enable_admin_ui') or config.get('enable_webtak'))
+            if _wt:
+                log_step(f"WebTAK: AdminUI={str(config.get('enable_admin_ui', False)).lower()}, "
+                         f"WebTAK={str(config.get('enable_webtak', False)).lower()}")
+            _cc = _coreconfig_step8_apply(
+                _cc, int_ca, ca_cfg_line, cert_block,
+                admin_ui=str(config.get('enable_admin_ui', False)).lower() if _wt else None,
+                webtak=str(config.get('enable_webtak', False)).lower() if _wt else None)
             _write_priv('/opt/tak/CoreConfig.xml', _cc)
             # v10.1.14 (W6): verify the edits actually landed. These failures used to be
             # swallowed (one log line, deploy still "succeeded") — a broker hiccup left
@@ -105028,15 +105022,7 @@ def run_takserver_deploy(config):
             _cc_check = _read_priv('/opt/tak/CoreConfig.xml')
             if isinstance(_cc_check, (bytes, bytearray)):
                 _cc_check = _cc_check.decode('utf-8', 'replace')
-            _missing = [_m for _m, _ok in (
-                (f'intermediate truststore (truststore-{int_ca}.jks)', f'truststore-{int_ca}.jks' in _cc_check),
-                # v10.1.23: match OUR single-line inserted block, not the bare element
-                # name — RELEASE43's stock example ships a commented-out multi-line
-                # certificateSigning template containing "TAKServerCAConfig" and
-                # "intermediate-signing.jks", which spoofed this check on unpatched files.
-                ('certificateSigning enrollment block', ca_cfg_line in _cc_check),
-                ('x509 auth input on 8089', 'auth="x509"' in _cc_check),
-            ) if not _ok]
+            _missing = _coreconfig_step8_missing(_cc_check, int_ca, ca_cfg_line)
             if _missing:
                 raise RuntimeError(f"post-write verification failed — missing: {', '.join(_missing)}")
         except Exception as _cce:
@@ -105132,6 +105118,31 @@ def run_takserver_deploy(config):
             log_step(f"LDAP resync: {resync_msg}")
         run_cmd('systemctl stop takserver'); time.sleep(10)
         run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
+
+        # ops #1118: belt and braces — with TAK stopped, confirm the Step-8 edits are still
+        # in the file and put them back if anything rewrote them (nothing is running now
+        # that could undo it). The earlier stop makes this a no-op on a healthy deploy.
+        try:
+            _cc_s8 = _read_priv('/opt/tak/CoreConfig.xml')
+            if isinstance(_cc_s8, (bytes, bytearray)):
+                _cc_s8 = _cc_s8.decode('utf-8', 'replace')
+            _s8_gone = _coreconfig_step8_missing(_cc_s8 or '', int_ca, ca_cfg_line)
+            if _s8_gone:
+                log_step(f"  CoreConfig lost its Step-8 edits ({', '.join(_s8_gone)}) — re-applying with TAK stopped...")
+                _wt2 = bool(config.get('enable_admin_ui') or config.get('enable_webtak'))
+                _cc_s8 = _coreconfig_step8_apply(
+                    _cc_s8, int_ca, ca_cfg_line, cert_block,
+                    admin_ui=str(config.get('enable_admin_ui', False)).lower() if _wt2 else None,
+                    webtak=str(config.get('enable_webtak', False)).lower() if _wt2 else None)
+                _write_priv('/opt/tak/CoreConfig.xml', _cc_s8)
+                _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
+                _still = _coreconfig_step8_missing(_read_priv('/opt/tak/CoreConfig.xml') or '', int_ca, ca_cfg_line)
+                if _still:
+                    raise RuntimeError(f"still missing after re-apply: {', '.join(_still)}")
+                log_step("✓ Step-8 CoreConfig edits re-asserted")
+        except Exception as _s8e:
+            log_step(f"  ✗ CoreConfig Step-8 re-check FAILED: {_s8e} — not starting a misconfigured TAK Server.")
+            deploy_status.update({'error': True, 'running': False}); return
 
         # For external_db: re-assert the JDBC target now that TAK is STOPPED.
         #
@@ -118874,6 +118885,48 @@ def _ensure_console_cert_docker_san(settings):
         return regen_note.rstrip('; ') if regen_note else ''
     except Exception as e:
         return f"console cert SAN check error (non-fatal): {str(e)[:100]}"
+
+
+def _coreconfig_step8_apply(cc, int_ca, ca_cfg_line, cert_block, admin_ui=None, webtak=None):
+    """Pure text transform for TAK deploy Step 8 (ops #1118): X.509 on 8089, the
+    intermediate truststore, the certificateSigning enrollment block, x509useGroupCache
+    and (optionally) the WebTAK flags. Idempotent over an already-patched file."""
+    # Pre-RELEASE43 5.7 artifacts ship an anonymous 8087 tcp input — flip it.
+    cc = cc.replace('<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>',
+                    '<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>')
+    # 5.7-RELEASE43+ stock CoreConfig ships the 8089 tls input directly (the 8087
+    # line survives only as a comment) — add auth="x509" to the live input. Both
+    # replaces no-op when their pattern is absent, so this is version-agnostic.
+    cc = cc.replace('<input _name="stdssl" protocol="tls" port="8089"',
+                    '<input auth="x509" _name="stdssl" protocol="tls" port="8089"')
+    cc = cc.replace('truststoreFile="certs/files/truststore-root.jks',
+                    f'truststoreFile="certs/files/truststore-{int_ca}.jks')
+    # RELEASE43+ artifacts write `<vbm enabled="false" />` (space before the
+    # self-close); older ones have no space. Normalize so one replace serves
+    # both artifact generations. Guarded so a re-run over an already-patched
+    # file can't insert a duplicate certificateSigning block (cert_block
+    # re-appends the vbm anchor).
+    if ca_cfg_line not in cc:
+        cc = cc.replace('<vbm enabled="false" />', '<vbm enabled="false"/>')
+        cc = cc.replace('<vbm enabled="false"/>', cert_block)
+    cc = cc.replace('<auth>', '<auth x509useGroupCache="true">')
+    if admin_ui is not None and webtak is not None:
+        cc = cc.replace('"cert_https"/',
+                        f'"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/')
+    return cc
+
+
+def _coreconfig_step8_missing(cc, int_ca, ca_cfg_line):
+    """Names of the Step-8 edits that are NOT in this CoreConfig text (empty = all there)."""
+    return [_m for _m, _ok in (
+        (f'intermediate truststore (truststore-{int_ca}.jks)', f'truststore-{int_ca}.jks' in cc),
+        # v10.1.23: match OUR single-line inserted block, not the bare element
+        # name — RELEASE43's stock example ships a commented-out multi-line
+        # certificateSigning template containing "TAKServerCAConfig" and
+        # "intermediate-signing.jks", which spoofed this check on unpatched files.
+        ('certificateSigning enrollment block', ca_cfg_line in cc),
+        ('x509 auth input on 8089', 'auth="x509"' in cc),
+    ) if not _ok]
 
 
 def _heal_takserver_coreconfig_step8():
