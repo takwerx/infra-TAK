@@ -1674,7 +1674,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.4.5-alpha"
+VERSION = "10.4.6-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
