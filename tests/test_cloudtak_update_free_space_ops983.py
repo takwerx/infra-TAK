@@ -209,6 +209,8 @@ def _run_update(free, tmp_path):
         'cloudtak_deploy_status': status, 'load_settings': lambda: {},
         '_get_cloudtak_deployment_config': lambda s: {'target_mode': 'local'},
         '_get_cloudtak_target_release_tag': lambda *a, **k: 'v13.124.0',
+        '_cloudtak_tag_for_minio_store': lambda tag, store_present: (tag, False),   # ops #1074: not under test here
+        '_cloudtak_needs_minio_hop': lambda tag: False, '_cloudtak_minio_hop_tag': lambda: None,   # ops #1074
         '_cloudtak_running_version': lambda *a, **k: '13.113.0',
         '_mod_result_versions': lambda *a, **k: calls.append(('versions', a)),
         'subprocess': type('S', (), {'run': staticmethod(tripwire), 'Popen': staticmethod(tripwire)}),

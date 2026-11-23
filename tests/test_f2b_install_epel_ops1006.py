@@ -124,9 +124,10 @@ def _ns(box):
     fake_subprocess = types.SimpleNamespace(run=box.run, TimeoutExpired=Exception)
     ns = {'os': _Os(), 'subprocess': fake_subprocess, 'open': fake_open,
           'load_settings': lambda: settings, 'save_settings': lambda s: None,
-          '_sudo_wrap': lambda cmd: list(cmd)}
-    for name in ('_distro_family', '_pkg_mgr', '_pkg_install', '_pkg_ensure_epel',
-                 '_fail2ban_install_and_configure'):
+          '_sudo_wrap': lambda cmd: list(cmd),
+          '_apt_failure_is_transient': lambda out: False}   # ops #1124
+    for name in ('_distro_family', '_pkg_mgr', '_apt_stalled', '_apt_retry_stalled',
+                 '_pkg_install', '_pkg_ensure_epel', '_fail2ban_install_and_configure'):
         src = _func(name, required=(name != '_pkg_ensure_epel'))
         if src:
             exec(src, ns)
