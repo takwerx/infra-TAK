@@ -555,9 +555,9 @@ def test_remote_deploy_checks_the_host_before_it_writes_caddy():
     # Only when this same deploy put the current stream site file on the host.
     assert step7.index('if ak_installed and _mtx_overlay_shipped:') < step7.index(
         '_mediamtx_remote_hls_road(settings, cfg, plog)')
-    assert ("_mtx_overlay_shipped, _ = _module_run_root(deploy_cfg, "
+    assert ("_mtx_overlay_shipped = bool(_module_run_root(deploy_cfg, "
             "'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py'") in deploy
-    assert deploy.index('_mtx_overlay_shipped = False') < deploy.index('_mtx_overlay_shipped, _ =')
+    assert deploy.index('_mtx_overlay_shipped = False') < deploy.index('_mtx_overlay_shipped = bool(')
     # After the editor on the host was started and checked.
     assert deploy.index('_mediamtx_remote_editor_check(deploy_cfg, plog)') < deploy.index(
         '_mediamtx_remote_hls_road(settings, cfg, plog)')

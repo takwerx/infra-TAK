@@ -50479,7 +50479,7 @@ paths:
         if os.path.exists(overlay_src):
             ok_ov, _ = _module_copy(deploy_cfg, overlay_src, '/tmp/mediamtx_ldap_overlay.py', log_fn=plog)
             if ok_ov:
-                _mtx_overlay_shipped, _ = _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
+                _mtx_overlay_shipped = bool(_module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)[0])
                 patcher = (
                     "import sys\n"
                     "EDITOR = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
@@ -115095,7 +115095,7 @@ def _startup_converge_mediamtx_remote_hls_road(after=None):
         live = _caddy_vhost_block(_read_priv(CADDYFILE_PATH) or '', _MEDIAMTX_VHOST_MARKER)
         if 'forward_auth' not in live or 'handle_path /hls-proxy/*' not in live:
             return road
-        generate_caddyfile(load_settings())     # fresh: the check on the host took a while
+        generate_caddyfile()        # reads the settings itself: the check on the host took a while
         if not _CADDY_REGISTRY_READY.is_set():
             print(f"{tag} Caddy change queued: written with the Caddyfile after the modules load",
                   flush=True)
