@@ -81909,7 +81909,7 @@ def _authentik_webadmin_role_check_and_heal(plog_fn=None):
         if not _wa:
             _log("webadmin role check: webadmin MISSING in Authentik — calling _ensure_authentik_webadmin")
             try:
-                _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True)
+                _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True, reset_password=False)
                 if _ok:
                     _healed = True
                 else:
@@ -81946,7 +81946,7 @@ def _authentik_webadmin_role_check_and_heal(plog_fn=None):
             if _need_role_heal:
                 _log(f"webadmin role drift detected ({', '.join(_reasons)}) — auto-healing")
                 try:
-                    _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True)
+                    _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True, reset_password=False)
                     if _ok:
                         _log("webadmin role healed via _ensure_authentik_webadmin")
                         _healed = True
@@ -84953,6 +84953,8 @@ entries:
     
                     # Create webadmin user in Authentik (only when TAK Server is deployed — used for TAK Server admin)
                     webadmin_pass = ''
+                    webadmin_pass_generated = False
+                    webadmin_created = False
                     if os.path.exists('/opt/tak'):
                         # Read password from TAK Server settings or use default
                         tak_settings_path = os.path.join(CONFIG_DIR, 'settings.json')
@@ -84961,10 +84963,11 @@ entries:
                                 tak_s = json.load(f)
                                 webadmin_pass = tak_s.get('webadmin_password', '')
                         if not webadmin_pass:
+                            # Generated, NOT saved yet — it is only used (and persisted) if
+                            # this deploy actually creates webadmin. An existing webadmin's
+                            # password belongs to the operator; see the set_password gate below.
                             webadmin_pass = secrets.token_urlsafe(16)
-                            plog(f"  ⚠ webadmin_password not in settings — generated random password")
-                            settings['webadmin_password'] = webadmin_pass
-                            save_settings(settings)
+                            webadmin_pass_generated = True
                     else:
                         plog("  ℹ TAK Server not installed — skipping webadmin user (optional; used for TAK Server admin)")
     
@@ -84986,31 +84989,49 @@ entries:
                             resp = urllib.request.urlopen(req, timeout=10)
                             user = json.loads(resp.read().decode())
                             webadmin_pk = user['pk']
+                            webadmin_created = True
                             plog(f"  ✓ Created webadmin user (pk={webadmin_pk})")
+                            if webadmin_pass_generated:
+                                plog("  ⚠ webadmin_password not in settings — generated a random password for the new webadmin user")
+                                settings['webadmin_password'] = webadmin_pass
+                                save_settings(settings)
                         except urllib.error.HTTPError as e:
                             if e.code == 400:
-                                plog("  ✓ webadmin user already exists")
+                                plog("  ✓ webadmin user already exists — leaving its password unchanged")
                                 # Get existing user PK and add to group
                                 req = urllib.request.Request(f'{ak_url}/api/v3/core/users/?search=webadmin',
                                     headers=ak_headers)
                                 resp = urllib.request.urlopen(req, timeout=10)
                                 results = json.loads(resp.read().decode())['results']
-                                webadmin_pk = results[0]['pk'] if results else None
+                                _wa_obj = next((u for u in results if u.get('username') == 'webadmin'), None)
+                                webadmin_pk = _wa_obj['pk'] if _wa_obj else None
                                 if webadmin_pk and group_pk:
-                                    req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{webadmin_pk}/',
-                                        data=json.dumps({'groups': [group_pk]}).encode(),
-                                        headers=ak_headers, method='PATCH')
-                                    try:
-                                        urllib.request.urlopen(req, timeout=10)
-                                        plog("  ✓ Added webadmin to tak_ROLE_ADMIN group")
-                                    except Exception:
-                                        pass
+                                    # MERGE, never replace: PATCHing groups=[tak_ROLE_ADMIN] stripped
+                                    # webadmin out of 'authentik Admins', the LDAP SA watchdog saw
+                                    # role drift and its heal reset the password a second time
+                                    # (test12, 2026-11-22).
+                                    _cur = [g.get('pk', g) if isinstance(g, dict) else g
+                                            for g in (_wa_obj.get('groups') or [])]
+                                    if group_pk not in _cur:
+                                        req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{webadmin_pk}/',
+                                            data=json.dumps({'groups': list(dict.fromkeys(_cur + [group_pk]))}).encode(),
+                                            headers=ak_headers, method='PATCH')
+                                        try:
+                                            urllib.request.urlopen(req, timeout=10)
+                                            plog("  ✓ Added webadmin to tak_ROLE_ADMIN group")
+                                        except Exception:
+                                            pass
                             else:
                                 plog(f"  ⚠ webadmin user error: {e.code} — continuing")
                                 webadmin_pk = None
-    
-                        # Set webadmin password
-                        if webadmin_pk:
+
+                        # Set webadmin password — ONLY on a user this deploy just created.
+                        # An existing webadmin's password is operator-owned: a redeploy that
+                        # found no webadmin_password in settings used to generate a random one
+                        # and set it on the live user, locking the operator out of the
+                        # SSO-protected console (test12, 2026-11-22). Changing an existing
+                        # password is the explicit "Sync webadmin" button's job.
+                        if webadmin_pk and webadmin_created:
                             try:
                                 req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{webadmin_pk}/set_password/',
                                     data=json.dumps({'password': webadmin_pass}).encode(),
@@ -88344,9 +88365,16 @@ def _heal_takauthentik_tasklog_purge_stale_failed_state(plog=None):
         return False
 
 
-def _ensure_authentik_webadmin(skip_bind_verify=False):
+def _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=True):
     """Ensure webadmin exists in Authentik with password from settings; 8446 uses LDAP when CoreConfig has <ldap/>.
     skip_bind_verify=True skips LDAP outpost recreate and bind verification (default False — TAK deploy and Sync webadmin use full verify).
+    reset_password=False (automatic callers: LDAP SA watchdog, TAK Server upgrades) heals roles/active/groups
+    but never changes the password of an EXISTING webadmin — that password is operator-owned (they may have
+    changed it in Authentik). A webadmin this call creates still gets the stored password. With
+    reset_password=False the bind verdict is skipped too: we don't know the operator's password, and a
+    'fail' verdict would DELETE and recreate the user. Only explicit operator actions (Sync webadmin,
+    TAK deploy, Connect LDAP) pass reset_password=True. test12 2026-11-22: the watchdog heal reset a
+    live webadmin password and locked the operator out of the SSO-protected console.
     Returns (True, None) on success, (False, error_msg) on failure."""
     import urllib.request as _req
     import urllib.error
@@ -88357,8 +88385,9 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
     if not ak_token:
         return False, 'Authentik .env not found'
     webadmin_pass = (settings.get('webadmin_password') or '').strip()
-    if not webadmin_pass:
-        return False, 'webadmin password is not set in infra-TAK settings. Re-deploy TAK Server and set a WebGUI password.'
+    _no_pass_err = 'webadmin password is not set in infra-TAK settings. Re-deploy TAK Server and set a WebGUI password.'
+    if reset_password and not webadmin_pass:
+        return False, _no_pass_err
     url = _get_authentik_api_url(settings)
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     try:
@@ -88390,9 +88419,14 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
         resp = _req.urlopen(req, timeout=10)
         results = json.loads(resp.read().decode())['results']
         user_obj = next((u for u in results if u.get('username') == 'webadmin'), None)
+        created = False
         if not user_obj:
+            if not webadmin_pass:
+                return False, _no_pass_err
             user_obj = _create_webadmin_user()
+            created = True
         webadmin_pk = user_obj['pk']
+        set_pw = reset_password or created
         patch_fields = {}
         # v0.9.13: recover a webadmin that was Deactivated via TAK Portal / Authentik UI.
         # Without this, Sync webadmin silently fails to restore 8446 login because
@@ -88410,8 +88444,9 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
         if patch_fields:
             req = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/', data=json.dumps(patch_fields).encode(), headers=headers, method='PATCH')
             _req.urlopen(req, timeout=10)
-        req = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/set_password/', data=json.dumps({'password': webadmin_pass}).encode(), headers=headers, method='POST')
-        _req.urlopen(req, timeout=10)
+        if set_pw:
+            req = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/set_password/', data=json.dumps({'password': webadmin_pass}).encode(), headers=headers, method='POST')
+            _req.urlopen(req, timeout=10)
         # Add webadmin to authentik Admins so LDAP application allows bind (8446 login)
         req = _req.Request(f'{url}/api/v3/core/groups/?search=authentik+Admins', headers=headers)
         resp = _req.urlopen(req, timeout=10)
@@ -88542,6 +88577,10 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
         ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
         if not ready:
             return False, f'webadmin set, but LDAP outpost not ready (status: {ready_status})'
+        if not set_pw:
+            # Password untouched (operator-owned) — we cannot verify a bind with it, and a
+            # 'fail' verdict below would DELETE + recreate the user. Outpost is ready; done.
+            return True, None
         # v0.8.5: Tri-state probe. Only do destructive recovery (DELETE + recreate) on a
         # CONFIRMED 'fail'. On 'inconclusive' (missing ldapsearch, spiral markers, or flow
         # errors with no credential signal) the bind is likely fine — possibly a routing
@@ -101028,7 +101067,7 @@ def run_takserver_upgrade(pkg_path):
         subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=90)  # v10.0.1: container-aware
         if _get_authentik_env_content(settings):
             ulog("Syncing webadmin to Authentik (LDAP cache refresh)...")
-            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=False)
             if ok_wa:
                 ulog("\u2713 webadmin synced to Authentik")
             else:
@@ -101143,7 +101182,7 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
         ulog("Restarting TAK Server...")
         subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=90)
         if _get_authentik_env_content(settings):
-            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=False)
             ulog("✓ webadmin synced to Authentik" if ok_wa else f"⚠ webadmin sync: {err_wa or 'failed'} — use Sync webadmin if 8446 login fails")
         generate_caddyfile(settings)
         _caddy_reload()
@@ -101932,7 +101971,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog("\u2713 TAK Server started")
         if _get_authentik_env_content(settings):
             ulog("Syncing webadmin to Authentik (LDAP cache refresh)...")
-            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=False)
             if ok_wa:
                 ulog("\u2713 webadmin synced to Authentik")
             else:
@@ -102167,7 +102206,7 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
             upgrade_log.append(f"  ⏳ {remaining//60:02d}:{remaining%60:02d} remaining")
         ulog("✓ TAK Server started")
         if _get_authentik_env_content(settings):
-            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=False)
             ulog("✓ webadmin synced to Authentik" if ok_wa else f"⚠ webadmin sync: {err_wa or 'failed'} — use Sync webadmin if 8446 login fails")
         generate_caddyfile(settings)
         _caddy_reload()
