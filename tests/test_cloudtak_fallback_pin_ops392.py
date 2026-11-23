@@ -24,8 +24,9 @@ noticed, because the pin is only read offline.
 These tests fail when the pin falls behind a release we already know matters:
   - the newest CloudTAK entry in KNOWN_SECURITY_RELEASES (a fallback must never be a version
     infra-TAK itself flags as having a security fix pending);
-  - 13.117.1, the first release that gives the tiles service its API_URL (13.117.0 left every
-    basemap tile at 500 in Docker).
+  - 13.127.0, the release ops #826 tested (update from 13.117.1, rollback, forward again on Ubuntu,
+    Rocky 9 and ARM). The floor was 13.117.1, the first release that gives the tiles service its
+    API_URL (13.117.0 left every basemap tile at 500 in Docker).
 Raise MIN_FALLBACK when a newer release becomes a must-have; the pin has to follow it.
 """
 
@@ -35,7 +36,7 @@ import pathlib
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 
-MIN_FALLBACK = (13, 117, 1)
+MIN_FALLBACK = (13, 127, 0)
 
 
 def _top_level(name):

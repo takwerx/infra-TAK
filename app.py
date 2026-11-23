@@ -1744,7 +1744,7 @@ AUTHENTIK_DEV_RELEASE    = "2026.8.5"   # OFFLINE FALLBACK ONLY — dev channel 
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
 # ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
 # contract; pre-13.45 plugin installs are still refused (compatibility floor — unchanged).
-CLOUDTAK_VETTED_RELEASE = "13.117.1"    # OFFLINE FALLBACK ONLY since v10.1.17 — the CloudTAK version
+CLOUDTAK_VETTED_RELEASE = "13.127.0"    # OFFLINE FALLBACK ONLY since v10.1.17 — the CloudTAK version
                                         # gate is REMOVED (operator decision 2026-08-02, reversing the
                                         # 2026-07-26 "the gate stays": dfpc-coe ships too fast to keep
                                         # bumping a pin by hand, and customers want the new builds).
@@ -1753,6 +1753,8 @@ CLOUDTAK_VETTED_RELEASE = "13.117.1"    # OFFLINE FALLBACK ONLY since v10.1.17 �
                                         # unreachable. Bump to current latest when convenient.
                                         # ops #392: 13.54.3 -> 13.117.1. The old value built a MinIO image
                                         # that is gone (quay.io 401) and lacks the SSRF fix in 13.117.0.
+                                        # ops #826: 13.117.1 -> 13.127.0 (update, rollback and forward again tested on Ubuntu,
+                                        # Rocky 9 and ARM). A box with the Replay plugin stays on its old build: see PLATFORM_REFERENCE.md.
                                         # tests/test_cloudtak_fallback_pin_ops392.py keeps it from going stale.
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Caddy's certificate store, and the issuer subdirectory Let's Encrypt lands in.
