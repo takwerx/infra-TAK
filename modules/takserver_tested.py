@@ -53,9 +53,9 @@ TESTED_KIND = 'takserver-tested'
 TESTED_MAX_BYTES = 16 * 1024
 TESTED_CHECK_SEC = 1800                      # same cadence as the TAK Portal verified file
 COMMIT_RE = _etl.SHA_RE
-EXPIRES_RE = _re.compile(r'^\d{4}-\d{2}-\d{2}$')
+EXPIRES_RE = _re.compile(r'^\d{4}-\d{2}-\d{2}$', _re.ASCII)
 # 5.8-RELEASE104 (what dpkg and rpm show) or 5.8-RELEASE-104 (what tak.gov file names show).
-VERSION_RE = _re.compile(r'^(\d+)\.(\d+)-RELEASE-?(\d+)$')
+VERSION_RE = _re.compile(r'^(\d+)\.(\d+)-RELEASE-?(\d+)$', _re.ASCII)   # ASCII: \d must not match other scripts' digits
 TAK_GOV_URL = 'https://tak.gov/products/tak-server'
 
 
@@ -69,7 +69,7 @@ def version_tuple(version):
     """(5, 8, 104) for '5.8-RELEASE104'. Finds the version inside a longer string too (a dpkg
     version can carry a suffix). None when no TAK Server release version is in it."""
     s = str(version or '').strip()
-    m = VERSION_RE.fullmatch(s) or _re.search(r'(\d+)\.(\d+)-RELEASE-?(\d+)', s)
+    m = VERSION_RE.fullmatch(s) or _re.search(r'(\d+)\.(\d+)-RELEASE-?(\d+)', s, _re.ASCII)
     return tuple(int(g) for g in m.groups()) if m else None
 
 

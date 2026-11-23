@@ -136,10 +136,19 @@ def test_a_cached_file_edited_on_disk_is_not_trusted(keys, tmp_path):
     ({'version': '5.8'}, 'version'), ({'version': '5.8-RELEASE-104'}, 'version'),
     ({'version': 'main'}, 'version'), ({'tested': 'yesterday'}, 'tested date'),
     ({'expires': None}, 'expires'), ({'serial': 0}, 'serial'), ({'schema': 2}, 'schema'),
+    # module-scan: \d matches other scripts' digits unless the pattern is ASCII-only
+    ({'version': '\u0665.\u0668-RELEASE\u0661\u0660\u0664'}, 'version'),
+    ({'version': '5.8-RELEASE104\n'}, 'version'), ({'version': '5.8-RELEASE104; id'}, 'version'),
+    ({'tested': '\u0662\u0660\u0662\u0666-11-23'}, 'tested date'),
 ])
 def test_a_file_that_does_not_say_both_tests_passed_for_a_real_version_is_refused(over, reason):
     with pytest.raises(ValueError, match=reason):
         _tst().parse(_doc(**over))
+
+
+def test_other_scripts_digits_are_not_a_version():
+    assert _tst().version_tuple('\u0665.\u0668-RELEASE\u0661\u0660\u0664') is None
+    assert _tst().normalize('\u0665.\u0668-RELEASE\u0661\u0660\u0664') == ''
 
 
 def test_a_file_signed_for_another_purpose_with_the_same_key_is_not_taken_for_this_one(keys):
@@ -319,6 +328,18 @@ def test_refresh_keeps_a_good_file_drops_a_forged_one_and_never_goes_back(keys, 
     b.serve(old, _sign(old, keys['key'], keys['dir']))
     assert b.record()['version'] == '5.8-RELEASE110'            # older serial: a replay, ignored
     assert b.settings['takserver_tested_serial'] == 3
+
+
+def test_a_later_file_naming_an_older_version_withdraws_the_newer_one(keys, tmp_path):
+    # module-scan: if a tested version turns out bad we sign the older good one again with a later serial
+    b = Box(tmp_path, keys)
+    bad = _doc(serial=7, version='5.8-RELEASE105')
+    b.serve(bad, _sign(bad, keys['key'], keys['dir']))
+    assert b.record()['version'] == '5.8-RELEASE105'
+    back = _doc(serial=8, version=V)
+    b.serve(back, _sign(back, keys['key'], keys['dir']))
+    assert b.record()['version'] == V
+    assert b.settings['takserver_tested_serial'] == 8
 
 
 def test_offline_box_says_nothing(keys, tmp_path):
