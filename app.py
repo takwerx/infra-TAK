@@ -61405,8 +61405,14 @@ def emailrelay_page():
     relay_config = settings.get('email_relay', {})
     authentik_smtp_configured = modules.get('authentik', {}).get('installed') and _authentik_smtp_configured()
     _em_job = mod_registry.job_state('emailrelay')
+    # ops #1140: the "Send system notifications to" box. When it is empty, root's mail
+    # follows Guard Dog's alert address, else the relay From address: show which.
+    _gd_to = _safe_alert_email_list(settings.get('guarddog_alert_email'))
     return render_template('email_relay.html',
         settings=settings, modules=modules, email=email,
+        notify_to=_safe_alert_email_list(settings.get(mod_registry.emailrelay.NOTIFY_KEY)),
+        notify_default=_gd_to or relay_config.get('from_addr', ''),
+        notify_default_is_guarddog=bool(_gd_to),
         relay_config=relay_config, providers=mod_registry.emailrelay.PROVIDERS,
         authentik_smtp_configured=authentik_smtp_configured,
         metrics=get_system_metrics(), version=VERSION,
