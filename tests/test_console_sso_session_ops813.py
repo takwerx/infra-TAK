@@ -632,9 +632,14 @@ def test_hardened_idle_lock_still_locks_a_password_session(console, clock):
 
 def test_console_vhost_still_hands_the_group_header_to_the_console():
     src = _func('generate_caddyfile') or APP
-    block = src[src.index('forward_auth @needs_sso'):]
-    block = block[:block.index('reverse_proxy 127.0.0.1:5001')]
-    assert 'X-Authentik-Groups' in block
+    # ops #1081: the block comes from the one writer of every forward_auth block. The console
+    # hands it the header list and its own matcher.
+    call = src[src.index("_caddy_forward_auth_lines(ak_up, \"        \", _CADDY_AK_COPY_HEADERS,"):]
+    call = call[:call.index('reverse_proxy 127.0.0.1:5001')]
+    assert "matcher='@needs_sso'" in call
+    assert 'X-Authentik-Groups' in APP[APP.index('_CADDY_AK_COPY_HEADERS = ('):][:200]
+    writer = APP[APP.index('def _caddy_forward_auth_lines('):]
+    assert "out.append(f'    copy_headers {copy_headers}')" in writer[:writer.index('\ndef ')]
     assert "'X-Authentik-Groups'" in src[src.index('_AK_FWD_HEADERS = ('):][:200], \
         'the client-sent group header must be stripped before forward_auth sets the real one'
 
