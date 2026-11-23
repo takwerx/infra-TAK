@@ -38980,11 +38980,7 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
             lines.append("        request_header /hls-proxy/* -Authorization")
         emit_rescue(f"{_pub_url(mtx_host)}/")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-        lines.append(f"        forward_auth {ak_up} {{")
-        lines.append("            uri /outpost.goauthentik.io/auth/caddy")
-        lines.append("            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
-        lines.append("            trusted_proxies private_ranges")
-        lines.append("        }")
+        lines.extend(_caddy_forward_auth_lines(ak_up, "        ", _CADDY_AK_COPY_HEADERS))
         lines.append(f"        reverse_proxy {mtx_up}")
         lines.append("    }")
     elif login_ok:
@@ -41977,6 +41973,42 @@ _TAKPORTAL_AK_COPY_HEADERS = ('X-Authentik-Username X-Authentik-Groups X-Authent
                               'X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider '
                               'X-Authentik-Meta-App X-Authentik-Meta-Version')
 
+# ops #1081: one writer for the Authentik sign-in check (forward_auth) of every vhost. The
+# outpost reads X-Forwarded-Host to pick the application it checks, so that header and
+# X-Forwarded-Proto are always the values of the request Caddy itself received, and the
+# block never has a `trusted_proxies` line: with one, Caddy keeps the X-Forwarded-* that a
+# client in that range sent. forward_auth takes reverse_proxy's subdirectives
+# (https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#trusted_proxies and
+# #defaults). Checked with `caddy adapt` and live requests on Caddy 2.7.6 and 2.11.4.
+_CADDY_AK_COPY_HEADERS = ('X-Authentik-Username X-Authentik-Groups X-Authentik-Email '
+                          'X-Authentik-Name X-Authentik-Uid')
+_CADDY_FORWARD_AUTH_URI = 'uri /outpost.goauthentik.io/auth/caddy'
+_CADDY_FORWARD_AUTH_PIN = ('header_up X-Forwarded-Host {http.request.hostport}',
+                           'header_up X-Forwarded-Proto {http.request.scheme}')
+
+
+def _caddy_forward_auth_lines(ak_up, indent, copy_headers='', matcher=''):
+    """Caddy lines of one Authentik forward_auth block, each starting with `indent`.
+    copy_headers: the X-Authentik-* names handed on to the backend ('' for none).
+    matcher: a named matcher such as '@needs_sso' ('' for every request)."""
+    target = f'{matcher} {ak_up}' if matcher else f'{ak_up}'
+    out = [f'forward_auth {target} {{', f'    {_CADDY_FORWARD_AUTH_URI}']
+    if copy_headers:
+        out.append(f'    copy_headers {copy_headers}')
+    out += [f'    {pin}' for pin in _CADDY_FORWARD_AUTH_PIN]
+    out.append('}')
+    return [indent + line for line in out]
+
+
+def _caddyfile_forward_auth_pinned(caddyfile):
+    """True when every forward_auth block in the infra-TAK part of a Caddyfile text is the
+    one _caddy_forward_auth_lines writes: X-Forwarded-Host and -Proto set by Caddy, and no
+    trusted_proxies. Operator blocks below the marker never count."""
+    gen = (caddyfile or '').split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    blocks = re.findall(r'(?ms)^[ \t]*forward_auth [^\n]*\{\n(.*?)^[ \t]*\}', gen)
+    return all('trusted_proxies' not in b and all(pin in b for pin in _CADDY_FORWARD_AUTH_PIN)
+               for b in blocks)
+
 
 def _caddy_vhost_block(caddyfile, marker):
     """Text of the generated vhost whose comment line is exactly `marker` ('' when there is
@@ -42020,13 +42052,9 @@ def _takportal_vhost_lines(portal_up, ak_up, use_sso, rescue_lines=()):
                '        handle @public {',
                f'            reverse_proxy {portal_up}',
                '        }',
-               '',
-               f'        forward_auth {ak_up} {{',
-               '            uri /outpost.goauthentik.io/auth/caddy',
-               f'            copy_headers {_TAKPORTAL_AK_COPY_HEADERS}',
-               '            trusted_proxies private_ranges',
-               '        }',
-               '',
+               '']
+            + _caddy_forward_auth_lines(ak_up, '        ', _TAKPORTAL_AK_COPY_HEADERS)
+            + ['',
                f'        reverse_proxy {portal_up}',
                '    }'])
 
@@ -42082,6 +42110,42 @@ def _startup_caddy_takportal_login_converge():
     print('Startup migration: ✓ TAK Portal is now only reachable through Authentik (or closed '
           'with a 503 when there is no Authentik) and Caddy %s (ops #648).'
           % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]) + check, flush=True)
+
+
+def _startup_caddy_forward_auth_converge():
+    """ops #1081 — an existing box whose Authentik sign-in checks (forward_auth) still have
+    a `trusted_proxies` line, or do not set X-Forwarded-Host themselves, is rebuilt on the
+    console update. Same shape as _startup_caddy_takportal_login_converge()."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        if _caddyfile_forward_auth_pinned(_read_priv(CADDYFILE_PATH)):
+            return
+    except Exception as e:
+        print('Startup migration: sign-in check converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    print('Startup migration: rebuilding the Authentik sign-in checks in Caddy so that Caddy '
+          'alone sets X-Forwarded-Host (ops #1081)', flush=True)
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        print('Startup migration: sign-in checks queued — written with the post-registry '
+              'Caddyfile regen (ops #1081).', flush=True)
+        return
+    try:
+        if not _caddyfile_forward_auth_pinned(_read_priv(CADDYFILE_PATH)):
+            print('Startup migration: ⚠ sign-in check converge FAILED — the regenerated '
+                  'Caddyfile was rejected and rolled back. The sign-in checks are STILL the '
+                  'old ones on this box (ops #1081).', flush=True)
+            return
+    except Exception:
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ Authentik sign-in checks rebuilt and Caddy %s (ops #1081).'
+          % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
 
 
 def _startup_caddy_selfheal():
@@ -42834,11 +42898,8 @@ def generate_caddyfile(settings=None):
         lines.append(f"        @needs_sso {{")
         lines.append(f"            not path /api/*")
         lines.append(f"        }}")
-        lines.append(f"        forward_auth @needs_sso {ak_up} {{")
-        lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-        lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
-        lines.append(f"            trusted_proxies private_ranges")
-        lines.append(f"        }}")
+        lines.extend(_caddy_forward_auth_lines(ak_up, "        ", _CADDY_AK_COPY_HEADERS,
+                                               matcher='@needs_sso'))
         # v10.1.1 S1: attach the proxy-auth secret AFTER forward_auth, on the same
         # matcher — so it is present exactly when forward_auth passed (a 302'd
         # request never reaches this directive; /api/* skips both). The console
@@ -42899,10 +42960,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"        handle @nodered_public {{")
             lines.append(f"            reverse_proxy {nodered_up}")
             lines.append(f"        }}")
-            lines.append(f"        forward_auth {ak_up} {{")
-            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-            lines.append(f"            trusted_proxies private_ranges")
-            lines.append(f"        }}")
+            lines.extend(_caddy_forward_auth_lines(ak_up, "        "))
             lines.append(f"        reverse_proxy {nodered_up}")
             lines.append(f"    }}")
         else:
@@ -43183,11 +43241,7 @@ def generate_caddyfile(settings=None):
                 lines.append(f"        handle {{")
                 _emit_outpost_callback_rescue(f"{_pub_url(fh_host, settings)}/")
                 lines.append(f"            reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-                lines.append(f"            forward_auth {ak_up} {{")
-                lines.append(f"                uri /outpost.goauthentik.io/auth/caddy")
-                lines.append(f"                copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
-                lines.append(f"                trusted_proxies private_ranges")
-                lines.append(f"            }}")
+                lines.extend(_caddy_forward_auth_lines(ak_up, "            ", _CADDY_AK_COPY_HEADERS))
                 for rp_line in fh_rp_block:
                     lines.append(f"            {rp_line}")
                 lines.append(f"        }}")
@@ -43237,10 +43291,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
             _emit_outpost_callback_rescue(f"{_pub_url(wo_host, settings)}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-            lines.append(f"        forward_auth {ak_up} {{")
-            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-            lines.append(f"            trusted_proxies private_ranges")
-            lines.append(f"        }}")
+            lines.extend(_caddy_forward_auth_lines(ak_up, "        "))
             lines += _webodm_proxy_lines(wo_up)
             lines.append(f"    }}")
         else:
@@ -43362,11 +43413,7 @@ def generate_caddyfile(settings=None):
             # turn a clean 404 into a redirect loop.
             lines.append(f"        @atlas_device path {at_device_paths}")
             lines.append(f"        respond @atlas_device 404")
-            lines.append(f"        forward_auth {ak_up} {{")
-            lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-            lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
-            lines.append(f"            trusted_proxies private_ranges")
-            lines.append(f"        }}")
+            lines.extend(_caddy_forward_auth_lines(ak_up, "        ", _CADDY_AK_COPY_HEADERS))
             # SEC_AUDIT (ATLAS) S-1 — the same mechanism the console already uses
             # for itself, extended to this module's vhost.
             #
@@ -120321,6 +120368,11 @@ def _startup_migrations():
             _startup_caddy_webodm_welcome_converge()
         except Exception as _ww_err:
             print(f"Startup migration: WebODM setup-page converge error (non-fatal): {_ww_err}",
+                  flush=True)
+        try:
+            _startup_caddy_forward_auth_converge()
+        except Exception as _fa_err:
+            print(f"Startup migration: sign-in check converge error (non-fatal): {_fa_err}",
                   flush=True)
         try:
             _startup_caddy_selfheal()

@@ -76,6 +76,7 @@ Official: [docs.goauthentik.io](https://docs.goauthentik.io/), [LDAP provider](h
 - TAK Server binds as the service account `adm_ldapservice`. Besides that service account, the `tak_ROLE_ADMIN` group and the `webadmin` user are the only group and user infra-TAK creates itself. Every other `tak_*` group comes from TAK Portal.
 - After restarting `authentik-worker`, blueprints have to re-apply before LDAP queries work.
 - **Authentik does not limit the characters in a username or a group name.** Its API (`POST /api/v3/core/users/`, `POST /api/v3/core/groups/`) stored names with spaces, quotes, `<`, `>` and `&` exactly as sent. Treat every name that comes from Authentik as free text: escape it for the place it goes (a page, a shell command, an LDAP filter). ✅ verified 2026-11-17, test6, Authentik 2026.8.5 (ops #827).
+- **The proxy outpost picks which application to check from the request host, and it reads `X-Forwarded-Host` before `Host`.** Sign-in sessions are per application (one cookie per application). So whatever sits in front of the outpost must set `X-Forwarded-Host` itself (see Caddy below). 📖 Authentik source, tag `version/2026.8.5`: `lookupApp` in `internal/outpost/proxyv2/handlers.go` calls `web.GetHost`.
 - Two things at once on one box can starve it. A first-time Authentik deploy next to a TAK Server, Node-RED and MediaMTX deploy has produced `127.0.0.1:9090: connection refused` (502) from Caddy. Space deploys out. 👁 observed.
 
 ## TAK Portal
@@ -125,6 +126,10 @@ Official: [caddyserver.com/docs](https://caddyserver.com/docs/), [forward_auth](
 
 - Reload (`systemctl reload caddy`) to apply a rewritten Caddyfile without dropping connections. Check a file with `caddy adapt` before reloading. 📖
 - `forward_auth` is how protected sites ask Authentik first. Our notes say it must come before `reverse_proxy` in a site block; confirm the ordering against the Caddy directive-order table before relying on it. Not re-proven here.
+- **`forward_auth` is a `reverse_proxy` shortcut and takes its subdirectives** (`trusted_proxies`, `header_up`). Caddy writes `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` on the request to the auth server itself. Without `trusted_proxies` it replaces whatever the client sent. With `trusted_proxies <ranges>` it keeps the `-Proto` and `-Host` a client in those ranges sent, and appends to its `-For`. A `header_up X-Forwarded-Host …` line wins over both. 📖 [reverse_proxy, "Defaults" and `trusted_proxies`](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#defaults). ✅ verified 2026-11-22, a local run of Caddy 2.7.6 and 2.11.4 with a stand-in auth server and a loopback client: all three cases seen on both versions.
+  - `X-Forwarded-Method` and `X-Forwarded-Uri` are always set by `forward_auth` itself.
+  - The Authentik outpost picks the application it checks from `X-Forwarded-Host` (see Authentik below), so our blocks have no `trusted_proxies` line and set `-Host` and `-Proto` with `header_up` from `{http.request.hostport}` and `{http.request.scheme}`. `{http.request.hostport}` is what Caddy sends by default: the port is there only when the client's `Host` has one (a moved HTTPS port). One helper writes every block: `_caddy_forward_auth_lines` in `app.py`.
+  - The `trusted_proxies private_ranges` line in Authentik's Caddy example is marked optional there. 📖 [Authentik, forward auth with Caddy](https://docs.goauthentik.io/add-secure-apps/providers/proxy/server_caddy/)
 
 ## Node-RED
 

@@ -33,9 +33,10 @@ APP = (REPO / 'app.py').read_text(encoding='utf-8')
 TREE = ast.parse(APP)
 
 _NAMES = ('_caddy_vhost_block', '_vhost_uses_sso', '_takportal_vhost_lines',
-          '_takportal_vhost_is_closed')
+          '_takportal_vhost_is_closed', '_caddy_forward_auth_lines')
 _CONSTS = ('_TAKPORTAL_VHOST_MARKER', '_TAKPORTAL_PUBLIC_PATHS', '_CADDY_STRIP_AUTHENTIK_HEADERS',
-           '_TAKPORTAL_AK_COPY_HEADERS', 'CADDYFILE_USER_BLOCKS_MARKER')
+           '_TAKPORTAL_AK_COPY_HEADERS', 'CADDYFILE_USER_BLOCKS_MARKER',
+           '_CADDY_FORWARD_AUTH_URI', '_CADDY_FORWARD_AUTH_PIN')
 PORTAL = '127.0.0.1:3000'
 AK = '127.0.0.1:9090'
 

@@ -41,7 +41,8 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 _WANT = {'MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER', '_CADDY_STRIP_AUTHENTIK_HEADERS',
-         '_emit_mediamtx_site'}
+         '_emit_mediamtx_site', '_caddy_forward_auth_lines', '_CADDY_AK_COPY_HEADERS',
+         '_CADDY_FORWARD_AUTH_URI', '_CADDY_FORWARD_AUTH_PIN'}
 
 
 def _load():
@@ -103,7 +104,8 @@ def _expected_ak(up, direct_hls=None):
         '        forward_auth 127.0.0.1:9090 {',
         '            uri /outpost.goauthentik.io/auth/caddy',
         '            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid',
-        '            trusted_proxies private_ranges',
+        '            header_up X-Forwarded-Host {http.request.hostport}',
+        '            header_up X-Forwarded-Proto {http.request.scheme}',
         '        }',
         f'        reverse_proxy {up}',
         '    }',
