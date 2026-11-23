@@ -1674,7 +1674,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.4.5-alpha"
+VERSION = "10.4.6-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -15180,6 +15180,81 @@ def _heal_nodered_cert_read_access(plog=None):
                      f'TLS will fail with EACCES until it is 644')
         except Exception:
             continue
+
+
+# ops #1079 — Node-RED (a container) streaming CoT to a TAK Server datafeed or input on a
+# port the host firewall does not open. The TAK Server deploy opens 22, 8089, 8443, 8446 and
+# 5001 to everyone; a datafeed an operator adds (8095 for PulsePoint in infra-TAK #642) is not
+# opened by anything. Traffic from a container to the host goes through the host firewall's
+# INPUT rules, so with ufw or firewalld on, the TCP out node waits and ends in ETIMEDOUT while
+# 8089 (open) works with the same certificate. Same shape as Email Relay's port 25 rule.
+_NODERED_DOCKER_SRC = '172.16.0.0/12'          # every Docker bridge subnet; never the internet
+_NODERED_TAK_PORTS_OPEN = frozenset({8089, 8443, 8446})   # opened to everyone by the TAK deploy
+
+
+def _coreconfig_nodered_stream_ports(cc_text):
+    """TLS client-certificate CoT ports of a CoreConfig: its `<input>` and `<datafeed>`
+    elements with protocol="tls" and an auth other than anonymous. Commented-out elements
+    are ignored. Plain tcp and anonymous inputs are left out on purpose: Node-RED connects
+    with its admin certificate over TLS, and opening a no-login port to every container on
+    the host would widen what a compromised container can reach. Ports TAK's own deploy
+    already opens to everyone are left out (a second, narrower rule would add nothing)."""
+    text = re.sub(r'<!--.*?-->', '', cc_text or '', flags=re.DOTALL)
+    ports = []
+    for el in re.findall(r'<(?:input|datafeed)\b[^>]*>', text):
+        proto = re.search(r'\bprotocol="([^"]*)"', el)
+        port = re.search(r'\bport="(\d+)"', el)
+        auth = re.search(r'\bauth="([^"]*)"', el)
+        if not proto or not port or proto.group(1).strip().lower() != 'tls':
+            continue
+        if auth and auth.group(1).strip().lower() == 'anonymous':
+            continue
+        p = int(port.group(1))
+        if 1 <= p <= 65535 and p not in _NODERED_TAK_PORTS_OPEN and p not in ports:
+            ports.append(p)
+    return ports
+
+
+def _heal_nodered_tak_stream_ports(plog=None):
+    """ops #1079 — let the Node-RED container reach every TAK datafeed/input port that the
+    host firewall would otherwise drop. Source-scoped: only the Docker networks, never the
+    internet. Runs only when a local Node-RED install exists and the local CoreConfig is
+    readable (a remote TAK Server or a split box has its own firewall to open). Idempotent
+    (ufw says "Skipping adding existing rule"; firewalld says ALREADY_ENABLED), run at every
+    console start and after a Node-RED deploy. Returns the ports it asked the firewall to
+    open. Never raises."""
+    def _say(m):
+        (plog or (lambda x: print(f"Node-RED TAK port heal: {x}", flush=True)))(m)
+
+    opened = []
+    try:
+        present = os.path.exists(os.path.join(os.path.expanduser('~/node-red'), 'docker-compose.yml'))
+        if not present:
+            r = subprocess.run(['docker', 'ps', '-a', '--filter', 'name=nodered',
+                                '--format', '{{.Names}}'],
+                               capture_output=True, text=True, timeout=8,
+                               env=_broker_shim_env())
+            present = bool((r.stdout or '').strip())
+        if not present:
+            return opened
+        try:
+            cc = _read_coreconfig()
+        except Exception:
+            return opened                      # no local TAK Server (remote or not installed)
+        ports = _coreconfig_nodered_stream_ports(cc)
+        if not ports or _fw_backend() is None:
+            return opened
+        for p in ports:
+            ok, msg = _fw_allow_from(_NODERED_DOCKER_SRC, p, 'tcp')
+            if ok:
+                opened.append(p)
+                _say(f'Docker networks may reach TAK port {p}/tcp (a TAK datafeed or input '
+                     f'the host firewall did not open; Node-RED needs it)')
+            else:
+                _say(f'⚠ could not open TAK port {p}/tcp for Node-RED: {(msg or "").strip()[:120]}')
+    except Exception as _e:
+        _say(f'⚠ skipped: {str(_e)[:120]}')
+    return opened
 
 
 # v10.1.9 W1: bump whenever the retrofit's BEHAVIOUR changes, so boxes that
@@ -31105,8 +31180,8 @@ _PN_PKG_RE = re.compile(r'^[a-z0-9][a-z0-9.+_-]{0,99}$')
 _PN_VER_RE = re.compile(r'^[A-Za-z0-9.+~^:_-]{1,64}$')
 # os_type as _read_os_release() writes it (ubuntu-22.04, rocky-9), optionally /<kernel
 # flavour> (ubuntu-22.04/aws) and @<kernel series> (ubuntu-22.04/aws@6.8: a 22.04 box on the
-# 6.8 HWE kernel, which numbers its releases apart from 5.15) for kernel rows, or '*' for
-# every OS.
+# 6.8 HWE kernel, which numbers its releases apart from 5.15; rocky-9@9.9: a RHEL-family 9.9
+# box, kernel 741.x, apart from 9.8's 687.x) for kernel rows, or '*' for every OS.
 _PN_OS_RE = re.compile(r'^(\*|[a-z]+-[0-9.]+(/[a-z][a-z0-9-]*)?(@[0-9]+\.[0-9]+)?)$')
 
 # Third-party packages whose upstream publishes GitHub advisories: package (same name on
@@ -31348,8 +31423,15 @@ def _patch_now_feed_items(advisories, installed, os_type, rb, pkg_mgr):
                 m = re.search(r'-([a-z][a-z0-9]*)$', run)
                 flavour = m.group(1) if m else ''
                 key = f'{os_type}/{flavour}' if flavour and flavour != 'generic' else os_type
-                sm = re.match(r'(\d+\.\d+)\.', run)
-                fixed = (per.get(f'{key}@{sm.group(1)}') if sm else None) or per.get(key)
+                # kernel series: 6.8 for 6.8.0-149 (22.04 HWE); on EL the minor release the
+                # build belongs to (.el9_9 -> 9.9), because 9.8 (687.x) and 9.9 (741.x)
+                # number their kernels on separate scales (ops #1084)
+                sm = re.search(r'\.el(\d+)_(\d+)', run)
+                series = f'{sm.group(1)}.{sm.group(2)}' if sm else None
+                if not sm:
+                    sm = re.match(r'(\d+\.\d+)\.', run)
+                    series = sm.group(1) if sm else None
+                fixed = (per.get(f'{key}@{series}') if series else None) or per.get(key)
                 if not (fixed and run and _kernel_version_key(run) < _kernel_version_key(fixed)):
                     continue
                 kernel = True
@@ -50469,7 +50551,7 @@ paths:
                 for _line in _f:
                     if _line.strip().startswith('AUTHENTIK_BOOTSTRAP_TOKEN='):
                         ak_token_val = _line.strip().split('=', 1)[1].strip()
-        ak_public_url = f'https://{_pub_hostport(_get_authentik_host(settings))}' if settings.get('fqdn') else 'http://127.0.0.1:9090'
+        ak_public_url = _mediamtx_remote_editor_ak_url(settings) or 'http://127.0.0.1:9090'
         # ops #632: the token goes to a 600 root env file on the remote, not into the
         # 0644 unit (the main box's Authentik admin token, readable by every user there).
         remote_secret_env = _mediamtx_editor_secret_env_text(ak_token_val)
@@ -68118,6 +68200,11 @@ volumes:
                 plog(f"  ⚠ deploy.sh failed: {e2}")
         else:
             plog("  (no nodered/deploy.sh in repo — skip)")
+        # ops #1079 — Docker networks to TAK datafeed/input ports the host firewall left shut.
+        try:
+            _heal_nodered_tak_stream_ports(plog)
+        except Exception as _nrp_e:
+            plog(f"  ⚠ TAK port check skipped: {_nrp_e}")
         plog("")
         plog("━━━ Step 4/4: Updating Caddy ━━━")
         # v10.1.50: Node-RED is ALREADY RUNNING by the time we get here. Everything below
@@ -77909,6 +77996,9 @@ def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label, tag='p
 # sessions to lose. It also keeps a box BOOT — Authentik and TAK coming up together, the
 # boot-time bind heal recreating the outpost ~100 s in — from restarting TAK (GH #83).
 _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S = 300
+# Reason text of the "console recreated the LDAP outpost" request (`_ensure_authentik_ldap_service_account`),
+# the only request that restarts TAK just because TAK was young when it was made (ops #1117).
+_TAK_RECYCLE_YOUNG_REASON = 'the console recreated the LDAP outpost (service-account password resync)'
 _TAK_RECYCLE_8089_TIMEOUT_S = 900       # Guard Dog's MAX_WAIT_TAK
 _TAK_RECYCLE_API_TIMEOUT_S = 300        # Guard Dog's api wait (_MAX_API)
 # GH #549: TAK's HTTPS side (groups/all, so ATAK Data Sync and CloudTAK) can stay without
@@ -78744,9 +78834,14 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
         delay = min(delay * 2, _TAK_API_CHECK_RETRY_MAX_S)
 
 
-def _tak_ldap_recycle_request(reason, need_groups=True, restart=False):
+def _tak_ldap_recycle_request(reason, need_groups=True, restart=False, restart_if_young=False):
     """Ask for one TAK client heal (TAK restart only as the fallback) once LDAP is healthy
     again; `restart` = TAK must restart regardless (CoreConfig's LDAP credential changed).
+    `restart_if_young` = restart, but only while TAK is still younger than
+    `_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S` when the request is carried out (ops #1117: a request
+    made under a just-started TAK on a fresh install waits for the box's first console update,
+    about an hour later; by then a restart drops every client for nothing, and the heal-first
+    path, with its restart fallback, does the job).
     Persisted, so it is carried out at the end of this run, or by the next console start if
     this run dies."""
     try:
@@ -78755,6 +78850,7 @@ def _tak_ldap_recycle_request(reason, need_groups=True, restart=False):
         prev = [p for p in (st.get('pending') or []) if p != reason]
         st['need_groups'] = bool(need_groups or (prev and st.get('need_groups')))
         st['restart'] = bool(restart or (prev and st.get('restart')))
+        st['restart_if_young'] = bool(restart_if_young or (prev and st.get('restart_if_young')))
         st['pending'] = (prev + [reason])[-5:]
         st['requested_epoch'] = time.time()
         s['tak_ldap_recycle'] = st
@@ -78846,7 +78942,7 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                     cur.pop('https_broken_since', None)   # GH #549: settled one way or the other
                     if float(cur.get('requested_epoch') or 0) <= req_at:
                         # a request made while we worked stays pending for the next caller
-                        for k in ('pending', 'requested_epoch', 'need_groups', 'restart'):
+                        for k in ('pending', 'requested_epoch', 'need_groups', 'restart', 'restart_if_young'):
                             cur.pop(k, None)
                 if healed_ldap_start is not None:
                     cur['healed_ldap_start'] = healed_ldap_start
@@ -78873,7 +78969,13 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         if pending:
             if req_at > tak_start:
                 reasons.extend(pending)
-                must_restart = bool(st.get('restart'))
+                # ops #1117: a `restart` saved by an older console for nothing but the
+                # outpost-recreate request (a fresh install, hours before its first update)
+                # was a young-TAK restart: treat it like `restart_if_young`.
+                _young_only = all(str(p_).startswith(_TAK_RECYCLE_YOUNG_REASON) for p_ in pending)
+                must_restart = (bool(st.get('restart')) and not _young_only) or (
+                    bool(st.get('restart') or st.get('restart_if_young'))
+                    and time.time() - tak_start < _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S)
             else:
                 plog(f"  {tag}: TAK Server already restarted after: {'; '.join(pending)} — reusing that restart")
         ldap_start = gd_restart = None
@@ -83905,6 +84007,48 @@ def _ensure_recovery_flow_standalone(env_path, plog, wait_attempts=60):
         return False
 
 
+# ops #1109 — a fresh Authentik deploy ships the LDAP outpost on internal routing and later
+# moves it to https://<authentik name> through Caddy; on Authentik 2026.x internal routing
+# spirals every bind. The move needs the name to have a DNS A record. With none, the deploy
+# ran to the end and failed with "Final LDAP SA bind FAILED ... flow spiral", which names
+# nothing the operator can fix. The name is checked first, with a short wait for a record
+# that was just created and has not reached this box's resolver yet.
+_AK_DEPLOY_DNS_WAIT_S = 30
+_AK_DEPLOY_DNS_POLL_S = 5
+
+
+def _authentik_deploy_dns_gate(settings, plog, resolve=None, wait_s=None, poll_s=None,
+                               sleep=None, clock=None):
+    """True when the Authentik deploy may go on, False after it printed the one plain line
+    that stops it. Only a name with NO A record stops it: a lookup that fails on this box's
+    own resolver ('error: ...') says nothing about the record, and a box with no domain has
+    no name to check. Touches no container."""
+    host = _get_authentik_host(settings)
+    if not host:
+        return True
+    resolve = resolve or _dns_resolve_ipv4
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    wait_s = _AK_DEPLOY_DNS_WAIT_S if wait_s is None else wait_s
+    poll_s = _AK_DEPLOY_DNS_POLL_S if poll_s is None else poll_s
+    deadline = clock() + wait_s
+    waited = False
+    while True:
+        _ips, problem = resolve(host)
+        if problem != 'missing':
+            if waited:
+                plog(f"  ✓ DNS name {host} resolves now")
+            return True
+        if clock() >= deadline:
+            break
+        if not waited:
+            plog(f"  DNS name {host} has no A record yet — waiting up to {int(wait_s)}s for it...")
+            waited = True
+        sleep(poll_s)
+    plog(f"✗ DNS name {host} has no A record yet. Add it, then press Deploy again.")
+    return False
+
+
 def run_authentik_deploy(reconfigure=False):
     # Every ⚠/✗ line is a step that did not finish. Reconfigure collects them so it can
     # say so at the end instead of always printing "✓ Reconfigure complete."
@@ -83958,6 +84102,12 @@ def run_authentik_deploy(reconfigure=False):
             plog("  infra-TAK will not stop other software on your box. Free the port(s) and retry.")
             plog(f"  Find the holder: sudo ss -lptn 'sport = :{conflicts[0]['port']}'")
             plog("  If it is the host OpenLDAP (slapd), 'sudo systemctl disable --now slapd' frees 389/636.")
+            authentik_deploy_status.update({'running': False, 'error': True})
+            return
+
+        # ops #1109: the LDAP outpost needs the Authentik name to resolve. Stop here, before
+        # any container or file is touched, rather than at the end with a flow-spiral message.
+        if not reconfigure and not _authentik_deploy_dns_gate(settings, plog):
             authentik_deploy_status.update({'running': False, 'error': True})
             return
 
@@ -87147,8 +87297,8 @@ def _ensure_authentik_ldap_service_account():
             _tak_start = _tak_started_epoch() if _coreconfig_has_ldap() else None
             if _tak_start is not None:
                 _tak_young = time.time() - _tak_start < _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S
-                _tak_ldap_recycle_request('the console recreated the LDAP outpost (service-account '
-                                          'password resync) under a running TAK Server', restart=_tak_young)
+                _tak_ldap_recycle_request(_TAK_RECYCLE_YOUNG_REASON + ' under a running TAK Server',
+                                          restart_if_young=_tak_young)
         except Exception:
             pass
         # 6. Ensure ldapsearch is available (install ldap-utils / openldap-clients if missing)
@@ -114435,6 +114585,399 @@ def _startup_converge_mediamtx_overlay():
         print(f"Startup migration: MediaMTX editor overlay converge error (non-fatal): {_e}", flush=True)
 
 
+# ── ops #1107: the same pass for a MediaMTX editor on a REMOTE host ────────────────────────
+#
+# _startup_converge_mediamtx_overlay() above stops when /opt/mediamtx-webeditor is not on
+# this box. An editor on a remote host got mediamtx_ldap_overlay.py only from a MediaMTX
+# deploy or from "Patch web editor", so after a console update it kept the old copy until an
+# operator pressed one of those. This pass ships the file over the saved SSH target at
+# console start, when it differs, and keeps the editor's Authentik token, API address and
+# trusted peer current in the same pass.
+#
+# The overlay takes every role from Authentik's API. On a remote host that call goes to
+# Authentik's PUBLIC address, which the host may not reach (DNS, firewall, a certificate it
+# does not trust). So before anything changes there, the host itself asks Authentik with
+# the values it would get. No answer: nothing changes on the host, the reason is logged
+# and mailed, and the next console start tries again.
+
+_MEDIAMTX_REMOTE_OVERLAY_ALERT_EVERY_S = 86400   # one mail a day per box
+_MEDIAMTX_REMOTE_STAGE_RE = re.compile(r'/tmp/infratak-mtx\.[A-Za-z0-9]{8}')
+_MEDIAMTX_REMOTE_EDITOR_AK_DEFAULT = 'http://127.0.0.1:9090'   # the overlay's own default
+
+# A read-only look at the remote editor, as root. One fact per line. The token never
+# leaves the host: it is compared by its SHA-256. The unit comes back whole (base64, one
+# line) so the same text functions the local pass uses can decide what it needs.
+_MEDIAMTX_REMOTE_OVERLAY_PROBE_SH = (
+    'D=/opt/mediamtx-webeditor; '
+    'if [ ! -d "$D" ]; then echo INFRATAK_EDITOR=absent; exit 0; fi; '
+    'echo INFRATAK_EDITOR=present; '
+    'echo "INFRATAK_ACTIVE=$(systemctl is-active mediamtx-webeditor 2>/dev/null)"; '
+    'echo "OVERLAY_SHA=$(sha256sum "$D/mediamtx_ldap_overlay.py" 2>/dev/null | cut -d" " -f1)"; '
+    'echo "TOKEN_SHA=$(sed -n "s/^AUTHENTIK_TOKEN=//p" /usr/local/etc/mediamtx-webeditor.env 2>/dev/null '
+    '| head -n 1 | tr -d "\\r\\n" | sha256sum | cut -d" " -f1)"; '
+    'echo "UNIT_B64=$(base64 /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null | tr -d "\\n")"'
+)
+
+# Runs ON the remote host, as root, standard library only: the same call, the same token and
+# the same rule for a usable answer as the overlay's _authentik_groups_lookup(). Prints one
+# word (ok, or why not: see _MEDIAMTX_REMOTE_AK_REASONS) and exits 0 for an answer, 3 for none.
+_MEDIAMTX_REMOTE_AK_CHECK_PY = r'''import json, socket, ssl, sys, urllib.error, urllib.request
+url, envfile = sys.argv[1], sys.argv[2]
+def no(word):
+    print(word)
+    sys.exit(3)
+tok = ''
+try:
+    with open(envfile) as f:
+        for ln in f:
+            if ln.startswith('AUTHENTIK_TOKEN='):
+                tok = ln.split('=', 1)[1].strip()
+                break
+except Exception:
+    no('token-file')
+if not tok:
+    no('no-token')
+try:
+    r = urllib.request.Request(
+        url + '/api/v3/core/users/?username=infratak-reach-check&include_groups=true',
+        headers={'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'})
+    d = json.loads(urllib.request.urlopen(r, timeout=8).read().decode())
+except urllib.error.HTTPError as e:
+    no('http-token' if e.code in (401, 403) else 'http-error')
+except Exception as e:
+    why = getattr(e, 'reason', e)
+    if isinstance(why, socket.gaierror):
+        no('dns')
+    if isinstance(why, ssl.SSLError):
+        no('tls')
+    if isinstance(why, ConnectionRefusedError):
+        no('refused')
+    if isinstance(why, (socket.timeout, TimeoutError)):
+        no('timeout')
+    no('not-authentik' if isinstance(e, ValueError) else 'other')
+if not isinstance(d, dict) or not isinstance(d.get('results'), list):
+    no('not-authentik')
+print('ok')
+'''
+
+# What the host's check answered, in plain words. The log and the mail carry only these fixed
+# texts, never text that came back from the host.
+_MEDIAMTX_REMOTE_AK_REASONS = {
+    'token-file': "the editor's token file on that box cannot be read",
+    'no-token': 'the editor on that box has no Authentik token',
+    'http-token': 'Authentik refused the token',
+    'http-error': 'Authentik answered with an error',
+    'dns': 'that box cannot find the name (DNS)',
+    'tls': 'that box does not trust the certificate',
+    'refused': 'the connection was refused',
+    'timeout': 'no reply in time',
+    'not-authentik': 'the reply did not come from Authentik',
+    'bad-address': 'the Authentik address in the editor unit is not a web address',
+}
+
+
+def _mediamtx_remote_editor_ak_url(settings):
+    """Authentik's API address for a MediaMTX editor on a remote host: the public one,
+    through Caddy. None without a domain (there is no public address then)."""
+    if not settings.get('fqdn'):
+        return None
+    return f'https://{_pub_hostport(_get_authentik_host(settings))}'
+
+
+def _mediamtx_remote_overlay_safe_tail(out, n=160):
+    """The end of a probe/apply output for a log line, without the unit or the token hash."""
+    kept = [ln for ln in (out or '').splitlines()
+            if not ln.startswith(('UNIT_B64=', 'TOKEN_SHA='))]
+    return ' '.join(kept)[-n:].strip()
+
+
+def _mediamtx_remote_overlay_plan(probe_out, overlay_sha, api_url, token, trusted):
+    """What a remote MediaMTX editor needs, from one probe. No side effects.
+
+    `probe_out` is the output of _MEDIAMTX_REMOTE_OVERLAY_PROBE_SH, `overlay_sha` the SHA-256
+    of this repo's mediamtx_ldap_overlay.py, `api_url` and `token` what the editor must use for
+    Authentik (None or '' when the console has none), `trusted` its header peers.
+
+    Returns None when there is no editor on the host or the probe cannot be read. Else:
+      overlay  True when the file on the host differs
+      unit     the unit text to write, or None when it is right already
+      env      the token to write into the 600 env file, or None
+      ldap     True when the editor is in Authentik mode (only then is the overlay loaded)
+      api_url  the Authentik address the editor will use after this plan
+      active   systemd's state of the editor before any change"""
+    facts = {}
+    for ln in (probe_out or '').splitlines():
+        k, sep, v = ln.strip().partition('=')
+        if sep and k in ('INFRATAK_EDITOR', 'INFRATAK_ACTIVE', 'OVERLAY_SHA', 'TOKEN_SHA', 'UNIT_B64'):
+            facts[k] = v.strip()
+    if facts.get('INFRATAK_EDITOR') != 'present' or 'OVERLAY_SHA' not in facts:
+        return None
+    try:
+        unit = _b64.b64decode(facts.get('UNIT_B64') or '', validate=True).decode('utf-8')
+    except Exception:
+        return None
+
+    def _sha(text):
+        return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+    plan = {'overlay': facts['OVERLAY_SHA'] != overlay_sha, 'unit': None, 'env': None,
+            'ldap': False, 'api_url': '', 'active': facts.get('INFRATAK_ACTIVE') or ''}
+    lines = unit.split('\n')
+    if 'Environment=LDAP_ENABLED=1' not in lines:
+        return plan     # not in Authentik mode: the file is not loaded, the unit is left alone
+    plan['ldap'] = True
+    token_ok = bool(token and _MEDIAMTX_EDITOR_AK_TOKEN_RE.fullmatch(token))
+    new_unit, env_txt = unit, ''
+    if any(ln.startswith('Environment=AUTHENTIK_TOKEN=') for ln in lines):
+        # ops #632 on a remote host: the token still sits in the 0644 unit. Move it to
+        # the 600 env file (the current token when the console has one).
+        new_unit, moved = _unit_text_token_to_envfile(unit)
+        if moved is not None:
+            plan['env'] = token if token_ok else (moved or None)
+            env_txt = 'AUTHENTIK_TOKEN=%s' % (plan['env'] or '')
+    elif token_ok and facts.get('TOKEN_SHA') == _sha(token):
+        env_txt = 'AUTHENTIK_TOKEN=%s' % token
+    new_unit, sync_tok = _mediamtx_editor_authentik_sync(new_unit, env_txt, api_url, token)
+    if sync_tok is not None:
+        plan['env'] = sync_tok
+    if trusted:
+        new_unit = _unit_text_with_env(new_unit, _MEDIAMTX_TRUSTED_PROXIES_KEY, trusted)
+    if new_unit != unit:
+        plan['unit'] = new_unit
+    # The address the editor uses after this plan: the one _mediamtx_editor_authentik_sync()
+    # writes (same rule), else the one the unit on the host already has.
+    if api_url and _MEDIAMTX_EDITOR_AK_URL_RE.fullmatch(api_url):
+        plan['api_url'] = api_url
+    else:
+        plan['api_url'] = next((ln.split('=', 2)[2].strip() for ln in lines
+                                if ln.startswith('Environment=AUTHENTIK_API_URL=')),
+                               _MEDIAMTX_REMOTE_EDITOR_AK_DEFAULT)
+    return plan
+
+
+def _mediamtx_remote_overlay_apply_sh(stage, gate_url, restart):
+    """Shell for the remote host, as root: put the staged files in place.
+
+    `stage` is the private folder the files were copied to (overlay, unit, env,
+    akcheck.py: each only when needed). With akcheck.py staged, the host first asks
+    Authentik at `gate_url` with the token it would get; no answer prints
+    INFRATAK_REACH=fail and changes nothing. Token file first, then the unit, then the
+    overlay, each written beside its target and renamed over it (never through a link,
+    never half a file). `try-restart` only: an editor that is stopped (the firewall check
+    stops it on a box with no firewall) stays stopped. The stage folder always goes."""
+    q = shlex.quote
+    return (
+        f'T={q(stage)}; D=/opt/mediamtx-webeditor; '
+        # E is _MEDIAMTX_EDITOR_SECRET_ENV, written out (the tests hold the two together)
+        'U=/etc/systemd/system/mediamtx-webeditor.service; E=/usr/local/etc/mediamtx-webeditor.env; '
+        'trap \'rm -rf "$T"\' EXIT; '
+        'if [ -f "$T/akcheck.py" ]; then EF="$E"; [ -f "$T/env" ] && EF="$T/env"; '
+        f'if R=$(python3 "$T/akcheck.py" {q(gate_url)} "$EF" 2>&1); then echo INFRATAK_REACH=ok; '
+        'else echo "INFRATAK_REACH=fail $(printf %s "$R" | tail -n 1 | cut -c1-40)"; exit 0; fi; fi; '
+        'set -e; '
+        'if [ -f "$T/env" ]; then install -m 600 -o root -g root "$T/env" "$E.infratak-new"; '
+        'mv -f "$E.infratak-new" "$E"; fi; '
+        'if [ -f "$T/unit" ]; then install -m 644 -o root -g root "$T/unit" "$U.infratak-new"; '
+        'mv -f "$U.infratak-new" "$U"; systemctl daemon-reload; fi; '
+        'if [ -f "$T/overlay" ]; then N="$D/.mediamtx_ldap_overlay.py.infratak-new"; '
+        'install -m 644 "$T/overlay" "$N"; chown -h "$(stat -c %u:%g "$D")" "$N"; '
+        'mv -f "$N" "$D/mediamtx_ldap_overlay.py"; fi; '
+        '(restorecon "$E" "$U" "$D/mediamtx_ldap_overlay.py" >/dev/null 2>&1 || true); '
+        + ('systemctl try-restart mediamtx-webeditor || echo INFRATAK_RESTART=fail; ' if restart else '') +
+        'echo "OVERLAY_SHA=$(sha256sum "$D/mediamtx_ldap_overlay.py" | cut -d" " -f1)"; '
+        'echo INFRATAK_APPLIED=1'
+    )
+
+
+def _mediamtx_remote_overlay_alert(settings, host, subj, body):
+    """Guard Dog mail for _startup_converge_mediamtx_overlay_remote, at most once a day per box."""
+    to_addr = (settings.get('guarddog_alert_email') or '').strip()
+    if not to_addr:
+        print("[guarddog] MediaMTX remote editor alert SUPPRESSED (no recipient configured)", flush=True)
+        return False
+    path = os.path.join(CONFIG_DIR, 'mediamtx_remote_overlay_alert.json')
+    try:
+        with open(path) as f:
+            sent = json.load(f)
+    except Exception:
+        sent = {}
+    now = time.time()
+    if now - float(sent.get(host) or 0) < _MEDIAMTX_REMOTE_OVERLAY_ALERT_EVERY_S:
+        return False
+    ident = _guarddog_server_identifier(settings) or socket.gethostname()
+    try:
+        ok = _guarddog_send_alert_email_via_relay(to_addr, subj, body + f"\n\nConsole: {ident}\n\n— Guard Dog")
+    except Exception as e:
+        print(f"[guarddog] MediaMTX remote editor alert failed: {e}", flush=True)
+        return False
+    if ok:
+        sent[host] = now
+        try:
+            with open(path, 'w') as f:
+                json.dump(sent, f)
+        except Exception:
+            pass
+    return ok
+
+
+def _startup_converge_mediamtx_overlay_remote(after=None):
+    """ops #1107: keep the stream site file on a REMOTE MediaMTX host current on console start.
+
+    `after` is the firewall check's thread: this pass waits for it, so the two never talk
+    to the host at once and an editor that check stopped is not looked at half way.
+    Returns a word for what happened (the tests read it): 'none' (no remote editor),
+    'unknown' (host not reached, nothing changed), 'current', 'held' (the host got no
+    answer from Authentik, nothing changed), 'updated', 'failed'."""
+    tag = 'Startup migration: [MediaMTX remote editor]'
+    try:
+        if after is not None:
+            after.join(900)
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+        host = (cfg.get('remote') or {}).get('host') or ''
+        if cfg.get('target_mode') != 'remote' or not cfg.get('deployed') or not host:
+            return 'none'
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
+        if not os.path.exists(src):
+            return 'none'
+        with open(src, 'rb') as f:      # bytes: the host's sha256sum reads bytes too
+            want_sha = hashlib.sha256(f.read()).hexdigest()
+
+        # What the editor must use for Authentik: the console's own token, the public address.
+        token, api_url = '', None
+        try:
+            _ak_url, _ak_hdrs, _ak_set = _w1_ak_ctx()
+            if _ak_url and str((_ak_hdrs or {}).get('Authorization') or '').startswith('Bearer '):
+                token = _ak_hdrs['Authorization'][len('Bearer '):].strip()
+                api_url = _mediamtx_remote_editor_ak_url(settings)
+        except Exception as _ae:
+            print(f"{tag} could not read the console's Authentik token ({str(_ae)[:120]}); "
+                  "the editor's token and address are left as they are", flush=True)
+
+        ok, out = _module_run_root(cfg, _MEDIAMTX_REMOTE_OVERLAY_PROBE_SH, timeout=60)
+        if ok and 'INFRATAK_EDITOR=absent' in (out or ''):
+            return 'none'
+        plan = _mediamtx_remote_overlay_plan(
+            out, want_sha, api_url, token, _mediamtx_editor_trusted_proxies(settings, cfg)) if ok else None
+        if plan is None:
+            print(f"{tag} could not look at {host} ({_mediamtx_remote_overlay_safe_tail(out)}). "
+                  "The stream site code there was not checked. The next console start tries again.",
+                  flush=True)
+            return 'unknown'
+        if not (plan['overlay'] or plan['unit'] is not None or plan['env']):
+            return 'current'
+
+        gate_url = plan['api_url']
+        # For the log and the mail: the address as the console knows it, never text read from the host.
+        shown_url = api_url if (api_url and api_url == gate_url) else 'the address in its unit file'
+        if plan['ldap'] and not _MEDIAMTX_EDITOR_AK_URL_RE.fullmatch(gate_url or ''):
+            return _mediamtx_remote_overlay_held(settings, host, shown_url, 'bad-address', tag)
+
+        # A private folder on the host for this pass (the SSH user's, 700): no fixed /tmp
+        # name another account could take first, none a stopped deploy left behind as root.
+        ok, out = _module_run(cfg, 'umask 077; mktemp -d /tmp/infratak-mtx.XXXXXXXX', timeout=30)
+        stage = ((out or '').strip().splitlines() or [''])[-1].strip()
+        if not ok or not _MEDIAMTX_REMOTE_STAGE_RE.fullmatch(stage):
+            print(f"{tag} could not make a staging folder on {host} ({(out or '')[-160:].strip()}). "
+                  "Nothing changed there. The next console start tries again.", flush=True)
+            return 'unknown'
+        local_tmp = []
+
+        def _tmp(text):
+            fd, path = tempfile.mkstemp(prefix='mediamtx-remote-')   # 0600
+            local_tmp.append(path)
+            with os.fdopen(fd, 'w') as f:
+                f.write(text)
+            return path
+
+        try:
+            files = []
+            if plan['overlay']:
+                files.append((src, 'overlay'))
+            if plan['unit'] is not None:
+                files.append((_tmp(plan['unit']), 'unit'))
+            if plan['env']:
+                files.append((_tmp(_mediamtx_editor_secret_env_text(plan['env'])), 'env'))
+            if plan['ldap']:
+                files.append((_tmp(_MEDIAMTX_REMOTE_AK_CHECK_PY), 'akcheck.py'))
+            for local, name in files:
+                c_ok, c_out = _module_copy(cfg, local, f'{stage}/{name}', timeout=60)
+                if not c_ok:
+                    _module_run_root(cfg, f'rm -rf {shlex.quote(stage)}', timeout=20)
+                    print(f"{tag} could not copy to {host} ({(c_out or '')[-160:].strip()}). "
+                          "Nothing changed there. The next console start tries again.", flush=True)
+                    return 'unknown'
+        finally:
+            for path in local_tmp:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+        ok, out = _module_run_root(
+            cfg, _mediamtx_remote_overlay_apply_sh(stage, gate_url, restart=plan['ldap']), timeout=120)
+        out = out or ''
+        m = re.search(r'^INFRATAK_REACH=fail ?(.*)$', out, re.M)
+        if m:
+            return _mediamtx_remote_overlay_held(settings, host, shown_url, m.group(1).strip(), tag)
+        got = re.search(r'^OVERLAY_SHA=([0-9a-f]{64})$', out, re.M)
+        if (not ok or 'INFRATAK_APPLIED=1' not in out or not got
+                or got.group(1) != want_sha):
+            steps = ('host reached' if ok else 'command failed on the host or the link dropped',
+                     'files in place' if 'INFRATAK_APPLIED=1' in out else 'files NOT all in place',
+                     'file checked' if got else 'file not checked')
+            print(f"{tag} ✗ the update on {host} did not finish ({', '.join(steps)}). "
+                  "The next console start tries again.", flush=True)
+            return 'failed'
+        if plan['overlay']:
+            print(f"{tag} stream site code on {host} updated (Authentik sign-in + viewer roles)", flush=True)
+        if plan['env']:
+            print(f"{tag} the editor's Authentik token on {host} was out of date; set to the current one",
+                  flush=True)
+        if plan['unit'] is not None:
+            print(f"{tag} the editor unit on {host} updated (Authentik API address, trusted header peers)",
+                  flush=True)
+        if plan['ldap'] and plan['active'] == 'active':
+            # It ran before the restart: it must run after it. Says so in the log if not.
+            if not _mediamtx_remote_editor_check(cfg, lambda ln: print(f"{tag} {ln}", flush=True)):
+                _mediamtx_remote_overlay_alert(
+                    settings, host, f"⚠ MediaMTX box {host}: web editor did not start after an update",
+                    f"infra-TAK updated the stream site code on the remote MediaMTX box {host} and "
+                    f"restarted the web editor there. The web editor did not come back.\n\n"
+                    f"Video streaming keeps running. The stream site and the MediaMTX web page do "
+                    f"not load until the editor runs.\n\nTo fix: open the MediaMTX page in the "
+                    f"infra-TAK console and press Patch web editor. If it stays down, press Web "
+                    f"editor logs on that page to see why.")
+                return 'failed'
+        elif plan['ldap']:
+            print(f"{tag} the web editor on {host} was not running ({plan['active'] or 'unknown'}), "
+                  "so it was not restarted", flush=True)
+        return 'updated'
+    except Exception as e:
+        print(f"{tag} error (non-fatal): {e}", flush=True)
+        return 'failed'
+
+
+def _mediamtx_remote_overlay_held(settings, host, url, word, tag):
+    """The remote host got no answer from Authentik: say so (log and mail). Returns 'held'.
+    `word` is what the host's check printed; only its fixed text is shown."""
+    why = _MEDIAMTX_REMOTE_AK_REASONS.get(word, 'no usable answer')
+    print(f"{tag} ✗ {host} got no answer from Authentik at {url} ({why}). The stream site code "
+          "there was NOT updated and nothing else changed: with the new code and no answer, every "
+          "person on the stream site would be a viewer of public streams only. The next console "
+          "start tries again.", flush=True)
+    _mediamtx_remote_overlay_alert(
+        settings, host, f"⚠ MediaMTX box {host}: stream site update is waiting",
+        f"infra-TAK has an update for the stream site code on the remote MediaMTX box {host}. "
+        f"It was NOT installed, because that box got no answer from Authentik:\n\n"
+        f"  Address: {url}\n  Answer:  {why}\n\n"
+        f"The stream site asks Authentik which groups a person is in. With no answer, every "
+        f"person on the stream site would be a viewer of public streams only. So the box "
+        f"keeps the code it has, without the latest security update.\n\n"
+        f"To fix: make sure {host} can open {url} (DNS, firewall, and a certificate that box "
+        f"trusts). Then restart the infra-TAK console. It tries again at every start.")
+    return 'held'
+
 def _startup_converge_mediamtx_unit_nonroot():
     """v10.1.33: move a legacy `User=root` mediamtx.service onto takwerx.
 
@@ -118953,8 +119496,14 @@ def _startup_migrations():
 
         # ops #630 — a remote MediaMTX box's firewall may be off. SSH to another box can take
         # minutes, so in the background: it must never hold up the console's start.
-        threading.Thread(target=_startup_converge_mediamtx_remote_firewall, daemon=True,
-                         name='startup-mediamtx-remote-fw').start()
+        _mtx_remote_fw_t = threading.Thread(target=_startup_converge_mediamtx_remote_firewall, daemon=True,
+                                            name='startup-mediamtx-remote-fw')
+        _mtx_remote_fw_t.start()
+        # ops #1107 — the stream site file (and the editor's Authentik token and address) on a
+        # remote MediaMTX box, the same pass _startup_converge_mediamtx_overlay() does for a
+        # local one. After the firewall check, never beside it: that check may stop the editor.
+        threading.Thread(target=_startup_converge_mediamtx_overlay_remote, args=(_mtx_remote_fw_t,),
+                         daemon=True, name='startup-mediamtx-remote-overlay').start()
 
         try:
             _startup_converge_mediamtx_ssl()
@@ -119066,6 +119615,14 @@ def _startup_migrations():
             _heal_nodered_cert_read_access(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _nrh_e:
             print(f"Startup migration: Node-RED cert heal error (non-fatal): {_nrh_e}", flush=True)
+
+        # ops #1079 — a TAK datafeed on a port the host firewall does not open (8095 for
+        # PulsePoint) made Node-RED's TCP out wait and time out. Open it for the Docker
+        # networks only. Idempotent, every boot.
+        try:
+            _heal_nodered_tak_stream_ports(lambda m: print(f"Startup migration: Node-RED TAK port heal: {m}", flush=True))
+        except Exception as _nrp_e:
+            print(f"Startup migration: Node-RED TAK port heal error (non-fatal): {_nrp_e}", flush=True)
 
         # ops #941 — a Docker TAK box whose certificate folder an old restore re-owned to
         # uid 1000: give it back to the container's user, or Rotate CA fails at Step 3.
