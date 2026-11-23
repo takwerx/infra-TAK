@@ -44,6 +44,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 with open(os.path.join(REPO, 'app.py'), encoding='utf-8') as _f:
     APP = _f.read()
 SA_PASS = 'sa-secret-do-not-log'
+YOUNG_REASON = re.search(r"^_TAK_RECYCLE_YOUNG_REASON = '([^']+)'", open(os.path.join(os.path.dirname(__file__), '..', 'app.py'), encoding='utf-8').read(), re.M).group(1)
 T0 = 1_800_000_000.0          # fake "now" at the start of each test
 BOOT = T0 - 400_000           # the box booted ~4.6 days earlier
 HOUR = 3600
@@ -386,6 +387,7 @@ class Box:
             '_TAK_API_CHECK_TOOL': 'infratak-check',
             'open': box.open,
         }
+        ns['_TAK_RECYCLE_YOUNG_REASON'] = YOUNG_REASON
         for c in ('_PGB_SWAP_LDAP_WINDOW_S', '_PGB_SWAP_LDAP_STABLE_S', '_PGB_SWAP_LDAP_EVERY_S',
                   '_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S', '_TAK_RECYCLE_8089_TIMEOUT_S', '_TAK_RECYCLE_API_TIMEOUT_S',
                   '_TAK_LDAP_HEAL_WAIT_S', '_TAK_LDAP_HEAL_ROUNDS', '_TAK_API_CHECK_TRIES',
@@ -413,8 +415,9 @@ class Box:
         return self.ns()['_tak_recycle_after_ldap_outage'](self.log.append, trigger,
                                                            check_outpost=check_outpost, final=final)
 
-    def request(self, reason, need_groups=True, restart=False):
-        self.ns()['_tak_ldap_recycle_request'](reason, need_groups, restart=restart)
+    def request(self, reason, need_groups=True, restart=False, restart_if_young=False):
+        self.ns()['_tak_ldap_recycle_request'](reason, need_groups, restart=restart,
+                                               restart_if_young=restart_if_young)
 
 
 def healthy_box(**kw):
@@ -1494,6 +1497,49 @@ def test_box_without_tak_groups_needs_only_the_bind():
     box.request('PgBouncer image swap', need_groups=False)
     box.recycle()
     assert box.drops() == ['tls:16']
+
+
+def test_install_time_young_tak_request_does_not_restart_tak_at_the_first_update_ops1117():
+    """ops #1117: a fresh install files 'outpost recreated under a young TAK' (restart only
+    while TAK is young). The box has no finished console update yet, so the request is
+    deferred for the install's whole first hour and carried out at the end of Update Now. TAK
+    is old by then: heal the clients first, no restart (the old code restarted TAK, which the
+    T&E update drill reads as a failure)."""
+    box = outage_box(tak_start=T0 - 60)
+    box.request(YOUNG_REASON + ' under a running TAK Server', restart_if_young=True)
+    box.t += 3 * HOUR                      # the box's first Update Now, hours after install
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert not any('a TAK Server restart was asked for' in l for l in box.log)
+    assert 'pending' not in box.settings['tak_ldap_recycle']
+
+
+def test_state_saved_by_the_old_console_does_not_restart_tak_at_the_first_update_ops1117():
+    """ops #1117, found on a real box: the baseline console (old code) saved restart=True for
+    the outpost-recreate request, and the update (new code) carries it out. Same result: no
+    restart. A hard restart request next to it (changed credential) still restarts."""
+    box = outage_box(tak_start=T0 - 3 * HOUR)
+    box.settings['tak_ldap_recycle'] = {'need_groups': True, 'restart': True,
+                                        'pending': [YOUNG_REASON + ' under a running TAK Server'],
+                                        'requested_epoch': T0 - 2 * HOUR}
+    assert box.recycle() is False
+    assert box.restarts() == []
+    box2 = outage_box(tak_start=T0 - 3 * HOUR)
+    box2.settings['tak_ldap_recycle'] = {'need_groups': True, 'restart': True,
+                                         'pending': [YOUNG_REASON + ' under a running TAK Server',
+                                                     'PgBouncer image swap to X'],
+                                         'requested_epoch': T0 - 2 * HOUR}
+    assert box2.recycle() is True
+    assert len(box2.restarts()) == 1
+
+
+def test_young_tak_request_still_restarts_while_tak_is_young_ops1117():
+    """The GH #616 case is kept: carried out at once under a TAK that is still young."""
+    box = outage_box(tak_start=T0 - 60)
+    box.request(YOUNG_REASON + ' under a running TAK Server', restart_if_young=True)
+    assert box.recycle() is True
+    assert len(box.restarts()) == 1
+    assert any('a TAK Server restart was asked for' in l for l in box.log)
 
 
 # ── no double work ──────────────────────────────────────────────────────────────────
