@@ -45660,6 +45660,18 @@ def _cloudtak_tag_major(tag):
     return int(m.group(1)) if m else None
 
 
+def _cloudtak_needs_minio_hop(release_tag):
+    """True when `release_tag` is a major the old-MinIO move cannot run from (14 and up)."""
+    major = _cloudtak_tag_major(release_tag)
+    return major is not None and major > CLOUDTAK_MINIO_HOP_MAJOR
+
+
+def _cloudtak_minio_hop_tag():
+    """The newest 13.x tag (a box with the old MinIO folder goes there first), or None when the
+    lookup fails. Never cached as the latest."""
+    return _get_cloudtak_latest_release_tag(use_cache=False, max_major=CLOUDTAK_MINIO_HOP_MAJOR)
+
+
 def _cloudtak_tag_for_minio_store(release_tag, store_present):
     """Tag to install on a box whose target is `release_tag`.
 
@@ -45667,10 +45679,9 @@ def _cloudtak_tag_for_minio_store(release_tag, store_present):
     On a box that still has .docker-store and a target of 14 or higher: the newest 13.x tag, hopped
     True. (None, True) when that 13.x tag cannot be looked up (the caller stops before any change).
     """
-    major = _cloudtak_tag_major(release_tag)
-    if not store_present or major is None or major <= CLOUDTAK_MINIO_HOP_MAJOR:
+    if not store_present or not _cloudtak_needs_minio_hop(release_tag):
         return release_tag, False
-    return _get_cloudtak_latest_release_tag(use_cache=False, max_major=CLOUDTAK_MINIO_HOP_MAJOR), True
+    return _cloudtak_minio_hop_tag(), True
 
 
 def _get_cloudtak_target_release_tag(settings=None, use_cache=True, allow_fallback=True):
@@ -58601,8 +58612,8 @@ def run_cloudtak_deploy(cfg=None):
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
             # ops #1074: an old MinIO folder on the remote host stops at 13.x first (14 cannot move it).
             _rs_ok, _ = _ssh_probe(remote_cfg, "test -d ~/CloudTAK/.docker-store", timeout=20)
-            _rt, _rhop = _cloudtak_tag_for_minio_store(remote_release_tag, bool(_rs_ok))
-            if _rhop:
+            if _rs_ok and _cloudtak_needs_minio_hop(remote_release_tag):
+                _rt = _cloudtak_minio_hop_tag()
                 if not _rt:
                     plog("✗ The remote host still has the old MinIO folder and the newest 13.x release could not be looked up. Nothing was changed.")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -60602,8 +60613,10 @@ def run_cloudtak_update():
             _store_now = bool(remote_host) and bool(_ssh_probe(remote_cfg, "test -d ~/CloudTAK/.docker-store && echo yes", timeout=20)[0])
         else:
             _store_now = os.path.isdir(os.path.expanduser('~/CloudTAK/.docker-store'))
-        _hop_tag, _hopped = _cloudtak_tag_for_minio_store(release_tag, _store_now)
-        if _hopped:
+        # (branches, not a returned value: the remote probe above carries SSH details, and a value that
+        # came out of it must not end up in the log line below)
+        if _store_now and _cloudtak_needs_minio_hop(release_tag):
+            _hop_tag = _cloudtak_minio_hop_tag()
             if not _hop_tag:
                 plog(f"✗ {release_tag} needs your old MinIO files moved into Garage first, and the newest 13.x release could not be looked up.")
                 plog("  Nothing was changed and CloudTAK is still running as before. Try again in a few minutes.")
