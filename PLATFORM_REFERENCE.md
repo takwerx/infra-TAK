@@ -132,6 +132,7 @@ Official: [nodered.org/docs](https://nodered.org/docs)
 
 - Function nodes cannot `require()` by default; declare modules in the node's `libs`.
 - Never `docker cp` a `flows.json` into a running container (it can persist an empty global context). `nodered/deploy.sh` stops the container first. Confirm `contextStorage` is `localfilesystem` in the file the container actually reads.
+- **With ufw (or firewalld) on, the Node-RED container can reach only the host ports the host firewall opens.** A container's traffic to the host (`host.docker.internal`, 172.17.0.1) goes through the host's INPUT rules like any outside caller. The TAK deploy opens 8089, 8443 and 8446 to everyone, so the default CoT stream works. A TAK datafeed or input on any other port (8095 for PulsePoint, infra-TAK #642) is dropped: the TCP connect waits and ends in `ETIMEDOUT`, not "connection refused", so it looks like a TLS or flow mistake. infra-TAK now allows `172.16.0.0/12` (Docker networks only) to each TLS datafeed or input port in CoreConfig (`_heal_nodered_tak_stream_ports`). ✅ verified 2026-11-22, AWS Ubuntu 22.04 fresh-install box, ufw active with incoming deny, TAK Server 5.8: from inside the container 8089 connected in 12 ms and 8095 timed out at 8 s with TAK listening on it; after the console started with the fix, ufw held one `8095/tcp ALLOW 172.16.0.0/12` rule and both ports connected with the admin certificate over TLS 1.3 (ops #1079). Not yet run on firewalld (Rocky 9).
 
 ## PulsePoint (incident data for the Node-RED PulsePoint feed)
 
