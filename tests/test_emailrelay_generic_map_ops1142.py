@@ -53,6 +53,10 @@ def test_same_name_twice_or_blank_or_zero_gives_one_line():
     assert names == [FQDN]
 
 
+def _safe_emails(value):
+    return [t for t in (value or '').replace(',', ' ').split() if '@' in t]
+
+
 # ── deploy() end to end against fakes ───────────────────────────────────────
 
 class _Run:
@@ -92,6 +96,7 @@ def _deploy(monkeypatch, tmp_path, *, os_type, saved_fqdn, hostname_f, postconf=
         '_sudo_wrap': lambda c: list(c),
         '_read_priv': lambda p: '',
         '_write_priv': lambda p, text, perm=None: written.__setitem__(p, text),
+        '_safe_alert_emails': _safe_emails,
         '_takportal_push_settings': lambda plog: False,
     }
     job = {'log': [], 'running': True}
@@ -160,3 +165,78 @@ def test_a_disagreement_is_said_in_the_deploy_log(monkeypatch, tmp_path):
     monkeypatch.setattr(er, '_plog', lambda m: logged.append(m))
     _deploy(monkeypatch, tmp_path, os_type='rhel', saved_fqdn=FQDN, hostname_f=SHORT)
     assert any('disagree' in m and FQDN in m and SHORT in m for m in logged), logged
+
+
+# ── one name list for both maps (lead's merge of #672 and #673, GH #665 + #667) ──────────
+
+def _three_name_host(monkeypatch, tmp_path, settings_extra=None):
+    """The reporter's host: `hostname -f` is the short name, myhostname is a .lan name from
+    DHCP and /etc/mailname holds the saved FQDN. Every write of either map is recorded."""
+    runner = _Run('tak-host', {'myorigin': '/etc/mailname', 'myhostname': 'tak-host.lan'})
+    monkeypatch.setattr(er.subprocess, 'run', runner)
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setattr(er, '_read_name_file',
+                        lambda path: FQDN if path == '/etc/mailname' else '', raising=False)
+    writes = []
+    settings = {'fqdn': FQDN, 'guarddog_alert_email': 'ops@real.example'}
+    settings.update(settings_extra or {})
+    ctx = {
+        'load_settings': lambda: settings,
+        'save_settings': lambda s: None,
+        'os_type': lambda: 'debian',
+        'wait_for_apt_lock': lambda plog, log: None,
+        '_pkg_install': lambda pkgs, log_fn=None, timeout=0: (True, ''),
+        '_sudo_wrap': lambda c: list(c),
+        '_read_priv': lambda p: 'myhostname = tak-host.lan\nrelayhost =\n',
+        '_write_priv': lambda p, text, perm=None, **k: writes.append((p, text)),
+        '_safe_alert_emails': _safe_emails,
+        '_takportal_push_settings': lambda plog: False,
+    }
+    return ctx, writes, settings
+
+
+def _keys(text):
+    return [ln.split()[0] for ln in text.splitlines() if ln and not ln.startswith('#')]
+
+
+THREE = [f'root@{FQDN}', 'root@tak-host.lan', 'root@tak-host']
+
+
+def test_deploy_gives_both_maps_all_three_names_in_every_write(monkeypatch, tmp_path):
+    """The reporter's case. Whichever write comes last, it must hold all three names, in the
+    sender map and in the root recipient map."""
+    ctx, writes, _ = _three_name_host(monkeypatch, tmp_path)
+    job = {'log': [], 'running': True}
+    er.deploy(ctx, job, {'provider': 'custom', 'smtp_user': 'u', 'smtp_pass': 'p',
+                         'from_addr': FROM, 'from_name': 'TAK',
+                         'relay_host': 'smtp.example.org', 'relay_port': '587'})
+    assert job.get('complete') is True, job
+    generic = [t for p, t in writes if p == '/etc/postfix/generic']
+    alias = [t for p, t in writes if p == er.ROOT_ALIAS_MAP]
+    assert generic and alias, writes
+    for text in generic + alias:
+        assert sorted(_keys(text)) == sorted(THREE), text
+    assert all(ln.split()[1] == FROM for ln in generic[-1].splitlines())
+    assert all(ln.split(None, 1)[1].strip() == 'ops@real.example'
+               for ln in alias[-1].splitlines() if ln and not ln.startswith('#'))
+
+
+def test_a_guard_dog_save_without_a_deploy_also_covers_all_three(monkeypatch, tmp_path):
+    """app.py calls sync_root_alias(ctx, settings) alone after a Guard Dog address save and
+    after an update: it must find the same three names without the deploy's help."""
+    ctx, writes, settings = _three_name_host(
+        monkeypatch, tmp_path, {'email_relay': {'from_addr': FROM}})
+    ok, _ = er.sync_root_alias(ctx, settings, reload=False)
+    assert ok
+    generic = [t for p, t in writes if p == '/etc/postfix/generic'][-1]
+    alias = [t for p, t in writes if p == er.ROOT_ALIAS_MAP][-1]
+    assert sorted(_keys(generic)) == sorted(THREE)
+    assert sorted(_keys(alias)) == sorted(THREE)
+
+
+def test_a_name_that_is_not_a_host_name_never_reaches_a_map(monkeypatch, tmp_path):
+    """Names go into Postfix tables: a stray character or a space must be dropped."""
+    runner = _Run('tak-host', {'myorigin': 'bad name;x', 'myhostname': 'tak-host.lan'})
+    monkeypatch.setattr(er.subprocess, 'run', runner)
+    names = er.postfix_local_names({'fqdn': FQDN})
+    assert names == [FQDN, 'tak-host.lan', 'tak-host']

@@ -96,6 +96,7 @@ import modules as mod_registry
 from modules import atlas_access as _atlas_access
 from modules import etlrunner as _etl
 from modules import takportal_verified as _tpv
+from modules import takserver_tested as _tst
 
 # v10.2.23 (ops #109): a client that reset TCP before its TLS handshake killed the
 # whole gunicorn worker (gthread wraps TLS on its event loop with nothing catching),
@@ -1883,7 +1884,8 @@ NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.96.0"
 # Authentik's redis service (legacy: Authentik itself stopped needing Redis in 2025.10, but the compose
 # keeps the service). ops #637: the tag used to be the bare `alpine` one, which jumps majors
 # whenever Docker Hub moves it. Pinned to the same tested release WebODM's broker runs (WEBODM_IMAGES).
-AUTHENTIK_REDIS_IMAGE = 'docker.io/library/redis:8.10.2-alpine'
+# ops #1089: 8.10.2 -> 8.10.3 (Oct 26): a cluster-bus fix; we run no cluster. Rollback: re-pin both to 8.10.2.
+AUTHENTIK_REDIS_IMAGE = 'docker.io/library/redis:8.10.3-alpine'
 # ops #819: 0.82.0 -> 0.82.1 (Nov 10): the account id is enforced on a proxy update (an account-scope
 # check). No config or store change. Rollback: re-pin the dev server image to 0.82.0.
 NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.82.1"  # UNDER TRIAL (ops #427, #819)
@@ -3991,8 +3993,21 @@ def _pkg_install(pkgs, repo=None, log_fn=None, timeout=1800):
         # sets the same for non-root boxes, where this env does not reach apt).
         env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l',
                    DPKG_FORCE='confdef,confold')
+        # ops #1124: the broker stops a stuck apt-get shortly before this call times out
+        env['TAKWERX_BROKER_TIMEOUT'] = str(max(int(timeout) - 10, 30))
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        if pm == 'dnf':
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        else:
+            # ops #1124: a stalled download host timed this out with no second try. A timeout
+            # is run once more (on a host that delivers, on Ubuntu); other failures are unchanged.
+            def _apt_once():
+                try:
+                    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+                except subprocess.TimeoutExpired:
+                    return subprocess.CompletedProcess(
+                        cmd, 124, '', f"timed out after {timeout} seconds (slow package mirror or a stuck package manager)")
+            r = _apt_retry_stalled(_apt_once, log_fn)
     except Exception as e:
         if log_fn:
             log_fn(f"  pkg install error ({pm}): {str(e)[:200]}")
@@ -13038,6 +13053,10 @@ def takserver_page():
     if tak.get('installed') and tak.get('running') and not deploy_status.get('running', False):
         deploy_status.update({'complete': False, 'error': False})
     tak_version = _get_takserver_version_info().get('version', '') if tak.get('installed') else ''
+    try:
+        _tak_tested = _takserver_tested_page_state(tak_version) if tak_version else None
+    except Exception:
+        _tak_tested = None
     _tak_jvm = _running_tak_jvm_version() if tak.get('installed') else ''
     _settings = load_settings()
     _tak_cfg = _get_tak_deployment_config(_settings)
@@ -13062,7 +13081,7 @@ def takserver_page():
     return render_template('takserver.html',
         tak58=_tak58, tak_db_refresh=_tak_dbr_page(tak.get('installed')),
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
-        tak_jvm=_tak_jvm,
+        tak_tested=_tak_tested, tak_jvm=_tak_jvm,
         tak_installed=tak.get('installed', False),
         show_connect_ldap=show_connect_ldap, ldap_connected=ldap_connected,
         authentik_base_url=_get_authentik_base_url(_settings),
@@ -19574,6 +19593,97 @@ def _takportal_expected_commit(tag):
     return ''
 
 
+# --- Latest tested TAK Server (ops #1119) ---------------------------------------------------
+# tak.gov needs a login, so a box cannot ask which TAK Server is newest. We publish the newest
+# version that passed our fresh install AND our update test in a small signed file (modules/
+# takserver_tested.py has the rules). The TAK Server page shows it next to the installed version,
+# and Guard Dog mails it once per version to boxes that run an older one. It never decides what a
+# box installs: the package still comes from the operator's own tak.gov download.
+_TAKSERVER_TESTED_CACHE = os.path.join(CONFIG_DIR, 'takserver-tested')
+_TAKSERVER_TESTED_LOCK = threading.Lock()
+_takserver_tested_attempt = {'ts': 0.0}
+
+
+def _takserver_tested_refresh(fresh=False):
+    """Fetch the signed tested-version file at the current commit of the catalog repo's main branch
+    and cache it when it verifies. Never raises. Same rules as _takportal_verified_refresh: `ts` is
+    the last ATTEMPT, both files come from one commit sha, and the signature decides."""
+    now = time.time()
+    if not fresh and _takserver_tested_attempt['ts'] and \
+            now - _takserver_tested_attempt['ts'] < _tst.TESTED_CHECK_SEC:
+        return False
+    if not _TAKSERVER_TESTED_LOCK.acquire(blocking=False):
+        return False
+    try:
+        _takserver_tested_attempt['ts'] = now
+        try:
+            _ref = f'refs/heads/{_tst.TESTED_BRANCH}'
+            sha = str((_git_ls_remote(_ref, repo=_tst.TESTED_REPO) or {}).get(_ref) or '')
+            if not _tst.COMMIT_RE.fullmatch(sha):
+                raise ValueError('GitHub returned no commit for the tested-version file')
+            base = f'https://raw.githubusercontent.com/{_tst.TESTED_REPO}/{sha}/{_tst.TESTED_FILE}'
+            raw = _takportal_verified_http(base, _tst.TESTED_MAX_BYTES)
+            sig = _takportal_verified_http(base + '.sig', 4096)
+            have = _tst.cached(_TAKSERVER_TESTED_CACHE)
+            try:
+                seen = int((load_settings() or {}).get('takserver_tested_serial') or 0)
+            except Exception:
+                seen = 0
+            d, why = _tst.accept_fetched(raw, sig, max(_tst.serial_of(have), seen))
+            if d is None:
+                print(f"[takserver-tested] {sha[:12]} refused: {why}", flush=True)
+                return False
+            if have is not None and _tst.serial_of(d) == _tst.serial_of(have):
+                return False
+            # sig first: a cached file with no matching sig is never trusted
+            _etlcat_cache_write(_tst.TESTED_FILE + '.sig', sig, cache_dir=_TAKSERVER_TESTED_CACHE)
+            _etlcat_cache_write(_tst.TESTED_FILE, raw, cache_dir=_TAKSERVER_TESTED_CACHE)
+            s = load_settings()
+            s['takserver_tested_serial'] = max(seen, _tst.serial_of(d))
+            save_settings(s)
+            print(f"[takserver-tested] now {d.get('version')} (serial {_tst.serial_of(d)})", flush=True)
+            return True
+        except Exception as e:
+            print(f"[takserver-tested] check failed (non-fatal): {str(e)[:160]}", flush=True)
+            return False
+    finally:
+        _TAKSERVER_TESTED_LOCK.release()
+
+
+def _takserver_tested_record(fresh=False):
+    """The verified tested-version record, or None (no signed file yet, or offline). Never raises."""
+    try:
+        _takserver_tested_refresh(fresh=fresh)
+        return _tst.cached(_TAKSERVER_TESTED_CACHE)
+    except Exception:
+        return None
+
+
+def _takserver_tested_page_state(installed_version):
+    """What the TAK Server page shows: {tested, tested_date, state} (see takserver_tested.page_state)."""
+    return _tst.page_state(installed_version, _takserver_tested_record())
+
+
+def _takserver_tested_items(unknown):
+    """Guard Dog pending items (0 or 1): this box runs an older TAK Server than the one we tested.
+    A box with no TAK Server, or one whose version cannot be read, gets none; an unreadable source
+    goes in `unknown` so its dedup state is carried instead of dropped."""
+    try:
+        if not detect_modules().get('takserver', {}).get('installed'):
+            return []
+        installed = (_get_takserver_version_info() or {}).get('version') or ''
+        if not installed:
+            unknown.add('takserver-tested')
+            return []
+        item = _tst.pending_item(installed, _takserver_tested_record(),
+                                 'TAK Server page → Update TAK Server.')
+        return [item] if item else []
+    except Exception as e:
+        unknown.add('takserver-tested')
+        print(f"[update-notify] TAK Server tested-version check failed: {e}", flush=True)
+        return []
+
+
 def _takportal_latest_tag(plog=None):
     """The TAK Portal release tag a deploy installs: the verified one, else the pinned floor.
     Never raises. (Name kept from when this read GitHub `releases/latest`; it no longer does.)
@@ -20954,6 +21064,21 @@ def _alert_email_rejects(value):
             if t and not _safe_alert_email(t)]
 
 
+def _emailrelay_sync_root_alias(settings=None):
+    """GH #667: point the host's mail for root at Guard Dog's alert address (else the relay
+    From address). Best effort: a failure here never fails the caller's save or update."""
+    try:
+        settings = settings if settings is not None else load_settings()
+        if not settings.get('email_relay'):
+            return None
+        if subprocess.run(['which', 'postfix'], capture_output=True, timeout=10).returncode != 0:
+            return None
+        return mod_registry.emailrelay.sync_root_alias(_MODULE_CTX, settings)
+    except Exception as e:
+        print(f"[emailrelay] root alias sync skipped: {e}", flush=True)
+        return None
+
+
 @app.route('/api/guarddog/deploy', methods=['POST'])
 @login_required
 def guarddog_deploy_api():
@@ -20973,6 +21098,7 @@ def guarddog_deploy_api():
     nickname = (data.get('server_nickname') or '').strip()
     settings['guarddog_server_nickname'] = nickname
     save_settings(settings)
+    _emailrelay_sync_root_alias(settings)
     guarddog_deploy_log.clear()
     guarddog_deploy_status.update({'running': True, 'complete': False, 'error': False})
     threading.Thread(target=run_guarddog_deploy, args=(alert_email,), daemon=True).start()
@@ -31749,6 +31875,12 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
     except Exception as e:
         print(f"[update-notify] WebODM check failed: {e}", flush=True)
     try:
+        # ops #1119: a TAK Server version we tested and this box does not run yet
+        pending.extend(_takserver_tested_items(unknown))
+    except Exception as e:
+        unknown.add('takserver-tested')
+        print(f"[update-notify] TAK Server tested-version check failed: {e}", flush=True)
+    try:
         # ops #608: the other modules with a console Update button.
         pending.extend(_module_update_items(unknown))
     except Exception as e:
@@ -31948,6 +32080,8 @@ def _update_notify_check_once(fast=False):
                     + (' (reminder)' if reminder else ''))
         elif sec_items:
             subj = f"🔒 Security update pending on {server_id} — update this machine"
+        elif all(p.get('tested_new') for p in new_items):
+            subj = f"✅ TAK Server {new_items[0]['target']} tested: ready to update on {server_id}"
         elif all(p.get('etl_new') for p in new_items):
             subj = (f"🆕 New ETL available on {server_id}" if len(new_items) == 1
                     else f"🆕 {len(new_items)} new ETLs available on {server_id}")
@@ -32245,6 +32379,7 @@ def guarddog_test_email():
     if data.get('save'):
         settings['guarddog_alert_email'] = to_addr
         save_settings(settings)
+        _emailrelay_sync_root_alias(settings)
     try:
         _guarddog_send_alert_email_via_relay(
             to_addr, 'Guard Dog Test Alert',
@@ -32282,6 +32417,7 @@ def guarddog_notifications_save():
     settings['guarddog_alert_email'] = email
     settings['guarddog_server_nickname'] = nickname
     save_settings(settings)
+    _emailrelay_sync_root_alias(settings)
     if os.path.exists('/opt/tak-guarddog'):
         try:
             ident = _guarddog_server_identifier(settings)
@@ -33893,18 +34029,16 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         if cert_pass and cert_pass != 'atakatak':
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
-        # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
-        if is_remote:
-            ok_sudo, sudo_out = _module_run(cfg, 'sudo -n true 2>&1', timeout=10)
-            if not ok_sudo or 'password' in (sudo_out or '').lower():
-                plog('✗ Certificate generation failed — SSH user requires a sudo password')
-                plog('  Fix on the Federation Hub host:')
-                plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
-                plog('  Or SSH as root. Then retry.')
-                status_dict.update({'running': False, 'complete': True, 'error': True})
-                return
-
+        # gh #666: no `sudo -n true` probe here. It asks "may this account run /usr/bin/true as
+        # root?", which is not the question, and it answered no for accounts whose sudoers list the
+        # real commands. The first privileged step below is the check: if sudo refuses it, stop
+        # before any certificate file is touched.
         ok_meta, meta_out = _module_run(cfg, meta_cmds, timeout=30)
+        if not ok_meta and _fedhub_sudo_refused(meta_out):
+            for _ln in _fedhub_sudo_refusal_lines('Certificate generation', 'patching cert-metadata.sh'):
+                plog(_ln)
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
         if not ok_meta:
             plog(f'⚠ cert-metadata.sh patch warning: {meta_out}')
         else:
@@ -34264,6 +34398,34 @@ def fedhub_update_log_api():
     })
 
 
+# gh #666 — what sudo prints when it refuses a command for want of a password. The Federation Hub
+# steps run over SSH with no terminal, so a refused `sudo` ends with one of these lines.
+_FEDHUB_SUDO_REFUSED_RE = re.compile(
+    r'a password is required|a terminal is required to read the password|no tty present and no askpass'
+    r'|no askpass program|is not in the sudoers file|may not run sudo', re.I)
+
+
+def _fedhub_sudo_refused(out):
+    """True when `out` is sudo refusing for want of a password (not any other failure)."""
+    return bool(out and _FEDHUB_SUDO_REFUSED_RE.search(out))
+
+
+def _fedhub_sudo_refusal_lines(action, step):
+    """Log lines for a refused sudo on the Federation Hub host. The old text told the admin to
+    grant `NOPASSWD: ALL`, which a CJIS deployment cannot do. These steps run apt-get, find, rm,
+    mv, sed, chmod, systemctl and the certificate scripts (as user tak), so no short command list
+    covers them: say that plainly instead of printing a list that would be wrong."""
+    return [
+        f'✗ {action} stopped: sudo on the Federation Hub host asked for a password while {step}.',
+        '  No certificate file was changed.',
+        '  Federation Hub setup runs many commands as root (apt-get, find, rm, mv, sed, chmod, systemctl)',
+        '  and the certificate scripts as user tak, over SSH with no terminal for a password prompt.',
+        '  The SSH user needs those commands allowed without a password, or use root for the SSH login.',
+        '  Allowing them is close to full root. If your policy cannot allow that, SSH as root for this task only.',
+        '  Then retry.',
+    ]
+
+
 def _fedhub_ca_lockdown(cfg, fh_dir, plog=None):
     """ops #839 — the CA signing keystores and CA keys of a Federation Hub (on this box or a
     remote host) are for the Federation Hub account only.
@@ -34422,18 +34584,15 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         if cert_pass and cert_pass != 'atakatak':
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
-        # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
-        if is_remote:
-            ok_sudo, sudo_out = _module_run(cfg, 'sudo -n true 2>&1', timeout=10)
-            if not ok_sudo or 'password' in (sudo_out or '').lower():
-                plog('✗ Certificate rotation failed — SSH user requires a sudo password')
-                plog('  Fix on the Federation Hub host:')
-                plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
-                plog('  Or SSH as root. Then retry.')
-                fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
-                return
-
+        # gh #666: no `sudo -n true` probe (see the deploy path). The first privileged step is the
+        # check; the old certificate files are only moved aside after it, so a refusal here leaves
+        # them exactly as they were.
         ok_meta, meta_out = _module_run(cfg, meta_cmds, timeout=30)
+        if not ok_meta and _fedhub_sudo_refused(meta_out):
+            for _ln in _fedhub_sudo_refusal_lines('Certificate rotation', 'patching cert-metadata.sh'):
+                plog(_ln)
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
         if not ok_meta:
             plog(f'⚠ cert-metadata patch warning: {(meta_out or "")[:240]}')
         else:
@@ -37136,13 +37295,19 @@ def _apt_wait_for_lock(max_wait=300, log_fn=None):
 def _apt_run_waiting(argv, timeout=300, max_wait=300, log_fn=None, **kw):
     """Run one privileged apt argv, waiting (bounded) for the apt lock first and retrying once
     if apt still lost the race for it. Returns the CompletedProcess. Extra kwargs (env=) pass on."""
-    _apt_wait_for_lock(max_wait, log_fn)
-    r = _run_priv_chain([argv], 'and', timeout=timeout, **kw)
-    out = (r.stdout or '') + (r.stderr or '')
-    if r.returncode != 0 and any(m in out for m in _APT_LOCK_MSGS):
+    def _once():
         _apt_wait_for_lock(max_wait, log_fn)
-        r = _run_priv_chain([argv], 'and', timeout=timeout, **kw)
-    return r
+        r = _apt_chain_run([argv], timeout, **kw)
+        out = (r.stdout or '') + (r.stderr or '')
+        if r.returncode != 0 and any(m in out for m in _APT_LOCK_MSGS):
+            _apt_wait_for_lock(max_wait, log_fn)
+            r = _apt_chain_run([argv], timeout, **kw)
+        return r
+    # ops #1124: only an INSTALL that timed out is run again (on another host on Ubuntu);
+    # `apt-get update` keeps its own handling.
+    if 'install' in argv:
+        return _apt_retry_stalled(_once, log_fn)
+    return _once()
 
 
 # ops #605: the Caddy deploy ran every apt line with a fixed timeout=120. On Ubuntu 22.04 the
@@ -45635,31 +45800,36 @@ def _get_nodered_version_info():
 
 _cloudtak_release_cache = {'tag': None, 'ts': 0}
 
-def _cloudtak_newest_allowed_tag(tags):
+def _cloudtak_newest_allowed_tag(tags, max_major=None):
     """Newest plain-version CloudTAK tag ('v13.128.0') whose major is at or under
-    CLOUDTAK_MAX_MAJOR, or None. Pre-releases ('v14.0.0-rc.1') and other names never match
-    (ops #1074)."""
+    CLOUDTAK_MAX_MAJOR (or the lower `max_major` when given), or None. Pre-releases
+    ('v14.0.0-rc.1') and other names never match (ops #1074)."""
+    _cap = CLOUDTAK_MAX_MAJOR if max_major is None else min(max_major, CLOUDTAK_MAX_MAJOR)
     best = None
     for t in tags or []:
         m = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', (t or '').strip())
         if not m:
             continue
         key = tuple(int(x) for x in m.groups())
-        if key[0] > CLOUDTAK_MAX_MAJOR:
+        if key[0] > _cap:
             continue
         if best is None or key > best[0]:
             best = (key, m.group(0))
     return best[1] if best else None
 
 
-def _get_cloudtak_latest_release_tag(use_cache=True):
+def _get_cloudtak_latest_release_tag(use_cache=True, max_major=None):
     """Newest stable release tag from GitHub that is allowed on this fleet (e.g. 'v13.128.0').
     Never above CLOUDTAK_MAX_MAJOR (ops #1074): GitHub's 'latest' is 14.0.0, which we have not
     tested, so the whole release list is read and filtered instead of asking for 'latest'.
     Cached for 4 hours to avoid hitting GitHub API on every page load.
     Pass use_cache=False during deploy to get a fresh result.
+    `max_major` asks for the newest tag at or under a lower major (ops #1074: the 13.x stop a box
+    with an old MinIO store must make before 14); that answer is never cached.
     Returns the tag string, or None if the API call fails."""
     import time as _time
+    if max_major is not None:
+        use_cache = False
     if use_cache and _cloudtak_release_cache['tag'] and (_time.time() - _cloudtak_release_cache['ts'] < 14400):
         return _cloudtak_release_cache['tag']
     try:
@@ -45672,27 +45842,32 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
             raise ValueError('GitHub did not return a release list')
         tag = _cloudtak_newest_allowed_tag(
             [r.get('tag_name') for r in data
-             if isinstance(r, dict) and not r.get('draft') and not r.get('prerelease')])
+             if isinstance(r, dict) and not r.get('draft') and not r.get('prerelease')],
+            max_major=max_major)
         if not tag:
             # The first page held no allowed release: ask git, which lists every tag.
             raise ValueError('no allowed release on the first page')
-        _cloudtak_release_cache['tag'] = tag
-        _cloudtak_release_cache['ts'] = _time.time()
+        if max_major is None:
+            _cloudtak_release_cache['tag'] = tag
+            _cloudtak_release_cache['ts'] = _time.time()
         return tag
     except Exception:
         # gh #365: the API answers 403 "rate limit exceeded" to shared home/CGNAT addresses.
         # git over https isn't rate limited that way, so ask it for the newest tag first.
-        tag = _cloudtak_latest_tag_from_git()
+        tag = _cloudtak_latest_tag_from_git(max_major=max_major)
         if tag:
-            _cloudtak_release_cache['tag'] = tag
-            _cloudtak_release_cache['ts'] = _time.time()
+            if max_major is None:
+                _cloudtak_release_cache['tag'] = tag
+                _cloudtak_release_cache['ts'] = _time.time()
             return tag
+        if max_major is not None:
+            return None
         # Stale cache is better than nothing — return it regardless of use_cache so that
         # a GitHub rate-limit or cold-start doesn't hard-block the update flow.
         return _cloudtak_release_cache.get('tag') or None
 
 
-def _cloudtak_latest_tag_from_git():
+def _cloudtak_latest_tag_from_git(max_major=None):
     """Newest allowed plain-version CloudTAK tag ('v13.117.0') via `git ls-remote`, or None.
     Second source for the release lookup when api.github.com refuses us (gh #365).
     Never above CLOUDTAK_MAX_MAJOR (ops #1074)."""
@@ -45709,7 +45884,44 @@ def _cloudtak_latest_tag_from_git():
         m = re.search(r'refs/tags/(v?\d+\.\d+\.\d+)$', line.strip())
         if m:
             tags.append(m.group(1))
-    return _cloudtak_newest_allowed_tag(tags)
+    return _cloudtak_newest_allowed_tag(tags, max_major=max_major)
+
+
+# ops #1074: CloudTAK 14.0.0 removed `cloudtak.sh migrate-store` and the MinIO services that
+# infra-TAK's MinIO -> Garage move runs from the checked-out tree. A box that still holds
+# ~/CloudTAK/.docker-store must therefore stop at the newest 13.x first (it moves the files into
+# Garage and archives the folder); the next Update then goes on to 14. Without this the update to
+# 14 builds for about 10 minutes, fails at "Garage store setup failed" and rolls back.
+CLOUDTAK_MINIO_HOP_MAJOR = 13
+
+
+def _cloudtak_tag_major(tag):
+    m = re.match(r'v?(\d+)\.\d+\.\d+', (tag or '').strip())
+    return int(m.group(1)) if m else None
+
+
+def _cloudtak_needs_minio_hop(release_tag):
+    """True when `release_tag` is a major the old-MinIO move cannot run from (14 and up)."""
+    major = _cloudtak_tag_major(release_tag)
+    return major is not None and major > CLOUDTAK_MINIO_HOP_MAJOR
+
+
+def _cloudtak_minio_hop_tag():
+    """The newest 13.x tag (a box with the old MinIO folder goes there first), or None when the
+    lookup fails. Never cached as the latest."""
+    return _get_cloudtak_latest_release_tag(use_cache=False, max_major=CLOUDTAK_MINIO_HOP_MAJOR)
+
+
+def _cloudtak_tag_for_minio_store(release_tag, store_present):
+    """Tag to install on a box whose target is `release_tag`.
+
+    Returns (tag, hopped). Same tag when the target is 13.x or lower or the box has no MinIO store.
+    On a box that still has .docker-store and a target of 14 or higher: the newest 13.x tag, hopped
+    True. (None, True) when that 13.x tag cannot be looked up (the caller stops before any change).
+    """
+    if not store_present or not _cloudtak_needs_minio_hop(release_tag):
+        return release_tag, False
+    return _cloudtak_minio_hop_tag(), True
 
 
 def _get_cloudtak_target_release_tag(settings=None, use_cache=True, allow_fallback=True):
@@ -45790,6 +46002,15 @@ def _get_cloudtak_version_info():
     _up = None
     try:
         _up = _get_cloudtak_latest_release_tag()
+    except Exception:
+        pass
+    # ops #1074: a box that still has the old MinIO folder goes to the newest 13.x first (the
+    # update would otherwise fail at the Garage step), so the card must name that version.
+    try:
+        _hop, _hopped = _cloudtak_tag_for_minio_store(
+            _up, bool(_up) and os.path.isdir(os.path.join(ct_dir, '.docker-store')))
+        if _hopped and _hop:
+            _up = _hop
     except Exception:
         pass
     out['latest'] = (_up or '').lstrip('vV') or CLOUDTAK_VETTED_RELEASE
@@ -50799,9 +51020,13 @@ def run_mediamtx_deploy():
                  "⚠ ffmpeg unavailable — MediaMTX streaming OK, but recording / MP4 download / test stream need ffmpeg (RPM Fusion repo unreachable?)")
         else:
             wait_for_apt_lock(plog, mediamtx_deploy_log)
-            r = _run_priv_chain([['apt-get', 'update', '-qq'], ['apt-get', 'install', '-y', 'wget', 'tar', 'curl', 'ffmpeg', 'openssl', 'python3', 'python3-pip']], 'and', timeout=300)
+            # ops #1124: a download host that stalls timed this step out on three fresh boxes with no
+            # second try; a timeout is now run once more, on a host that delivers (Ubuntu).
+            r = _apt_retry_stalled(
+                lambda: _apt_chain_run([['apt-get', 'update', '-qq'], ['apt-get', 'install', '-y', 'wget', 'tar', 'curl', 'ffmpeg', 'openssl', 'python3', 'python3-pip']], 300),
+                plog)
             if r.returncode != 0:
-                plog(f"✗ apt install failed: {r.stdout[-200:]}")
+                plog(f"✗ apt install failed: {((r.stdout or '') + (r.stderr or ''))[-300:]}")
                 mediamtx_deploy_status.update({'running': False, 'error': True})
                 return
         plog("✓ Dependencies installed (wget, ffmpeg, python3)")
@@ -58629,6 +58854,16 @@ def run_cloudtak_deploy(cfg=None):
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
+            # ops #1074: an old MinIO folder on the remote host stops at 13.x first (14 cannot move it).
+            _rs_ok, _ = _ssh_probe(remote_cfg, "test -d ~/CloudTAK/.docker-store", timeout=20)
+            if _rs_ok and _cloudtak_needs_minio_hop(remote_release_tag):
+                _rt = _cloudtak_minio_hop_tag()
+                if not _rt:
+                    plog("✗ The remote host still has the old MinIO folder and the newest 13.x release could not be looked up. Nothing was changed.")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
+                plog(f"  Old MinIO folder on the remote host: installing {_rt} first (CloudTAK 14 cannot move it into Garage).")
+                remote_release_tag = _rt
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
             else:
@@ -58832,6 +59067,17 @@ def run_cloudtak_deploy(cfg=None):
         plog("")
         plog("━━━ Step 2/7: Cloning CloudTAK ━━━")
         release_tag = _get_cloudtak_target_release_tag(use_cache=False)
+        # ops #1074: Deploy over an existing tree that still has the old MinIO folder stops at 13.x
+        # first (CloudTAK 14 cannot move it into Garage).
+        _dh_tag, _dh_hop = _cloudtak_tag_for_minio_store(
+            release_tag, os.path.isdir(os.path.join(cloudtak_dir, '.docker-store')))
+        if _dh_hop:
+            if not _dh_tag:
+                plog("✗ This box still has the old MinIO folder and the newest 13.x release could not be looked up. Nothing was changed.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            plog(f"  Old MinIO folder found: installing {_dh_tag} first (CloudTAK 14 cannot move it into Garage).")
+            release_tag = _dh_tag
         if os.path.exists(cloudtak_dir):
             # A real checkout needs a VALID repo, not merely a .git directory — a deleted or
             # interrupted CloudTAK can leave a HOLLOW .git (objects/ + info/ but no HEAD/config),
@@ -59090,13 +59336,12 @@ def run_cloudtak_deploy(cfg=None):
         except Exception as _me:
             plog(f"  WARNING: arm64 media-infra build step errored (media may be unavailable): {_me}")
 
-        api_url = ''
-        media_url = ''
-        for _line in env_content.splitlines():
-            if _line.startswith('API_URL='):
-                api_url = _line.split('=', 1)[1].strip()
-            elif _line.startswith('CLOUDTAK_Config_media_url='):
-                media_url = _line.split('=', 1)[1].strip()
+        # Read the two URLs back from the .env just written, not from env_content: env_content holds the
+        # generated secrets, and a value taken out of it is flagged by CodeQL as a secret in the log
+        # (alert #29, a false positive: only the API and media URLs are logged here).
+        _written_env = _cloudtak_env_read(env_path)
+        api_url = (_written_env.get('API_URL') or '').strip()
+        media_url = (_written_env.get('CLOUDTAK_Config_media_url') or '').strip()
         plog(f"✓ .env written")
         if api_url:
             plog(f"  API URL: {api_url}")
@@ -60605,6 +60850,24 @@ def run_cloudtak_update():
             plog("  Nothing was changed and CloudTAK is still running as before. Check this box's DNS/internet and try again in a few minutes.")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
+        # ops #1074: a box that still holds the old MinIO folder (.docker-store) stops at the newest
+        # 13.x before 14 (14 removed the MinIO -> Garage move). Decide BEFORE any build.
+        if is_remote:
+            _store_now = bool(remote_host) and bool(_ssh_probe(remote_cfg, "test -d ~/CloudTAK/.docker-store && echo yes", timeout=20)[0])
+        else:
+            _store_now = os.path.isdir(os.path.expanduser('~/CloudTAK/.docker-store'))
+        # (branches, not a returned value: the remote probe above carries SSH details, and a value that
+        # came out of it must not end up in the log line below)
+        if _store_now and _cloudtak_needs_minio_hop(release_tag):
+            _hop_tag = _cloudtak_minio_hop_tag()
+            if not _hop_tag:
+                plog(f"✗ {release_tag} needs your old MinIO files moved into Garage first, and the newest 13.x release could not be looked up.")
+                plog("  Nothing was changed and CloudTAK is still running as before. Try again in a few minutes.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            plog(f"  This box still has the old MinIO folder (~/CloudTAK/.docker-store). CloudTAK 14 cannot move it into Garage.")
+            plog(f"  Updating to {_hop_tag} first, which moves your files. Press Update again afterwards to go on to {release_tag}.")
+            release_tag = _hop_tag
         plog(f"  Target: {release_tag} (upstream latest — CloudTAK tracks dfpc-coe releases directly)")
         # ops #129: record from/to on the update result (the card and Diagnostics said "? -> ?").
         from_ver = ''
@@ -60623,8 +60886,12 @@ def run_cloudtak_update():
             except Exception:
                 _have = _want = ()
             if _have and _want and _want < _have:
-                plog(f"✗ {release_tag} is older than the {from_ver} already running; not downgrading. Nothing was changed.")
-                cloudtak_deploy_status.update({'running': False, 'error': True})
+                # ops #1134: the box already runs a CloudTAK newer than the one we test (14.0.0 while
+                # we pin 13.x). Refusing the downgrade is harmless, so say so in plain words and
+                # end WITHOUT an error: nothing failed and nothing was changed.
+                plog(f"✓ CloudTAK {from_ver} is newer than the version we test. Nothing to do.")
+                plog("  Nothing was changed and CloudTAK is still running as before.")
+                cloudtak_deploy_status.update({'running': False, 'error': False})
                 return
         # ops #983: refuse BEFORE anything is checked out or built when the disk cannot hold the
         # rebuild. A full disk used to fail the build after minutes and leave the checkout unwritable.
@@ -61685,7 +61952,7 @@ WEBODM_OVERLAY_REF = 'v0.8.9'
 WEBODM_OVERLAY_SHA = '3f0efb383a9f1bd022eac15ac4b3da83e643fccc'  # commit of tag v0.8.9 (was the default branch's tip)
 WEBODM_IMAGES = {
     'wo_db':      'webodm/webodm_db:18@sha256:6d43e32ec24c388c5d5975bf6462d21abd6959af3c43d146a2473c1db4d5019c',
-    'wo_broker':  'redis:8.10.2-alpine',
+    'wo_broker':  'redis:8.10.3-alpine',
     'wo_webapp':  'webodm/webodm_webapp:' + WEBODM_VERSION,
     'wo_worker':  'webodm/webodm_webapp:' + WEBODM_VERSION,
     'wo_nodeodm': 'webodm/nodeodx:2.4.0',
@@ -63814,7 +64081,28 @@ def _ensure_authentik_recovery_flow(ak_url, ak_headers):
                         _req.urlopen(r, timeout=15)
             except urllib.error.HTTPError:
                 pass
-        return True, 'Recovery flow created and linked; "Forgot password?" is on the login page.', recovery_flow_slug
+
+        # 7) Link the recovery flow to the brand(s) too. This is a SEPARATE setting from the
+        #    identification stage above: the stage's recovery_flow drives the login page's
+        #    "Forgot password?" link, but the brand's flow_recovery is what the Admin
+        #    interface's per-user "Create/Email recovery link" actions need. Without it
+        #    Authentik shows "This brand does not have a recovery flow" on every user
+        #    (test12 2026-11-23 — no release ever set it). Seed only when EMPTY: a recovery
+        #    flow the operator picked on the brand is theirs.
+        brand_msg = ''
+        try:
+            _linked = 0
+            for br in _api_get('core/brands/?page_size=100').get('results', []):
+                if br.get('flow_recovery'):
+                    continue
+                _api_patch(f'core/brands/{br["brand_uuid"]}/', {'flow_recovery': recovery_flow_pk})
+                _linked += 1
+            if _linked:
+                brand_msg = f' Linked to {_linked} brand(s) for admin recovery links.'
+        except Exception as e:
+            brand_msg = f' (Brand recovery link not set: {str(e)[:80]})'
+        return True, ('Recovery flow created and linked; "Forgot password?" is on the login page.'
+                      + brand_msg), recovery_flow_slug
     except urllib.error.HTTPError as e:
         return False, _err(e), None
     except Exception as e:
@@ -81882,7 +82170,7 @@ def _authentik_webadmin_role_check_and_heal(plog_fn=None):
         if not _wa:
             _log("webadmin role check: webadmin MISSING in Authentik — calling _ensure_authentik_webadmin")
             try:
-                _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True)
+                _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True, reset_password=False)
                 if _ok:
                     _healed = True
                 else:
@@ -81919,7 +82207,7 @@ def _authentik_webadmin_role_check_and_heal(plog_fn=None):
             if _need_role_heal:
                 _log(f"webadmin role drift detected ({', '.join(_reasons)}) — auto-healing")
                 try:
-                    _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True)
+                    _ok, _msg = _ensure_authentik_webadmin(skip_bind_verify=True, reset_password=False)
                     if _ok:
                         _log("webadmin role healed via _ensure_authentik_webadmin")
                         _healed = True
@@ -84275,6 +84563,8 @@ def run_authentik_deploy(reconfigure=False):
             # password?" missing) on their next console update.
             plog("  Ensuring password-recovery flow...")
             _ensure_recovery_flow_standalone(env_path, plog)
+            for _n in _ak_admin_recovery_email_notes():
+                plog(_n)
             _sync_webadmin_after_authentik_reconfigure(plog)
             # ops #184: last, after every step above that takes LDAP down under TAK
             _authentik_reconfigure_heal_tak_clients(plog, before=ldap_path_before)
@@ -84926,6 +85216,8 @@ entries:
     
                     # Create webadmin user in Authentik (only when TAK Server is deployed — used for TAK Server admin)
                     webadmin_pass = ''
+                    webadmin_pass_generated = False
+                    webadmin_created = False
                     if os.path.exists('/opt/tak'):
                         # Read password from TAK Server settings or use default
                         tak_settings_path = os.path.join(CONFIG_DIR, 'settings.json')
@@ -84934,10 +85226,11 @@ entries:
                                 tak_s = json.load(f)
                                 webadmin_pass = tak_s.get('webadmin_password', '')
                         if not webadmin_pass:
+                            # Generated, NOT saved yet — it is only used (and persisted) if
+                            # this deploy actually creates webadmin. An existing webadmin's
+                            # password belongs to the operator; see the set_password gate below.
                             webadmin_pass = secrets.token_urlsafe(16)
-                            plog(f"  ⚠ webadmin_password not in settings — generated random password")
-                            settings['webadmin_password'] = webadmin_pass
-                            save_settings(settings)
+                            webadmin_pass_generated = True
                     else:
                         plog("  ℹ TAK Server not installed — skipping webadmin user (optional; used for TAK Server admin)")
     
@@ -84959,31 +85252,49 @@ entries:
                             resp = urllib.request.urlopen(req, timeout=10)
                             user = json.loads(resp.read().decode())
                             webadmin_pk = user['pk']
+                            webadmin_created = True
                             plog(f"  ✓ Created webadmin user (pk={webadmin_pk})")
+                            if webadmin_pass_generated:
+                                plog("  ⚠ webadmin_password not in settings — generated a random password for the new webadmin user")
+                                settings['webadmin_password'] = webadmin_pass
+                                save_settings(settings)
                         except urllib.error.HTTPError as e:
                             if e.code == 400:
-                                plog("  ✓ webadmin user already exists")
+                                plog("  ✓ webadmin user already exists — leaving its password unchanged")
                                 # Get existing user PK and add to group
                                 req = urllib.request.Request(f'{ak_url}/api/v3/core/users/?search=webadmin',
                                     headers=ak_headers)
                                 resp = urllib.request.urlopen(req, timeout=10)
                                 results = json.loads(resp.read().decode())['results']
-                                webadmin_pk = results[0]['pk'] if results else None
+                                _wa_obj = next((u for u in results if u.get('username') == 'webadmin'), None)
+                                webadmin_pk = _wa_obj['pk'] if _wa_obj else None
                                 if webadmin_pk and group_pk:
-                                    req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{webadmin_pk}/',
-                                        data=json.dumps({'groups': [group_pk]}).encode(),
-                                        headers=ak_headers, method='PATCH')
-                                    try:
-                                        urllib.request.urlopen(req, timeout=10)
-                                        plog("  ✓ Added webadmin to tak_ROLE_ADMIN group")
-                                    except Exception:
-                                        pass
+                                    # MERGE, never replace: PATCHing groups=[tak_ROLE_ADMIN] stripped
+                                    # webadmin out of 'authentik Admins', the LDAP SA watchdog saw
+                                    # role drift and its heal reset the password a second time
+                                    # (test12, 2026-11-22).
+                                    _cur = [g.get('pk', g) if isinstance(g, dict) else g
+                                            for g in (_wa_obj.get('groups') or [])]
+                                    if group_pk not in _cur:
+                                        req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{webadmin_pk}/',
+                                            data=json.dumps({'groups': list(dict.fromkeys(_cur + [group_pk]))}).encode(),
+                                            headers=ak_headers, method='PATCH')
+                                        try:
+                                            urllib.request.urlopen(req, timeout=10)
+                                            plog("  ✓ Added webadmin to tak_ROLE_ADMIN group")
+                                        except Exception:
+                                            pass
                             else:
                                 plog(f"  ⚠ webadmin user error: {e.code} — continuing")
                                 webadmin_pk = None
-    
-                        # Set webadmin password
-                        if webadmin_pk:
+
+                        # Set webadmin password — ONLY on a user this deploy just created.
+                        # An existing webadmin's password is operator-owned: a redeploy that
+                        # found no webadmin_password in settings used to generate a random one
+                        # and set it on the live user, locking the operator out of the
+                        # SSO-protected console (test12, 2026-11-22). Changing an existing
+                        # password is the explicit "Sync webadmin" button's job.
+                        if webadmin_pk and webadmin_created:
                             try:
                                 req = urllib.request.Request(f'{ak_url}/api/v3/core/users/{webadmin_pk}/set_password/',
                                     data=json.dumps({'password': webadmin_pass}).encode(),
@@ -85717,6 +86028,8 @@ entries:
         else:
             plog("  2. Email Relay: SMTP is already configured — this deploy applied or will apply Authentik email when that step succeeded above.")
         plog("  3. TAK Server: deploy only after this log shows the LDAP SA bind verified (above).")
+        plog("  4. Set a real recovery email for akadmin (and webadmin, once TAK Server is deployed) on this page")
+        plog("     \u2192 Protected admin accounts. Without it, 'Forgot password?' cannot reach you.")
         plog("=" * 50)
         # v0.8.5: Proactive routing migration — if TAK Server is already installed when
         # Authentik is deployed (re-deploy / reconfigure path), migrate outpost to FQDN
@@ -88317,9 +88630,16 @@ def _heal_takauthentik_tasklog_purge_stale_failed_state(plog=None):
         return False
 
 
-def _ensure_authentik_webadmin(skip_bind_verify=False):
+def _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=True):
     """Ensure webadmin exists in Authentik with password from settings; 8446 uses LDAP when CoreConfig has <ldap/>.
     skip_bind_verify=True skips LDAP outpost recreate and bind verification (default False — TAK deploy and Sync webadmin use full verify).
+    reset_password=False (automatic callers: LDAP SA watchdog, TAK Server upgrades) heals roles/active/groups
+    but never changes the password of an EXISTING webadmin — that password is operator-owned (they may have
+    changed it in Authentik). A webadmin this call creates still gets the stored password. With
+    reset_password=False the bind verdict is skipped too: we don't know the operator's password, and a
+    'fail' verdict would DELETE and recreate the user. Only explicit operator actions (Sync webadmin,
+    TAK deploy, Connect LDAP) pass reset_password=True. test12 2026-11-22: the watchdog heal reset a
+    live webadmin password and locked the operator out of the SSO-protected console.
     Returns (True, None) on success, (False, error_msg) on failure."""
     import urllib.request as _req
     import urllib.error
@@ -88330,8 +88650,9 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
     if not ak_token:
         return False, 'Authentik .env not found'
     webadmin_pass = (settings.get('webadmin_password') or '').strip()
-    if not webadmin_pass:
-        return False, 'webadmin password is not set in infra-TAK settings. Re-deploy TAK Server and set a WebGUI password.'
+    _no_pass_err = 'webadmin password is not set in infra-TAK settings. Re-deploy TAK Server and set a WebGUI password.'
+    if reset_password and not webadmin_pass:
+        return False, _no_pass_err
     url = _get_authentik_api_url(settings)
     headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
     try:
@@ -88363,9 +88684,14 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
         resp = _req.urlopen(req, timeout=10)
         results = json.loads(resp.read().decode())['results']
         user_obj = next((u for u in results if u.get('username') == 'webadmin'), None)
+        created = False
         if not user_obj:
+            if not webadmin_pass:
+                return False, _no_pass_err
             user_obj = _create_webadmin_user()
+            created = True
         webadmin_pk = user_obj['pk']
+        set_pw = reset_password or created
         patch_fields = {}
         # v0.9.13: recover a webadmin that was Deactivated via TAK Portal / Authentik UI.
         # Without this, Sync webadmin silently fails to restore 8446 login because
@@ -88383,8 +88709,9 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
         if patch_fields:
             req = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/', data=json.dumps(patch_fields).encode(), headers=headers, method='PATCH')
             _req.urlopen(req, timeout=10)
-        req = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/set_password/', data=json.dumps({'password': webadmin_pass}).encode(), headers=headers, method='POST')
-        _req.urlopen(req, timeout=10)
+        if set_pw:
+            req = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/set_password/', data=json.dumps({'password': webadmin_pass}).encode(), headers=headers, method='POST')
+            _req.urlopen(req, timeout=10)
         # Add webadmin to authentik Admins so LDAP application allows bind (8446 login)
         req = _req.Request(f'{url}/api/v3/core/groups/?search=authentik+Admins', headers=headers)
         resp = _req.urlopen(req, timeout=10)
@@ -88515,6 +88842,10 @@ def _ensure_authentik_webadmin(skip_bind_verify=False):
         ready, ready_status = _wait_ldap_outpost_ready(timeout_secs=180)
         if not ready:
             return False, f'webadmin set, but LDAP outpost not ready (status: {ready_status})'
+        if not set_pw:
+            # Password untouched (operator-owned) — we cannot verify a bind with it, and a
+            # 'fail' verdict below would DELETE + recreate the user. Outpost is ready; done.
+            return True, None
         # v0.8.5: Tri-state probe. Only do destructive recovery (DELETE + recreate) on a
         # CONFIRMED 'fail'. On 'inconclusive' (missing ldapsearch, spiral markers, or flow
         # errors with no credential signal) the bind is likely fine — possibly a routing
@@ -89154,6 +89485,218 @@ def _read_authentik_admin_accounts_via_ak_shell():
     return accounts, None
 
 
+# ── Admin recovery email (2026-11-23) ─────────────────────────────────────────────
+# akadmin and webadmin are born with addresses nobody reads: akadmin gets
+# AUTHENTIK_BOOTSTRAP_EMAIL=admin@takwerx.local, webadmin gets webadmin@<fqdn> (a
+# synthetic address so WebODM's OIDC email claim is non-empty). "Forgot password?"
+# mails the reset link to that address, so neither admin could ever recover its own
+# password. And Authentik's user page refuses self-service email changes by default
+# (brand setting "Allow users to change email" = off — correct, it protects recovery),
+# so the operator also could not fix it from the account itself. The Authentik page now
+# flags a placeholder and sets a real address through the admin API.
+_AK_ADMIN_PLACEHOLDER_EMAILS = ('admin@takwerx.local',)
+_AK_ADMIN_EMAIL_RE = re.compile(r'^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?'
+                                r'(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)*\.[A-Za-z]{2,63}$')
+
+
+def _ak_admin_email_is_placeholder(username, email, settings=None):
+    """True when a protected admin's email is one infra-TAK made up (or empty) — i.e. a
+    password-reset email to it reaches nobody."""
+    e = (email or '').strip().lower()
+    if not e or '@' not in e:
+        return True
+    if e in _AK_ADMIN_PLACEHOLDER_EMAILS:
+        return True
+    dom = e.rsplit('@', 1)[1]
+    if dom in ('localhost', 'tak.local') or dom.endswith('.local') or dom.endswith('.localhost'):
+        return True
+    if username == 'webadmin' and e.split('@', 1)[0] == 'webadmin':
+        fq = ((settings or load_settings()).get('fqdn') or '').strip().split(':')[0].lower()
+        if fq and dom == fq:
+            return True
+    return False
+
+
+def _ak_admin_recovery_email_notes():
+    """Deploy/update-log notes (tagged AK_ACTION_NEEDED) for each protected admin whose
+    recovery email is a placeholder. Never raises; [] when Authentik can't be read."""
+    out = []
+    try:
+        ak_url, ak_headers, settings = _w1_ak_ctx()
+        if not ak_url:
+            return out
+        for username in _AUTHENTIK_RECOVERABLE_USERS:
+            res = _w1_ak_get(ak_url, f'core/users/?username={username}', ak_headers).get('results', [])
+            u = next((x for x in res if x.get('username') == username), None)
+            if u and _ak_admin_email_is_placeholder(username, u.get('email'), settings):
+                out.append(f"  \u26a0 {AK_ACTION_NEEDED} {username} has no real recovery email "
+                           f"({u.get('email') or 'empty'}) \u2014 a password reset cannot reach you. "
+                           f"Set one on the Authentik page \u2192 Protected admin accounts.")
+    except Exception:
+        pass
+    return out
+
+
+@app.route('/api/authentik/admin-email', methods=['POST'])
+@login_required
+def authentik_admin_email_api():
+    """Set the recovery email of a protected admin account (akadmin / webadmin) through
+    the Authentik admin API. Only that one field is written."""
+    data = request.get_json(silent=True) or {}
+    username = (data.get('user') or '').strip()
+    email = (data.get('email') or '').strip()
+    if username not in _AUTHENTIK_RECOVERABLE_USERS:
+        return jsonify({'success': False, 'message': 'Only akadmin or webadmin.'}), 400
+    if len(email) > 254 or not _AK_ADMIN_EMAIL_RE.fullmatch(email):
+        return jsonify({'success': False, 'message': 'That is not a valid email address.'}), 400
+    if _ak_admin_email_is_placeholder(username, email):
+        return jsonify({'success': False, 'message': 'Use an address that receives mail — this one is a placeholder.'}), 400
+    ak_url, ak_headers, _settings = _w1_ak_ctx()
+    if not ak_url:
+        return jsonify({'success': False, 'message': 'Authentik is not deployed or has no API token.'}), 400
+    try:
+        res = _w1_ak_get(ak_url, f'core/users/?username={username}', ak_headers).get('results', [])
+        u = next((x for x in res if x.get('username') == username), None)
+        if not u:
+            return jsonify({'success': False, 'message': f'{username} does not exist in Authentik.'}), 404
+        _ak_api_call(f"{ak_url}/api/v3/core/users/{u['pk']}/", headers=ak_headers,
+                     data=json.dumps({'email': email}).encode(), method='PATCH')
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'Authentik API error: {str(e)[:160]}'}), 502
+    audit('authentik:admin-recovery-email', f'{username} recovery email changed', force=True)
+    if username == 'webadmin':
+        _webadmin_email_status(force=True)
+    print(f"[authentik] {username} recovery email set by operator", flush=True)
+    return jsonify({'success': True, 'message': f'{username} recovery email saved.'})
+
+
+# ── webadmin recovery-email banner + Guard Dog reminder (2026-11-23) ──────────────
+# webadmin is the account operators sign in to the console with when it sits behind
+# Authentik SSO. With a made-up email it cannot recover its own password, and a lockout
+# locks the operator out of the console too (test12, 2026-11-23). So until its email is
+# real, every console page shows a banner with the steps, and Guard Dog mails the alert
+# address. The banner clears when Authentik shows a real address — checked live, never
+# a click that only claims it — or when the operator says the current address does
+# receive mail (stored with that address, so a later change re-arms the check).
+WEBADMIN_EMAIL_CACHE_S = 300
+WEBADMIN_EMAIL_REMIND_S = 72 * 3600
+_webadmin_email_lock = threading.Lock()
+_webadmin_email_state = {'at': 0.0, 'result': None}
+
+
+def _webadmin_email_status(force=False):
+    """{'needs_action': bool, 'email': str, 'authentik_url': str}. needs_action is False
+    whenever it cannot be read (no Authentik, no webadmin, API down) — no false alarms."""
+    now = time.time()
+    with _webadmin_email_lock:
+        cached = _webadmin_email_state['result']
+        if cached and not force and now - _webadmin_email_state['at'] < WEBADMIN_EMAIL_CACHE_S:
+            return cached
+    result = {'needs_action': False, 'email': '', 'authentik_url': ''}
+    try:
+        ak_url, ak_headers, settings = _w1_ak_ctx()
+        if ak_url and os.path.exists('/opt/tak'):
+            res = _w1_ak_get(ak_url, 'core/users/?username=webadmin', ak_headers).get('results', [])
+            u = next((x for x in res if x.get('username') == 'webadmin'), None)
+            if u:
+                email = (u.get('email') or '').strip()
+                acked = (settings.get('webadmin_email_ack') or '') == email and bool(email)
+                result = {'needs_action': _ak_admin_email_is_placeholder('webadmin', email, settings) and not acked,
+                          'email': email, 'authentik_url': _get_authentik_base_url(settings)}
+    except Exception:
+        pass
+    with _webadmin_email_lock:
+        _webadmin_email_state.update(at=now, result=result)
+    return result
+
+
+def _webadmin_email_remind_tick():
+    """Mail the Guard Dog alert address while webadmin's email is a placeholder: at once,
+    then every WEBADMIN_EMAIL_REMIND_S until it is fixed. Never raises."""
+    try:
+        st = _webadmin_email_status(force=True)
+        if not st.get('needs_action'):
+            return
+        settings = load_settings()
+        to_addr = (settings.get('guarddog_alert_email') or '').strip()
+        last = float(settings.get('webadmin_email_reminder_last') or 0)
+        if not to_addr or time.time() - last < WEBADMIN_EMAIL_REMIND_S:
+            return
+        host = (settings.get('fqdn') or settings.get('server_ip') or 'this server')
+        body = '\n'.join([
+            f'ACTION NEEDED on {host}: give the webadmin account a real email address.',
+            '',
+            f"webadmin's email in Authentik is {st.get('email') or '(empty)'}. infra-TAK made",
+            'this address up, and nobody receives mail there. If you forget the webadmin',
+            'password, "Forgot password?" cannot reach you, and you can be locked out of the',
+            'infra-TAK console.',
+            '',
+            'How to fix it (2 minutes):',
+            f"1. Open Authentik: {st.get('authentik_url') or 'the Authentik link on the console'}",
+            '   and sign in as webadmin (or akadmin).',
+            '2. Click "Admin interface" (top right). Do NOT use the user Settings page:',
+            '   it says "Not allowed to change email address".',
+            '3. Go to Directory -> Users -> webadmin -> Edit User.',
+            '4. In Email, type an address you read. Click Save Changes.',
+            '5. In the infra-TAK console, type "I have changed email" in the box on the',
+            '   yellow banner, then click Confirm. The banner and these emails stop.',
+            '',
+            'Password reset email also needs Email Relay to be set up.',
+            '',
+            'Guard Dog sends this reminder every 3 days until the email is changed.',
+        ])
+        if _guarddog_send_alert_email_via_relay(to_addr, f'[{host}] Action needed: set a real email for webadmin', body):
+            settings = load_settings()
+            settings['webadmin_email_reminder_last'] = int(time.time())
+            save_settings(settings)
+            print('[guarddog] webadmin recovery-email reminder sent', flush=True)
+    except Exception as e:
+        print(f'[guarddog] webadmin recovery-email reminder error (non-fatal): {str(e)[:120]}', flush=True)
+
+
+def _webadmin_email_watch():
+    """Background: first check a few minutes after start, then hourly."""
+    time.sleep(240)
+    while True:
+        _webadmin_email_remind_tick()
+        time.sleep(3600)
+
+
+@app.route('/api/authentik/webadmin-email-status')
+@login_required
+def authentik_webadmin_email_status_api():
+    """Drives the webadmin recovery-email banner on the console pages."""
+    return jsonify(_webadmin_email_status())
+
+
+@app.route('/api/authentik/webadmin-email-confirm', methods=['POST'])
+@login_required
+def authentik_webadmin_email_confirm_api():
+    """"I have changed the email": re-read Authentik now. Clears only when Authentik shows a
+    real address, or when keep=true (the operator says the current address receives mail)."""
+    data = request.get_json(silent=True) or {}
+    # Deliberate on purpose (operator decision 2026-11-23): the operator types the phrase,
+    # it is not a one-click dismiss. The keep path has its own confirm dialog.
+    if data.get('keep') is not True:
+        _phrase = ' '.join(str(data.get('phrase') or '').split()).lower()
+        if _phrase != 'i have changed email':
+            return jsonify({'success': False, 'message': 'Type "I have changed email" in the box first.'}), 400
+    st = _webadmin_email_status(force=True)
+    if not st.get('needs_action'):
+        return jsonify({'success': True, 'message': 'Thanks — webadmin has a real recovery email now.'})
+    if data.get('keep') is True and st.get('email'):
+        settings = load_settings()
+        settings['webadmin_email_ack'] = st['email']
+        save_settings(settings)
+        audit('authentik:webadmin-email-ack', f"operator kept {st['email']}", force=True)
+        _webadmin_email_status(force=True)
+        return jsonify({'success': True, 'message': f"OK — keeping {st['email']}."})
+    return jsonify({'success': False,
+                    'message': (f"Authentik still shows {st.get('email') or 'no email'} for webadmin. "
+                                "Save the new address in Authentik (Admin interface → Directory → Users → "
+                                "webadmin → Edit User), then click this again.")})
+
+
 def _get_authentik_admin_accounts_status():
     """Return is_active/is_superuser for the protected admin accounts (akadmin, webadmin).
 
@@ -89195,6 +89738,9 @@ def _get_authentik_admin_accounts_status():
                     entry['exists'] = True
                     entry['is_active'] = bool(user_obj.get('is_active'))
                     entry['is_superuser'] = bool(user_obj.get('is_superuser'))
+                    entry['email'] = user_obj.get('email') or ''
+                    entry['email_placeholder'] = _ak_admin_email_is_placeholder(
+                        username, entry['email'], settings)
             except _err.HTTPError as e:
                 entry['error'] = f'Authentik API {e.code}'
                 if e.code in (401, 403):
@@ -89206,7 +89752,12 @@ def _get_authentik_admin_accounts_status():
 
     # If every API result is clean (no error), trust it.
     if api_attempted and not any(a.get('error') for a in api_accounts):
-        return {'available': True, 'source': 'api', 'accounts': api_accounts}
+        try:
+            _smtp = _authentik_smtp_configured()
+        except Exception:
+            _smtp = None
+        return {'available': True, 'source': 'api', 'accounts': api_accounts,
+                'smtp_configured': _smtp}
 
     # API failed (or token missing). Try ak shell fallback. This is the path
     # that recovers the panel when akadmin is deactivated.
@@ -101001,7 +101552,7 @@ def run_takserver_upgrade(pkg_path):
         subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=90)  # v10.0.1: container-aware
         if _get_authentik_env_content(settings):
             ulog("Syncing webadmin to Authentik (LDAP cache refresh)...")
-            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=False)
             if ok_wa:
                 ulog("\u2713 webadmin synced to Authentik")
             else:
@@ -101116,7 +101667,7 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
         ulog("Restarting TAK Server...")
         subprocess.run(_tak_systemctl('restart'), shell=True, capture_output=True, text=True, timeout=90)
         if _get_authentik_env_content(settings):
-            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=False)
             ulog("✓ webadmin synced to Authentik" if ok_wa else f"⚠ webadmin sync: {err_wa or 'failed'} — use Sync webadmin if 8446 login fails")
         generate_caddyfile(settings)
         _caddy_reload()
@@ -101905,7 +102456,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog("\u2713 TAK Server started")
         if _get_authentik_env_content(settings):
             ulog("Syncing webadmin to Authentik (LDAP cache refresh)...")
-            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=False)
             if ok_wa:
                 ulog("\u2713 webadmin synced to Authentik")
             else:
@@ -102140,7 +102691,7 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
             upgrade_log.append(f"  ⏳ {remaining//60:02d}:{remaining%60:02d} remaining")
         ulog("✓ TAK Server started")
         if _get_authentik_env_content(settings):
-            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False)
+            ok_wa, err_wa = _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=False)
             ulog("✓ webadmin synced to Authentik" if ok_wa else f"⚠ webadmin sync: {err_wa or 'failed'} — use Sync webadmin if 8446 login fails")
         generate_caddyfile(settings)
         _caddy_reload()
@@ -102900,7 +103451,7 @@ def _apt_update_capture(timeout=600, log_fn=None):
 
     ok, out = _run()
     # v10.2.10 (Cloudsmith 402): a dead Caddy Cloudsmith repo fails the update the same way.
-    _healed = (not ok and 'cloudsmith.io' in out and _caddy_apt_repo_heal() == 'dead')
+    _healed = (not ok and re.search(r'cloudsmith\.io', out) is not None and _caddy_apt_repo_heal() == 'dead')
     if not ok and (_apt_disable_dead_local_sources() or _healed):
         ok2, out2 = _run()
         if ok2:
@@ -102908,6 +103459,270 @@ def _apt_update_capture(timeout=600, log_fn=None):
                                 'and retried — update succeeded.\n' + out2).strip()
         return ok2, out2
     return ok, out
+
+
+# ops #1124: three fresh Ubuntu 22.04 boxes (ops #1111, Mon Nov 23) stopped at "apt-get install ...
+# timed out after 300 seconds". The download host answered but then sent nothing (0 KB/s for a
+# real package). The console's apt steps ran once, waited their whole limit and failed, with no
+# retry and no other host, so a customer whose mirror stalls the same way gets a failed deploy.
+# Now: an apt step that TIMES OUT is run once more. On Ubuntu, before that second try, the box's
+# Ubuntu hosts are swapped for one that delivers a real package (the same rule the fresh-install
+# test tool uses, ops PR 1114: it serves the suite and its -security pocket and gives one real
+# updated package above 100 KB/s; a probe only rejects, a fast answer proves nothing, ops #934).
+# The swap lasts for the second try only: the operator's own source files are put back after it.
+# Packages stay signed by Ubuntu's own keys, so a mirror cannot add anything apt would trust.
+_APT_STALL_HOSTS = {
+    'amd64': ('us.archive.ubuntu.com', 'mirrors.edge.kernel.org'),
+    'arm64': ('ports.ubuntu.com',),
+}
+_APT_MIRROR_MIN_KBS = 100
+_APT_MIRROR_PROBE_S = 15
+_APT_UBUNTU_HOST_RE = re.compile(
+    r'(https?://)((?:[A-Za-z0-9-]+\.)*archive\.ubuntu\.com|security\.ubuntu\.com'
+    r'|(?:[A-Za-z0-9-]+\.)*ports\.ubuntu\.com)(?=[/\s]|$)')
+_APT_PROBE_FILE_RE = re.compile(r'pool/[A-Za-z0-9._+~/-]+')
+
+
+def _apt_is_ubuntu():
+    try:
+        with open('/etc/os-release') as f:
+            for line in f:
+                if line.startswith('ID='):
+                    return line.split('=', 1)[1].strip().strip('"').lower() == 'ubuntu'
+    except Exception:
+        pass
+    return False
+
+
+def _apt_ubuntu_source_files():
+    files = ['/etc/apt/sources.list']
+    try:
+        d = '/etc/apt/sources.list.d'
+        files += [os.path.join(d, f) for f in sorted(os.listdir(d))
+                  if f.endswith(('.list', '.sources'))]
+    except Exception:
+        pass
+    return files
+
+
+def _apt_current_host():
+    """The first Ubuntu host the apt source files name ('' when none)."""
+    for p in _apt_ubuntu_source_files():
+        try:
+            with open(p, 'r', errors='replace') as f:
+                m = _APT_UBUNTU_HOST_RE.search(f.read())
+        except Exception:
+            continue
+        if m:
+            return m.group(2)
+    return ''
+
+
+def _apt_rewrite_hosts(text, new_host, base):
+    """`text` with every Ubuntu host (archive, security, ports) swapped for new_host. ARM mirrors
+    serve /ubuntu-ports where the x86 ones serve /ubuntu."""
+    out = _APT_UBUNTU_HOST_RE.sub(lambda m: m.group(1) + new_host, text)
+    if base == 'ubuntu-ports':
+        out = re.sub(r'(https?://' + re.escape(new_host) + r')/ubuntu(?=[/\s]|$)',
+                     r'\1/ubuntu-ports', out)
+    return out
+
+
+def _apt_probe_file(gz_path):
+    """One 1.5 to 8 MB package path out of a mirror's -updates Packages.gz ('' when none)."""
+    import gzip
+    try:
+        with gzip.open(gz_path, 'rt', errors='replace') as f:
+            text = f.read()
+    except Exception:
+        return ''
+    for stanza in text.split('\n\n'):
+        fn, size = '', 0
+        for line in stanza.splitlines():
+            if line.startswith('Filename: '):
+                fn = line[10:].strip()
+            elif line.startswith('Size: '):
+                try:
+                    size = int(line[6:].strip())
+                except ValueError:
+                    size = 0
+        if fn and 1500000 <= size <= 8000000 and _APT_PROBE_FILE_RE.fullmatch(fn) and '..' not in fn:
+            return fn
+    return ''
+
+
+def _apt_probe_kbs(host, base, suite, arch, run=None):
+    """Speed in KB/s of one recently updated package from `host` (0 when nothing came). The
+    package comes from the -updates index, so a mirror that is quick for index files and
+    stalls on new packages is caught (ops #934)."""
+    run = run or subprocess.run
+    t = str(_APT_MIRROR_PROBE_S)
+    d = tempfile.mkdtemp(prefix='infratak-aptprobe-')
+    try:
+        gz = os.path.join(d, 'Packages.gz')
+        r = run(['curl', '-s', '--max-time', t, '-o', gz, '-w', '%{speed_download}',
+                 f'http://{host}/{base}/dists/{suite}-updates/main/binary-{arch}/Packages.gz'],
+                capture_output=True, text=True, timeout=_APT_MIRROR_PROBE_S + 10)
+        bps = r.stdout
+        fn = _apt_probe_file(gz)
+        if fn:
+            r = run(['curl', '-s', '--max-time', t, '-o', '/dev/null', '-w', '%{speed_download}',
+                     f'http://{host}/{base}/{fn}'],
+                    capture_output=True, text=True, timeout=_APT_MIRROR_PROBE_S + 10)
+            bps = r.stdout
+        return int(float((bps or '0').strip() or 0) / 1024)
+    except Exception:
+        return 0
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _apt_mirror_ok(host, base, suite, arch, run=None):
+    """True when `host` serves the suite AND its -security pocket and delivers one real package
+    above _APT_MIRROR_MIN_KBS. `host`, `base` and `suite` are fixed literals or a codename that
+    matched [a-z]+; they go to curl as arguments, never to a shell."""
+    run = run or subprocess.run
+    for pocket in (suite, suite + '-security'):
+        try:
+            r = run(['curl', '-fs', '--max-time', str(_APT_MIRROR_PROBE_S), '-o', '/dev/null',
+                     f'http://{host}/{base}/dists/{pocket}/Release'],
+                    capture_output=True, text=True, timeout=_APT_MIRROR_PROBE_S + 10)
+        except Exception:
+            return False
+        if r.returncode != 0:
+            return False
+    return _apt_probe_kbs(host, base, suite, arch, run=run) >= _APT_MIRROR_MIN_KBS
+
+
+def _apt_pick_mirror(log_fn=None, run=None):
+    """(host, base) of a mirror that delivers, other than the one the box already uses, or None."""
+    log = log_fn or (lambda m: None)
+    suite = _apt_codename()
+    if not re.fullmatch(r'[a-z]+', suite or ''):
+        return None
+    arch = _host_arch()
+    base = 'ubuntu-ports' if arch == 'arm64' else 'ubuntu'
+    current = _apt_current_host()
+    for cand in _APT_STALL_HOSTS.get(arch, ()):
+        if cand == current:
+            continue
+        if _apt_mirror_ok(cand, base, suite, arch, run=run):
+            return cand, base
+        log(f"  apt host {cand} did not deliver a real package, not used")
+    return None
+
+
+def _apt_switch_ubuntu_hosts(new_host, base, log_fn=None):
+    """Point every apt source file that names an Ubuntu host at new_host. Returns
+    {path: original text} for the files changed ({} when none, or when a write failed, in which
+    case the files already changed are put back first). Third-party repos (PGDG, Docker, Caddy)
+    never match the host pattern and are not touched."""
+    saved = {}
+    try:
+        for p in _apt_ubuntu_source_files():
+            try:
+                with open(p, 'r', errors='replace') as f:
+                    body = f.read()
+            except Exception:
+                continue
+            new = _apt_rewrite_hosts(body, new_host, base)
+            if new == body:
+                continue
+            saved[p] = body
+            _write_priv(p, new)
+    except Exception as e:
+        if log_fn:
+            log_fn(f"  ⚠ could not change the apt sources ({type(e).__name__}: {e}); keeping the box's own host")
+        _apt_restore_sources(saved, log_fn)
+        return {}
+    return saved
+
+
+def _apt_restore_sources(saved, log_fn=None):
+    """Put the operator's apt source files back exactly as they were."""
+    for p, body in saved.items():
+        try:
+            _write_priv(p, body)
+        except Exception as e:
+            if log_fn:
+                log_fn(f"  ⚠ could not restore {p}: {type(e).__name__}: {e}")
+
+
+def _apt_stalled(r):
+    """True when an apt step ran out of time (returncode 124, or the 'timed out after' text), or
+    when apt gave up on a download host that sent nothing, in its own words ("Connection timed
+    out", "Could not connect", "Temporary failure resolving", see _APT_TRANSIENT_RE). apt's own
+    120 s no-data limit usually fires before the console's step limit, so both must count. Any
+    other failure (a missing package, a held lock, a bad signature) is not a stall."""
+    out = f"{getattr(r, 'stdout', '') or ''}{getattr(r, 'stderr', '') or ''}"
+    # `takwerx_broker: TIMEOUT: command timed out` is the non-root broker stopping apt-get at the
+    # deadline the console sent (_apt_broker_env); its exit code is 126, not 124.
+    return (r.returncode == 124 or 'timed out after' in out or 'TIMEOUT: command timed out' in out
+            or _apt_failure_is_transient(out))
+
+
+def _apt_broker_env(timeout, env=None):
+    """`env` (default: the console's) with TAKWERX_BROKER_TIMEOUT a little under `timeout`. On a
+    non-root box the console runs apt through the broker; when the console gives up on a step it
+    only kills its own brokerctl, and the root apt-get kept running, holding the dpkg lock, so
+    the second try died with "Could not get lock" (ops #1124 box test: 5 minutes later it was
+    still there). This value rides the request, and the broker kills apt-get at that time."""
+    out = dict(env if env is not None else os.environ)
+    out['TAKWERX_BROKER_TIMEOUT'] = str(max(int(timeout) - 10, 30))
+    return out
+
+
+def _apt_chain_run(cmds, timeout, **kw):
+    """_run_priv_chain with a timeout turned into returncode 124, so the caller can retry it."""
+    kw['env'] = _apt_broker_env(timeout, kw.get('env'))
+    try:
+        return _run_priv_chain(cmds, 'and', timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            cmds, 124, '', f"timed out after {timeout} seconds (slow package mirror or a stuck package manager)")
+
+
+def _apt_retry_stalled(run_once, log_fn=None):
+    """Run one apt step; if it TIMES OUT, run it once more (ops #1124). `run_once()` returns a
+    CompletedProcess (returncode 124 for a timeout). Any other failure is returned as it is: it
+    keeps today's handling. On Ubuntu the second try runs on a download host that delivers a
+    real package, with the box's source files put back afterwards. When no other host
+    delivers, the second try runs on the box's own host and the log says so."""
+    r = run_once()
+    if r.returncode == 0 or not _apt_stalled(r):
+        return r
+    log = log_fn or (lambda m: None)
+    log("  ⚠ The package step stalled or timed out (a download host that answers but sends nothing?). Trying once more.")
+    _apt_wait_for_lock(150, log_fn)
+    saved, host = {}, ''
+    try:
+        if _apt_is_ubuntu():
+            pick = _apt_pick_mirror(log_fn)
+            if pick:
+                saved = _apt_switch_ubuntu_hosts(pick[0], pick[1], log_fn)
+            if saved:
+                host = pick[0]
+                log(f"  Second try uses {host} (it delivered a real package just now).")
+                try:
+                    _apt_chain_run([['apt-get', 'update', '-qq']], 300)
+                except Exception:
+                    pass
+            else:
+                log("  No other apt host delivered a real package. Second try uses the box's own host.")
+        r2 = run_once()
+    finally:
+        if saved:
+            _apt_restore_sources(saved, log_fn)
+            try:
+                _apt_chain_run([['apt-get', 'update', '-qq']], 180)
+            except Exception:
+                pass
+    if r2.returncode != 0:
+        note = ('[infra-TAK] The first try stalled or timed out. The second try ran on '
+                f"{host or 'the box own host'} and failed too. ")
+        return subprocess.CompletedProcess(r2.args, r2.returncode, r2.stdout,
+                                           note + (r2.stderr or ''))
+    return r2
 
 
 def _pgdg_gis_pin_ensure(log_fn=None):
@@ -104413,36 +105228,30 @@ def run_takserver_deploy(config):
             f'<nameEntry name="OU" value="{config["cert_ou"]}"/>\n</nameEntries>\n'
             f'</certificateConfig>\n{ca_cfg_line}\n'
             '</certificateSigning>\n<vbm enabled="false"/>')
+        # ops #1118: TAK Server holds CoreConfig in memory (loaded at the Step-5 first start,
+        # stock) and writes that copy back to disk when it shuts down — the same race the
+        # external-DB re-assert below measured (Azure 2026-09-19). Step 8 and the LDAP
+        # connect below used to edit the file while TAK ran, so the LDAP restart's
+        # shutdown put the stock config (plus serverId) back over them: no truststore-
+        # INTERMEDIATE-CA, no enrollment block, CloudTAK setup died UND_ERR_SOCKET
+        # (fresh Ubuntu 22.04, 10.4.4). Stop TAK FIRST so nothing can overwrite the edits,
+        # and so the next start loads them (its own shutdown write is then correct).
+        log_step("Stopping TAK Server so CoreConfig edits cannot be overwritten on its shutdown...")
+        run_cmd('systemctl stop takserver', check=False); time.sleep(10)
+        run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
         try:
             _cc = _read_priv('/opt/tak/CoreConfig.xml')
-            log_step("Enabling X.509 auth on 8089...")
-            # Pre-RELEASE43 5.7 artifacts ship an anonymous 8087 tcp input — flip it.
-            _cc = _cc.replace('<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>',
-                              '<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>')
-            # 5.7-RELEASE43+ stock CoreConfig ships the 8089 tls input directly (the 8087
-            # line survives only as a comment) — add auth="x509" to the live input. Both
-            # replaces no-op when their pattern is absent, so this is version-agnostic.
-            _cc = _cc.replace('<input _name="stdssl" protocol="tls" port="8089"',
-                              '<input auth="x509" _name="stdssl" protocol="tls" port="8089"')
-            log_step("Setting intermediate CA truststore...")
-            _cc = _cc.replace('truststoreFile="certs/files/truststore-root.jks',
-                              f'truststoreFile="certs/files/truststore-{int_ca}.jks')
-            log_step("Enabling certificate enrollment...")
-            # RELEASE43+ artifacts write `<vbm enabled="false" />` (space before the
-            # self-close); older ones have no space. Normalize so one replace serves
-            # both artifact generations. Guarded so a re-run over an already-patched
-            # file can't insert a duplicate certificateSigning block (cert_block
-            # re-appends the vbm anchor).
-            if ca_cfg_line not in _cc:
-                _cc = _cc.replace('<vbm enabled="false" />', '<vbm enabled="false"/>')
-                _cc = _cc.replace('<vbm enabled="false"/>', cert_block)
-            _cc = _cc.replace('<auth>', '<auth x509useGroupCache="true">')
-            if config.get('enable_admin_ui') or config.get('enable_webtak'):
-                admin_ui = str(config.get('enable_admin_ui', False)).lower()
-                webtak = str(config.get('enable_webtak', False)).lower()
-                log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}")
-                _cc = _cc.replace('"cert_https"/',
-                                  f'"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/')
+            if isinstance(_cc, (bytes, bytearray)):
+                _cc = _cc.decode('utf-8', 'replace')
+            log_step("Enabling X.509 auth on 8089, intermediate truststore and certificate enrollment...")
+            _wt = bool(config.get('enable_admin_ui') or config.get('enable_webtak'))
+            if _wt:
+                log_step(f"WebTAK: AdminUI={str(config.get('enable_admin_ui', False)).lower()}, "
+                         f"WebTAK={str(config.get('enable_webtak', False)).lower()}")
+            _cc = _coreconfig_step8_apply(
+                _cc, int_ca, ca_cfg_line, cert_block,
+                admin_ui=str(config.get('enable_admin_ui', False)).lower() if _wt else None,
+                webtak=str(config.get('enable_webtak', False)).lower() if _wt else None)
             _write_priv('/opt/tak/CoreConfig.xml', _cc)
             # v10.1.14 (W6): verify the edits actually landed. These failures used to be
             # swallowed (one log line, deploy still "succeeded") — a broker hiccup left
@@ -104453,15 +105262,7 @@ def run_takserver_deploy(config):
             _cc_check = _read_priv('/opt/tak/CoreConfig.xml')
             if isinstance(_cc_check, (bytes, bytearray)):
                 _cc_check = _cc_check.decode('utf-8', 'replace')
-            _missing = [_m for _m, _ok in (
-                (f'intermediate truststore (truststore-{int_ca}.jks)', f'truststore-{int_ca}.jks' in _cc_check),
-                # v10.1.23: match OUR single-line inserted block, not the bare element
-                # name — RELEASE43's stock example ships a commented-out multi-line
-                # certificateSigning template containing "TAKServerCAConfig" and
-                # "intermediate-signing.jks", which spoofed this check on unpatched files.
-                ('certificateSigning enrollment block', ca_cfg_line in _cc_check),
-                ('x509 auth input on 8089', 'auth="x509"' in _cc_check),
-            ) if not _ok]
+            _missing = _coreconfig_step8_missing(_cc_check, int_ca, ca_cfg_line)
             if _missing:
                 raise RuntimeError(f"post-write verification failed — missing: {', '.join(_missing)}")
         except Exception as _cce:
@@ -104557,6 +105358,31 @@ def run_takserver_deploy(config):
             log_step(f"LDAP resync: {resync_msg}")
         run_cmd('systemctl stop takserver'); time.sleep(10)
         run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
+
+        # ops #1118: belt and braces — with TAK stopped, confirm the Step-8 edits are still
+        # in the file and put them back if anything rewrote them (nothing is running now
+        # that could undo it). The earlier stop makes this a no-op on a healthy deploy.
+        try:
+            _cc_s8 = _read_priv('/opt/tak/CoreConfig.xml')
+            if isinstance(_cc_s8, (bytes, bytearray)):
+                _cc_s8 = _cc_s8.decode('utf-8', 'replace')
+            _s8_gone = _coreconfig_step8_missing(_cc_s8 or '', int_ca, ca_cfg_line)
+            if _s8_gone:
+                log_step(f"  CoreConfig lost its Step-8 edits ({', '.join(_s8_gone)}) — re-applying with TAK stopped...")
+                _wt2 = bool(config.get('enable_admin_ui') or config.get('enable_webtak'))
+                _cc_s8 = _coreconfig_step8_apply(
+                    _cc_s8, int_ca, ca_cfg_line, cert_block,
+                    admin_ui=str(config.get('enable_admin_ui', False)).lower() if _wt2 else None,
+                    webtak=str(config.get('enable_webtak', False)).lower() if _wt2 else None)
+                _write_priv('/opt/tak/CoreConfig.xml', _cc_s8)
+                _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
+                _still = _coreconfig_step8_missing(_read_priv('/opt/tak/CoreConfig.xml') or '', int_ca, ca_cfg_line)
+                if _still:
+                    raise RuntimeError(f"still missing after re-apply: {', '.join(_still)}")
+                log_step("✓ Step-8 CoreConfig edits re-asserted")
+        except Exception as _s8e:
+            log_step(f"  ✗ CoreConfig Step-8 re-check FAILED: {_s8e} — not starting a misconfigured TAK Server.")
+            deploy_status.update({'error': True, 'running': False}); return
 
         # For external_db: re-assert the JDBC target now that TAK is STOPPED.
         #
@@ -118301,6 +119127,48 @@ def _ensure_console_cert_docker_san(settings):
         return f"console cert SAN check error (non-fatal): {str(e)[:100]}"
 
 
+def _coreconfig_step8_apply(cc, int_ca, ca_cfg_line, cert_block, admin_ui=None, webtak=None):
+    """Pure text transform for TAK deploy Step 8 (ops #1118): X.509 on 8089, the
+    intermediate truststore, the certificateSigning enrollment block, x509useGroupCache
+    and (optionally) the WebTAK flags. Idempotent over an already-patched file."""
+    # Pre-RELEASE43 5.7 artifacts ship an anonymous 8087 tcp input — flip it.
+    cc = cc.replace('<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>',
+                    '<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>')
+    # 5.7-RELEASE43+ stock CoreConfig ships the 8089 tls input directly (the 8087
+    # line survives only as a comment) — add auth="x509" to the live input. Both
+    # replaces no-op when their pattern is absent, so this is version-agnostic.
+    cc = cc.replace('<input _name="stdssl" protocol="tls" port="8089"',
+                    '<input auth="x509" _name="stdssl" protocol="tls" port="8089"')
+    cc = cc.replace('truststoreFile="certs/files/truststore-root.jks',
+                    f'truststoreFile="certs/files/truststore-{int_ca}.jks')
+    # RELEASE43+ artifacts write `<vbm enabled="false" />` (space before the
+    # self-close); older ones have no space. Normalize so one replace serves
+    # both artifact generations. Guarded so a re-run over an already-patched
+    # file can't insert a duplicate certificateSigning block (cert_block
+    # re-appends the vbm anchor).
+    if ca_cfg_line not in cc:
+        cc = cc.replace('<vbm enabled="false" />', '<vbm enabled="false"/>')
+        cc = cc.replace('<vbm enabled="false"/>', cert_block)
+    cc = cc.replace('<auth>', '<auth x509useGroupCache="true">')
+    if admin_ui is not None and webtak is not None:
+        cc = cc.replace('"cert_https"/',
+                        f'"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/')
+    return cc
+
+
+def _coreconfig_step8_missing(cc, int_ca, ca_cfg_line):
+    """Names of the Step-8 edits that are NOT in this CoreConfig text (empty = all there)."""
+    return [_m for _m, _ok in (
+        (f'intermediate truststore (truststore-{int_ca}.jks)', f'truststore-{int_ca}.jks' in cc),
+        # v10.1.23: match OUR single-line inserted block, not the bare element
+        # name — RELEASE43's stock example ships a commented-out multi-line
+        # certificateSigning template containing "TAKServerCAConfig" and
+        # "intermediate-signing.jks", which spoofed this check on unpatched files.
+        ('certificateSigning enrollment block', ca_cfg_line in cc),
+        ('x509 auth input on 8089', 'auth="x509"' in cc),
+    ) if not _ok]
+
+
 def _heal_takserver_coreconfig_step8():
     """v10.1.14 (W6): repair CoreConfigs damaged by silently-swallowed Step-8 writes.
 
@@ -121250,6 +122118,12 @@ def _startup_migrations():
                              name='authentik-group-names').start()
         except Exception as _gn_err:
             print(f"Startup: Authentik group name watch start error (non-fatal): {_gn_err}")
+        # webadmin recovery email: Guard Dog reminder until it is a real address.
+        try:
+            threading.Thread(target=_webadmin_email_watch, daemon=True,
+                             name='webadmin-email-watch').start()
+        except Exception as _we_err:
+            print(f"Startup: webadmin email watch start error (non-fatal): {_we_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()
@@ -121624,6 +122498,10 @@ def _post_update_auto_deploy():
             # Repaired on the shared mount, so no TAK restart.
             if _tak_is_container():
                 _tak_repair_container_healthchecks(lambda m: print(f"Post-update:{m}", flush=True))
+
+            # GH #667: a relay deployed before this fix sends mail for root nowhere.
+            # Idempotent; no-op without a relay.
+            _emailrelay_sync_root_alias()
 
             # v10.2.8 W11d — CloudTAK whose cert came from a CA this TAK no longer has (a
             # container upgrade or CA replacement) cannot log anyone in; re-issue it from the
@@ -124091,6 +124969,7 @@ _MODULE_CTX = {
     '_fw_allow': _fw_allow,
     '_fw_remove': _fw_remove,
     '_sudo_wrap': _sudo_wrap,
+    '_safe_alert_emails': _safe_alert_emails,   # GH #667: emailrelay reads Guard Dog's address
     'run_cmd': run_cmd,
     'os_type': _distro_family,      # callable -> 'debian' | 'rhel'
     '_host_arch': _host_arch,
