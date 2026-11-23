@@ -115,7 +115,7 @@ def test_run_cloudtak_update_asks_without_fallback_and_refuses_downgrade():
     src = src[:src.index('\ndef ', 10)]
     assert 'allow_fallback=False' in src
     assert 'if not release_tag:' in src
-    assert 'not downgrading' in src
+    assert 'is newer than the version we test' in src   # ops #1134 wording
     # the stop happens before anything touches the tree
-    assert src.index('not downgrading') < src.index('Step 2/3')
+    assert src.index('is newer than the version we test') < src.index('Step 2/3')
     assert src.index('if not release_tag:') < src.index('Step 2/3')
