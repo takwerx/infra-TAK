@@ -36,7 +36,8 @@ _NAMES = ('_caddy_vhost_block', '_vhost_uses_sso', '_takportal_vhost_lines',
           '_takportal_vhost_is_closed', '_caddy_forward_auth_lines')
 _CONSTS = ('_TAKPORTAL_VHOST_MARKER', '_TAKPORTAL_PUBLIC_PATHS', '_CADDY_STRIP_AUTHENTIK_HEADERS',
            '_TAKPORTAL_AK_COPY_HEADERS', 'CADDYFILE_USER_BLOCKS_MARKER',
-           '_CADDY_FORWARD_AUTH_URI', '_CADDY_FORWARD_AUTH_PIN')
+           '_CADDY_FORWARD_AUTH_URI', '_CADDY_FORWARD_AUTH_PIN',
+           '_CADDY_APP_HEADER', '_CADDY_APP_LOCK_MATCHER', '_CADDY_APP_LOCK_TEXT', '_CADDY_APP_SLUG_RE')
 PORTAL = '127.0.0.1:3000'
 AK = '127.0.0.1:9090'
 
@@ -143,7 +144,7 @@ def test_generate_caddyfile_uses_the_helpers_and_has_no_bare_proxy():
     blk = src[i:src.index("_emit_alias_redirect(_get_service_alias(settings, 'takportal')", i)]
     assert 'reverse_proxy {portal_up}' not in blk
     assert '_vhost_uses_sso(ak, _tp_existing, _TAKPORTAL_VHOST_MARKER)' in blk
-    assert '_takportal_vhost_lines(portal_up, ak_up, _tp_sso, _tp_rescue)' in blk
+    assert '_takportal_vhost_lines(portal_up, ak_up, _tp_sso, _tp_rescue,' in blk
     assert "if ak.get('installed')" not in blk
 
 

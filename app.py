@@ -39038,7 +39038,7 @@ MEDIAMTX_OPEN_PATHS = ('/watch/*', '/shared/*', '/shared-hls/*')
 _MEDIAMTX_VHOST_MARKER = '# MediaMTX Web Console'
 
 
-def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue, login_ok=False):
+def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue, login_ok=False, app=''):
     """Append the MediaMTX stream-domain vhost to `lines` (called by generate_caddyfile).
 
     v10.2.6: with Authentik, /hls-proxy/* goes through the login to the web editor, whose
@@ -39100,7 +39100,7 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
             lines.append("        request_header /hls-proxy/* -Authorization")
         emit_rescue(f"{_pub_url(mtx_host)}/")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-        lines.extend(_caddy_forward_auth_lines(ak_up, "        ", _CADDY_AK_COPY_HEADERS))
+        lines.extend(_caddy_forward_auth_lines(ak_up, "        ", _CADDY_AK_COPY_HEADERS, app=app))
         lines.append(f"        reverse_proxy {mtx_up}")
         lines.append("    }")
     elif login_ok:
@@ -42107,17 +42107,188 @@ _CADDY_FORWARD_AUTH_PIN = ('header_up X-Forwarded-Host {http.request.hostport}',
                            'header_up X-Forwarded-Proto {http.request.scheme}')
 
 
-def _caddy_forward_auth_lines(ak_up, indent, copy_headers='', matcher=''):
+# ops #1108: after the sign-in check, the site compares the application the outpost answered
+# for with its own. The outpost names it in X-authentik-meta-app (authentik
+# internal/outpost/proxyv2/application/mode_common.go, version/2026.8.5). The slug of each
+# site comes from Authentik's own provider list and is kept in .config/forward_auth_apps.json
+# (0600); a site that is not in it gets the check with no compare, never a guessed name.
+_CADDY_APP_HEADER = 'X-Authentik-Meta-App'
+_CADDY_APP_LOCK_MATCHER = '@ak_other_app'
+_CADDY_APP_LOCK_TEXT = ('Sign-in was checked for another application. '
+                        'Restart the infra-TAK console, then try again.')
+_CADDY_APP_SLUG_RE = re.compile(r'[A-Za-z0-9_-]{1,100}')
+_CADDY_APP_LOCK_FILE = os.path.join(CONFIG_DIR, 'forward_auth_apps.json')
+_caddy_app_lock_cache = {'ts': 0.0}
+
+
+def _caddy_forward_auth_lines(ak_up, indent, copy_headers='', matcher='', app=''):
     """Caddy lines of one Authentik forward_auth block, each starting with `indent`.
     copy_headers: the X-Authentik-* names handed on to the backend ('' for none).
-    matcher: a named matcher such as '@needs_sso' ('' for every request)."""
-    target = f'{matcher} {ak_up}' if matcher else f'{ak_up}'
-    out = [f'forward_auth {target} {{', f'    {_CADDY_FORWARD_AUTH_URI}']
-    if copy_headers:
-        out.append(f'    copy_headers {copy_headers}')
-    out += [f'    {pin}' for pin in _CADDY_FORWARD_AUTH_PIN]
-    out.append('}')
+    matcher: a named matcher such as '@needs_sso' ('' for every request).
+    app: the Authentik application slug of this site ('' when it is not known). With it, a
+    request passes only when the outpost answered for that application (ops #1108)."""
+    locked = isinstance(app, str) and bool(_CADDY_APP_SLUG_RE.fullmatch(app))
+    # With an application the backend still gets only the headers it got before, unless it
+    # asked for this one (TAK Portal does).
+    keep = _CADDY_APP_HEADER.lower() in (copy_headers or '').lower().split()
+    copy = f'{copy_headers} {_CADDY_APP_HEADER}'.strip() if locked and not keep else copy_headers
+    # Behind a matcher the compare must see only the requests that were checked, so the
+    # check and the compare go into one `route MATCHER` block.
+    target = f'{matcher} {ak_up}' if matcher and not locked else f'{ak_up}'
+    check = [f'forward_auth {target} {{', f'    {_CADDY_FORWARD_AUTH_URI}']
+    if copy:
+        check.append(f'    copy_headers {copy}')
+    check += [f'    {pin}' for pin in _CADDY_FORWARD_AUTH_PIN]
+    check.append('}')
+    if not locked:
+        return [indent + line for line in check]
+    # The client's own copy of the header is removed first, the answer's copy is compared as
+    # one exact value, and an answer without it is refused. The group header is not read: a
+    # group name can hold its separator (ops #1082). Live requests on Caddy 2.7.6 and 2.11.4.
+    check += [f'{_CADDY_APP_LOCK_MATCHER} not header {_CADDY_APP_HEADER} {app}',
+              f'respond {_CADDY_APP_LOCK_MATCHER} "{_CADDY_APP_LOCK_TEXT}" 403']
+    if not keep:
+        check.append(f'request_header -{_CADDY_APP_HEADER}')
+    out = [f'request_header -{_CADDY_APP_HEADER}']
+    if matcher:
+        out += [f'route {matcher} {{'] + ['    ' + line for line in check] + ['}']
+    else:
+        out += check
     return [indent + line for line in out]
+
+
+def _caddy_app_lock_map(providers):
+    """{site host[:port]: application slug} from Authentik's proxy provider list (ops #1108).
+    Only a forward_single provider with an application counts: only there is the site of a
+    request the provider's own external_host. A host that two providers name gets no entry,
+    because nobody can say which application the outpost answers for."""
+    found, twice = {}, set()
+    for p in providers or []:
+        if not isinstance(p, dict) or p.get('mode') != 'forward_single':
+            continue
+        slug = p.get('assigned_application_slug') or ''
+        m = re.fullmatch(r'https?://([^/\s]+)/?', (p.get('external_host') or '').strip())
+        if not m or not isinstance(slug, str) or not _CADDY_APP_SLUG_RE.fullmatch(slug):
+            continue
+        host = m.group(1).lower()
+        if host in found:
+            twice.add(host)
+        found[host] = slug
+    return {h: s for h, s in found.items() if h not in twice}
+
+
+def _caddy_app_lock_saved():
+    """The saved {site: application slug} map, {} when there is none."""
+    try:
+        with open(_CADDY_APP_LOCK_FILE) as f:
+            apps = (json.load(f) or {}).get('apps')
+        return apps if isinstance(apps, dict) else {}
+    except Exception:
+        return {}
+
+
+def _caddy_app_lock_save(apps):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = _CADDY_APP_LOCK_FILE + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump({'apps': apps}, f, sort_keys=True)
+    os.replace(tmp, _CADDY_APP_LOCK_FILE)
+
+
+def _caddy_app_lock_refresh(plog=None, timeout=20, retries=2):
+    """Read from Authentik which application belongs to each site, and save it (ops #1108).
+    Returns the map, or None when Authentik gave no usable answer. Then the saved map stays
+    as it is: a slow or stopped Authentik never removes and never changes a compare."""
+    log = plog or (lambda m: None)
+    try:
+        if not os.path.exists(os.path.expanduser('~/authentik/.env')):
+            return None
+        s = load_settings()
+        token = (_get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                 or _get_authentik_env_value(s, 'AUTHENTIK_TOKEN'))
+        ak_url = _get_authentik_api_url(s)
+        if not token or not ak_url:
+            return None
+        resp = _ak_api_call(f'{ak_url}/api/v3/providers/proxy/?page_size=200',
+                            headers={'Authorization': f'Bearer {token}',
+                                     'Content-Type': 'application/json'},
+                            max_retries=retries, timeout=timeout)
+        data = json.loads(resp.read().decode())
+        if not isinstance(data, dict) or not isinstance(data.get('results'), list):
+            return None
+        if (data.get('pagination') or {}).get('next'):
+            log('sign-in application compare: more than 200 proxy providers, kept as it is')
+            return None
+        apps = _caddy_app_lock_map(data['results'])
+        if apps != _caddy_app_lock_saved():
+            _caddy_app_lock_save(apps)
+        return apps
+    except Exception as e:
+        log('sign-in application compare: no answer from Authentik (%s), kept as it is'
+            % str(e)[:100])
+        return None
+
+
+def _caddy_app_lock_apps():
+    """The {site: application slug} map for generate_caddyfile(). It asks Authentik at most
+    once in 5 minutes (one short try), so a module deploy that made a new application gets
+    its compare with the Caddyfile that the deploy writes. Otherwise the saved map."""
+    now = time.time()
+    if now - _caddy_app_lock_cache['ts'] >= 300:
+        _caddy_app_lock_cache['ts'] = now
+        apps = _caddy_app_lock_refresh(timeout=5, retries=1)
+        if apps is not None:
+            return apps
+    return _caddy_app_lock_saved()
+
+
+def _caddy_app_lock_slug(apps, host, settings=None):
+    """Application slug for the sign-in check of the site `host`, '' when it is not known."""
+    if not host or not isinstance(apps, dict):
+        return ''
+    slug = apps.get(_pub_hostport(host, settings).lower())
+    return slug if isinstance(slug, str) and _CADDY_APP_SLUG_RE.fullmatch(slug) else ''
+
+
+def _caddyfile_app_locks(caddyfile):
+    """Sorted application slugs that the infra-TAK part of a Caddyfile text compares."""
+    gen = (caddyfile or '').split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    return sorted(re.findall(r'(?m)^[ \t]*%s not header %s (\S+)[ \t]*$'
+                             % (re.escape(_CADDY_APP_LOCK_MATCHER), re.escape(_CADDY_APP_HEADER)),
+                             gen))
+
+
+def _caddy_app_lock_converge(plog=None):
+    """ops #1108 — run when Authentik answers (console start, after an update): every site
+    with a sign-in check also compares the application. Rebuilds the Caddyfile only when the
+    map changed or the file on disk holds no compare yet. Never raises."""
+    log = plog or (lambda m: print(f'Startup migration: {m}', flush=True))
+    try:
+        if not os.path.exists(CADDYFILE_PATH):
+            return
+        before = _caddy_app_lock_saved()
+        apps = _caddy_app_lock_refresh(log)
+        if apps is None:
+            return
+        _caddy_app_lock_cache['ts'] = time.time()
+        s = load_settings()
+        if not (s.get('fqdn') or '').strip():
+            return
+        if apps == before and (not apps or _caddyfile_app_locks(_read_priv(CADDYFILE_PATH))):
+            return
+        generate_caddyfile(s)
+        if not _CADDY_REGISTRY_READY.is_set():
+            log('sign-in application compare queued: written with the post-registry '
+                'Caddyfile regen (ops #1108).')
+            return
+        now = _caddyfile_app_locks(_read_priv(CADDYFILE_PATH))
+        _ok, _detail = _caddy_reload_if_changed(timeout=60)
+        log('sign-in application compare: %d site(s) (%s), Caddy %s (ops #1108).'
+            % (len(now), ', '.join(now) or 'none',
+               'reloaded' if _ok else 'reload FAILED: ' + _detail[:120]))
+    except Exception as e:
+        log('sign-in application compare: converge error (non-fatal): %s' % str(e)[:160])
 
 
 def _caddyfile_forward_auth_pinned(caddyfile):
@@ -42154,7 +42325,7 @@ def _vhost_uses_sso(ak, existing_caddyfile, marker):
     return 'forward_auth' in _caddy_vhost_block(existing_caddyfile, marker)
 
 
-def _takportal_vhost_lines(portal_up, ak_up, use_sso, rescue_lines=()):
+def _takportal_vhost_lines(portal_up, ak_up, use_sso, rescue_lines=(), app=''):
     """Caddy lines for the TAK Portal vhost after its log / encoding lines. Fails closed:
     without Authentik the vhost answers 503 and nothing reaches TAK Portal."""
     if not use_sso:
@@ -42173,7 +42344,7 @@ def _takportal_vhost_lines(portal_up, ak_up, use_sso, rescue_lines=()):
                f'            reverse_proxy {portal_up}',
                '        }',
                '']
-            + _caddy_forward_auth_lines(ak_up, '        ', _TAKPORTAL_AK_COPY_HEADERS)
+            + _caddy_forward_auth_lines(ak_up, '        ', _TAKPORTAL_AK_COPY_HEADERS, app=app)
             + ['',
                f'        reverse_proxy {portal_up}',
                '    }'])
@@ -42929,6 +43100,19 @@ def generate_caddyfile(settings=None):
         for _h in _AK_FWD_HEADERS:
             lines.append(f"{indent}request_header -{_h}")
 
+    # ops #1108: the Authentik application of each site, for the compare after its sign-in
+    # check. '' (no compare) for a site Authentik's provider list does not name.
+    try:
+        _fa_apps = _caddy_app_lock_apps()
+    except Exception:
+        _fa_apps = {}
+
+    def _fa_app(host):
+        try:
+            return _caddy_app_lock_slug(_fa_apps, host, settings)
+        except Exception:
+            return ''
+
     # v10.1.76 — TAK Client Feed: the ONE public, token-authed route family.
     # MUST be emitted BEFORE the catch-all `route {}` below. With Authentik installed
     # that catch-all applies forward_auth, and a machine consumer cannot complete an
@@ -43019,7 +43203,7 @@ def generate_caddyfile(settings=None):
         lines.append(f"            not path /api/*")
         lines.append(f"        }}")
         lines.extend(_caddy_forward_auth_lines(ak_up, "        ", _CADDY_AK_COPY_HEADERS,
-                                               matcher='@needs_sso'))
+                                               matcher='@needs_sso', app=_fa_app(infratak_host)))
         # v10.1.1 S1: attach the proxy-auth secret AFTER forward_auth, on the same
         # matcher — so it is present exactly when forward_auth passed (a 302'd
         # request never reaches this directive; /api/* skips both). The console
@@ -43080,7 +43264,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"        handle @nodered_public {{")
             lines.append(f"            reverse_proxy {nodered_up}")
             lines.append(f"        }}")
-            lines.extend(_caddy_forward_auth_lines(ak_up, "        "))
+            lines.extend(_caddy_forward_auth_lines(ak_up, "        ", app=_fa_app(nodered_host)))
             lines.append(f"        reverse_proxy {nodered_up}")
             lines.append(f"    }}")
         else:
@@ -43200,7 +43384,8 @@ def generate_caddyfile(settings=None):
             _emit_outpost_callback_rescue(f"{_pub_url(portal_host, settings)}/")
             _tp_rescue = lines[_n:]
             del lines[_n:]
-        lines += _takportal_vhost_lines(portal_up, ak_up, _tp_sso, _tp_rescue)
+        lines += _takportal_vhost_lines(portal_up, ak_up, _tp_sso, _tp_rescue,
+                                        app=_fa_app(portal_host))
         lines.append(f"}}")
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'takportal'), portal_host)
@@ -43314,7 +43499,8 @@ def generate_caddyfile(settings=None):
             ak_up if _mtx_ak else None,
             _get_mediamtx_hls_upstream(settings) if _mtx_direct else None,
             _emit_ak_header_strip, _emit_outpost_callback_rescue,
-            login_ok=_mtx_ak or _mediamtx_editor_login_ok(settings))
+            login_ok=_mtx_ak or _mediamtx_editor_login_ok(settings),
+            app=_fa_app(mtx_host))
         _emit_alias_redirect(_get_service_alias(settings, 'mediamtx'), mtx_host)
 
     fedhub = modules.get('fedhub', {})
@@ -43361,7 +43547,8 @@ def generate_caddyfile(settings=None):
                 lines.append(f"        handle {{")
                 _emit_outpost_callback_rescue(f"{_pub_url(fh_host, settings)}/")
                 lines.append(f"            reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-                lines.extend(_caddy_forward_auth_lines(ak_up, "            ", _CADDY_AK_COPY_HEADERS))
+                lines.extend(_caddy_forward_auth_lines(ak_up, "            ", _CADDY_AK_COPY_HEADERS,
+                                                       app=_fa_app(fh_host)))
                 for rp_line in fh_rp_block:
                     lines.append(f"            {rp_line}")
                 lines.append(f"        }}")
@@ -43411,7 +43598,7 @@ def generate_caddyfile(settings=None):
             lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
             _emit_outpost_callback_rescue(f"{_pub_url(wo_host, settings)}/")
             lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-            lines.extend(_caddy_forward_auth_lines(ak_up, "        "))
+            lines.extend(_caddy_forward_auth_lines(ak_up, "        ", app=_fa_app(wo_host)))
             lines += _webodm_proxy_lines(wo_up)
             lines.append(f"    }}")
         else:
@@ -43533,7 +43720,8 @@ def generate_caddyfile(settings=None):
             # turn a clean 404 into a redirect loop.
             lines.append(f"        @atlas_device path {at_device_paths}")
             lines.append(f"        respond @atlas_device 404")
-            lines.extend(_caddy_forward_auth_lines(ak_up, "        ", _CADDY_AK_COPY_HEADERS))
+            lines.extend(_caddy_forward_auth_lines(ak_up, "        ", _CADDY_AK_COPY_HEADERS,
+                                                   app=_fa_app(at_host)))
             # SEC_AUDIT (ATLAS) S-1 — the same mechanism the console already uses
             # for itself, extended to this module's vhost.
             #
@@ -121174,6 +121362,8 @@ def _startup_migrations():
         except Exception as _fa_err:
             print(f"Startup migration: sign-in check converge error (non-fatal): {_fa_err}",
                   flush=True)
+        # ops #1108: after the Authentik steps above, so the provider hosts are final.
+        _caddy_app_lock_converge()
         try:
             _startup_caddy_selfheal()
         except Exception as _cs_err:
@@ -121907,6 +122097,9 @@ def _post_update_auto_deploy():
                                         )
                                     except Exception as _chain_e:
                                         print(f"Post-update: proxy chain heal skipped: {_chain_e}")
+                                    # ops #1108: Authentik answers now and the chain is healed.
+                                    _caddy_app_lock_converge(
+                                        lambda m: print(f"Post-update: {m}", flush=True))
                         except Exception as _akph_e:
                             print(f"Post-update: proxy external_hosts canonicalization skipped: {_akph_e}")
                         # v0.9.12: self-heal LDAP service account password drift.

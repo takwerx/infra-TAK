@@ -42,7 +42,8 @@ _NAMES = ('_caddy_forward_auth_lines', '_caddyfile_forward_auth_pinned', '_takpo
           '_emit_mediamtx_site')
 _CONSTS = ('_CADDY_AK_COPY_HEADERS', '_CADDY_FORWARD_AUTH_URI', '_CADDY_FORWARD_AUTH_PIN',
            '_TAKPORTAL_PUBLIC_PATHS', '_CADDY_STRIP_AUTHENTIK_HEADERS', '_TAKPORTAL_AK_COPY_HEADERS',
-           'CADDYFILE_USER_BLOCKS_MARKER', 'MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER')
+           'CADDYFILE_USER_BLOCKS_MARKER', 'MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER',
+           '_CADDY_APP_HEADER', '_CADDY_APP_LOCK_MATCHER', '_CADDY_APP_LOCK_TEXT', '_CADDY_APP_SLUG_RE')
 AK = '127.0.0.1:9090'
 PIN_HOST = 'header_up X-Forwarded-Host {http.request.hostport}'
 PIN_PROTO = 'header_up X-Forwarded-Proto {http.request.scheme}'

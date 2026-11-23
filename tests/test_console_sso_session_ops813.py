@@ -707,7 +707,11 @@ def test_console_vhost_still_hands_the_group_header_to_the_console():
     assert "matcher='@needs_sso'" in call
     assert 'X-Authentik-Groups' in APP[APP.index('_CADDY_AK_COPY_HEADERS = ('):][:200]
     writer = APP[APP.index('def _caddy_forward_auth_lines('):]
-    assert "out.append(f'    copy_headers {copy_headers}')" in writer[:writer.index('\ndef ')]
+    writer = writer[:writer.index('\ndef ')]
+    # ops #1108: the caller's list is written as it is; one header is added to it only for
+    # the application compare, and never taken away.
+    assert "check.append(f'    copy_headers {copy}')" in writer
+    assert "if locked and not keep else copy_headers" in writer
     assert "'X-Authentik-Groups'" in src[src.index('_AK_FWD_HEADERS = ('):][:200], \
         'the client-sent group header must be stripped before forward_auth sets the real one'
 
