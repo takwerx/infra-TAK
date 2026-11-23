@@ -34028,18 +34028,16 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         if cert_pass and cert_pass != 'atakatak':
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
-        # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
-        if is_remote:
-            ok_sudo, sudo_out = _module_run(cfg, 'sudo -n true 2>&1', timeout=10)
-            if not ok_sudo or 'password' in (sudo_out or '').lower():
-                plog('✗ Certificate generation failed — SSH user requires a sudo password')
-                plog('  Fix on the Federation Hub host:')
-                plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
-                plog('  Or SSH as root. Then retry.')
-                status_dict.update({'running': False, 'complete': True, 'error': True})
-                return
-
+        # gh #666: no `sudo -n true` probe here. It asks "may this account run /usr/bin/true as
+        # root?", which is not the question, and it answered no for accounts whose sudoers list the
+        # real commands. The first privileged step below is the check: if sudo refuses it, stop
+        # before any certificate file is touched.
         ok_meta, meta_out = _module_run(cfg, meta_cmds, timeout=30)
+        if not ok_meta and _fedhub_sudo_refused(meta_out):
+            for _ln in _fedhub_sudo_refusal_lines('Certificate generation', 'patching cert-metadata.sh'):
+                plog(_ln)
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
         if not ok_meta:
             plog(f'⚠ cert-metadata.sh patch warning: {meta_out}')
         else:
@@ -34399,6 +34397,34 @@ def fedhub_update_log_api():
     })
 
 
+# gh #666 — what sudo prints when it refuses a command for want of a password. The Federation Hub
+# steps run over SSH with no terminal, so a refused `sudo` ends with one of these lines.
+_FEDHUB_SUDO_REFUSED_RE = re.compile(
+    r'a password is required|a terminal is required to read the password|no tty present and no askpass'
+    r'|no askpass program|is not in the sudoers file|may not run sudo', re.I)
+
+
+def _fedhub_sudo_refused(out):
+    """True when `out` is sudo refusing for want of a password (not any other failure)."""
+    return bool(out and _FEDHUB_SUDO_REFUSED_RE.search(out))
+
+
+def _fedhub_sudo_refusal_lines(action, step):
+    """Log lines for a refused sudo on the Federation Hub host. The old text told the admin to
+    grant `NOPASSWD: ALL`, which a CJIS deployment cannot do. These steps run apt-get, find, rm,
+    mv, sed, chmod, systemctl and the certificate scripts (as user tak), so no short command list
+    covers them: say that plainly instead of printing a list that would be wrong."""
+    return [
+        f'✗ {action} stopped: sudo on the Federation Hub host asked for a password while {step}.',
+        '  No certificate file was changed.',
+        '  Federation Hub setup runs many commands as root (apt-get, find, rm, mv, sed, chmod, systemctl)',
+        '  and the certificate scripts as user tak, over SSH with no terminal for a password prompt.',
+        '  The SSH user needs those commands allowed without a password, or use root for the SSH login.',
+        '  Allowing them is close to full root. If your policy cannot allow that, SSH as root for this task only.',
+        '  Then retry.',
+    ]
+
+
 def _fedhub_ca_lockdown(cfg, fh_dir, plog=None):
     """ops #839 — the CA signing keystores and CA keys of a Federation Hub (on this box or a
     remote host) are for the Federation Hub account only.
@@ -34557,18 +34583,15 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         if cert_pass and cert_pass != 'atakatak':
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
-        # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
-        if is_remote:
-            ok_sudo, sudo_out = _module_run(cfg, 'sudo -n true 2>&1', timeout=10)
-            if not ok_sudo or 'password' in (sudo_out or '').lower():
-                plog('✗ Certificate rotation failed — SSH user requires a sudo password')
-                plog('  Fix on the Federation Hub host:')
-                plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
-                plog('  Or SSH as root. Then retry.')
-                fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
-                return
-
+        # gh #666: no `sudo -n true` probe (see the deploy path). The first privileged step is the
+        # check; the old certificate files are only moved aside after it, so a refusal here leaves
+        # them exactly as they were.
         ok_meta, meta_out = _module_run(cfg, meta_cmds, timeout=30)
+        if not ok_meta and _fedhub_sudo_refused(meta_out):
+            for _ln in _fedhub_sudo_refusal_lines('Certificate rotation', 'patching cert-metadata.sh'):
+                plog(_ln)
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
         if not ok_meta:
             plog(f'⚠ cert-metadata patch warning: {(meta_out or "")[:240]}')
         else:
