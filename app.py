@@ -3991,6 +3991,8 @@ def _pkg_install(pkgs, repo=None, log_fn=None, timeout=1800):
         # sets the same for non-root boxes, where this env does not reach apt).
         env = dict(os.environ, DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l',
                    DPKG_FORCE='confdef,confold')
+        # ops #1124: the broker stops a stuck apt-get shortly before this call times out
+        env['TAKWERX_BROKER_TIMEOUT'] = str(max(int(timeout) - 10, 30))
     try:
         if pm == 'dnf':
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
@@ -102985,8 +102987,20 @@ def _apt_stalled(r):
     return r.returncode == 124 or 'timed out after' in out or _apt_failure_is_transient(out)
 
 
+def _apt_broker_env(timeout, env=None):
+    """`env` (default: the console's) with TAKWERX_BROKER_TIMEOUT a little under `timeout`. On a
+    non-root box the console runs apt through the broker; when the console gives up on a step it
+    only kills its own brokerctl, and the root apt-get kept running, holding the dpkg lock, so
+    the second try died with "Could not get lock" (ops #1124 box test: 5 minutes later it was
+    still there). This value rides the request, and the broker kills apt-get at that time."""
+    out = dict(env if env is not None else os.environ)
+    out['TAKWERX_BROKER_TIMEOUT'] = str(max(int(timeout) - 10, 30))
+    return out
+
+
 def _apt_chain_run(cmds, timeout, **kw):
     """_run_priv_chain with a timeout turned into returncode 124, so the caller can retry it."""
+    kw['env'] = _apt_broker_env(timeout, kw.get('env'))
     try:
         return _run_priv_chain(cmds, 'and', timeout=timeout, **kw)
     except subprocess.TimeoutExpired:
@@ -103016,7 +103030,7 @@ def _apt_retry_stalled(run_once, log_fn=None):
                 host = pick[0]
                 log(f"  Second try uses {host} (it delivered a real package just now).")
                 try:
-                    _run_priv_chain([['apt-get', 'update', '-qq']], 'and', timeout=300)
+                    _apt_chain_run([['apt-get', 'update', '-qq']], 300)
                 except Exception:
                     pass
             else:
@@ -103026,7 +103040,7 @@ def _apt_retry_stalled(run_once, log_fn=None):
         if saved:
             _apt_restore_sources(saved, log_fn)
             try:
-                _run_priv_chain([['apt-get', 'update', '-qq']], 'and', timeout=180)
+                _apt_chain_run([['apt-get', 'update', '-qq']], 180)
             except Exception:
                 pass
     if r2.returncode != 0:

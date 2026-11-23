@@ -64,7 +64,7 @@ NAMES = (
     '_APT_STALL_HOSTS', '_APT_MIRROR_MIN_KBS', '_APT_MIRROR_PROBE_S', '_APT_UBUNTU_HOST_RE',
     '_APT_PROBE_FILE_RE', '_apt_current_host', '_apt_rewrite_hosts', '_apt_probe_file',
     '_apt_probe_kbs', '_apt_mirror_ok', '_apt_pick_mirror', '_apt_switch_ubuntu_hosts',
-    '_apt_restore_sources', '_apt_stalled', '_APT_TRANSIENT_RE', '_apt_failure_is_transient', '_apt_chain_run', '_apt_retry_stalled', '_pkg_install',
+    '_apt_restore_sources', '_apt_stalled', '_APT_TRANSIENT_RE', '_apt_failure_is_transient', '_apt_broker_env', '_apt_chain_run', '_apt_retry_stalled', '_pkg_install',
 )
 
 
@@ -82,6 +82,7 @@ class Box:
         self.release_ok = release_ok or {}   # (host, pocket) -> False when that Release is missing
         self.events = []                     # ordered record of what ran
         self.seen_sources = []               # the sources text at each install call
+        self.envs = []                       # the env of each apt call
         ns = {
             're': re, 'os': __import__('os'), 'shutil': shutil, 'tempfile': tempfile,
             '_pkg_mgr': lambda: 'apt', '_sudo_wrap': lambda c: list(c),
@@ -99,6 +100,7 @@ class Box:
         self.ns = ns
 
     def _chain(self, cmds, mode='and', timeout=120, **kw):
+        self.envs.append(kw.get('env'))
         for c in cmds:
             self.events.append('chain:' + ' '.join(c[:2]))
         return subprocess.CompletedProcess(cmds, 0, '', '')
@@ -108,6 +110,7 @@ class Box:
             return self._curl(argv)
         assert argv[:3] == ['apt-get', 'install', '-y'], argv
         self.events.append('install')
+        self.envs.append(kw.get('env'))
         self.seen_sources.append(self.src.read_text())
         out = self.installs.pop(0) if len(self.installs) > 1 else self.installs[0]
         if out == 'timeout':
@@ -225,6 +228,22 @@ def test_apt_giving_up_on_a_silent_host_itself_is_retried_too():
         ok, _ = _install(box)
         assert ok and box.events.count('install') == 2
         assert 'us.archive.ubuntu.com' in box.seen_sources[1]
+    finally:
+        box.close()
+
+
+def test_apt_steps_ask_the_broker_to_stop_apt_before_the_console_gives_up():
+    # box test, ops #1124: the console only killed its own brokerctl at the limit, the root apt-get kept the
+    # dpkg lock for minutes and the second try died with "Could not get lock". The broker kills apt-get at
+    # TAKWERX_BROKER_TIMEOUT, so it must be set, and below the console's own limit.
+    box = Box(installs=[(0, '')])
+    try:
+        _install(box)                                           # timeout=300
+        box.ns['_apt_chain_run']([['apt-get', 'update', '-qq']], 300)
+        box.ns['_apt_chain_run']([['apt-get', 'update', '-qq']], 20, env={'X': '1'})
+        got = [e['TAKWERX_BROKER_TIMEOUT'] for e in box.envs]
+        assert got == ['290', '290', '30'], got
+        assert box.envs[2]['X'] == '1'                          # a caller's env is kept
     finally:
         box.close()
 
