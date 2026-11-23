@@ -32,12 +32,18 @@ import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
+from urllib.parse import urlparse
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 APP = (ROOT / 'app.py').read_text(encoding='utf-8')
 TREE = ast.parse(APP)
 
 STALLED = 'us-east-2.ec2.archive.ubuntu.com'
+
+
+def _hosts(text):
+    """The host names of every http(s) URL in a text, parsed (never a substring match on a URL)."""
+    return {urlparse(u).hostname for u in re.findall(r'https?://[^\s\]\'",]+', text)}
 JAMMY_LIST = (
     f'deb http://{STALLED}/ubuntu jammy main restricted\n'
     f'deb http://{STALLED}/ubuntu jammy-updates main restricted\n'
@@ -178,7 +184,7 @@ def test_a_host_that_answers_but_delivers_nothing_is_skipped():
         ok, _ = _install(box)
         assert ok
         assert 'http://mirrors.edge.kernel.org/ubuntu ' in box.seen_sources[1]
-        assert 'us.archive.ubuntu.com' not in box.seen_sources[1]
+        assert 'us.archive.ubuntu.com' not in _hosts(box.seen_sources[1])
     finally:
         box.close()
 
@@ -189,7 +195,7 @@ def test_a_host_without_the_security_pocket_is_skipped():
               release_ok={('us.archive.ubuntu.com', 'jammy-security'): False})
     try:
         _install(box)
-        assert 'mirrors.edge.kernel.org' in box.seen_sources[1]
+        assert 'mirrors.edge.kernel.org' in _hosts(box.seen_sources[1])
     finally:
         box.close()
 
@@ -214,7 +220,7 @@ def test_failed_second_try_names_both_tries_and_restores_sources():
     try:
         ok, out = _install(box, logs)
         assert ok is False
-        assert 'first try stalled or timed out' in out and 'us.archive.ubuntu.com' in out
+        assert 'first try stalled or timed out' in out and 'us.archive.ubuntu.com' in out.split()   # the host as a whole word
         assert box.src.read_text() == JAMMY_LIST
     finally:
         box.close()
@@ -227,7 +233,7 @@ def test_apt_giving_up_on_a_silent_host_itself_is_retried_too():
     try:
         ok, _ = _install(box)
         assert ok and box.events.count('install') == 2
-        assert 'us.archive.ubuntu.com' in box.seen_sources[1]
+        assert 'us.archive.ubuntu.com' in _hosts(box.seen_sources[1])
     finally:
         box.close()
 
