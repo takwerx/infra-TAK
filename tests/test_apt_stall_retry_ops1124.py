@@ -44,6 +44,11 @@ STALLED = 'us-east-2.ec2.archive.ubuntu.com'
 def _hosts(text):
     """The host names of every http(s) URL in a text, parsed (never a substring match on a URL)."""
     return {urlparse(u).hostname for u in re.findall(r'https?://[^\s\]\'",]+', text)}
+
+
+def _has_host(text, host):
+    """True when `host` is the parsed host of a URL in the text, or a whole word of it (exact match)."""
+    return any(h == host for h in _hosts(text) | set(text.split()))
 JAMMY_LIST = (
     f'deb http://{STALLED}/ubuntu jammy main restricted\n'
     f'deb http://{STALLED}/ubuntu jammy-updates main restricted\n'
@@ -184,7 +189,7 @@ def test_a_host_that_answers_but_delivers_nothing_is_skipped():
         ok, _ = _install(box)
         assert ok
         assert 'http://mirrors.edge.kernel.org/ubuntu ' in box.seen_sources[1]
-        assert 'us.archive.ubuntu.com' not in _hosts(box.seen_sources[1])
+        assert not _has_host(box.seen_sources[1], 'us.archive.ubuntu.com')
     finally:
         box.close()
 
@@ -195,7 +200,7 @@ def test_a_host_without_the_security_pocket_is_skipped():
               release_ok={('us.archive.ubuntu.com', 'jammy-security'): False})
     try:
         _install(box)
-        assert 'mirrors.edge.kernel.org' in _hosts(box.seen_sources[1])
+        assert _has_host(box.seen_sources[1], 'mirrors.edge.kernel.org')
     finally:
         box.close()
 
@@ -220,7 +225,7 @@ def test_failed_second_try_names_both_tries_and_restores_sources():
     try:
         ok, out = _install(box, logs)
         assert ok is False
-        assert 'first try stalled or timed out' in out and 'us.archive.ubuntu.com' in out.split()   # the host as a whole word
+        assert 'first try stalled or timed out' in out and _has_host(out, 'us.archive.ubuntu.com')
         assert box.src.read_text() == JAMMY_LIST
     finally:
         box.close()
@@ -233,7 +238,7 @@ def test_apt_giving_up_on_a_silent_host_itself_is_retried_too():
     try:
         ok, _ = _install(box)
         assert ok and box.events.count('install') == 2
-        assert 'us.archive.ubuntu.com' in _hosts(box.seen_sources[1])
+        assert _has_host(box.seen_sources[1], 'us.archive.ubuntu.com')
     finally:
         box.close()
 
