@@ -89188,7 +89188,7 @@ def _webadmin_email_remind_tick():
             '2. Click "Admin interface" (top right). Do NOT use the user Settings page:',
             '   it says "Not allowed to change email address".',
             '3. Go to Directory -> Users -> webadmin -> Edit User.',
-            '4. In Email, type an address you read. Click Update.',
+            '4. In Email, type an address you read. Click Save Changes.',
             '5. In the infra-TAK console, click "I have changed the email" on the yellow',
             '   banner. The banner and these emails stop.',
             '',
