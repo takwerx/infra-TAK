@@ -413,8 +413,9 @@ class Box:
         return self.ns()['_tak_recycle_after_ldap_outage'](self.log.append, trigger,
                                                            check_outpost=check_outpost, final=final)
 
-    def request(self, reason, need_groups=True, restart=False):
-        self.ns()['_tak_ldap_recycle_request'](reason, need_groups, restart=restart)
+    def request(self, reason, need_groups=True, restart=False, restart_if_young=False):
+        self.ns()['_tak_ldap_recycle_request'](reason, need_groups, restart=restart,
+                                               restart_if_young=restart_if_young)
 
 
 def healthy_box(**kw):
@@ -1494,6 +1495,32 @@ def test_box_without_tak_groups_needs_only_the_bind():
     box.request('PgBouncer image swap', need_groups=False)
     box.recycle()
     assert box.drops() == ['tls:16']
+
+
+def test_install_time_young_tak_request_does_not_restart_tak_at_the_first_update_ops1117():
+    """ops #1117: a fresh install files 'outpost recreated under a young TAK' (restart only
+    while TAK is young). The box has no finished console update yet, so the request is
+    deferred for the install's whole first hour and carried out at the end of Update Now. TAK
+    is old by then: heal the clients first, no restart (the old code restarted TAK, which the
+    T&E update drill reads as a failure)."""
+    box = outage_box(tak_start=T0 - 60)
+    box.request('the console recreated the LDAP outpost (service-account password resync) under '
+                'a running TAK Server', restart_if_young=True)
+    box.t += 3 * HOUR                      # the box's first Update Now, hours after install
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert not any('a TAK Server restart was asked for' in l for l in box.log)
+    assert 'pending' not in box.settings['tak_ldap_recycle']
+
+
+def test_young_tak_request_still_restarts_while_tak_is_young_ops1117():
+    """The GH #616 case is kept: carried out at once under a TAK that is still young."""
+    box = outage_box(tak_start=T0 - 60)
+    box.request('the console recreated the LDAP outpost (service-account password resync) under '
+                'a running TAK Server', restart_if_young=True)
+    assert box.recycle() is True
+    assert len(box.restarts()) == 1
+    assert any('a TAK Server restart was asked for' in l for l in box.log)
 
 
 # ── no double work ──────────────────────────────────────────────────────────────────

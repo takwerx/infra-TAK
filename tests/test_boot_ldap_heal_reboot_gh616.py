@@ -168,8 +168,8 @@ def _ensure(monkeypatch, tak_start):
         '_coreconfig_has_ldap': lambda: True,
         '_tak_started_epoch': lambda: tak_start,
         '_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S': 300,
-        '_tak_ldap_recycle_request': lambda reason, need_groups=True, restart=False: events.append(
-            ('request', reason, restart)),
+        '_tak_ldap_recycle_request': lambda reason, need_groups=True, restart=False, restart_if_young=False: events.append(
+            ('request', reason, restart_if_young)),
     }
     exec(compile(_src('_ensure_authentik_ldap_service_account'), 'app.py:_ensure_authentik_ldap_service_account',
                  'exec'), ns)
@@ -207,7 +207,7 @@ def test_the_request_restarts_a_tak_the_box_boot_rule_would_skip_gh616():
     assert box.recycle(trigger='boot LDAP service-account heal', final=False) is False
     assert box.restarts() == []
     box.request('the console recreated the LDAP outpost (service-account password resync) under a '
-                'running TAK Server', restart=True)
+                'running TAK Server', restart_if_young=True)
     assert box.recycle(trigger='boot LDAP service-account heal', final=False) is True
     assert len(box.restarts()) == 1
 
