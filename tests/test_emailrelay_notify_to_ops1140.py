@@ -167,7 +167,7 @@ def test_deploy_writes_the_box_address_into_the_root_map(box):
                          'guarddog_alert_email': 'gd@real.example'})
     box.deploy()
     got = box.map_targets()
-    assert got['root@tak.example.test'] == 'ops@desk.example, two@desk.example'
+    assert got['root@box1.internal'] == 'ops@desk.example, two@desk.example'
     assert 'gd@real.example' not in box.files[MAP]
 
 
