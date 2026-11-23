@@ -42189,11 +42189,16 @@ def _caddy_app_lock_saved():
 
 def _caddy_app_lock_save(apps):
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    tmp = _CADDY_APP_LOCK_FILE + '.tmp'
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, 'w') as f:
-        json.dump({'apps': apps}, f, sort_keys=True)
-    os.replace(tmp, _CADDY_APP_LOCK_FILE)
+    # Its own temp name: two console workers can save at the same moment.
+    tmp = '%s.%s.tmp' % (_CADDY_APP_LOCK_FILE, os.urandom(4).hex())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump({'apps': apps}, f, sort_keys=True)
+        os.replace(tmp, _CADDY_APP_LOCK_FILE)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def _caddy_app_lock_refresh(plog=None, timeout=20, retries=2):
