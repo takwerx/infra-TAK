@@ -15147,6 +15147,81 @@ def _heal_nodered_cert_read_access(plog=None):
             continue
 
 
+# ops #1079 — Node-RED (a container) streaming CoT to a TAK Server datafeed or input on a
+# port the host firewall does not open. The TAK Server deploy opens 22, 8089, 8443, 8446 and
+# 5001 to everyone; a datafeed an operator adds (8095 for PulsePoint in infra-TAK #642) is not
+# opened by anything. Traffic from a container to the host goes through the host firewall's
+# INPUT rules, so with ufw or firewalld on, the TCP out node waits and ends in ETIMEDOUT while
+# 8089 (open) works with the same certificate. Same shape as Email Relay's port 25 rule.
+_NODERED_DOCKER_SRC = '172.16.0.0/12'          # every Docker bridge subnet; never the internet
+_NODERED_TAK_PORTS_OPEN = frozenset({8089, 8443, 8446})   # opened to everyone by the TAK deploy
+
+
+def _coreconfig_nodered_stream_ports(cc_text):
+    """TLS client-certificate CoT ports of a CoreConfig: its `<input>` and `<datafeed>`
+    elements with protocol="tls" and an auth other than anonymous. Commented-out elements
+    are ignored. Plain tcp and anonymous inputs are left out on purpose: Node-RED connects
+    with its admin certificate over TLS, and opening a no-login port to every container on
+    the host would widen what a compromised container can reach. Ports TAK's own deploy
+    already opens to everyone are left out (a second, narrower rule would add nothing)."""
+    text = re.sub(r'<!--.*?-->', '', cc_text or '', flags=re.DOTALL)
+    ports = []
+    for el in re.findall(r'<(?:input|datafeed)\b[^>]*>', text):
+        proto = re.search(r'\bprotocol="([^"]*)"', el)
+        port = re.search(r'\bport="(\d+)"', el)
+        auth = re.search(r'\bauth="([^"]*)"', el)
+        if not proto or not port or proto.group(1).strip().lower() != 'tls':
+            continue
+        if auth and auth.group(1).strip().lower() == 'anonymous':
+            continue
+        p = int(port.group(1))
+        if 1 <= p <= 65535 and p not in _NODERED_TAK_PORTS_OPEN and p not in ports:
+            ports.append(p)
+    return ports
+
+
+def _heal_nodered_tak_stream_ports(plog=None):
+    """ops #1079 — let the Node-RED container reach every TAK datafeed/input port that the
+    host firewall would otherwise drop. Source-scoped: only the Docker networks, never the
+    internet. Runs only when a local Node-RED install exists and the local CoreConfig is
+    readable (a remote TAK Server or a split box has its own firewall to open). Idempotent
+    (ufw says "Skipping adding existing rule"; firewalld says ALREADY_ENABLED), run at every
+    console start and after a Node-RED deploy. Returns the ports it asked the firewall to
+    open. Never raises."""
+    def _say(m):
+        (plog or (lambda x: print(f"Node-RED TAK port heal: {x}", flush=True)))(m)
+
+    opened = []
+    try:
+        present = os.path.exists(os.path.join(os.path.expanduser('~/node-red'), 'docker-compose.yml'))
+        if not present:
+            r = subprocess.run(['docker', 'ps', '-a', '--filter', 'name=nodered',
+                                '--format', '{{.Names}}'],
+                               capture_output=True, text=True, timeout=8,
+                               env=_broker_shim_env())
+            present = bool((r.stdout or '').strip())
+        if not present:
+            return opened
+        try:
+            cc = _read_coreconfig()
+        except Exception:
+            return opened                      # no local TAK Server (remote or not installed)
+        ports = _coreconfig_nodered_stream_ports(cc)
+        if not ports or _fw_backend() is None:
+            return opened
+        for p in ports:
+            ok, msg = _fw_allow_from(_NODERED_DOCKER_SRC, p, 'tcp')
+            if ok:
+                opened.append(p)
+                _say(f'Docker networks may reach TAK port {p}/tcp (a TAK datafeed or input '
+                     f'the host firewall did not open; Node-RED needs it)')
+            else:
+                _say(f'⚠ could not open TAK port {p}/tcp for Node-RED: {(msg or "").strip()[:120]}')
+    except Exception as _e:
+        _say(f'⚠ skipped: {str(_e)[:120]}')
+    return opened
+
+
 # v10.1.9 W1: bump whenever the retrofit's BEHAVIOUR changes, so boxes that
 # already recorded completion under an older build get the new pass exactly once.
 # 1 = original. 2 = $SSH_CLIENT-scoped hostssl + removal of TAK's stock
@@ -68033,6 +68108,11 @@ volumes:
                 plog(f"  ⚠ deploy.sh failed: {e2}")
         else:
             plog("  (no nodered/deploy.sh in repo — skip)")
+        # ops #1079 — Docker networks to TAK datafeed/input ports the host firewall left shut.
+        try:
+            _heal_nodered_tak_stream_ports(plog)
+        except Exception as _nrp_e:
+            plog(f"  ⚠ TAK port check skipped: {_nrp_e}")
         plog("")
         plog("━━━ Step 4/4: Updating Caddy ━━━")
         # v10.1.50: Node-RED is ALREADY RUNNING by the time we get here. Everything below
@@ -118776,6 +118856,14 @@ def _startup_migrations():
             _heal_nodered_cert_read_access(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _nrh_e:
             print(f"Startup migration: Node-RED cert heal error (non-fatal): {_nrh_e}", flush=True)
+
+        # ops #1079 — a TAK datafeed on a port the host firewall does not open (8095 for
+        # PulsePoint) made Node-RED's TCP out wait and time out. Open it for the Docker
+        # networks only. Idempotent, every boot.
+        try:
+            _heal_nodered_tak_stream_ports(lambda m: print(f"Startup migration: Node-RED TAK port heal: {m}", flush=True))
+        except Exception as _nrp_e:
+            print(f"Startup migration: Node-RED TAK port heal error (non-fatal): {_nrp_e}", flush=True)
 
         # ops #941 — a Docker TAK box whose certificate folder an old restore re-owned to
         # uid 1000: give it back to the container's user, or Rotate CA fails at Step 3.
