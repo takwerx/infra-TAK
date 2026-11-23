@@ -72738,6 +72738,39 @@ def _yaml_duplicate_keys(raw, yaml_mod):
     return found
 
 
+def _authentik_redis_image_target(current):
+    """The image an EXISTING Authentik `redis` service should run, or None to leave it alone (ops #1147).
+
+    AUTHENTIK_REDIS_IMAGE reached only fresh deploys and composes with no redis service: the
+    patchers never rewrote the image of a redis service that was already there, so older boxes
+    kept the floating tag they were deployed with and pulled whatever that tag meant next
+    (ops #637 pinned it so that cannot happen). Returns AUTHENTIK_REDIS_IMAGE for the official
+    redis image on a floating tag (alpine, latest, a bare major or minor) or on an older
+    exact version. Left alone (None): the pin itself, a newer exact version (never a
+    downgrade), a digest pin and any other image (a mirror, valkey): those are the operator's.
+    """
+    if not isinstance(current, str):
+        return None
+    cur = current.strip().strip('\'"')
+    m = re.fullmatch(r'(?:docker\.io/)?(?:library/)?redis(?::([\w.-]+))?', cur)
+    if not m:
+        return None
+    tag = m.group(1) or 'latest'
+    pin_tag = AUTHENTIK_REDIS_IMAGE.rsplit(':', 1)[-1]
+    if tag == pin_tag:
+        return None            # the pin, written in the short form
+    if tag in ('alpine', 'latest'):
+        return AUTHENTIK_REDIS_IMAGE
+    ver = re.fullmatch(r'(\d+)(?:\.(\d+))?(?:\.(\d+))?(-alpine)?', tag)
+    if not ver:
+        return None            # a variant we do not know (bookworm, trixie, ...)
+    parts = ver.group(1, 2, 3)
+    if parts[2] is None:
+        return AUTHENTIK_REDIS_IMAGE   # `8`, `8.10`, `8-alpine`: floats to the newest patch release
+    pin_ver = tuple(int(x) for x in re.match(r'(\d+)\.(\d+)\.(\d+)', pin_tag).groups())
+    return AUTHENTIK_REDIS_IMAGE if tuple(int(x) for x in parts) < pin_ver else None
+
+
 def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
     """Legacy text-based compose patcher — kept as fallback if PyYAML cannot parse the file.
     Used by _ensure_authentik_compose_patches when yaml.safe_load raises YAMLError.
@@ -72871,6 +72904,17 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                     changed = True
                     if plog:
                         plog("  ✓ Added redis: to top-level volumes section [legacy patcher]")
+
+        # ops #1147: an existing redis service moves from a floating tag (or an older pin) to the pin
+        _lg_txt = ''.join(lines)
+        _lg_m = re.search(r'^  redis:\n(?:    [^\n]*\n)*?    image: ([^\n]*)', _lg_txt, re.M)
+        if _lg_m:
+            _lg_want = _authentik_redis_image_target(_lg_m.group(1))
+            if _lg_want:
+                lines = (_lg_txt[:_lg_m.start(1)] + _lg_want + _lg_txt[_lg_m.end(1):]).splitlines(keepends=True)
+                changed = True
+                if plog:
+                    plog(f"  ✓ Pinned redis image {_lg_m.group(1).strip()} → {_lg_want} [legacy patcher]")
 
         if changed:
             with open(compose_path, 'w') as f:
@@ -73033,6 +73077,16 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
         changed = True
         if plog:
             plog("  ✓ Added Redis service to docker-compose.yml (was missing — Authentik worker was burning CPU)")
+    else:
+        # ops #1147: a redis service that is already there keeps the image it was deployed with, a
+        # floating tag on older boxes. Move it to the pin (the new compose recreates only redis).
+        _redis_cur = (services.get('redis') or {}).get('image') if isinstance(services.get('redis'), dict) else None
+        _redis_want = _authentik_redis_image_target(_redis_cur)
+        if _redis_want:
+            services['redis']['image'] = _redis_want
+            changed = True
+            if plog:
+                plog(f"  ✓ Pinned redis image {_redis_cur} → {_redis_want}")
 
     # ── AUTHENTIK_REDIS__HOST env var in server + worker ─────────────────────
     for _svc_name in ('server', 'worker'):
@@ -118098,6 +118152,25 @@ def _startup_authentik_idle_load_converge(log=None):
                         if k.returncode == 1:
                             force_up = True
                             _l('W2 canary: compose has the mask mount but the worker still sees the stock blueprint — forcing up -d')
+                except Exception:
+                    pass
+
+            # ops #1147 canary: compose names the redis pin, but the RUNNING container may still be
+            # on the floating tag it was created with (another caller wrote the compose, so this
+            # pass found nothing to change). `up -d` recreates only the redis service.
+            if not compose_changed and not force_up:
+                try:
+                    with open(compose_path) as f:
+                        _rsvc = ((_yaml.safe_load(f.read()) or {}).get('services') or {}).get('redis')
+                    _redis_want = _rsvc.get('image') if isinstance(_rsvc, dict) else None
+                    if isinstance(_redis_want, str) and _redis_want:
+                        k = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.Config.Image}}',
+                                                       'authentik-redis-1']),
+                                           capture_output=True, text=True, timeout=20)
+                        _redis_run = (k.stdout or '').strip()
+                        if k.returncode == 0 and _redis_run and _redis_run != _redis_want:
+                            force_up = True
+                            _l(f'redis canary: compose says {_redis_want} but authentik-redis-1 runs {_redis_run} — forcing up -d')
                 except Exception:
                     pass
 
