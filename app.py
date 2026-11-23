@@ -1883,7 +1883,8 @@ NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.96.0"
 # Authentik's redis service (legacy: Authentik itself stopped needing Redis in 2025.10, but the compose
 # keeps the service). ops #637: the tag used to be the bare `alpine` one, which jumps majors
 # whenever Docker Hub moves it. Pinned to the same tested release WebODM's broker runs (WEBODM_IMAGES).
-AUTHENTIK_REDIS_IMAGE = 'docker.io/library/redis:8.10.2-alpine'
+# ops #1089: 8.10.2 -> 8.10.3 (Oct 26): a cluster-bus fix; we run no cluster. Rollback: re-pin both to 8.10.2.
+AUTHENTIK_REDIS_IMAGE = 'docker.io/library/redis:8.10.3-alpine'
 # ops #819: 0.82.0 -> 0.82.1 (Nov 10): the account id is enforced on a proxy update (an account-scope
 # check). No config or store change. Rollback: re-pin the dev server image to 0.82.0.
 NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.82.1"  # UNDER TRIAL (ops #427, #819)
@@ -61685,7 +61686,7 @@ WEBODM_OVERLAY_REF = 'v0.8.9'
 WEBODM_OVERLAY_SHA = '3f0efb383a9f1bd022eac15ac4b3da83e643fccc'  # commit of tag v0.8.9 (was the default branch's tip)
 WEBODM_IMAGES = {
     'wo_db':      'webodm/webodm_db:18@sha256:6d43e32ec24c388c5d5975bf6462d21abd6959af3c43d146a2473c1db4d5019c',
-    'wo_broker':  'redis:8.10.2-alpine',
+    'wo_broker':  'redis:8.10.3-alpine',
     'wo_webapp':  'webodm/webodm_webapp:' + WEBODM_VERSION,
     'wo_worker':  'webodm/webodm_webapp:' + WEBODM_VERSION,
     'wo_nodeodm': 'webodm/nodeodx:2.4.0',
