@@ -81,6 +81,54 @@ def _postmap(ctx, path, plog):
     return True
 
 
+def _resolve_fqdn(settings):
+    """The mail name this relay uses, plus what `hostname -f` says right now.
+
+    Prefer the administrator-saved FQDN; fall back to `hostname -f`, then `hostname`.
+    `hostname -f` can return an unresolvable name on some VPS configs, causing mydomain
+    to be derived as "0" and the postfix install to fail with
+    "meter mydomain: bad parameter value: 0". Returns (fqdn, hostname_f).
+    """
+    r = subprocess.run(['hostname', '-f'], capture_output=True, text=True)
+    hostname_f = (r.stdout or '').strip() if r.returncode == 0 else ''
+    if not hostname_f:
+        r2 = subprocess.run(['hostname'], capture_output=True, text=True)
+        hostname_f = (r2.stdout or '').strip()
+    fqdn = ((settings or {}).get('fqdn') or hostname_f or 'localhost').strip()
+    if not fqdn or fqdn == '0':
+        fqdn = (settings or {}).get('fqdn', 'localhost')
+    return fqdn, hostname_f
+
+
+def _generic_map_text(from_addr, *origins):
+    """Body of /etc/postfix/generic: one `root@<name>  <from_addr>` line per distinct name.
+
+    ops #1142 (infra-TAK GH #665). Postfix stamps local mail from root with whatever its
+    origin is: /etc/mailname on Debian/Ubuntu (the saved FQDN), $myhostname elsewhere
+    (`hostname -f`). The map used to be keyed only on a bare `hostname -f`, so on a host
+    where that differs from the saved FQDN the key never matched and the sender was never
+    rewritten, with no message. Key every name Postfix could stamp; duplicates and blanks
+    are dropped, order is kept (first = the saved FQDN).
+    """
+    seen, lines = set(), []
+    for name in origins:
+        name = (name or '').strip()
+        if not name or name == '0' or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        lines.append(f"root@{name}    {from_addr}")
+    return '\n'.join(lines) + '\n', sorted(seen)
+
+
+def _read_mailname():
+    """/etc/mailname (what Debian's myorigin points at); '' when absent."""
+    try:
+        with open('/etc/mailname', encoding='utf-8') as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
 def deploy_validate(data):
     """Request-side validation for /deploy and /swap (the byte-identical clone
     collapsed onto one view). Resolves the relay host/port here so the custom
@@ -117,16 +165,8 @@ def deploy(ctx, job, params):
         plog("📧 Step 1/5 — Installing Postfix...")
         if ctx['os_type']() == 'debian':
             ctx['wait_for_apt_lock'](plog, job['log'])
-            # Resolve mailname: prefer saved FQDN, fall back to hostname -f, hard-fallback to hostname
-            # hostname -f can return an unresolvable name on some VPS configs, causing
-            # mydomain to be derived as "0" and postfix install to fail with
-            # "meter mydomain: bad parameter value: 0"
-            fqdn_result = subprocess.run(['hostname', '-f'], capture_output=True, text=True)
-            if fqdn_result.returncode != 0 or not fqdn_result.stdout.strip():
-                fqdn_result = subprocess.run(['hostname'], capture_output=True, text=True)
-            fqdn = (settings.get('fqdn') or fqdn_result.stdout.strip() or 'localhost').strip()
-            if not fqdn or fqdn == '0':
-                fqdn = settings.get('fqdn', 'localhost')
+            # Mail name: see _resolve_fqdn (ops #1142 shares it with the generic map below).
+            fqdn, _ = _resolve_fqdn(settings)
             # `fqdn` comes from settings.json — an administrator types it into the
             # console. It used to be interpolated into a root shell string here
             # (v10.1.48 W2). The pre-seed lines go in on STDIN instead: no shell,
@@ -215,9 +255,16 @@ smtp_generic_maps = hash:/etc/postfix/generic
         subprocess.run(ctx['_sudo_wrap'](['chmod', '600', '/etc/postfix/sasl_passwd', '/etc/postfix/sasl_passwd.db']), capture_output=True)
 
         # Generic map for from address rewriting
-        hostname = subprocess.run(['hostname', '-f'], capture_output=True, text=True).stdout.strip()
-        generic_line = f"root@{hostname}    {from_addr}"
-        ctx['_write_priv']('/etc/postfix/generic', generic_line + '\n')
+        # ops #1142 (GH #665): key it on the saved FQDN (what /etc/mailname holds on
+        # Debian/Ubuntu) AND on `hostname -f` / the live mailname when those differ, so the
+        # rewrite fires whichever name Postfix stamps.
+        map_fqdn, map_hostname_f = _resolve_fqdn(settings)
+        generic_text, generic_names = _generic_map_text(
+            from_addr, map_fqdn, _read_mailname(), map_hostname_f)
+        if len(generic_names) > 1:
+            plog(f"⚠ Host names disagree ({', '.join(generic_names)}); "
+                 "sender rewrite covers each of them")
+        ctx['_write_priv']('/etc/postfix/generic', generic_text)
         _postmap(ctx, '/etc/postfix/generic', plog)
         plog("✓ Credentials written and hashed")
 
