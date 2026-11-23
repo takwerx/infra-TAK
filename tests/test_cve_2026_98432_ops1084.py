@@ -44,7 +44,12 @@ ADV = pn._ns()['_patch_now_parse'](DOC)
 # first fixed kernel per OS key, as published (Ubuntu `linux` rows, Rocky 9.8)
 FIXED = {
     'ubuntu-22.04': '5.15.0-203', 'ubuntu-22.04/aws': '5.15.0-1120', 'ubuntu-22.04/azure': '5.15.0-1126',
+    'ubuntu-22.04/lowlatency': '5.15.0-198',
+    # 22.04 on the 6.8 HWE kernels (what aws-arm runs): numbered like noble's
+    'ubuntu-22.04@6.8': '6.8.0-149', 'ubuntu-22.04/aws@6.8': '6.8.0-1069',
+    'ubuntu-22.04/azure@6.8': '6.8.0-1073', 'ubuntu-22.04/lowlatency@6.8': '6.8.0-149',
     'ubuntu-24.04': '6.8.0-149', 'ubuntu-24.04/aws': '6.8.0-1069', 'ubuntu-24.04/azure': '6.8.0-1073',
+    'ubuntu-24.04/lowlatency': '6.8.0-149',
     'rocky-9': '5.14.0-687.64.1',
 }
 
@@ -81,6 +86,12 @@ def test_wording_is_plain_and_not_cut_short_by_the_parser():
     ('ubuntu-24.04', 'ubuntu-24.04', '6.8.0-148-generic', '6.8.0-149-generic'),
     ('ubuntu-24.04', 'ubuntu-24.04/aws', '6.8.0-1068-aws', '6.8.0-1069-aws'),
     ('ubuntu-24.04', 'ubuntu-24.04/azure', '6.8.0-1072-azure', '6.8.0-1073-azure'),
+    ('ubuntu-22.04', 'ubuntu-22.04/lowlatency', '5.15.0-190-lowlatency', '5.15.0-198-lowlatency'),
+    ('ubuntu-24.04', 'ubuntu-24.04/lowlatency', '6.8.0-148-lowlatency', '6.8.0-149-lowlatency'),
+    ('ubuntu-22.04', 'ubuntu-22.04@6.8', '6.8.0-148-generic', '6.8.0-149-generic'),
+    ('ubuntu-22.04', 'ubuntu-22.04/aws@6.8', '6.8.0-1066-aws', '6.8.0-1069-aws'),
+    ('ubuntu-22.04', 'ubuntu-22.04/azure@6.8', '6.8.0-1072-azure', '6.8.0-1073-azure'),
+    ('ubuntu-22.04', 'ubuntu-22.04/lowlatency@6.8', '6.8.0-148-lowlatency', '6.8.0-149-lowlatency'),
     ('rocky-9', 'rocky-9', '5.14.0-687.63.1.el9_8.x86_64', '5.14.0-687.64.1.el9_8.x86_64'),
     ('rocky-9', 'rocky-9', '5.14.0-611.5.1.el9_7.x86_64', '5.14.0-700.1.1.el9_8.x86_64'),
 ])
@@ -100,8 +111,8 @@ def test_old_running_kernel_is_told_to_install_and_restart_fixed_one_is_not(os_t
 
 @pytest.mark.parametrize('os_type, running', [
     ('ubuntu-22.04', '5.15.0-1100-gcp'),            # a cloud with no published row: no guess
-    ('ubuntu-24.04', '6.8.0-100-lowlatency'),
-    ('ubuntu-22.04', '6.8.0-100-generic'),          # 22.04 on the 6.8 HWE kernel: other numbering
+    ('ubuntu-24.04', '6.8.0-1000-oem'),
+    ('ubuntu-22.04', '6.8.0-1000-gcp'),             # 22.04 on a 6.8 cloud kernel with no row
 ])
 def test_a_kernel_with_no_published_fix_row_is_never_claimed_exposed(os_type, running):
     assert _items(os_type, _rb(running)) == []
@@ -187,9 +198,18 @@ def _banner_ns(codename):
     ('noble', '6.8.0-1072-azure', CVE), ('noble', '6.8.0-1073-azure', None),
     # no row for this flavour: never claim exposure we cannot verify
     ('jammy', '5.15.0-1100-gcp', None), ('noble', '6.8.0-1000-gcp', None),
+    # 22.04 on the 6.8 HWE kernels (aws-arm runs 6.8.0-1069-aws): their own numbers
+    ('jammy', '6.8.0-148-generic', CVE), ('jammy', '6.8.0-149-generic', None),
+    ('jammy', '6.8.0-1066-aws', CVE), ('jammy', '6.8.0-1069-aws', None),
+    ('jammy', '6.8.0-1072-azure', CVE), ('jammy', '6.8.0-1073-azure', None),
+    ('jammy', '6.8.0-148-lowlatency', CVE), ('jammy', '6.8.0-149-lowlatency', None),
     ('bookworm', '6.1.0-10-amd64', None),
-    # -lowlatency numbers like generic and was judged that way before: unchanged
+    # -lowlatency has its own fix numbers (linux-lowlatency 5.15.0-198 / 6.8.0-149) ...
+    ('jammy', '5.15.0-199-lowlatency', None), ('jammy', '5.15.0-198-lowlatency', None),
+    ('noble', '6.8.0-148-lowlatency', CVE), ('noble', '6.8.0-149-lowlatency', None),
+    # ... and older rows still judge it by the plain codename, as before
     ('noble', '6.8.0-100-lowlatency', 'CVE-2026-31431 (Copy Fail)'),
+    ('jammy', '5.15.0-197-lowlatency', 'CVE-2026-53266'),
 ])
 def test_banner_names_the_cve_only_while_the_running_kernel_predates_the_fix(codename, running, want):
     assert _banner_ns(codename)(running) == want
