@@ -351,3 +351,16 @@ def test_the_card_badge_is_unchanged_the_takserver_row_still_has_no_latest():
     # the cards read _get_takserver_version_info(); this change must not invent an update badge there
     src = ast.get_source_segment(APP, _FNS['_get_takserver_version_info'])
     assert "'latest': None" in src and '_tst' not in src
+
+
+def test_a_failure_in_the_tested_source_never_hides_the_other_pending_updates():
+    # CI, first push: other tests cut _collect_pending_updates out of app.py without this helper and
+    # got a NameError for the whole sweep. Every source in that function is shielded; so is this one.
+    fn = _FNS['_collect_pending_updates']
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Try):
+            if any(isinstance(c, ast.Call) and getattr(c.func, 'id', '') == '_takserver_tested_items'
+                   for b in node.body for c in ast.walk(b)):
+                assert any(h.type is not None and getattr(h.type, 'id', '') == 'Exception' for h in node.handlers)
+                return
+    pytest.fail('_collect_pending_updates calls _takserver_tested_items outside a try/except Exception')

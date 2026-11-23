@@ -31769,8 +31769,12 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
                 pending.append(_apply_security_identity(wo))
     except Exception as e:
         print(f"[update-notify] WebODM check failed: {e}", flush=True)
-    # ops #1119: a TAK Server version we tested and this box does not run yet
-    pending.extend(_takserver_tested_items(unknown))
+    try:
+        # ops #1119: a TAK Server version we tested and this box does not run yet
+        pending.extend(_takserver_tested_items(unknown))
+    except Exception as e:
+        unknown.add('takserver-tested')
+        print(f"[update-notify] TAK Server tested-version check failed: {e}", flush=True)
     try:
         # ops #608: the other modules with a console Update button.
         pending.extend(_module_update_items(unknown))
