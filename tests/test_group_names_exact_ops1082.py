@@ -496,3 +496,94 @@ def test_group_names_route_needs_a_console_login_and_the_page_shows_the_warning(
     # Group names are free text: they go into the page escaped.
     assert 'escapeHtml(f.name)' in js and 'escapeHtml(n)' in js
     assert 'refreshGroupNames();' in page
+
+
+# --- Part 3: the editor keeps a working Authentik token and address ----------------------
+
+UNIT = """[Unit]
+Description=MediaMTX Web Configuration Editor
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/mediamtx-webeditor/mediamtx_config_editor.py
+Environment=PORT=5080
+Environment=LDAP_ENABLED=1
+Environment=AUTHENTIK_API_URL=http://127.0.0.1:9090
+Environment=INFRATAK_TRUSTED_PROXIES=127.0.0.1,::1
+EnvironmentFile=-/usr/local/etc/mediamtx-webeditor.env
+Restart=always
+"""
+
+
+@pytest.fixture
+def sync():
+    import re as _re
+    ns = {'re': _re}
+    for name in ('_MEDIAMTX_EDITOR_SECRET_ENV', '_MEDIAMTX_EDITOR_ENVFILE_LINE',
+                 '_MEDIAMTX_EDITOR_AK_TOKEN_RE', '_MEDIAMTX_EDITOR_AK_URL_RE'):
+        exec(_assign(name), ns)
+    for name in ('_unit_text_with_env', '_mediamtx_editor_authentik_sync'):
+        exec(_func(name), ns)
+    return ns['_mediamtx_editor_authentik_sync']
+
+
+def test_current_token_and_address_change_nothing(sync):
+    assert sync(UNIT, '# note\nAUTHENTIK_TOKEN=tok-current-1234\n',
+                'http://127.0.0.1:9090', 'tok-current-1234') == (UNIT, None)
+
+
+def test_stale_or_missing_token_is_replaced(sync):
+    assert sync(UNIT, 'AUTHENTIK_TOKEN=tok-old-00000000\n', 'http://127.0.0.1:9090',
+                'tok-current-1234') == (UNIT, 'tok-current-1234')
+    assert sync(UNIT, '', 'http://127.0.0.1:9090', 'tok-current-1234')[1] == 'tok-current-1234'
+    assert sync(UNIT, 'AUTHENTIK_TOKEN=\n', 'http://127.0.0.1:9090', 'tok-current-1234')[1] == 'tok-current-1234'
+
+
+def test_address_follows_authentik_to_another_host(sync):
+    unit, token = sync(UNIT, 'AUTHENTIK_TOKEN=tok-current-1234\n', 'http://10.0.0.7:9090', 'tok-current-1234')
+    assert token is None
+    assert 'Environment=AUTHENTIK_API_URL=http://10.0.0.7:9090' in unit.split('\n')
+    assert unit.count('AUTHENTIK_API_URL=') == 1
+    assert unit.replace('http://10.0.0.7:9090', 'http://127.0.0.1:9090') == UNIT
+
+
+def test_editor_without_authentik_mode_is_left_alone(sync):
+    plain = UNIT.replace('Environment=LDAP_ENABLED=1\n', '')
+    assert sync(plain, '', 'http://10.0.0.7:9090', 'tok-current-1234') == (plain, None)
+    assert sync('', '', 'http://10.0.0.7:9090', 'tok-current-1234') == ('', None)
+
+
+@pytest.mark.parametrize('url, token', [
+    (None, ''), ('', ''), ('http://127.0.0.1:9090', ''), ('http://127.0.0.1:9090', None),
+    ('http://127.0.0.1:9090', 'tok with space'), ('http://127.0.0.1:9090', 'tok\nAUTHENTIK_API_URL=x'),
+    ('http://127.0.0.1:9090', 'short'), ('http://a b', 'tok-current-1234'),
+    ('http://h:9090\nEnvironment=X=1', 'tok-current-1234'),
+])
+def test_no_usable_value_never_writes_one(sync, url, token):
+    """No token, or one that is not a plain token, is never written; an address that is
+    not a plain address never reaches the unit."""
+    unit, tok = sync(UNIT, 'AUTHENTIK_TOKEN=tok-old-00000000\n', url, token)
+    if not token or token != 'tok-current-1234':
+        assert tok is None
+    assert unit == UNIT or (url == 'http://127.0.0.1:9090')
+    assert '\nEnvironment=X=1' not in unit and 'a b' not in unit
+
+
+def test_a_token_still_in_the_unit_is_not_duplicated_into_the_file(sync):
+    """A unit from before the token moved to the env file has no EnvironmentFile line:
+    that move runs first, this step then does nothing until it has."""
+    old = UNIT.replace('EnvironmentFile=-/usr/local/etc/mediamtx-webeditor.env\n',
+                       'Environment=AUTHENTIK_TOKEN=tok-old-00000000\n')
+    assert sync(old, '', 'http://127.0.0.1:9090', 'tok-current-1234')[1] is None
+
+
+def test_converge_runs_the_sync_after_the_token_move_and_before_the_restart():
+    body = _func('_startup_converge_mediamtx_overlay')
+    move = body.index('_unit_text_token_to_envfile(')
+    call = body.index('_mediamtx_editor_authentik_sync(')
+    restart = body.index("'restart', 'mediamtx-webeditor'")
+    assert move < call < restart
+    assert '_write_mediamtx_editor_secret_env(_sync_tok)' in body
+    # The token itself never goes to the log.
+    for line in body.splitlines():
+        if 'print(' in line:
+            assert '_sync_tok' not in line and '_ak_tok' not in line

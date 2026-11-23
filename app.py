@@ -114181,6 +114181,37 @@ def _unit_text_token_to_envfile(txt):
     return '\n'.join(out), token
 
 
+_MEDIAMTX_EDITOR_AK_TOKEN_RE = re.compile(r'[A-Za-z0-9._~+/=-]{8,256}')
+_MEDIAMTX_EDITOR_AK_URL_RE = re.compile(r'https?://[A-Za-z0-9.:\[\]-]{1,255}')
+
+
+def _mediamtx_editor_authentik_sync(unit_txt, env_txt, api_url, token):
+    """ops #1082: what the stream site editor on THIS box needs to ask Authentik who is in
+    which group. Its overlay takes every role from that answer, so a token or address
+    that went stale (Authentik redeployed, or moved to another host, after MediaMTX was
+    deployed) would leave every administrator a plain viewer.
+
+    `unit_txt` is the editor's unit, `env_txt` its 600 token file, `api_url` and `token`
+    what the console itself uses for Authentik. Returns (unit text, token): the unit with
+    AUTHENTIK_API_URL set to `api_url`, and the token to write, or None when the file
+    already holds it. Nothing changes for an editor that is not in Authentik mode, or
+    when the console has no usable value (never writes an empty or odd one)."""
+    lines = (unit_txt or '').split('\n')
+    if 'Environment=LDAP_ENABLED=1' not in lines:
+        return unit_txt, None
+    new_unit = unit_txt
+    if api_url and _MEDIAMTX_EDITOR_AK_URL_RE.fullmatch(api_url):
+        new_unit = _unit_text_with_env(unit_txt, 'AUTHENTIK_API_URL', api_url)
+    new_token = None
+    if (token and _MEDIAMTX_EDITOR_AK_TOKEN_RE.fullmatch(token)
+            and _MEDIAMTX_EDITOR_ENVFILE_LINE in lines):
+        have = next((ln.split('=', 1)[1].strip() for ln in (env_txt or '').splitlines()
+                     if ln.startswith('AUTHENTIK_TOKEN=')), '')
+        if have != token:
+            new_token = token
+    return new_unit, new_token
+
+
 def _startup_converge_mediamtx_overlay():
     """v10.1.34: ship mediamtx_ldap_overlay.py to existing boxes on a console update.
 
@@ -114261,6 +114292,38 @@ def _startup_converge_mediamtx_overlay():
                     except Exception as _te:
                         print(f"Startup migration: could not move the MediaMTX editor token "
                               f"({str(_te)[:120]})", flush=True)
+            # ops #1082: the overlay above takes every role from Authentik's API. Keep
+            # the editor's token and API address the same as the console's own, in the
+            # SAME pass that ships the file (after the token move above, so the unit
+            # already reads the env file).
+            if txt:
+                try:
+                    _ak_url, _ak_hdrs, _ak_set = _w1_ak_ctx()
+                    _ak_tok = ''
+                    if _ak_url and str((_ak_hdrs or {}).get('Authorization') or '').startswith('Bearer '):
+                        _ak_tok = _ak_hdrs['Authorization'][len('Bearer '):].strip()
+                    try:
+                        _env_have = _read_priv(_MEDIAMTX_EDITOR_SECRET_ENV)
+                    except Exception:
+                        _env_have = ''
+                    _sync_unit, _sync_tok = _mediamtx_editor_authentik_sync(
+                        txt, _env_have, _ak_url, _ak_tok)
+                    if _sync_tok is not None:
+                        _write_mediamtx_editor_secret_env(_sync_tok)
+                        changed = True
+                        print("Startup migration: the MediaMTX editor's Authentik token was "
+                              "out of date; set to the current one", flush=True)
+                    if _sync_unit != txt:
+                        _write_priv(unit, _sync_unit)
+                        txt = _sync_unit
+                        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']),
+                                       capture_output=True, timeout=30)
+                        changed = True
+                        print("Startup migration: the MediaMTX editor's Authentik API address "
+                              "set to %s" % _ak_url, flush=True)
+                except Exception as _se:
+                    print(f"Startup migration: could not check the MediaMTX editor's "
+                          f"Authentik token ({str(_se)[:120]})", flush=True)
             # v10.1.48: the overlay above now refuses X-Authentik-* headers from an
             # unpinned peer. Converge the unit in the SAME pass that ships the file, so
             # an existing box never runs new overlay + old unit. This is a local editor
