@@ -1,0 +1,268 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# infra-TAK — TAK Infrastructure Platform
+# Copyright (C) 2026 Michael Leckliter
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""ATLAS reads its administrator from Authentik's signed token.
+
+ATLAS 2.10.0 can take the administrator's name and groups from
+`X-Authentik-Jwt`, the token Authentik's outpost sends, instead of the plain
+identity headers (`TAKMDM_ADMIN_IDENTITY_SOURCE=jwt`). The token is signed, and
+its groups are a list, so ATLAS no longer has to trust headers it cannot check.
+
+This module is the InfraTAK half, per deployment:
+
+1. **A signing key of the provider's own** (`ATLAS token signing — <provider>`).
+   A proxy provider has none by default, and then Authentik signs with the
+   provider's client secret (HS256), which ATLAS refuses on purpose.
+2. **The key on the provider**, through `providers/oauth2/<pk>/`. ⚠️ The proxy
+   provider API has no `signing_key` field; a proxy provider is an OAuth2
+   provider underneath, and the OAuth2 endpoint lists every one of them.
+3. **Proof before the switch:** the provider's JWKS must publish a key, and
+   the generated Caddyfile must copy `X-Authentik-Jwt` into this deployment's
+   vhost. Only then does `.env` say `jwt`, with the audience (the provider's
+   client ID) and the key address.
+
+⚠️ **Anything short of that writes `headers`.** `jwt` with no key, or with a
+Caddy that does not pass the token, refuses every administrator, and the
+console is what they would use to fix it.
+
+The key address is Authentik's **public** URL (`atlas_roster.authentik_public_url`):
+`_get_authentik_api_url` answers the host's loopback, which inside ATLAS's
+container is the container itself.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import urllib.parse
+import urllib.request
+
+from . import atlas_instances
+
+ENV_SOURCE = 'TAKMDM_ADMIN_IDENTITY_SOURCE'
+ENV_AUDIENCE = 'TAKMDM_ADMIN_JWT_AUDIENCE'
+ENV_JWKS = 'TAKMDM_ADMIN_JWT_JWKS_URL'
+
+#: Long, because nothing checks a signing key's certificate dates: the token
+#: is verified with the public key alone. Ten years keeps the console from
+#: showing an "expired" certificate it does not need.
+KEY_VALIDITY_DAYS = 3650
+
+TOKEN_HEADER = 'X-Authentik-Jwt'
+
+
+def key_name(provider_name):
+    return 'ATLAS token signing — %s' % provider_name
+
+
+def jwks_url(public_url, app_slug):
+    """📖 Authentik serves a provider's keys at `/application/o/<slug>/jwks/`."""
+    return '%s/application/o/%s/jwks/' % (public_url.rstrip('/'), app_slug)
+
+
+def caddy_copies_token(caddyfile, host):
+    """Does the vhost for `host` copy `X-Authentik-Jwt` from forward_auth?
+
+    ⚠️ Checked in **that** vhost. TAK Portal's vhost copies the token too, and
+    matching the file as a whole would call a Caddyfile ready whose ATLAS block
+    does not pass it.
+    """
+    if not caddyfile or not host:
+        return False
+    start = re.search(r'(?m)^%s \{\s*$' % re.escape(host), caddyfile)
+    if not start:
+        return False
+    end = re.search(r'(?m)^\}\s*$', caddyfile[start.end():])
+    block = caddyfile[start.end(): start.end() + end.start()] if end else caddyfile[start.end():]
+    for line in block.splitlines():
+        words = line.split()
+        if words[:1] == ['copy_headers'] and TOKEN_HEADER in words[1:]:
+            return True
+    return False
+
+
+class AuthentikAdmin:
+    """The few Authentik API calls this needs, as the administrator token."""
+
+    def __init__(self, api_url, token, opener=None):
+        self.base = api_url.rstrip('/') + '/api/v3/'
+        self.headers = {'Authorization': 'Bearer %s' % token,
+                        'Content-Type': 'application/json'}
+        self.opener = opener or urllib.request.urlopen
+
+    def call(self, path, data=None, method=None):
+        req = urllib.request.Request(
+            self.base + path,
+            data=json.dumps(data).encode() if data is not None else None,
+            headers=self.headers, method=method)
+        body = self.opener(req, timeout=15).read().decode()
+        return json.loads(body) if body else {}
+
+    def results(self, path):
+        return self.call(path).get('results', [])
+
+
+def _find(api, path, field, value):
+    """The row whose `field` is exactly `value` (Authentik filters are substrings)."""
+    for row in api.results('%s?%s=%s' % (path, field, urllib.parse.quote(value))):
+        if row.get(field) == value:
+            return row
+    return None
+
+
+def find_provider(api, name):
+    """The deployment's proxy provider, by exact name, or None."""
+    return _find(api, 'providers/proxy/', 'name', name)
+
+
+def ensure_signing_key(api, name):
+    """The provider's own key pair, made if missing. Returns (row, note)."""
+    row = _find(api, 'crypto/certificatekeypairs/', 'name', name)
+    if row is not None:
+        return row, 'present'
+    made = api.call('crypto/certificatekeypairs/generate/', {
+        'common_name': name,
+        'subject_alt_name': '',
+        'validity_days': KEY_VALIDITY_DAYS,
+    }, method='POST')
+    return made, 'created'
+
+
+def ensure_key_on_provider(api, provider_pk, key_pk):
+    """Put the key on the provider. Returns 'present' or 'set'."""
+    current = api.call('providers/oauth2/%s/' % provider_pk)
+    if str(current.get('signing_key') or '') == str(key_pk):
+        return 'present'
+    api.call('providers/oauth2/%s/' % provider_pk, {'signing_key': str(key_pk)},
+             method='PATCH')
+    return 'set'
+
+
+def jwks_has_key(url, opener=None):
+    """Does the provider's JWKS publish at least one key?"""
+    open_ = opener or urllib.request.urlopen
+    body = json.loads(open_(urllib.request.Request(url), timeout=15).read().decode() or '{}')
+    return bool(body.get('keys'))
+
+
+def _read_caddyfile(path='/etc/caddy/Caddyfile'):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return handle.read()
+    except OSError:
+        return ''
+
+
+def ensure(ctx, inst, dirpath, write_env_value, plog, host, opener=None,
+           jwks_opener=None, caddyfile=None, compose_passes=None):
+    """Switch one deployment to the signed token, or keep it on headers.
+
+    `host` is the console's host name as Caddy serves it. `caddyfile` is the
+    generated file's text (read from disk when None). `compose_passes(dirpath)`
+    returns the `TAKMDM_*` names the checked-out ATLAS compose file passes to
+    the container, or None when it cannot be read; only a release that passes
+    `TAKMDM_ADMIN_IDENTITY_SOURCE` (ATLAS 2.10.0 and newer) is switched. Returns
+    ``{'env_changed': bool, 'source': 'jwt' | 'headers'}``; the caller
+    restarts `api` when `env_changed`. Never raises.
+
+    ``source`` is 'unchanged' when an unexpected error stopped the checks;
+    `.env` is then not touched.
+    """
+    env = os.path.join(dirpath, '.env')
+
+    def keep_headers(why):
+        plog('  ⚠ Administrator sign-in stays on the identity headers: %s' % why)
+        try:
+            changed = write_env_value(env, ENV_SOURCE, 'headers')
+        except Exception as exc:
+            plog('  ⚠ Could not write %s: %s' % (ENV_SOURCE, str(exc)[:80]))
+            changed = False
+        return {'env_changed': changed, 'source': 'headers'}
+
+    try:
+        passed = compose_passes(dirpath) if compose_passes else None
+        if passed is None or ENV_SOURCE not in passed:
+            # ⚠️ Before any Authentik change: an older ATLAS cannot use the
+            # key, and its compose file would drop the setting anyway.
+            return keep_headers('this ATLAS release does not read %s (2.10.0 '
+                                'or newer does)' % ENV_SOURCE)
+        settings = ctx['load_settings']()
+        admin = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
+                 ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
+        if not admin:
+            return keep_headers('Authentik is not configured')
+        from . import atlas_roster
+        public = atlas_roster.authentik_public_url(ctx, settings)
+        if not public:
+            return keep_headers("Authentik's public name is unknown")
+        names = atlas_instances.authentik_names(inst)
+        api = AuthentikAdmin(ctx['_get_authentik_api_url'](settings), admin, opener)
+
+        provider = find_provider(api, names['provider'])
+        if provider is None or not provider.get('client_id'):
+            return keep_headers('Authentik has no provider "%s"' % names['provider'])
+        key, key_note = ensure_signing_key(api, key_name(names['provider']))
+        if not key.get('pk'):
+            return keep_headers('the signing key was not made')
+        on_provider = ensure_key_on_provider(api, provider['pk'], key['pk'])
+
+        url = jwks_url(public, names['app_slug'])
+        if not jwks_has_key(url, jwks_opener):
+            return keep_headers('the provider publishes no key at %s yet' % url)
+        text =_read_caddyfile() if caddyfile is None else caddyfile
+        if not caddy_copies_token(text, host):
+            return keep_headers('Caddy does not pass %s to %s yet' % (TOKEN_HEADER, host))
+
+        changed = write_env_value(env, ENV_AUDIENCE, provider['client_id'])
+        changed = write_env_value(env, ENV_JWKS, url) or changed
+        # ⚠️ Last, after the two values it depends on are in place.
+        changed = write_env_value(env, ENV_SOURCE, 'jwt') or changed
+        plog('  ✓ Administrator sign-in uses the signed token (key %s, %s on the '
+             'provider)' % (key_note, on_provider))
+        return {'env_changed': changed, 'source': 'jwt'}
+    except Exception as exc:
+        # ⚠️ **Left as it was, not switched back to headers.** A timeout during
+        # one update says nothing about the key or the Caddyfile; dropping a
+        # working deployment to headers over it would quietly undo the switch.
+        # The checks above that *do* say something (no key published, Caddy
+        # not passing the token) write headers themselves.
+        # Never a secret: the message comes from urllib or the filesystem.
+        plog('  ⚠ Administrator sign-in not checked, left as it was: %s'
+             % str(exc)[:120])
+        return {'env_changed': False, 'source': 'unchanged'}
+
+
+def remove(ctx, inst, opener=None):
+    """Delete the deployment's signing key. Returns a note, or '' when nothing
+    was there. Never raises.
+
+    ⚠️ Only the key this module named for this provider; never one by pk.
+    """
+    try:
+        settings = ctx['load_settings']()
+        admin = (ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_TOKEN') or
+                 ctx['_get_authentik_env_value'](settings, 'AUTHENTIK_BOOTSTRAP_TOKEN'))
+        if not admin:
+            return ''
+        api = AuthentikAdmin(ctx['_get_authentik_api_url'](settings), admin, opener)
+        name = key_name(atlas_instances.authentik_names(inst)['provider'])
+        row = _find(api, 'crypto/certificatekeypairs/', 'name', name)
+        if row is None:
+            return ''
+        api.call('crypto/certificatekeypairs/%s/' % row['pk'], method='DELETE')
+        return 'signing key "%s" deleted' % name
+    except Exception as exc:
+        return 'signing key not deleted: %s' % str(exc)[:80]

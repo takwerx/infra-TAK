@@ -67,6 +67,7 @@ from . import atlas_backup
 from . import atlas_instances
 from . import atlas_renewal
 from . import atlas_roster
+from . import atlas_signed_identity
 from . import atlas_tak_cas
 from .atlas_instances import MODE_DYNAMIC, MODE_FIXED
 
@@ -4064,6 +4065,9 @@ def deploy(ctx, job, params):
             # grows its forward_auth block once Authentik is in the picture.
             ctx['generate_caddyfile'](ctx['load_settings']())
             ctx['_caddy_reload'](plog)
+            # ATLAS W504: after the vhost is re-emitted, which it checks.
+            if _reconcile_signed_identity(ctx, _inst, plog):
+                _compose(ctx, 'up -d api', timeout=300, inst=_inst)
             plog('  ✓ Sign in with an Authentik administrator account.')
         else:
             # ⚠️ Degrading here does NOT mean an open console. ATLAS has two auth
@@ -5201,6 +5205,32 @@ def _reconcile_provider_host(ctx, inst, plog):
         return 'failed'
 
 
+def _reconcile_signed_identity(ctx, inst, plog, regenerate=False):
+    """Switch ATLAS to Authentik's signed token, or keep it on headers (ATLAS W504).
+
+    Returns True when `.env` changed, so the caller recreates `api`. Never
+    raises. See `atlas_signed_identity` for the order and why each check
+    comes before the switch.
+
+    ⚠️ **After the vhost is generated**, because the switch is allowed only
+    once the Caddyfile on disk copies the token into this deployment's vhost.
+    `regenerate` does that first, for the one path that does not already
+    (an update with nothing to install).
+    """
+    try:
+        if regenerate:
+            ctx['generate_caddyfile'](ctx['load_settings']())
+            ctx['_caddy_reload'](plog)
+        me = deployment_identity(ctx, inst, ctx['load_settings']())
+        result = atlas_signed_identity.ensure(
+            ctx, inst, me['dir'], write_env_value, plog, host=me['host'],
+            compose_passes=env_keys_compose_passes)
+        return bool(result.get('env_changed'))
+    except Exception as exc:
+        plog('  ⚠ Could not check administrator sign-in: %s' % str(exc)[:120])
+        return False
+
+
 def _run_update_recorded(ctx, inst=None):
     """v10.2.8 W10: _run_update, with its outcome recorded through the console's seam (card +
     Diagnostics). One record per deployment: `atlas` for the plain one, `atlas-<slug>` for an
@@ -5340,6 +5370,10 @@ def _run_update(ctx, inst=None):
                 except Exception as exc:
                     restart_api = False
                     plog('⚠ Could not check the admin gate: ' + str(exc)[:120])
+                # ATLAS W504: here too, or a deployment already on the newest
+                # release would never move to the signed token.
+                restart_api = _reconcile_signed_identity(
+                    ctx, inst, plog, regenerate=True) or restart_api
                 if _renewal['env_changed'] or restart_api:
                     _compose(ctx, 'up -d api', timeout=300, inst=inst)
                 if _cas['recreated']:
@@ -5447,6 +5481,8 @@ def _run_update(ctx, inst=None):
             changed = _arm_admin_gates(ctx, dirpath, plog, inst=inst,
                                        global_group=_global_admin_group(ctx))
             changed = _push_email_relay(ctx, dirpath, plog) or changed
+            # ATLAS W504: after the vhost above, which it checks.
+            changed = _reconcile_signed_identity(ctx, inst, plog) or changed
             if changed:
                 _compose(ctx, 'up -d api', timeout=300, inst=inst)
             _seed_relay_choice(ctx, plog, inst=inst)
@@ -6014,6 +6050,11 @@ def remove_instance(ctx, inst, plog=None):
     roster_note = atlas_roster.remove(ctx, inst)
     if roster_note:
         note(f'{label}: {roster_note}')
+    # ATLAS W504: the provider's own signing key, or a reused slug's provider
+    # would find the old one by name and sign with it.
+    key_note = atlas_signed_identity.remove(ctx, inst)
+    if key_note:
+        note(f'{label}: {key_note}')
 
     # ⚠️ Only the keys this deployment owns. `atlas_` is a prefix of
     # `atlas_corona_`, so a `startswith` sweep while removing the *plain*
