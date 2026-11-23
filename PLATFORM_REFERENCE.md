@@ -133,6 +133,15 @@ Official: [nodered.org/docs](https://nodered.org/docs)
 - Function nodes cannot `require()` by default; declare modules in the node's `libs`.
 - Never `docker cp` a `flows.json` into a running container (it can persist an empty global context). `nodered/deploy.sh` stops the container first. Confirm `contextStorage` is `localfilesystem` in the file the container actually reads.
 
+## PulsePoint (incident data for the Node-RED PulsePoint feed)
+
+Official: PulsePoint publishes no public API documentation for the web app endpoint we read; there is no official source for this section.
+
+- **`api.pulsepoint.org/v1/webapp?resource=incidents&agencyid=ID` can answer with an AWS WAF bot challenge instead of data.** The reply is `HTTP 202`, an empty body and the header `x-amzn-waf-action: challenge`. Every agency ID gets it, from any network. ✅ verified 2026-11-22 from a Mac on a home network and from inside a Node-RED container (node v22) on a Ubuntu 22.04 test box; the same reply seen by a reporter on a cloud box (infra-TAK #642).
+  - A caller that parses the body sees `Unexpected end of JSON input`. Check the status and `x-amzn-waf-action` before parsing.
+  - infra-TAK reports the block, backs off 5 to 60 minutes and does not try to solve or evade the challenge.
+  - Not known: whether PulsePoint offers an official data route for agencies or integrators.
+
 ## CoTURN (Remote Assist TURN relay)
 
 Official: [coturn releases](https://github.com/coturn/coturn/releases), [docker image](https://hub.docker.com/r/coturn/coturn)
