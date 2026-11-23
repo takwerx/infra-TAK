@@ -40,7 +40,8 @@ import urllib.request
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 _FUNCS = {'_get_cloudtak_latest_release_tag', '_cloudtak_latest_tag_from_git',
-          '_cloudtak_newest_allowed_tag', '_cloudtak_tag_major', '_cloudtak_tag_for_minio_store'}
+          '_cloudtak_newest_allowed_tag', '_cloudtak_tag_major', '_cloudtak_tag_for_minio_store',
+          '_cloudtak_needs_minio_hop', '_cloudtak_minio_hop_tag'}
 
 
 def _ns(cap=14):
@@ -133,22 +134,102 @@ def _before(src, first, then):
 
 def test_update_decides_before_anything_is_checked_out_or_built():
     src = _func_src('run_cloudtak_update')
-    _before(src, '_cloudtak_tag_for_minio_store(', 'Step 2/3: Checking out')
-    _before(src, '_cloudtak_tag_for_minio_store(', '_mod_result_versions(')
+    _before(src, '_cloudtak_minio_hop_tag(', 'Step 2/3: Checking out')
+    _before(src, '_cloudtak_minio_hop_tag(', '_mod_result_versions(')
     assert 'newest 13.x release could not be looked up' in src
 
 
 def test_deploy_local_and_remote_use_the_hop():
     src = _func_src('run_cloudtak_deploy')
-    assert src.count('_cloudtak_tag_for_minio_store(') == 2
-    first, last = src.find('_cloudtak_tag_for_minio_store('), src.rfind('_cloudtak_tag_for_minio_store(')
-    # remote hop comes before the remote checkout; local hop before the local in-place checkout
-    assert first < src.find('_cloudtak_remote_reclone_sh(remote_release_tag)')
-    assert last < src.find("checkout -f {release_tag}", last)
+    # local: the one-call helper (the folder check is a local isdir); remote: branches, so nothing that
+    # came out of the SSH probe is logged (CodeQL clear-text-logging)
+    assert src.count('_cloudtak_tag_for_minio_store(') == 1
+    assert src.count('_cloudtak_needs_minio_hop(') == 1 and src.count('_cloudtak_minio_hop_tag(') == 1
+    assert src.find('_cloudtak_needs_minio_hop(') < src.find('_cloudtak_remote_reclone_sh(remote_release_tag)')
+    assert src.find('_cloudtak_tag_for_minio_store(') < src.find("checkout -f {release_tag}")
     assert 'newest 13.x release could not be looked up' in src
+
+
+def test_update_uses_branches_not_a_returned_value():
+    src = _func_src('run_cloudtak_update')
+    assert '_cloudtak_needs_minio_hop(' in src and '_cloudtak_minio_hop_tag(' in src
+    assert '_cloudtak_tag_for_minio_store(' not in src
+
+
+def test_needs_hop_only_above_13():
+    ns = _ns()
+    assert ns['_cloudtak_needs_minio_hop']('v14.0.0') and ns['_cloudtak_needs_minio_hop']('v15.2.1')
+    assert not ns['_cloudtak_needs_minio_hop']('v13.128.0') and not ns['_cloudtak_needs_minio_hop']('nightly')
 
 
 def test_card_names_the_13_stop_for_a_minio_box():
     src = _func_src('_get_cloudtak_version_info')
     assert '_cloudtak_tag_for_minio_store(' in src
     _before(src, '_cloudtak_tag_for_minio_store(', "out['latest'] =")
+
+
+# --------------------------------------------------------------------------- #
+# behaviour of the real run_cloudtak_update: the top of it, with the box stubbed out
+# --------------------------------------------------------------------------- #
+import collections
+
+
+class _Stop(BaseException):   # BaseException: run_cloudtak_update's own `except Exception` must not swallow it
+    pass
+
+
+def _run_update_top(tmp_path, hop_tag, store=True, target='v14.0.0'):
+    tree = ast.parse(APP)
+    wanted = {'run_cloudtak_update', '_cloudtak_tag_major', '_cloudtak_needs_minio_hop', '_cloudtak_minio_hop_tag'}
+    body = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in wanted]
+    log, status, calls = collections.deque(), {'running': True, 'error': False}, []
+
+    def git_prep(*a, **k):
+        calls.append(('git_prep',))
+        raise _Stop()
+    (tmp_path / '.git').mkdir(exist_ok=True)
+    if store:
+        (tmp_path / '.docker-store').mkdir(exist_ok=True)
+    ns = {'re': re, 'datetime': __import__('datetime').datetime, 'cloudtak_deploy_log': log, 'cloudtak_deploy_status': status,
+          'CLOUDTAK_MINIO_HOP_MAJOR': 13, 'load_settings': lambda: {},
+          '_get_cloudtak_deployment_config': lambda s: {'target_mode': 'local'},
+          '_get_cloudtak_target_release_tag': lambda *a, **k: target,
+          '_get_cloudtak_latest_release_tag': lambda use_cache=True, max_major=None: hop_tag,
+          '_cloudtak_running_version': lambda *a, **k: '13.113.0',
+          '_cloudtak_update_space_problem': lambda *a, **k: None,
+          '_mod_result_versions': lambda *a, **k: calls.append(('versions', k)),
+          '_cloudtak_git_prep': git_prep, '_cloudtak_legacy_minio_image': lambda d: '', '_ssh_probe': lambda *a, **k: (False, ''),
+          'subprocess': type('S', (), {'run': staticmethod(lambda *a, **k: type('R', (), {'returncode': 0, 'stdout': 'abc', 'stderr': ''})())}),
+          'os': os, 'CLOUDTAK_PLUGINS': [], 'traceback': __import__('traceback')}
+    ns['os'] = type('O', (), {'path': type('P', (), {
+        'expanduser': staticmethod(lambda p: p.replace('~/CloudTAK', str(tmp_path))), 'isdir': staticmethod(os.path.isdir),
+        'join': staticmethod(os.path.join), 'exists': staticmethod(os.path.exists),
+        'dirname': staticmethod(os.path.dirname), 'islink': staticmethod(os.path.islink)}),
+        'makedirs': os.makedirs})
+    exec(compile(ast.Module(body=body, type_ignores=[]), 'app.py', 'exec'), ns)
+    try:
+        ns['run_cloudtak_update']()
+    except _Stop:
+        pass
+    return '\n'.join(log), status, calls
+
+
+def test_update_of_a_minio_box_goes_to_13_first(tmp_path):
+    text, status, calls = _run_update_top(tmp_path, 'v13.128.0')
+    assert 'old MinIO folder' in text and 'Updating to v13.128.0 first' in text
+    assert 'Target: v13.128.0' in text and 'Target: v14.0.0' not in text
+    assert calls[0] == ('versions', {'frm': '13.113.0', 'to': '13.128.0'})
+    assert status['error'] is False
+
+
+def test_update_without_the_folder_goes_straight_to_14(tmp_path):
+    text, status, calls = _run_update_top(tmp_path, 'v13.128.0', store=False)
+    assert 'Target: v14.0.0' in text and 'Updating to v13' not in text
+    assert calls[0] == ('versions', {'frm': '13.113.0', 'to': '14.0.0'})
+
+
+def test_update_stops_before_any_change_when_13_cannot_be_looked_up(tmp_path):
+    text, status, calls = _run_update_top(tmp_path, None)
+    assert 'newest 13.x release could not be looked up' in text
+    assert status['error'] is True and status['running'] is False
+    assert calls == [], f'nothing may be touched, it did: {calls}'
