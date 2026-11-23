@@ -77869,6 +77869,9 @@ def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label, tag='p
 # sessions to lose. It also keeps a box BOOT — Authentik and TAK coming up together, the
 # boot-time bind heal recreating the outpost ~100 s in — from restarting TAK (GH #83).
 _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S = 300
+# Reason text of the "console recreated the LDAP outpost" request (`_ensure_authentik_ldap_service_account`),
+# the only request that restarts TAK just because TAK was young when it was made (ops #1117).
+_TAK_RECYCLE_YOUNG_REASON = 'the console recreated the LDAP outpost (service-account password resync)'
 _TAK_RECYCLE_8089_TIMEOUT_S = 900       # Guard Dog's MAX_WAIT_TAK
 _TAK_RECYCLE_API_TIMEOUT_S = 300        # Guard Dog's api wait (_MAX_API)
 # GH #549: TAK's HTTPS side (groups/all, so ATAK Data Sync and CloudTAK) can stay without
@@ -78839,8 +78842,12 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         if pending:
             if req_at > tak_start:
                 reasons.extend(pending)
-                must_restart = bool(st.get('restart')) or (
-                    bool(st.get('restart_if_young'))
+                # ops #1117: a `restart` saved by an older console for nothing but the
+                # outpost-recreate request (a fresh install, hours before its first update)
+                # was a young-TAK restart: treat it like `restart_if_young`.
+                _young_only = all(str(p_).startswith(_TAK_RECYCLE_YOUNG_REASON) for p_ in pending)
+                must_restart = (bool(st.get('restart')) and not _young_only) or (
+                    bool(st.get('restart') or st.get('restart_if_young'))
                     and time.time() - tak_start < _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S)
             else:
                 plog(f"  {tag}: TAK Server already restarted after: {'; '.join(pending)} — reusing that restart")
@@ -87115,8 +87122,7 @@ def _ensure_authentik_ldap_service_account():
             _tak_start = _tak_started_epoch() if _coreconfig_has_ldap() else None
             if _tak_start is not None:
                 _tak_young = time.time() - _tak_start < _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S
-                _tak_ldap_recycle_request('the console recreated the LDAP outpost (service-account '
-                                          'password resync) under a running TAK Server',
+                _tak_ldap_recycle_request(_TAK_RECYCLE_YOUNG_REASON + ' under a running TAK Server',
                                           restart_if_young=_tak_young)
         except Exception:
             pass

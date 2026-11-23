@@ -44,7 +44,7 @@ import urllib.request
 import pytest
 
 from test_startup_ldap_resync_waits_for_authentik_ops438 import Boot
-from test_tak_ldap_recycle import APP, HOUR, T0, Box, _const, _src, healthy_box, sess
+from test_tak_ldap_recycle import APP, HOUR, T0, YOUNG_REASON, Box, _const, _src, healthy_box, sess
 
 
 # ── A. boot heal: no password reset or outpost recreate while the outpost starts ─────────────
@@ -168,6 +168,7 @@ def _ensure(monkeypatch, tak_start):
         '_coreconfig_has_ldap': lambda: True,
         '_tak_started_epoch': lambda: tak_start,
         '_TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S': 300,
+        '_TAK_RECYCLE_YOUNG_REASON': YOUNG_REASON,
         '_tak_ldap_recycle_request': lambda reason, need_groups=True, restart=False, restart_if_young=False: events.append(
             ('request', reason, restart_if_young)),
     }
@@ -206,8 +207,7 @@ def test_the_request_restarts_a_tak_the_box_boot_rule_would_skip_gh616():
     box = healthy_box(tak_start=T0 - 60, ldap_start=T0)
     assert box.recycle(trigger='boot LDAP service-account heal', final=False) is False
     assert box.restarts() == []
-    box.request('the console recreated the LDAP outpost (service-account password resync) under a '
-                'running TAK Server', restart_if_young=True)
+    box.request(YOUNG_REASON + ' under a running TAK Server', restart_if_young=True)
     assert box.recycle(trigger='boot LDAP service-account heal', final=False) is True
     assert len(box.restarts()) == 1
 
