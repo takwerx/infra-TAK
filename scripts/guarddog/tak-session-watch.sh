@@ -218,7 +218,7 @@ fi
 # takVersion), and `read` splits the line on whitespace. So text fields are cut to one
 # plain word and numbers are printed as int, and the shell checks both again after the
 # read and fails closed. Client text must never reach $(( )) or a test.
-read -r SUBS GROUPLESS SERVICE UNKNOWN TOPUID TOPUIDN TOPCLIENT TOPVER TOPIP TOPIPSOCK TOPIPUIDS GLNAMED GLLEFT LEFTOVERS KEYS <<EOF
+read -r SUBS GROUPLESS SERVICE UNKNOWN TOPUID TOPUIDN TOPCLIENT TOPVER TOPIP TOPIPSOCK TOPIPUIDS GLNAMED GLLEFT LEFTOVERS GLDEVS KEYS <<EOF
 $(printf '%s' "$SUBS_JSON" | PEER_IPS="$PEER_IPS" PEER_ADDRS="$PEER_ADDRS" python3 -c '
 import json, os, re, sys, collections
 _UNSAFE = re.compile(r"[^A-Za-z0-9._:-]")
@@ -228,9 +228,9 @@ def out(*a): print(" ".join(str(x) for x in a))
 try:
     rows = json.load(sys.stdin).get("data") or []
 except Exception:
-    out("ERR",0,0,0,"-",0,"-","-","-",0,0,0,0,"-","-"); sys.exit(0)
+    out("ERR",0,0,0,"-",0,"-","-","-",0,0,0,0,"-","-","-"); sys.exit(0)
 if not isinstance(rows, list):
-    out("ERR",0,0,0,"-",0,"-","-","-",0,0,0,0,"-","-"); sys.exit(0)
+    out("ERR",0,0,0,"-",0,"-","-","-",0,0,0,0,"-","-","-"); sys.exit(0)
 
 groupless = service = unknown = 0
 keys = set()
@@ -260,6 +260,7 @@ def row_is_local(r):    # our own containers and loopback: ss on the host does n
 sock_proven = False    # ss and the API agree on at least one channel-holding client: the match works here
 gl_named = 0           # channel-less device rows TAK knows by user name or DN
 left = []              # ...of which the socket is gone and the row is silent: leftovers
+gl_devs = []           # every channel-less device row: (entry, device id, client, version, silent ms)
 
 for r in rows:
     if not isinstance(r, dict):
@@ -295,6 +296,14 @@ for r in rows:
                 service += 1      # server-side service with no channel: expected, not a fault
             else:
                 groupless += 1    # anything with device identity: the thing worth alerting on
+                # ops #1052: name the device behind the row so the operator can find it. Device id,
+                # client name and version, and silence only: never callsign, user name or DN.
+                try:
+                    _sil = int(r.get("lastReportDiffMilliseconds"))
+                except (TypeError, ValueError):
+                    _sil = -1
+                gl_devs.append((str(r.get("subscriptionUid") or ""), _uid,
+                                str(r.get("takClient") or "").strip(), str(r.get("takVersion") or "").strip(), _sil))
                 if str(r.get("username") or "").strip() or str(r.get("dn") or "").strip():
                     gl_named += 1
                     sid = str(r.get("subscriptionUid") or "")
@@ -343,10 +352,19 @@ if sock:
 if not sock_proven:
     left = []
 left.sort(key=lambda x: (len(x), x))
+# ops #1052: one text entry per channel-less device row, longest-silent first, at most 5:
+# entry+device+client+version+minutes silent+L (a leftover) or -. "+" never occurs inside a field
+# (safe() maps it to "-"), so the shell can split on it. Text fields come from the client.
+gl_devs.sort(key=lambda d: -d[4])
+def dev_entry(d):
+    mins = str(d[4] // 60000) if d[4] >= 0 else "?"
+    return "+".join([safe(d[0], 24), safe(d[1], 48), safe(d[2].replace(" ", "_"), 24),
+                     safe(d[3].split()[0] if d[3].split() else "", 24), mins, "L" if d[0] in left else "-"])
+gl_dev_txt = ",".join(dev_entry(d) for d in gl_devs[:5]) or "-"
 out(int(len(rows)), int(groupless), int(service), int(unknown),
     safe(top_uid, 64), int(top_n), safe(tc, 24), safe(tv, 24),
     safe(top_ip.strip("[]"), 64), int(top_sock), int(top_ipuids),
-    int(gl_named), int(len(left)), ",".join(safe(x, 24) for x in left[:5]) or "-",
+    int(gl_named), int(len(left)), ",".join(safe(x, 24) for x in left[:5]) or "-", gl_dev_txt,
     ",".join(safe(k, 64) for k in sorted(keys, key=str)) or "-")
 ' 2>/dev/null)
 EOF
@@ -368,6 +386,10 @@ for _v in TOPUID TOPCLIENT TOPVER TOPIP LEFTOVERS KEYS; do
     ''|*[!A-Za-z0-9._:,-]*) printf -v "$_v" '%s' '-' ;;
   esac
 done
+# ops #1052: the device list also holds "+" between its fields and "?" for an unknown silence.
+case "$GLDEVS" in
+  ''|*[!A-Za-z0-9._:,+?-]*) GLDEVS='-' ;;
+esac
 case "$EXTERNAL" in ''|*[!0-9]*) EXTERNAL=0 ;; esac
 
 # Record the schema once so a future release can stop guessing at the group key.
@@ -510,6 +532,23 @@ if [ "$GROUPLESS" -gt 0 ]; then
    above: $SERVICE)
   Connected and authenticated, but holding no channel, so TAK routes them
   nothing."
+  # ops #1052: name the device behind each row, so the operator can find it. Entry, device ID,
+  # client and version, minutes silent. Never callsign, user name or certificate name.
+  if [ "$GLDEVS" != "-" ]; then
+    _DEVTXT=""
+    _OLDIFS=$IFS
+    IFS=,
+    for _e in $GLDEVS; do
+      IFS=+ read -r _d_sid _d_uid _d_cl _d_ver _d_min _d_left <<DEV
+$_e
+DEV
+      _DEVTXT="$_DEVTXT
+    TAK entry $_d_sid: device $_d_uid, $_d_cl $_d_ver, silent $_d_min min$([ "$_d_left" = "L" ] && echo ', leftover')"
+    done
+    IFS=$_OLDIFS
+    FINDINGS="$FINDINGS
+  Devices with no channel (longest silent first, up to 5):$_DEVTXT"
+  fi
   # GH #634: a row whose socket is gone is not "connected". Say so, name the TAK entries, and do
   # not promise a self-heal that the console does not do for a connection TAK knows by name.
   if [ "$GLLEFT" -gt 0 ]; then
