@@ -65,7 +65,7 @@ GARAGE_RPC_SECRET=%s
 """ % ('ab' * 32)
 
 HELPERS = ('_cloudtak_build_env_content', '_cloudtak_env_secrets', '_cloudtak_env_preserve_unknown',
-           '_cloudtak_store_endpoint', 'run_cloudtak_deploy')
+           '_cloudtak_store_endpoint', '_cloudtak_env_read', 'run_cloudtak_deploy')
 
 
 class _Stop(Exception):

@@ -59093,13 +59093,12 @@ def run_cloudtak_deploy(cfg=None):
         except Exception as _me:
             plog(f"  WARNING: arm64 media-infra build step errored (media may be unavailable): {_me}")
 
-        api_url = ''
-        media_url = ''
-        for _line in env_content.splitlines():
-            if _line.startswith('API_URL='):
-                api_url = _line.split('=', 1)[1].strip()
-            elif _line.startswith('CLOUDTAK_Config_media_url='):
-                media_url = _line.split('=', 1)[1].strip()
+        # Read the two URLs back from the .env just written, not from env_content: env_content holds the
+        # generated secrets, and a value taken out of it is flagged by CodeQL as a secret in the log
+        # (alert #29, a false positive: only the API and media URLs are logged here).
+        _written_env = _cloudtak_env_read(env_path)
+        api_url = (_written_env.get('API_URL') or '').strip()
+        media_url = (_written_env.get('CLOUDTAK_Config_media_url') or '').strip()
         plog(f"✓ .env written")
         if api_url:
             plog(f"  API URL: {api_url}")
