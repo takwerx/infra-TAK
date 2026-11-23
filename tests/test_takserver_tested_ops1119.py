@@ -181,7 +181,7 @@ def test_the_mail_item_says_in_plain_words_what_we_tested_and_where_to_click():
     assert it['summary'] == f'We tested TAK Server {V}. It installs and updates fine.'
     assert it['identity'] == V and it['target'] == V and it['installed'] == '5.8-RELEASE84'
     assert it['how'] == 'TAK Server page → Update TAK Server.'
-    assert any('tak.gov' in line and 'upload' in line for line in it['detail'])
+    assert any(_tst().TAK_GOV_URL in line and 'upload' in line for line in it['detail'])
     assert it['tested_new'] is True
 
 
@@ -249,7 +249,7 @@ def test_one_plain_mail_the_first_time_and_none_the_second():
     assert subj == f'✅ TAK Server {V} tested: ready to update on tak-prod-1'
     assert f'We tested TAK Server {V}. It installs and updates fine.' in body
     assert 'To install: TAK Server page → Update TAK Server.' in body
-    assert 'tak.gov' in body
+    assert _tst().TAK_GOV_URL in body
     state = saved[-1]
     assert state['takserver-tested'] == V
     r2, sent2, saved2, _ = _sweep([_item()], state)
