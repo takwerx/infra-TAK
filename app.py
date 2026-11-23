@@ -114547,9 +114547,14 @@ def _mediamtx_remote_overlay_plan(probe_out, overlay_sha, api_url, token, truste
         new_unit = _unit_text_with_env(new_unit, _MEDIAMTX_TRUSTED_PROXIES_KEY, trusted)
     if new_unit != unit:
         plan['unit'] = new_unit
-    plan['api_url'] = next((ln.split('=', 2)[2].strip() for ln in new_unit.split('\n')
-                            if ln.startswith('Environment=AUTHENTIK_API_URL=')),
-                           _MEDIAMTX_REMOTE_EDITOR_AK_DEFAULT)
+    # The address the editor uses after this plan: the one _mediamtx_editor_authentik_sync()
+    # writes (same rule), else the one the unit on the host already has.
+    if api_url and _MEDIAMTX_EDITOR_AK_URL_RE.fullmatch(api_url):
+        plan['api_url'] = api_url
+    else:
+        plan['api_url'] = next((ln.split('=', 2)[2].strip() for ln in lines
+                                if ln.startswith('Environment=AUTHENTIK_API_URL=')),
+                               _MEDIAMTX_REMOTE_EDITOR_AK_DEFAULT)
     return plan
 
 
@@ -114566,7 +114571,8 @@ def _mediamtx_remote_overlay_apply_sh(stage, gate_url, restart):
     q = shlex.quote
     return (
         f'T={q(stage)}; D=/opt/mediamtx-webeditor; '
-        f'U=/etc/systemd/system/mediamtx-webeditor.service; E={q(_MEDIAMTX_EDITOR_SECRET_ENV)}; '
+        # E is _MEDIAMTX_EDITOR_SECRET_ENV, written out (the tests hold the two together)
+        'U=/etc/systemd/system/mediamtx-webeditor.service; E=/usr/local/etc/mediamtx-webeditor.env; '
         'trap \'rm -rf "$T"\' EXIT; '
         'if [ -f "$T/akcheck.py" ]; then EF="$E"; [ -f "$T/env" ] && EF="$T/env"; '
         f'if R=$(python3 "$T/akcheck.py" {q(gate_url)} "$EF" 2>&1); then echo INFRATAK_REACH=ok; '

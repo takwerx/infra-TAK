@@ -664,3 +664,10 @@ def test_root_wrapper_keeps_the_whole_script_as_root():
     assert re.search(r'_module_run_root\(\s*cfg, _mediamtx_remote_overlay_apply_sh\(', fn)
     assert re.search(r'_module_run_root\(cfg, _MEDIAMTX_REMOTE_OVERLAY_PROBE_SH', fn)
     assert 'sudo' not in fn
+
+
+def test_apply_script_names_the_same_token_file_as_the_deploy(tmp_path, host, authentik):
+    console = Console(tmp_path, host, authentik.url)
+    sh = console.ns['_mediamtx_remote_overlay_apply_sh']('/tmp/infratak-mtx.abcdefgh', authentik.url, True)
+    assert 'E=%s; ' % console.ns['_MEDIAMTX_EDITOR_SECRET_ENV'] in sh
+    assert console.ns['_MEDIAMTX_EDITOR_SECRET_ENV'] in console.ns['_MEDIAMTX_REMOTE_OVERLAY_PROBE_SH']
