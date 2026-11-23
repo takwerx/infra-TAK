@@ -4999,12 +4999,16 @@ def _sso_directory_verdict(uname):
 
 def _sso_user_is_console_admin(uname):
     """May this Authentik user, on a request that passed forward_auth, have a console
-    session? Authentik's API decides. Returns 'admin' (it says so now), 'held' (no answer
-    now, and it said so within SSO_UNCONFIRMED_MAX_SECONDS), 'denied' (a clear no) or ''
-    (no answer and nothing recent). Only the first two open the console."""
+    session? Authentik's API decides (_sso_directory_lookup: active, and a superuser or
+    in the administrator group). Returns 'admin' (it says so now), 'held' (no answer
+    now, and it said so within SSO_UNCONFIRMED_MAX_SECONDS) or '' (refused: a clear no,
+    or no answer and nothing recent). The result is false exactly when the console must
+    stay closed."""
     verdict = _sso_directory_verdict(uname)
-    if verdict in ('admin', 'denied'):
-        return verdict
+    if verdict == 'admin':
+        return 'admin'
+    if verdict == 'denied':
+        return ''
     try:
         seen = 0
         if (session.get('authenticated') and _session_made_by_sso()
@@ -5112,14 +5116,16 @@ def _apply_authentik_session():
     _sso_verdict = _sso_user_is_console_admin(uname)
     if _sso_verdict not in ('admin', 'held'):
         request.environ['infratak.sso_denied'] = uname
-        if not _sso_verdict:
+        # Why, for the page and the audit row (the answer is cached, this asks nothing new).
+        _sso_no_answer = _sso_directory_verdict(uname) != 'denied'
+        if _sso_no_answer:
             request.environ['infratak.sso_denied_reason'] = 'no-answer'
         if session.get('authenticated') and not _had_password_session:
             session.clear()   # an Authentik-made session of someone who is no longer an administrator
         audit('auth:sso-denied', '%s: %s' % (
-            uname, 'not a console administrator in Authentik' if _sso_verdict
-            else 'Authentik gave no answer, and none in the last %d minutes'
-            % (SSO_UNCONFIRMED_MAX_SECONDS // 60)))
+            uname, 'Authentik gave no answer, and none in the last %d minutes'
+            % (SSO_UNCONFIRMED_MAX_SECONDS // 60) if _sso_no_answer
+            else 'not a console administrator in Authentik'))
         return False
     # 'held' keeps the time of the last real answer, so it cannot renew itself.
     if _sso_verdict == 'admin':
