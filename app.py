@@ -4872,19 +4872,20 @@ def _proxy_auth_state(create=False):
 # an Authentik superuser, who can join that group at will). The Authentik application
 # policy says the same thing; the console checks it too, so neither depends on the other.
 #
-# Two sources, in this order:
-#   1. Authentik's user API, asked with the box's own token. It is the live answer, so a
-#      session also ends after the person is removed from the group or deactivated.
-#      (The outpost keeps the group list from sign-in time, and /api/* does not pass
-#      forward_auth, see generate_caddyfile.)
-#   2. When the API gives no answer (Authentik restarting, token unusable): the
-#      X-Authentik-Groups header on a request that passed forward_auth, and for a session
-#      that already exists, a short time limit since Authentik last confirmed it.
-# A clear "no" from the API always wins. No answer never lets a new person in without the
-# group header, and never keeps a session past SSO_UNCONFIRMED_MAX_SECONDS.
+# One source: Authentik's user API, asked with the box's own token. It is the live
+# answer, so a session also ends after the person is removed from the group or
+# deactivated. (The outpost keeps the group list from sign-in time, and /api/* does not
+# pass forward_auth, see generate_caddyfile.)
 #
-# Header format: https://docs.goauthentik.io/add-secure-apps/providers/proxy/
-# ("X-authentik-groups: foo|bar|baz ... separated by a pipe").
+# When the API gives no answer (Authentik restarting, token unusable), only a person the
+# API confirmed in the last SSO_UNCONFIRMED_MAX_SECONDS is let in or kept. Nobody else
+# gets a session from Authentik sign-in until it answers; the console password still
+# works.
+#
+# ops #1082: the X-Authentik-Groups header is not read here. The outpost joins the group
+# names with "|" into one value and a group name is free text that may hold "|" itself,
+# so a split of the header does not give back the exact names. Header format:
+# https://docs.goauthentik.io/add-secure-apps/providers/proxy/
 CONSOLE_SSO_ADMIN_GROUP = 'authentik Admins'
 SSO_RECHECK_SECONDS = 60            # ask Authentik again at most this often per user
 SSO_UNKNOWN_RETRY_SECONDS = 20      # after no answer, wait this long before the next try
@@ -4897,11 +4898,6 @@ _sso_dir_cache = {}       # username -> (verdict, time checked)
 _sso_dir_inflight = {}    # username -> Thread
 _sso_dir_last_admin = {}  # username -> time the API last said 'admin'
 _sso_dir_ctx = {'at': 0.0, 'url': None, 'headers': None}
-
-
-def _authentik_header_groups(raw):
-    """Group names from an X-Authentik-Groups header value (pipe separated)."""
-    return {p.strip() for p in str(raw or '').split('|') if p.strip()}
 
 
 def _sso_directory_ctx(drop=False):
@@ -5001,15 +4997,30 @@ def _sso_directory_verdict(uname):
     return 'unknown'
 
 
-def _sso_user_is_console_admin(uname, groups_header):
+def _sso_user_is_console_admin(uname):
     """May this Authentik user, on a request that passed forward_auth, have a console
-    session? The API answer decides; with no answer, the group header does."""
+    session? Authentik's API decides (_sso_directory_lookup: active, and a superuser or
+    in the administrator group). Returns 'admin' (it says so now), 'held' (no answer
+    now, and it said so within SSO_UNCONFIRMED_MAX_SECONDS) or '' (refused: a clear no,
+    or no answer and nothing recent). The result is false exactly when the console must
+    stay closed."""
     verdict = _sso_directory_verdict(uname)
     if verdict == 'admin':
-        return True
+        return 'admin'
     if verdict == 'denied':
-        return False
-    return CONSOLE_SSO_ADMIN_GROUP in _authentik_header_groups(groups_header)
+        return ''
+    try:
+        seen = 0
+        if (session.get('authenticated') and _session_made_by_sso()
+                and session.get('authentik_username') == uname):
+            seen = int(session.get('sso_ok_at') or 0)
+    except (TypeError, ValueError):
+        seen = 0
+    with _sso_dir_lock:
+        seen = max(seen, int(_sso_dir_last_admin.get(uname) or 0))
+    if seen and 0 <= int(time.time()) - seen <= SSO_UNCONFIRMED_MAX_SECONDS:
+        return 'held'
+    return ''
 
 
 def _session_made_by_sso():
@@ -5059,6 +5070,11 @@ def _sso_denied_message():
     uname = request.environ.get('infratak.sso_denied')
     if not uname:
         return None
+    if request.environ.get('infratak.sso_denied_reason') == 'no-answer':
+        return ('You are signed in to Authentik as %s, but Authentik did not answer when '
+                'the console asked if this account is an infra-TAK administrator, so the '
+                'console did not open. Try again in a minute. You can also sign in here '
+                'with the console password.' % uname)
     return ('You are signed in to Authentik as %s, but this account is not an infra-TAK '
             'administrator, so the console did not open. An administrator can add the '
             'account to the "%s" group in Authentik (Admin, Groups). If that was done '
@@ -5097,18 +5113,37 @@ def _apply_authentik_session():
     # ops #813: passing forward_auth proves who the person is, not that they may run the
     # console. Only a console administrator gets a session here.
     _had_password_session = bool(session.get('authenticated')) and not _session_made_by_sso()
-    if not _sso_user_is_console_admin(uname, request.headers.get('X-Authentik-Groups')):
+    _sso_verdict = _sso_user_is_console_admin(uname)
+    if _sso_verdict not in ('admin', 'held'):
         request.environ['infratak.sso_denied'] = uname
+        # Why, for the page and the audit row (the answer is cached, this asks nothing new).
+        _sso_no_answer = _sso_directory_verdict(uname) != 'denied'
+        if _sso_no_answer:
+            request.environ['infratak.sso_denied_reason'] = 'no-answer'
         if session.get('authenticated') and not _had_password_session:
             session.clear()   # an Authentik-made session of someone who is no longer an administrator
-        audit('auth:sso-denied', '%s: not a console administrator in Authentik' % uname)
+        audit('auth:sso-denied', '%s: %s' % (
+            uname, 'Authentik gave no answer, and none in the last %d minutes'
+            % (SSO_UNCONFIRMED_MAX_SECONDS // 60) if _sso_no_answer
+            else 'not a console administrator in Authentik'))
         return False
+    # 'held' keeps the time of the last real answer, so it cannot renew itself.
+    if _sso_verdict == 'admin':
+        _sso_ok_at = int(time.time())
+    else:
+        try:
+            _sso_ok_at = int(session.get('sso_ok_at') or 0) if (
+                not _had_password_session and session.get('authentik_username') == uname) else 0
+        except (TypeError, ValueError):
+            _sso_ok_at = 0
+        with _sso_dir_lock:
+            _sso_ok_at = max(_sso_ok_at, int(_sso_dir_last_admin.get(uname) or 0))
     session['authenticated'] = True
     session['authentik_username'] = uname
     # A session the console password made stays a password session: the password is its
     # own proof and does not depend on Authentik.
     session['auth_via'] = 'password' if _had_password_session else 'sso'
-    session['sso_ok_at'] = int(time.time())
+    session['sso_ok_at'] = _sso_ok_at
     _stamp_session_login()   # ops #634
     _stamp_notice_login(False)
     # v10.1.40: stamp the idle clock at the moment SSO authenticates.
@@ -31069,8 +31104,10 @@ _PN_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$')
 _PN_PKG_RE = re.compile(r'^[a-z0-9][a-z0-9.+_-]{0,99}$')
 _PN_VER_RE = re.compile(r'^[A-Za-z0-9.+~^:_-]{1,64}$')
 # os_type as _read_os_release() writes it (ubuntu-22.04, rocky-9), optionally /<kernel
-# flavour> (ubuntu-22.04/aws) for kernel rows, or '*' for every OS.
-_PN_OS_RE = re.compile(r'^(\*|[a-z]+-[0-9.]+(/[a-z][a-z0-9-]*)?)$')
+# flavour> (ubuntu-22.04/aws) and @<kernel series> (ubuntu-22.04/aws@6.8: a 22.04 box on the
+# 6.8 HWE kernel, which numbers its releases apart from 5.15) for kernel rows, or '*' for
+# every OS.
+_PN_OS_RE = re.compile(r'^(\*|[a-z]+-[0-9.]+(/[a-z][a-z0-9-]*)?(@[0-9]+\.[0-9]+)?)$')
 
 # Third-party packages whose upstream publishes GitHub advisories: package (same name on
 # apt and dnf) -> (repo, advisory package names that follow its releases or None for all,
@@ -31311,7 +31348,8 @@ def _patch_now_feed_items(advisories, installed, os_type, rb, pkg_mgr):
                 m = re.search(r'-([a-z][a-z0-9]*)$', run)
                 flavour = m.group(1) if m else ''
                 key = f'{os_type}/{flavour}' if flavour and flavour != 'generic' else os_type
-                fixed = per.get(key)
+                sm = re.match(r'(\d+\.\d+)\.', run)
+                fixed = (per.get(f'{key}@{sm.group(1)}') if sm else None) or per.get(key)
                 if not (fixed and run and _kernel_version_key(run) < _kernel_version_key(fixed)):
                     continue
                 kernel = True
@@ -89280,6 +89318,116 @@ def authentik_admin_accounts_api():
     return jsonify(_get_authentik_admin_accounts_status())
 
 
+# ops #1082: group names that another program can read as a different group.
+#
+# Authentik gives a signed-in person's groups to the app behind it as ONE header value,
+# the names joined with "|" (https://docs.goauthentik.io/add-secure-apps/providers/proxy/),
+# and an Authentik group name is free text. An app that splits that value (some also
+# split on ";" and ",") reads a group named "a|b" as the two groups "a" and "b". The
+# console and the stream site do not read the header for that reason (they ask Authentik
+# for the exact list), but other apps behind Authentik do. So the console looks for such
+# names, says so in its log and on the Authentik page, and leaves the group alone: a
+# rename by the console could break the TAK group it maps to.
+AK_GROUP_NAME_SEPARATORS = '|;,'
+AK_GROUP_NAME_SCAN_SECONDS = 1800     # the background check
+AK_GROUP_NAME_PAGE_SECONDS = 120      # the Authentik page asks again at most this often
+_ak_group_names_lock = threading.Lock()
+_ak_group_names_state = {'at': 0.0, 'result': None, 'logged': set()}
+
+
+def _ak_group_name_findings(names):
+    """Which of `names` can be read as other groups. A name is listed when it holds "|"
+    (the header's own separator), or when a part of it between "|", ";" or "," is the
+    name of ANOTHER group (compared without case and outer spaces, as such readers do).
+    Returns [{'name': ..., 'reads_as': [other group names]}], sorted by name."""
+    names = [n for n in names if isinstance(n, str) and n]
+    by_key = {}
+    for n in names:
+        by_key.setdefault(n.strip().lower(), n)
+    by_key.setdefault(CONSOLE_SSO_ADMIN_GROUP.lower(), CONSOLE_SSO_ADMIN_GROUP)
+    out = []
+    for n in sorted(set(names)):
+        if not any(c in n for c in AK_GROUP_NAME_SEPARATORS):
+            continue
+        parts = [n]
+        for sep in AK_GROUP_NAME_SEPARATORS:
+            parts = [q for part in parts for q in part.split(sep)]
+        own = n.strip().lower()
+        reads_as = []
+        for part in parts:
+            key = part.strip().lower()
+            if key and key != own and key in by_key and by_key[key] not in reads_as:
+                reads_as.append(by_key[key])
+        if '|' in n or reads_as:
+            out.append({'name': n, 'reads_as': reads_as})
+    return out
+
+
+def _ak_group_names_scan(force=False, max_age=AK_GROUP_NAME_SCAN_SECONDS):
+    """Read every Authentik group name and return
+    {'available': True, 'findings': [...], 'checked_at': epoch} or
+    {'available': False, 'error': ...}. Cached; each finding is logged and audited once
+    per console run. Never raises."""
+    now = time.time()
+    with _ak_group_names_lock:
+        cached = _ak_group_names_state['result']
+        if cached and not force and now - _ak_group_names_state['at'] < max_age:
+            return cached
+    try:
+        ak_url, ak_headers, _settings = _w1_ak_ctx()
+        if not ak_url:
+            return {'available': False, 'error': 'Authentik is not deployed or has no API token'}
+        names, page = [], 1
+        while page and page <= 200:
+            data = _w1_ak_get(
+                ak_url, 'core/groups/?include_users=false&page_size=100&page=%d' % page,
+                ak_headers)
+            for g in (data.get('results') or []):
+                if isinstance(g, dict) and isinstance(g.get('name'), str):
+                    names.append(g['name'])
+            page = (data.get('pagination') or {}).get('next') or 0
+        result = {'available': True, 'findings': _ak_group_name_findings(names),
+                  'groups_checked': len(names), 'checked_at': int(now)}
+    except Exception as e:
+        return {'available': False, 'error': f'Could not read the groups from Authentik: {str(e)[:120]}'}
+    with _ak_group_names_lock:
+        _ak_group_names_state.update(at=now, result=result)
+        fresh = [f for f in result['findings'] if f['name'] not in _ak_group_names_state['logged']]
+        _ak_group_names_state['logged'].update(f['name'] for f in fresh)
+    for f in fresh:
+        detail = ('%r can be read as %s' % (f['name'], ', '.join(repr(x) for x in f['reads_as']))
+                  if f['reads_as'] else '%r holds the separator "|"' % f['name'])
+        print('[authentik] \u26a0 GROUP NAME WARNING: the Authentik group %s by an app that '
+              'splits the group list. If you did not make this group on purpose, look at who '
+              'made it and who is in it (Authentik Admin, Directory, Groups), then rename or '
+              'delete it.' % detail, flush=True)
+        try:
+            audit('authentik:group-name-separator', detail, force=True)
+        except Exception:
+            pass
+    return result
+
+
+def _ak_group_names_watch():
+    """Background check: a first look soon after the console starts, then one every
+    AK_GROUP_NAME_SCAN_SECONDS."""
+    time.sleep(120)
+    while True:
+        try:
+            _ak_group_names_scan(force=True)
+        except Exception:
+            pass
+        time.sleep(AK_GROUP_NAME_SCAN_SECONDS)
+
+
+@app.route('/api/authentik/group-names')
+@login_required
+def authentik_group_names_api():
+    """ops #1082: Authentik groups whose name can be read as another group. Drives the
+    warning on /authentik, which shows only when there is one."""
+    return jsonify(_ak_group_names_scan(max_age=AK_GROUP_NAME_PAGE_SECONDS))
+
+
 @app.route('/api/authentik/audit-log')
 @login_required
 def authentik_audit_log_api():
@@ -106232,6 +106380,26 @@ _KERNEL_CVE_FIXES = {
     'CVE-2026-53266': {
         'jammy': (5, 15, 0, 198),
     },
+    # ops #1084: IPv4 TCP connection setup, remote, no login (CVSS 9.8).
+    # https://ubuntu.com/security/CVE-2026-98432 — `linux` package rows. Cloud kernels
+    # (-aws, -azure) number their releases on their own scale (5.15.0-1120 vs 5.15.0-203),
+    # so they get their own `<codename>/<flavour>` key; a flavour with no key is skipped.
+    'CVE-2026-98432': {
+        'jammy': (5, 15, 0, 203),
+        'noble': (6, 8, 0, 149),
+        'jammy/aws': (5, 15, 0, 1120),
+        'jammy/azure': (5, 15, 0, 1126),
+        'noble/aws': (6, 8, 0, 1069),
+        'noble/azure': (6, 8, 0, 1073),
+        'jammy/lowlatency': (5, 15, 0, 198),   # linux-lowlatency 5.15.0-198.208
+        'noble/lowlatency': (6, 8, 0, 149),    # linux-lowlatency 6.8.0-149.149.1
+        # 22.04 on the 6.8 HWE kernels (linux-hwe-6.8, linux-aws-6.8, linux-azure-6.8,
+        # linux-lowlatency-hwe-6.8): the same numbers as noble's
+        'jammy@6.8': (6, 8, 0, 149),
+        'jammy/aws@6.8': (6, 8, 0, 1069),
+        'jammy/azure@6.8': (6, 8, 0, 1073),
+        'jammy/lowlatency@6.8': (6, 8, 0, 149),
+    },
 }
 
 
@@ -106256,8 +106424,20 @@ def _kernel_cve_banner(running_kernel):
     running = _running_kernel_tuple(running_kernel)
     if not codename or not running:
         return None
+    # ops #1084: a cloud kernel (5.15.0-1120-aws) is looked up as "<codename>/aws", never
+    # against the generic number: 1120 is not "newer" than 203, it is a different scale.
+    # -generic is the plain codename. -lowlatency has its own `<codename>/lowlatency` fix
+    # number when a row lists one, else it is judged by the plain codename as it always
+    # was. Any other flavour with no key (gcp, oem, fde) never matches.
+    m = re.search(r'-([a-z][a-z0-9]*)$', running_kernel or '')
+    flavour = m.group(1) if m else ''
+    keys = [codename] if flavour in ('', 'generic') else [f'{codename}/{flavour}']
+    if flavour == 'lowlatency':
+        keys.append(codename)
+    # a 22.04 box on the 6.8 HWE kernel: "<key>@6.8" first (its own numbers), else as before
+    keys = [f'{k}@{running[0]}.{running[1]}' for k in keys] + keys
     for cve, fixed_by in _KERNEL_CVE_FIXES.items():
-        fixed = fixed_by.get(codename)
+        fixed = next((fixed_by[k] for k in keys if fixed_by.get(k)), None)
         if fixed and running < fixed:
             return cve
     return None
@@ -114083,6 +114263,37 @@ def _unit_text_token_to_envfile(txt):
     return '\n'.join(out), token
 
 
+_MEDIAMTX_EDITOR_AK_TOKEN_RE = re.compile(r'[A-Za-z0-9._~+/=-]{8,256}')
+_MEDIAMTX_EDITOR_AK_URL_RE = re.compile(r'https?://[A-Za-z0-9.:\[\]-]{1,255}')
+
+
+def _mediamtx_editor_authentik_sync(unit_txt, env_txt, api_url, token):
+    """ops #1082: what the stream site editor on THIS box needs to ask Authentik who is in
+    which group. Its overlay takes every role from that answer, so a token or address
+    that went stale (Authentik redeployed, or moved to another host, after MediaMTX was
+    deployed) would leave every administrator a plain viewer.
+
+    `unit_txt` is the editor's unit, `env_txt` its 600 token file, `api_url` and `token`
+    what the console itself uses for Authentik. Returns (unit text, token): the unit with
+    AUTHENTIK_API_URL set to `api_url`, and the token to write, or None when the file
+    already holds it. Nothing changes for an editor that is not in Authentik mode, or
+    when the console has no usable value (never writes an empty or odd one)."""
+    lines = (unit_txt or '').split('\n')
+    if 'Environment=LDAP_ENABLED=1' not in lines:
+        return unit_txt, None
+    new_unit = unit_txt
+    if api_url and _MEDIAMTX_EDITOR_AK_URL_RE.fullmatch(api_url):
+        new_unit = _unit_text_with_env(unit_txt, 'AUTHENTIK_API_URL', api_url)
+    new_token = None
+    if (token and _MEDIAMTX_EDITOR_AK_TOKEN_RE.fullmatch(token)
+            and _MEDIAMTX_EDITOR_ENVFILE_LINE in lines):
+        have = next((ln.split('=', 1)[1].strip() for ln in (env_txt or '').splitlines()
+                     if ln.startswith('AUTHENTIK_TOKEN=')), '')
+        if have != token:
+            new_token = token
+    return new_unit, new_token
+
+
 def _startup_converge_mediamtx_overlay():
     """v10.1.34: ship mediamtx_ldap_overlay.py to existing boxes on a console update.
 
@@ -114163,6 +114374,38 @@ def _startup_converge_mediamtx_overlay():
                     except Exception as _te:
                         print(f"Startup migration: could not move the MediaMTX editor token "
                               f"({str(_te)[:120]})", flush=True)
+            # ops #1082: the overlay above takes every role from Authentik's API. Keep
+            # the editor's token and API address the same as the console's own, in the
+            # SAME pass that ships the file (after the token move above, so the unit
+            # already reads the env file).
+            if txt:
+                try:
+                    _ak_url, _ak_hdrs, _ak_set = _w1_ak_ctx()
+                    _ak_tok = ''
+                    if _ak_url and str((_ak_hdrs or {}).get('Authorization') or '').startswith('Bearer '):
+                        _ak_tok = _ak_hdrs['Authorization'][len('Bearer '):].strip()
+                    try:
+                        _env_have = _read_priv(_MEDIAMTX_EDITOR_SECRET_ENV)
+                    except Exception:
+                        _env_have = ''
+                    _sync_unit, _sync_tok = _mediamtx_editor_authentik_sync(
+                        txt, _env_have, _ak_url, _ak_tok)
+                    if _sync_tok is not None:
+                        _write_mediamtx_editor_secret_env(_sync_tok)
+                        changed = True
+                        print("Startup migration: the MediaMTX editor's Authentik token was "
+                              "out of date; set to the current one", flush=True)
+                    if _sync_unit != txt:
+                        _write_priv(unit, _sync_unit)
+                        txt = _sync_unit
+                        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']),
+                                       capture_output=True, timeout=30)
+                        changed = True
+                        print("Startup migration: the MediaMTX editor's Authentik API address "
+                              "set to %s" % _ak_url, flush=True)
+                except Exception as _se:
+                    print(f"Startup migration: could not check the MediaMTX editor's "
+                          f"Authentik token ({str(_se)[:120]})", flush=True)
             # v10.1.48: the overlay above now refuses X-Authentik-* headers from an
             # unpinned peer. Converge the unit in the SAME pass that ships the file, so
             # an existing box never runs new overlay + old unit. This is a local editor
@@ -120496,6 +120739,12 @@ def _startup_migrations():
                              name='coturn-converge').start()
         except Exception as _ct_err:
             print(f"Startup migration: CoTURN converge start error (non-fatal): {_ct_err}")
+        # ops #1082: watch Authentik for group names that read as another group.
+        try:
+            threading.Thread(target=_ak_group_names_watch, daemon=True,
+                             name='authentik-group-names').start()
+        except Exception as _gn_err:
+            print(f"Startup: Authentik group name watch start error (non-fatal): {_gn_err}")
     except Exception as e:
         print(f"Startup migration error: {e}")
         import traceback; traceback.print_exc()

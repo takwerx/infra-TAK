@@ -297,7 +297,7 @@ def _apply(state, headers):
           # ops #813: who may have a session is a later check with its own tests
           # (test_console_sso_session_ops813.py). Here the person is an administrator, so
           # these tests stay about the proxy-auth secret alone.
-          '_sso_user_is_console_admin': lambda uname, groups: True,
+          '_sso_user_is_console_admin': lambda uname: 'admin',
           '_session_made_by_sso': lambda: True, 'audit': lambda *a, **k: None}
     exec(compile(_fn('_apply_authentik_session'), 'app.py', 'exec'), ns)
     return ns['_apply_authentik_session'](), session
