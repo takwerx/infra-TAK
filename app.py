@@ -1756,6 +1756,12 @@ CLOUDTAK_VETTED_RELEASE = "13.127.0"    # OFFLINE FALLBACK ONLY since v10.1.17 â
                                         # ops #826: 13.117.1 -> 13.127.0 (update, rollback and forward again tested on Ubuntu,
                                         # Rocky 9 and ARM). A box with the Replay plugin stays on its old build: see PLATFORM_REFERENCE.md.
                                         # tests/test_cloudtak_fallback_pin_ops392.py keeps it from going stale.
+# ops #1074: CloudTAK 14.0.0 (Nov 22, 2026) is a MAJOR release we have not tested: it refuses to start
+# while the old MinIO store folder exists, drops the basemap and font routes, and needs newer ETL
+# images. Every channel installs "upstream latest", so without a cap one press of Update (or a fresh
+# Deploy) would put an untested major on a customer's box. The cap offers the newest 13.x until a
+# test passes; raise it (and the fallback pin) only after one does. tests/test_cloudtak_major_cap_ops1074.py
+CLOUDTAK_MAX_MAJOR = 13
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Caddy's certificate store, and the issuer subdirectory Let's Encrypt lands in.
 # Caddy namespaces the store by the ACME directory URL, so the issuer name is NOT a
@@ -45509,8 +45515,27 @@ def _get_nodered_version_info():
 
 _cloudtak_release_cache = {'tag': None, 'ts': 0}
 
+def _cloudtak_newest_allowed_tag(tags):
+    """Newest plain-version CloudTAK tag ('v13.128.0') whose major is at or under
+    CLOUDTAK_MAX_MAJOR, or None. Pre-releases ('v14.0.0-rc.1') and other names never match
+    (ops #1074)."""
+    best = None
+    for t in tags or []:
+        m = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', (t or '').strip())
+        if not m:
+            continue
+        key = tuple(int(x) for x in m.groups())
+        if key[0] > CLOUDTAK_MAX_MAJOR:
+            continue
+        if best is None or key > best[0]:
+            best = (key, m.group(0))
+    return best[1] if best else None
+
+
 def _get_cloudtak_latest_release_tag(use_cache=True):
-    """Fetch the latest stable release tag from GitHub (e.g. 'v12.94.0').
+    """Newest stable release tag from GitHub that is allowed on this fleet (e.g. 'v13.128.0').
+    Never above CLOUDTAK_MAX_MAJOR (ops #1074): GitHub's 'latest' is 14.0.0, which we have not
+    tested, so the whole release list is read and filtered instead of asking for 'latest'.
     Cached for 4 hours to avoid hitting GitHub API on every page load.
     Pass use_cache=False during deploy to get a fresh result.
     Returns the tag string, or None if the API call fails."""
@@ -45519,15 +45544,21 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
         return _cloudtak_release_cache['tag']
     try:
         import urllib.request as _ur
-        req = _ur.Request('https://api.github.com/repos/dfpc-coe/CloudTAK/releases/latest',
+        req = _ur.Request('https://api.github.com/repos/dfpc-coe/CloudTAK/releases?per_page=100',
                           headers={'Accept': 'application/vnd.github+json', 'User-Agent': 'infra-TAK'})
         with _ur.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
-            tag = (data.get('tag_name') or '').strip() or None
-            if tag:
-                _cloudtak_release_cache['tag'] = tag
-                _cloudtak_release_cache['ts'] = _time.time()
-            return tag
+        if not isinstance(data, list):
+            raise ValueError('GitHub did not return a release list')
+        tag = _cloudtak_newest_allowed_tag(
+            [r.get('tag_name') for r in data
+             if isinstance(r, dict) and not r.get('draft') and not r.get('prerelease')])
+        if not tag:
+            # The first page held no allowed release: ask git, which lists every tag.
+            raise ValueError('no allowed release on the first page')
+        _cloudtak_release_cache['tag'] = tag
+        _cloudtak_release_cache['ts'] = _time.time()
+        return tag
     except Exception:
         # gh #365: the API answers 403 "rate limit exceeded" to shared home/CGNAT addresses.
         # git over https isn't rate limited that way, so ask it for the newest tag first.
@@ -45542,8 +45573,9 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
 
 
 def _cloudtak_latest_tag_from_git():
-    """Newest plain-version CloudTAK tag ('v13.117.0') via `git ls-remote`, or None.
-    Second source for the release lookup when api.github.com refuses us (gh #365)."""
+    """Newest allowed plain-version CloudTAK tag ('v13.117.0') via `git ls-remote`, or None.
+    Second source for the release lookup when api.github.com refuses us (gh #365).
+    Never above CLOUDTAK_MAX_MAJOR (ops #1074)."""
     try:
         r = subprocess.run(['git', 'ls-remote', '--tags', '--refs', 'https://github.com/dfpc-coe/CloudTAK.git'],
                            capture_output=True, text=True, timeout=30,
@@ -45552,14 +45584,12 @@ def _cloudtak_latest_tag_from_git():
         return None
     if r.returncode != 0:
         return None
-    best = None
+    tags = []
     for line in (r.stdout or '').splitlines():
-        m = re.search(r'refs/tags/(v?(\d+)\.(\d+)\.(\d+))$', line.strip())
+        m = re.search(r'refs/tags/(v?\d+\.\d+\.\d+)$', line.strip())
         if m:
-            key = (int(m.group(2)), int(m.group(3)), int(m.group(4)))
-            if best is None or key > best[0]:
-                best = (key, m.group(1))
-    return best[1] if best else None
+            tags.append(m.group(1))
+    return _cloudtak_newest_allowed_tag(tags)
 
 
 def _get_cloudtak_target_release_tag(settings=None, use_cache=True, allow_fallback=True):
