@@ -106,6 +106,8 @@ The full codebase map is in **[ARCHITECTURE.md](ARCHITECTURE.md)**. To build a M
 - All config files are 600 permissions
 - Authentik bootstrap credentials auto-generated per deployment
 
+For security officers and IT reviewers: **[How we keep infra-TAK secure](docs/SECURITY-PRACTICES.md)** ([PDF](docs/infra-TAK-security-practices.pdf)) says what we do to find and fix problems, how fast we patch, what is still open, and how to report a problem or suggest something we should test.
+
 ## Design notes
 
 - **[Authentik login branding](docs/AUTHENTIK-LOGIN-BRANDING.md)** — Custom CSS vs **Brand → Attributes** (`theme: dark`), black backgrounds, flow wording; links to official Authentik docs and community guides.
