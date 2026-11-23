@@ -445,7 +445,7 @@ def test_once_through_the_sign_in_a_failed_check_never_puts_the_direct_road_back
     assert console.mark() == HOST + '\n'
     console.generate()                         # any later regeneration (a deploy, a save)
     assert DIRECT not in console.site()
-    assert any('Patch web editor' in ln for ln in console.log)
+    assert any('stays behind the sign-in' in ln and 'no answer from MediaMTX' in ln for ln in console.log)
 
 
 def test_an_old_caddyfile_is_put_right_at_the_next_start(tmp_path, host):

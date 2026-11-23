@@ -115059,8 +115059,8 @@ def _mediamtx_remote_hls_road(settings, cfg, log):
     why = _MEDIAMTX_REMOTE_HLS_ROAD_REASONS.get(word, 'no usable answer')
     if marked:
         log(f"✗ The stream site on {host} does not serve video now ({why}). Video stays "
-            "behind the sign-in and plays again when the editor there serves it. On the "
-            "MediaMTX page of the console, press Patch web editor.")
+            "behind the sign-in and plays again when the editor there serves it. The next "
+            "console start checks again.")
         return 'kept'
     log(f"⚠ The stream site on {host} does not serve video yet ({why}). Video there still "
         "goes straight to MediaMTX (viewers get a password prompt). The next console start "
