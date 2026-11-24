@@ -307,6 +307,61 @@ def test_viewers_still_see_what_their_group_allows(site, authentik):
     assert as_caddy(site.browser(), '/watch/secret').status_code == 403
 
 
+def test_inside_the_login_a_request_with_no_token_keeps_no_sign_in(site, authentik):
+    """Every path but the open ones came through forward_auth. A request there with the
+    marker and no identity at all is nobody's sign-in: a session from an earlier request
+    (a person since taken out of a group, or an old cookie) does not stand in for it."""
+    b = site.browser()
+    assert admin_doors(b, token=authentik.token_for('akadmin'), name_header='akadmin') == 3
+    r = as_caddy(b, '/')                                     # marker only, not an open path
+    assert r.status_code == 200 and b'user=None role=None' in r.data
+    assert as_caddy(b, '/api/stream-visibility').status_code != 200
+    v = site.browser()
+    alice = {'token': authentik.token_for('alice'), 'name_header': 'alice'}
+    assert as_caddy(v, '/hls-proxy/secret/index.m3u8', **alice).status_code == 200
+    assert as_caddy(v, '/hls-proxy/secret/index.m3u8').status_code == 403
+    # ... and the open path after that has no sign-in to lean on.
+    assert as_caddy(v, '/watch/secret').status_code == 403
+
+
+def test_the_open_paths_are_the_ones_caddy_leaves_outside_the_login(site):
+    ns = _app_ns()
+    assert site.overlay.OPEN_PATH_PREFIXES == tuple(p.rstrip('*') for p in ns['MEDIAMTX_OPEN_PATHS'])
+    assert all(p.startswith('/') and p.endswith('/') for p in site.overlay.OPEN_PATH_PREFIXES)
+
+
+def test_the_editors_own_login_is_left_alone(site, authentik):
+    """The editor's own login page is the way in when Authentik's sign-in cannot be
+    checked (no key). A session made there has no ldap_mode and is not this code's."""
+    b = site.browser()
+    with b.session_transaction() as s:
+        s.update({'username': 'local-admin', 'logged_in': True, 'role': 'admin'})
+    authentik.mode = 'error'                                  # no key: every token is refused
+    for req in ({'token': authentik.token_for('akadmin'), 'name_header': 'akadmin'},
+                {'token': 'a.b.c', 'name_header': 'akadmin'}, {}):
+        r = as_caddy(b, '/', **req)
+        assert r.status_code == 200 and b'user=local-admin role=admin' in r.data, req
+
+
+def test_odd_tokens_are_refused_with_their_reason(site, authentik):
+    ov = site.overlay
+    stream = authentik.providers[STREAM_PK]
+    base = {'aud': stream['client_id'], 'preferred_username': 'akadmin'}
+    assert ov._signed_username('x' * (ov.TOKEN_MAX_BYTES + 1)) == (None, 'too-long')
+    assert ov._signed_username('') == (None, 'no-token')
+    for exp in (float('inf'), float('nan'), True, '9999999999', None):
+        token = make_token(stream['client_secret'], dict(base, exp=exp))
+        assert ov._signed_username(token) == (None, 'expired'), exp
+    assert ov._signed_username(make_token(stream['client_secret'], dict(base, exp=int(time.time()) + 600))) \
+        == ('akadmin', None)
+    # The audience may be a list that holds this site's client id.
+    listed = make_token(stream['client_secret'], dict(base, exp=int(time.time()) + 600,
+                                                      aud=['x', stream['client_id']]))
+    assert ov._signed_username(listed) == ('akadmin', None)
+    for reason in ('no-token', 'too-long', 'not-a-token', 'algorithm', 'no-key', 'signature', 'expired', 'no-name'):
+        assert reason in ov._TOKEN_REASONS
+
+
 def test_a_sign_in_from_before_the_token_was_checked_is_not_kept(site):
     """An editor session made from the plain header (a Caddyfile from before this change)
     ends at the first request from a Caddyfile that passes the token."""

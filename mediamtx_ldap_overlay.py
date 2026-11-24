@@ -31,6 +31,7 @@ import hmac
 import os
 import re
 import json
+import math
 import threading
 import time
 import urllib.parse
@@ -214,6 +215,9 @@ TOKEN_KEY_RETRY_SECONDS = 20           # after no answer, or a token the key doe
 TOKEN_KEY_TIMEOUT_SECONDS = 4          # one API call
 TOKEN_CLOCK_LEEWAY_SECONDS = 60
 TOKEN_MAX_BYTES = 16384
+# The stream vhost's paths outside the login (app.py, MEDIAMTX_OPEN_PATHS; a test keeps the two
+# equal). Only there does a request come without a token from a Caddyfile that passes it.
+OPEN_PATH_PREFIXES = ('/watch/', '/shared/', '/shared-hls/')
 _IDENTITY_SESSION_KEYS = ('username', 'logged_in', 'role', 'ldap_groups', 'ldap_mode',
                           'identity_source')
 
@@ -314,8 +318,10 @@ def _signed_username(token):
     """The username inside Authentik's signed token, or (None, reason) when the token does
     not prove one. Returns (username, None) for a good token. Never raises."""
     try:
-        if not token or len(token) > TOKEN_MAX_BYTES:
+        if not token:
             return None, 'no-token'
+        if len(token) > TOKEN_MAX_BYTES:
+            return None, 'too-long'
         parts = token.split('.')
         if len(parts) != 3:
             return None, 'not-a-token'
@@ -336,7 +342,7 @@ def _signed_username(token):
                 return None, 'signature'
         now = time.time()
         exp = claims.get('exp')
-        if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
             return None, 'expired'
         if exp + TOKEN_CLOCK_LEEWAY_SECONDS < now:
             return None, 'expired'
@@ -355,6 +361,7 @@ def _signed_username(token):
 _TOKEN_REASONS = {
     'no-token': 'the proxy sent no signed token for this sign-in',
     'not-a-token': 'the signed token could not be read',
+    'too-long': 'the signed token is longer than %d bytes' % TOKEN_MAX_BYTES,
     'algorithm': 'the signed token is not HS256',
     'no-key': ('Authentik did not give the key to check it (API %s, application "%s"). '
                'Check AUTHENTIK_TOKEN in the editor env file and that Authentik is up'
@@ -442,8 +449,11 @@ def apply_ldap_overlay(app):
     _untrusted_seen = set()
 
     def _forget_identity():
-        for key in _IDENTITY_SESSION_KEYS:
-            session.pop(key, None)
+        """Drop a sign-in that came from Authentik. A sign-in through the editor's own
+        login page (no ldap_mode) is not this code's to end."""
+        if session.get('ldap_mode'):
+            for key in _IDENTITY_SESSION_KEYS:
+                session.pop(key, None)
 
     @app.before_request
     def _authentik_auto_auth():
@@ -471,10 +481,14 @@ def apply_ldap_overlay(app):
         # is not read. A sign-in kept from before the token was checked is not kept.
         signed_mode = marker == IDENTITY_MARKER_SIGNED
         if signed_mode:
-            if session.get('ldap_mode') and session.get('identity_source') != IDENTITY_MARKER_SIGNED:
+            if session.get('identity_source') != IDENTITY_MARKER_SIGNED:
                 _forget_identity()
-            if not (ak_user or ak_token):
-                return      # a path outside the login (share link, watch page): no change
+            # Outside the login (share link, watch page) Caddy sends no identity: the
+            # sign-in from the request before stands. Every other path came through
+            # forward_auth, so a request there with no good token is nobody's sign-in,
+            # whatever the session held before.
+            if not (ak_user or ak_token) and request.path.startswith(OPEN_PATH_PREFIXES):
+                return
             ak_user, why = _signed_username(ak_token)
             if ak_user is None:
                 _forget_identity()

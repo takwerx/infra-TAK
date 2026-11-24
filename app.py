@@ -39662,6 +39662,17 @@ def _mediamtx_editor_login_converge_run(s):
     _ok, _detail = _caddy_reload_if_changed(timeout=60)
     if _was_safe:
         # ops #1153: nothing was open. The vhost only gained the signed-token lines.
+        try:
+            _still = _mediamtx_vhost_needs_regen(
+                _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0],
+                _mediamtx_editor_login_ok(s))
+        except Exception:
+            _still = True
+        if _still:
+            print('Startup migration: ⚠ MediaMTX web console vhost was NOT updated (the '
+                  'regenerated Caddyfile was rejected and rolled back). The stream site '
+                  'works as before; the next console start tries again.', flush=True)
+            return
         print('Startup migration: ✓ MediaMTX web console vhost updated (Authentik\'s signed '
               'token now goes to the stream site) and Caddy %s.'
               % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
