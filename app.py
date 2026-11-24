@@ -66702,6 +66702,10 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
             # takes an ATLAS provider's token signing key off (signing_key = None in
             # ProxyProvider.set_oauth_defaults, authentik/providers/proxy/models.py at
             # version/2026.8.5). This runs after every console update.
+            # ✅ Seen on a box, Nov 23, 2026 (Authentik 2026.8.5): a save with `mode` in
+            # it takes the key off at once. This one-field PATCH is refused there with
+            # HTTP 400 for a forward-auth provider (internal_host check), so on that
+            # version it changes nothing; a version that accepts it takes the key off.
             if (prov.get('cookie_domain') or '').strip() == cookie_domain:
                 continue
             try:
