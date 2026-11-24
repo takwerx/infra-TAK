@@ -111,6 +111,27 @@ gd_ldap_groups_ok() {
   return 1
 }
 
+# ops #1039: is the Authentik CORE ready (/-/health/ready/ answers 200 on the published
+# port 9090)? A box whose core is only SLOW (CPU-starved, a small VM, a boot with CloudTAK
+# building) answers "not ready" for minutes, and in that time no LDAP outpost can resolve
+# groups, however often it is recreated. Recreating it then only restarts it into the same
+# not-ready core and resets the connections TAK's API holds to it. rc 0 = ready, 1 = not.
+# Only a REFUSED connection (curl exit 7: nothing listens on 9090, the port is not published on
+# this box) falls back to Docker's health verdict for authentik-server, so such a box never holds
+# the boot for the whole budget. A probe that TIMES OUT (curl exit 28) is a core too slow to
+# answer: not ready. (First version treated every "no answer" as refused; on the slow-core box the
+# core timed out the probe, Docker said healthy, and the outpost was recreated into it anyway.)
+gd_ak_core_ready() {
+  local _code _rc
+  _code="$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 10 \
+           'http://127.0.0.1:9090/-/health/ready/' 2>/dev/null)"; _rc=$?
+  [ "$_code" = "200" ] && return 0
+  if [ "$_rc" -eq 7 ]; then
+    docker ps --filter name=authentik-server --format '{{.Status}}' 2>/dev/null | grep -q healthy && return 0
+  fi
+  return 1
+}
+
 # --- PostgreSQL access (local single-server only; two-server scripts keep their
 # own SSH path and never call these) -----------------------------------------
 # gd_psql_scalar "<sql>" [db]   -> -t -A scalar, stdout, rc passthrough
