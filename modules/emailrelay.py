@@ -75,16 +75,55 @@ MAIN_CF = '/etc/postfix/main.cf'
 _HOSTNAME_RE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$')
 
 
+NOTIFY_KEY = 'system_notify_email'
+
+
 def root_destination(ctx, settings, from_addr=''):
-    """Who reads the host's own mail: Guard Dog's alert address(es) when set (an
-    address somebody already monitors), else the relay From address (what the generic
-    map always used, so nothing changes for a box with no Guard Dog address)."""
+    """Who reads the host's own mail, first match wins (ops #1140):
+    1. the "Send system notifications to" box on the Email Relay page,
+    2. Guard Dog's alert address(es), an address somebody already monitors,
+    3. the relay From address (what the generic map always used, so nothing changes
+       for a box that sets neither)."""
     safe = ctx['_safe_alert_emails']
-    gd = safe((settings or {}).get('guarddog_alert_email'))
-    if gd:
-        return gd
+    for key in (NOTIFY_KEY, 'guarddog_alert_email'):
+        got = safe((settings or {}).get(key))
+        if got:
+            return got
     fa = from_addr or ((settings or {}).get('email_relay') or {}).get('from_addr') or ''
     return safe(fa)[:1]
+
+
+def root_destination_source(ctx, settings):
+    """Which of the three places root_destination() reads from: 'notify', 'guarddog'
+    or 'from' (the page says it in words)."""
+    safe = ctx['_safe_alert_emails']
+    if safe((settings or {}).get(NOTIFY_KEY)):
+        return 'notify'
+    if safe((settings or {}).get('guarddog_alert_email')):
+        return 'guarddog'
+    return 'from'
+
+
+_ADDR_SPLIT_RE = re.compile(r'[,;\s]+')
+NOTIFY_MAX_ADDRESSES = 5
+
+
+def parse_notify_to(ctx, value):
+    """Validate the box. Returns (comma_joined_addresses, error). An empty value is
+    valid and clears the setting. Every address goes through the same allowlist as
+    Guard Dog's alert address (ctx['_safe_alert_emails']); one bad entry rejects the
+    whole save, so a typo never silently drops an address."""
+    value = (value or '').strip()
+    if len(value) > 1000:
+        return None, 'Too long'
+    good = ctx['_safe_alert_emails'](value)
+    keep = {g.lower() for g in good}
+    bad = [t for t in _ADDR_SPLIT_RE.split(value) if t and t.lower() not in keep]
+    if bad:
+        return None, 'Invalid email address: ' + ', '.join(bad[:3])
+    if len(good) > NOTIFY_MAX_ADDRESSES:
+        return None, f'At most {NOTIFY_MAX_ADDRESSES} addresses'
+    return ','.join(good), None
 
 
 def render_root_alias_map(names, dests):
@@ -465,6 +504,7 @@ def uninstall(ctx, job, params):
     ctx['_pkg_remove']('postfix', timeout=120)
     settings = ctx['load_settings']()
     settings.pop('email_relay', None)
+    settings.pop(NOTIFY_KEY, None)
     ctx['save_settings'](settings)
     return {'success': True, 'steps': ['Postfix stopped and removed', 'SMTP credentials removed', 'Configuration cleared']}
 
@@ -495,6 +535,32 @@ def register(ctx):
             return jsonify({'success': True, 'output': accepted_message(settings, to_addr)})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:200]})
+
+    def notify_to_view():
+        """Save the "Send system notifications to" box and apply it at once (ops #1140).
+        Empty clears it: root's mail then follows Guard Dog's alert address, else the
+        relay From address."""
+        data = request.get_json(silent=True) or {}
+        value, err = parse_notify_to(ctx, data.get('notify_to'))
+        if err:
+            return jsonify({'success': False, 'error': err}), 400
+        settings = ctx['load_settings']()
+        if not settings.get('email_relay'):
+            return jsonify({'success': False,
+                            'error': 'Email Relay is not set up. Deploy the relay first.'}), 400
+        if value:
+            settings[NOTIFY_KEY] = value
+        else:
+            settings.pop(NOTIFY_KEY, None)
+        ctx['save_settings'](settings)
+        ok, msg = sync_root_alias(ctx, settings)
+        resp = {'success': bool(ok), 'saved': value,
+                'source': root_destination_source(ctx, settings),
+                'goes_to': ','.join(root_destination(ctx, settings)), 'message': msg}
+        if not ok:
+            resp['error'] = 'Saved, but the server could not apply it: ' + msg
+            return jsonify(resp), 500
+        return jsonify(resp)
 
     def configure_authentik_view():
         """Push Email Relay settings into Authentik and set up recovery flow (SMTP + Forgot password?)."""
@@ -549,11 +615,13 @@ def register(ctx):
         'extra_routes': [
             {'url': '/api/emailrelay/test', 'methods': ['POST'],
              'endpoint': 'emailrelay_test', 'view': test_view},
+            {'url': '/api/emailrelay/notify-to', 'methods': ['POST'],
+             'endpoint': 'emailrelay_notify_to', 'view': notify_to_view},
             {'url': '/api/emailrelay/configure-authentik', 'methods': ['POST'],
              'endpoint': 'emailrelay_configure_authentik', 'view': configure_authentik_view},
         ],
         # facts (data for later waves — recorded so 10.1.23+ don't re-survey)
         'ports': [],                    # opens no firewall ports (SMTP is localhost:25)
         'service_units': ['postfix'],
-        'settings_keys': ['email_relay'],
+        'settings_keys': ['email_relay', NOTIFY_KEY],
     })
