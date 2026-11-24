@@ -67,6 +67,7 @@ from . import atlas_backup
 from . import atlas_instances
 from . import atlas_renewal
 from . import atlas_roster
+from . import atlas_signed_identity
 from . import atlas_tak_cas
 from .atlas_instances import MODE_DYNAMIC, MODE_FIXED
 
@@ -1197,6 +1198,13 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
         # `settings` is passed by the page's route; a caller that does not
         # pass it is not asking about the group, and gets None.
         'admin_group_problem': agency_group_problem(settings, inst),
+        # ops #1151: a deployment behind Authentik that does not read the signed
+        # token yet says so on its row. Asked only by the page's route (it
+        # passes `settings`), and only of a built deployment: two file reads.
+        'admin_signin_problem': (
+            atlas_signed_identity.card_note(instance_paths(ctx, inst)['dir'],
+                                            env_keys_compose_passes)
+            if built and settings is not None else None),
     }
 
 
@@ -1209,7 +1217,8 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
 #: rely on; `test_atlas_route_contract.py` holds both halves to it.
 INSTANCE_FIELDS = ('slug', 'name', 'mode', 'size_gb', 'port', 'built',
                    'running', 'stranded', 'version', 'running_version',
-                   'agency_name', 'renewal_enabled', 'admin_group_problem', 'latest',
+                   'agency_name', 'renewal_enabled', 'admin_group_problem',
+                   'admin_signin_problem', 'latest',
                    'update_available', 'paths')
 
 
@@ -4064,6 +4073,9 @@ def deploy(ctx, job, params):
             # grows its forward_auth block once Authentik is in the picture.
             ctx['generate_caddyfile'](ctx['load_settings']())
             ctx['_caddy_reload'](plog)
+            # ATLAS W504: after the vhost is re-emitted, which it checks.
+            if _reconcile_signed_identity(ctx, _inst, plog):
+                _compose(ctx, 'up -d api', timeout=300, inst=_inst)
             plog('  ✓ Sign in with an Authentik administrator account.')
         else:
             # ⚠️ Degrading here does NOT mean an open console. ATLAS has two auth
@@ -4531,7 +4543,7 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                 data=json.dumps({'name': _names['provider'], 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': _atlas_host, 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                    'access_token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -5201,6 +5213,136 @@ def _reconcile_provider_host(ctx, inst, plog):
         return 'failed'
 
 
+def _reconcile_signed_identity(ctx, inst, plog, regenerate=False):
+    """Switch ATLAS to Authentik's signed token, or keep it on headers (ATLAS W504).
+
+    Returns True when `.env` changed, so the caller recreates `api`. Never
+    raises. See `atlas_signed_identity` for the order and why each check
+    comes before the switch.
+
+    ⚠️ **After the vhost is generated**, because the switch is allowed only
+    once the Caddyfile on disk copies the token into this deployment's vhost.
+    `regenerate` does that first, for the one path that does not already
+    (an update with nothing to install).
+    """
+    try:
+        if regenerate:
+            ctx['generate_caddyfile'](ctx['load_settings']())
+            ctx['_caddy_reload'](plog)
+        me = deployment_identity(ctx, inst, ctx['load_settings']())
+        result = atlas_signed_identity.ensure(
+            ctx, inst, me['dir'], write_env_value, plog, host=me['host'],
+            compose_passes=env_keys_compose_passes)
+        return bool(result.get('env_changed'))
+    except Exception as exc:
+        plog('  ⚠ Could not check administrator sign-in: %s' % str(exc)[:120])
+        return False
+
+
+def converge_signed_identity(ctx, log):
+    """ops #1151: put a lost signing key back on every deployment that reads the
+    signed token. {deployment name: 'healed' | 'headers' | 'failed'}; a
+    deployment that needs nothing is not in the answer. Never raises.
+
+    📖 Authentik takes the signing key off a proxy provider on every save
+    through its proxy provider API (`atlas_signed_identity.key_lost` has the
+    source lines). The console does such a save after each of its own updates
+    (`_ensure_proxy_providers_cookie_domain`, a domain change), and an operator
+    does one with Save in Authentik's admin page. ATLAS on `jwt` then answers
+    401 to every administrator, and it has no other sign-in.
+
+    Called through the module spec by the console (boot converge, and after it
+    writes the proxy providers) and every five minutes by this module's own
+    loop, so a save nobody told us about is repaired within that time.
+
+    ⚠️ **Only a deployment already on `jwt`, and only when the key is gone.**
+    The move from headers to the signed token stays with Deploy and Update,
+    which regenerate the vhost first. Here the usual answer is two Authentik
+    reads and no write.
+    """
+    out = {}
+    try:
+        instances = load_instances(ctx)
+        if not instances:
+            return out
+        wanted = [inst for inst in instances
+                  if atlas_signed_identity.env_source(
+                      instance_paths(ctx, inst)['dir']) == 'jwt']
+        if not wanted:
+            return out
+        projects = compose_projects_present(ctx)
+    except Exception as exc:
+        log('ATLAS signed sign-in: could not read the deployments: %s' % str(exc)[:80])
+        return out
+    for inst in wanted:
+        name = atlas_instances.derive(inst)['name']
+
+        def say(msg, n=name):
+            log('ATLAS %s: %s' % (n, msg.strip()))
+        try:
+            if not instance_is_built(ctx, inst, projects):
+                continue
+            if not atlas_signed_identity.key_lost(ctx, inst):
+                continue
+            say('the signing key is no longer on the Authentik provider, putting it back')
+            if _reconcile_signed_identity(ctx, inst, say):
+                _compose(ctx, 'up -d api', timeout=300, inst=inst)
+            dirpath = instance_paths(ctx, inst)['dir']
+            if atlas_signed_identity.env_source(dirpath) != 'jwt':
+                out[name] = 'headers'
+            elif atlas_signed_identity.key_lost(ctx, inst):
+                out[name] = 'failed'
+            else:
+                out[name] = 'healed'
+        except Exception as exc:
+            say('⚠ signed sign-in not checked: %s' % str(exc)[:80])
+            out[name] = 'failed'
+    return out
+
+
+def before_console_rollback(ctx, log, target_reads_signed_token):
+    """ops #1151: called by the console's Rollback, before it checks out the
+    older release. {deployment name: 'headers' | 'failed'}. Never raises.
+
+    ⚠️ **A release without `atlas_signed_identity` cannot keep `jwt` working.**
+    Its Caddyfile does not pass `X-Authentik-Jwt`, and its Authentik
+    reconfigure takes the signing key off the provider with nothing to put it
+    back. A deployment left on `jwt` would refuse every administrator until
+    someone edited `.env` by hand. So each one goes back to the identity
+    headers first, which is what that release expects. The next ATLAS Update
+    on a release that has the module switches it again.
+
+    Nothing is done when the older release has the module.
+    """
+    out = {}
+    if target_reads_signed_token:
+        return out
+    try:
+        instances = load_instances(ctx)
+        projects = compose_projects_present(ctx) if instances else set()
+    except Exception as exc:
+        log('signed sign-in: could not read the deployments: %s' % str(exc)[:80])
+        return out
+    for inst in instances:
+        name = atlas_instances.derive(inst)['name']
+        try:
+            dirpath = instance_paths(ctx, inst)['dir']
+            if atlas_signed_identity.env_source(dirpath) != 'jwt':
+                continue
+            if not instance_is_built(ctx, inst, projects):
+                continue
+            write_env_value(os.path.join(dirpath, '.env'),
+                            atlas_signed_identity.ENV_SOURCE, 'headers')
+            _compose(ctx, 'up -d api', timeout=300, inst=inst)
+            log('%s: administrator sign-in set back to the identity headers for '
+                'the older release' % name)
+            out[name] = 'headers'
+        except Exception as exc:
+            log('%s: ⚠ administrator sign-in not set back: %s' % (name, str(exc)[:80]))
+            out[name] = 'failed'
+    return out
+
+
 def _run_update_recorded(ctx, inst=None):
     """v10.2.8 W10: _run_update, with its outcome recorded through the console's seam (card +
     Diagnostics). One record per deployment: `atlas` for the plain one, `atlas-<slug>` for an
@@ -5340,6 +5482,10 @@ def _run_update(ctx, inst=None):
                 except Exception as exc:
                     restart_api = False
                     plog('⚠ Could not check the admin gate: ' + str(exc)[:120])
+                # ATLAS W504: here too, or a deployment already on the newest
+                # release would never move to the signed token.
+                restart_api = _reconcile_signed_identity(
+                    ctx, inst, plog, regenerate=True) or restart_api
                 if _renewal['env_changed'] or restart_api:
                     _compose(ctx, 'up -d api', timeout=300, inst=inst)
                 if _cas['recreated']:
@@ -5447,6 +5593,8 @@ def _run_update(ctx, inst=None):
             changed = _arm_admin_gates(ctx, dirpath, plog, inst=inst,
                                        global_group=_global_admin_group(ctx))
             changed = _push_email_relay(ctx, dirpath, plog) or changed
+            # ATLAS W504: after the vhost above, which it checks.
+            changed = _reconcile_signed_identity(ctx, inst, plog) or changed
             if changed:
                 _compose(ctx, 'up -d api', timeout=300, inst=inst)
             _seed_relay_choice(ctx, plog, inst=inst)
@@ -5787,6 +5935,12 @@ def _start_revocation_loop(ctx):
                 revocation_tick(ctx, lambda m: print('[' + KEY + '] revocations:' + m, flush=True))
             except Exception as exc:
                 print('[' + KEY + '] revocations: tick failed: ' + str(exc)[:160], flush=True)
+            # ops #1151: the same five minutes. A box with no deployment on
+            # `jwt` reads its settings and stops there.
+            try:
+                converge_signed_identity(ctx, lambda m: print('[' + KEY + '] ' + m, flush=True))
+            except Exception as exc:
+                print('[' + KEY + '] signed sign-in: tick failed: ' + str(exc)[:160], flush=True)
             time.sleep(atlas_renewal.REVOCATION_INTERVAL_S)
 
     threading.Thread(target=loop, daemon=True, name='atlas-revocations').start()
@@ -6014,6 +6168,11 @@ def remove_instance(ctx, inst, plog=None):
     roster_note = atlas_roster.remove(ctx, inst)
     if roster_note:
         note(f'{label}: {roster_note}')
+    # ATLAS W504: the provider's own signing key, or a reused slug's provider
+    # would find the old one by name and sign with it.
+    key_note = atlas_signed_identity.remove(ctx, inst)
+    if key_note:
+        note(f'{label}: {key_note}')
 
     # ⚠️ Only the keys this deployment owns. `atlas_` is a prefix of
     # `atlas_corona_`, so a `startswith` sweep while removing the *plain*
@@ -6962,6 +7121,11 @@ def register(ctx):
         # ops #919: called by the console's boot converge (so after its own
         # update), to swap every ATLAS application to its one access policy.
         'converge_access': converge_access,
+        # ops #1151: called by the console after it saves the Authentik proxy
+        # providers (that save takes the signing key off), and at boot.
+        'converge_signed_identity': converge_signed_identity,
+        # ops #1151: called by the console's Rollback before the checkout.
+        'before_console_rollback': before_console_rollback,
         'uninstall': uninstall,
         'control_map': {
             'start':   lambda c: _compose_argv(c, 'up', '-d', 'api'),
