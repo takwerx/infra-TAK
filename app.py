@@ -125041,7 +125041,11 @@ def _startup_f2b_ufw_lock_switch():
                                  capture_output=True, text=True, timeout=15).stdout.strip()
             if act == 'active':
                 r = subprocess.run(
-                    _sudo_wrap(['flock', '-w', '90', _UFW_LOCK_PATH, 'systemctl', 'stop', 'fail2ban']),
+                    # Literal path on purpose: broker/scan_enforce_coverage.py (and the broker's
+                    # one exact allowed argv, FLOCK_F2B_STOP_ARGV) read the argv shape, and a
+                    # variable shows up as <var> and is reported as a denied call site.
+                    # tests/test_ufw_lock_and_parity.py keeps it equal to _UFW_LOCK_PATH.
+                    _sudo_wrap(['flock', '-w', '90', '/run/infratak-ufw.lock', 'systemctl', 'stop', 'fail2ban']),
                     capture_output=True, text=True, timeout=300)
                 if r.returncode != 0:
                     _log(f"fail2ban: could not stop it under the ufw lock (rc {r.returncode}: "
