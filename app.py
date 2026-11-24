@@ -1897,8 +1897,15 @@ NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.96.0"
 AUTHENTIK_REDIS_IMAGE = 'docker.io/library/redis:8.10.3-alpine'
 # ops #819: 0.82.0 -> 0.82.1 (Nov 10): the account id is enforced on a proxy update (an account-scope
 # check). No config or store change. Rollback: re-pin the dev server image to 0.82.0.
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.82.1"  # UNDER TRIAL (ops #427, #819)
-NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.96.0"
+# ops #1088: 0.83.2 / v2.98.0 UNDER TRIAL on dev (T&E only, not promoted). 0.83.0 moves a peer's
+# connection state out of peers.peer_status_* into the new peer_connections + management_instances
+# tables (a migration copies peer_status_last_seen on first start; upstream names no way back), so
+# _netbird_peer_stats_from_db reads those tables when a live instance row exists. Dashboard v2.98.0
+# ships nginx 1.30.7 (v2.96.0 had 1.30.6, without the Nov 18 nginx fixes). Rollback: re-pin the dev
+# pair to 0.82.1 / v2.96.0; the pin-restore heal converges boxes back (0.82.1 on a 0.83-migrated
+# store is a T&E row, ops #1088).
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.83.2"  # UNDER TRIAL (ops #427, #819, #1088)
+NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.98.0"
 
 
 def _get_netbird_target_images(settings=None):
@@ -66415,10 +66422,17 @@ def _netbird_peer_stats_from_db(nb_dir=None):
 
     Review #2 (PR #42) note: this SQL is fully static — no user/remote input is
     interpolated, so there is no injection surface (opened `mode=ro` besides). The residual
-    risk is schema-coupling to NetBird's internal `store.db` (`peers.peer_status_connected`);
-    tolerated because the image is PINNED (NETBIRD_SERVER_IMAGE) so the schema is fixed — RE-VERIFY
-    this table/column on any pin bump. Fails soft (try/except → None → callers fall back to the
-    mgmt API), so a broken read only blanks the peer-count stat, never the deploy."""
+    risk is schema-coupling to NetBird's internal `store.db`; tolerated because the image is
+    PINNED (NETBIRD_SERVER_IMAGE) so the schema is fixed — RE-VERIFY these tables/columns on any pin
+    bump. Fails soft (try/except → None → callers fall back to the mgmt API), so a broken read only
+    blanks the peer-count stat, never the deploy.
+
+    ops #1088: NetBird 0.83.0 stopped reading and writing `peers.peer_status_connected` (the column
+    stays, frozen). From 0.83 a peer counts as connected while its `peer_connections.instance_id`
+    names a `management_instances` row whose `last_seen` is under 5 minutes old (upstream
+    peer.go / connection.go, InstanceStaleAfter). A live instance row is therefore what says "the
+    0.83 server is running": with none, the old column is read (0.82 and older, and a box rolled
+    back to 0.82.1 on a 0.83-migrated store, where the new tables stay but are no longer written)."""
     import sqlite3
     nb_dir = nb_dir or NETBIRD_INSTALL_DIR
     db_path = os.path.join(nb_dir, 'data', 'store.db')
@@ -66426,9 +66440,26 @@ def _netbird_peer_stats_from_db(nb_dir=None):
         return None
     try:
         conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=3)
-        row = conn.execute(
-            'SELECT COUNT(*), COALESCE(SUM(peer_status_connected), 0) FROM peers'
-        ).fetchone()
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('peer_connections', 'management_instances')")}
+        live_instance = False
+        if tables == {'peer_connections', 'management_instances'}:
+            live_instance = conn.execute(
+                "SELECT 1 FROM management_instances WHERE last_seen > datetime('now', '-300 seconds') LIMIT 1"
+            ).fetchone() is not None
+        if live_instance:
+            row = conn.execute(
+                'SELECT (SELECT COUNT(*) FROM peers), '
+                '(SELECT COUNT(*) FROM peers p '
+                ' JOIN peer_connections pc ON pc.peer_id = p.id '
+                ' JOIN management_instances mi ON mi.id = pc.instance_id '
+                " WHERE mi.last_seen > datetime('now', '-300 seconds'))"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                'SELECT COUNT(*), COALESCE(SUM(peer_status_connected), 0) FROM peers'
+            ).fetchone()
         conn.close()
         if not row:
             return None
