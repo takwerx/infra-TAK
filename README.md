@@ -461,23 +461,24 @@ overrides, so treat that list as authoritative over this table.
 
 ### v10.4.6-alpha — 2026-11-24 — CloudTAK 14, sign-ins that last 24 hours, safer ATLAS and Authentik sign-in, Email Relay fixes
 
-**Headline: CloudTAK 14 is now tested and offered, Authentik sign-ins last the 24 hours they were meant to, ATLAS identifies its administrators from Authentik's signed token, and Email Relay delivers root mail again. Update from the Console page, Update Now.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.6-alpha))
+**Headline: CloudTAK 14 is now tested and offered, Authentik sign-ins last the 24 hours they were meant to, ATLAS 2.10 and newer identify their administrators from Authentik's signed token, and Email Relay delivers root mail again. Update from the Console page, Update Now.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.6-alpha))
 
 **Security.**
-- Authentik moves to 2026.8.6, and Redis (used by Authentik and WebODM) to 8.10.3.
-- ATLAS: administrators are identified from Authentik's signed token, not from plain headers. If Authentik restarts and drops the key, the console puts it back within about a minute. Update Now moves every ATLAS deployment.
+- Authentik moves to 2026.8.6. New installs get it. On an existing server, press **Update** on the Authentik page (Update Now does not move it).
+- Redis moves to 8.10.3 for WebODM and for new Authentik installs. An existing Authentik keeps its current Redis.
+- ATLAS 2.10 or newer: administrators are identified from Authentik's signed token, not from plain headers. ATLAS on the main channel stays on headers as before. If Authentik restarts and drops the key, the console puts it back within about a minute.
 - The stream site reads the signed-in person from Authentik's signed token as well.
 - MediaMTX on a remote host: stream site video goes the same way as on a single server, and a console start keeps the stream site file current.
 - Node-RED data feed ports open to the Docker networks when the host firewall is on, so Node-RED can reach TAK Server again.
 
 **Sign-in.**
 - Sign-ins through Authentik last 24 hours. Before, they ended after 1 hour. Update Now moves existing providers to 24 hours, and a length you set yourself stays.
-- A user who is switched off and on again, or gets a password that was tried before, can sign in to TAK right away. No LDAP outpost restart is needed.
+- A user who is switched off and on again, or gets a password that was tried before, can sign in to TAK within about 15 to 35 seconds. No LDAP outpost restart is needed.
 - The webadmin password is never overwritten. A console banner and a Guard Dog reminder ask you to set a recovery email, and the Authentik page has an admin email card.
 - Admin accounts get the Guard Dog alert address, not a made-up one, so access-request emails no longer bounce.
 
 **CloudTAK.**
-- CloudTAK updates to 14.x. We tested the update with Marketplace plugins installed at older versions: the plugins keep their versions and load after the update.
+- CloudTAK updates to 14.x. We tested the update with Print and Search Containment installed: both stay installed and load after the update.
 - A server with the old MinIO folder stops at the newest 13.x before 14.
 - When CloudTAK is already newer than the tested version, the Update button says "Nothing to do" in place of an error.
 - The CloudTAK page links to the official CloudTAK documentation.
@@ -490,8 +491,6 @@ overrides, so treat that list as authoritative over this table.
 
 **Updates.**
 - A "What's new" link sits next to each app's update notice.
-- The TAK Server page shows the newest tested version, and customers are told when a new one passes our tests.
-- Update Now no longer restarts TAK Server for an LDAP recreate made at install time.
 - A stalled download in an update step is retried once. A "not enough free disk" message names the backup lists you can clear.
 - A fresh Ubuntu install keeps the changes of Step 8 (CloudTAK setup works with no Update Now).
 - Print is not started when its image was never built.
