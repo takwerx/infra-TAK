@@ -56,9 +56,9 @@ def _fake_run(calls):
         out = ''
         if argv[:2] == ['hostname', '-f']:
             out = 'box1.internal\n'
-        elif argv[:3] == ['postconf', '-hx', 'myorigin']:
+        elif argv[:4] == ['postconf', '-h', '-x', 'myorigin']:
             out = '/etc/mailname\n'           # Debian default: the name comes from the file
-        elif argv[:3] == ['postconf', '-hx', 'myhostname']:
+        elif argv[:4] == ['postconf', '-h', '-x', 'myhostname']:
             out = 'box1.internal\n'
         return types.SimpleNamespace(returncode=0, stdout=out, stderr='')
     return run

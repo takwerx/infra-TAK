@@ -251,14 +251,16 @@ def _read_name_file(path):
 
 
 def _postfix_origins():
-    """The names Postfix itself will stamp on root's mail: `postconf -hx myorigin` (a file
+    """The names Postfix itself will stamp on root's mail: `postconf -h -x myorigin` (a file
     path such as /etc/mailname is read) and `myhostname`. Asking Postfix beats guessing:
     on Rocky `myhostname` is `<host>.localdomain`, which neither the saved FQDN nor
-    `hostname -f` ever equals. A failed query just returns fewer names."""
+    `hostname -f` ever equals. A failed query just returns fewer names. The flags are sent
+    apart (`-h -x`, never `-hx`) because the broker's postconf rule reads one flag per
+    argument and refuses a combined one when it enforces (ops #1171)."""
     names = []
     for param in ('myorigin', 'myhostname'):
         try:
-            r = subprocess.run(['postconf', '-hx', param], capture_output=True,
+            r = subprocess.run(['postconf', '-h', '-x', param], capture_output=True,
                                text=True, timeout=15)
             val = (r.stdout or '').strip() if r.returncode == 0 else ''
         except (OSError, subprocess.SubprocessError):
@@ -275,7 +277,7 @@ def postfix_local_names(settings):
     One discovery for both maps: the sender rewrite (/etc/postfix/generic) and the root
     recipient map (/etc/postfix/virtual_root) are built from this list, so they can never
     disagree (GH #665 and GH #667). Order: the saved FQDN first, then what Postfix reports
-    (`postconf -hx myorigin`, which reads /etc/mailname, and `myhostname`), then
+    (`postconf -h -x myorigin`, which reads /etc/mailname, and `myhostname`), then
     `hostname -f`. Names that are not plain host names are dropped, because they go into a
     Postfix table."""
     fqdn, hostname_f = _resolve_fqdn(settings)
