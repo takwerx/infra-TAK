@@ -10274,7 +10274,7 @@ def help_page():
     _relay = settings.get('email_relay') or {}
     return render_template('help.html', settings=settings, version=VERSION, current_ssh_port=current_ssh_port,
                            diag_support_email=DIAG_SUPPORT_EMAIL,
-                           diag_email_ready=bool(_relay.get('relay_host') and _relay.get('smtp_user')))
+                           diag_email_ready=bool(_relay.get('relay_host') and (_relay.get('smtp_user') or _relay.get('smtp_auth') is False)))
 
 
 # ── v10.2.1 (W3): Help → Diagnostics ──────────────────────────────────────────
@@ -11592,7 +11592,7 @@ def _diag_takportal_authentik(settings, existing):
 
 def _diag_section_emailrelay(settings):
     relay = settings.get('email_relay') or {}
-    configured = bool(relay.get('relay_host') and relay.get('smtp_user'))
+    configured = bool(relay.get('relay_host') and (relay.get('smtp_user') or relay.get('smtp_auth') is False))
     out = [f"configured: {configured}  relay: {relay.get('relay_host') or '-'}:{relay.get('relay_port') or '-'}  "
            f"from: {relay.get('from_addr') or '-'}  postfix: {_diag_cmd(['systemctl', 'is-active', 'postfix'], priv=False)}"]
     if not configured:
@@ -11813,7 +11813,7 @@ def support_diagnostics_email():
         return jsonify({'success': False, 'error': 'Enter one valid email address'}), 400
     settings = load_settings()
     relay = settings.get('email_relay') or {}
-    if not (relay.get('relay_host') and relay.get('smtp_user')):
+    if not (relay.get('relay_host') and (relay.get('smtp_user') or relay.get('smtp_auth') is False)):
         return jsonify({'success': False, 'error': 'Email Relay is not configured on this box — use Download instead'}), 400
     with _DIAG_LOCK:
         report, when = _DIAG_JOB['report'], _DIAG_JOB['generated_at']
@@ -20942,7 +20942,7 @@ def guarddog_page():
     gd = modules.get('guarddog', {})
     tak = modules.get('takserver', {})
     relay = settings.get('email_relay', {})
-    email_relay_configured = bool(relay.get('relay_host') and relay.get('smtp_user'))
+    email_relay_configured = bool(relay.get('relay_host') and (relay.get('smtp_user') or relay.get('smtp_auth') is False))
     tak_cfg = _get_tak_deployment_config(settings)
     is_two_server = tak_cfg.get('mode') == 'two_server'
     s1_host = (tak_cfg.get('server_one', {}).get('host') or '').strip() if is_two_server else ''
@@ -47840,7 +47840,7 @@ def _takportal_merged_settings_json(settings, adopt=()):
     # must follow a relay reconfigure. When it is NOT, they fall back to seed-only like
     # everything else, so a hand-configured portal SMTP survives every settings push.
     _relay = settings.get('email_relay') or {}
-    _relay_configured = bool(_relay.get('relay_host') and _relay.get('smtp_user'))
+    _relay_configured = bool(_relay.get('relay_host') and (_relay.get('smtp_user') or _relay.get('smtp_auth') is False))
     # v10.2.18 (ops #71): a TAK Portal template placeholder is not the operator's value either.
     placeholders = _takportal_template_placeholder_keys(merged)
     for k, v in our.items():
@@ -49494,7 +49494,7 @@ def takportal_uninstall():
 def _portal_email_settings(settings):
     """Build TAK Portal email settings from the Email Relay config if deployed."""
     relay = settings.get('email_relay', {})
-    if relay.get('relay_host') and relay.get('smtp_user'):
+    if relay.get('relay_host') and (relay.get('smtp_user') or relay.get('smtp_auth') is False):
         from_addr = relay.get('from_addr', '')
         from_name = relay.get('from_name', 'TAK Admin')
         smtp_from = f"{from_name} <{from_addr}>" if from_name and from_addr else from_addr
@@ -61913,7 +61913,7 @@ def _email_relay_health(settings=None, force=False):
         return c['data']
     settings = settings if settings is not None else load_settings()
     relay = settings.get('email_relay') or {}
-    configured = bool(relay.get('relay_host') and relay.get('smtp_user'))
+    configured = bool(relay.get('relay_host') and (relay.get('smtp_user') or relay.get('smtp_auth') is False))
     data = {'configured': configured, 'ok': True, 'queued': 0}
     if configured:
         try:
@@ -93771,7 +93771,7 @@ def _ca_rotation_state_save(state):
 def _email_relay_ready(settings=None):
     """Email Relay is configured (the test every Email Relay card uses)."""
     relay = (settings or load_settings()).get('email_relay') or {}
-    return bool(relay.get('relay_host') and relay.get('smtp_user'))
+    return bool(relay.get('relay_host') and (relay.get('smtp_user') or relay.get('smtp_auth') is False))
 
 
 def _ca_rotation_date(ts):
