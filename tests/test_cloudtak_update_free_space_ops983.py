@@ -38,7 +38,7 @@ GB = 1024 ** 3
 _FUNCS = {'_cloudtak_fs_free_local', '_cloudtak_fs_free_remote',
           '_cloudtak_update_space_problem', '_cloudtak_update_space_lines'}
 _CONSTS = {'_CLOUDTAK_UPDATE_MEASURED_GB', '_CLOUDTAK_UPDATE_MIN_FREE',
-           '_CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT'}
+           '_CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT', '_FREE_SPACE_BACKUPS_HINT'}
 REMOTE = {'host': '203.0.113.7', 'ssh_user': 'root'}
 
 
