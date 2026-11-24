@@ -549,3 +549,24 @@ def test_every_console_step_that_saves_the_providers_asks_for_the_key_check():
                  '_authentik_sync_all_domain_refs',            # a domain change
                  '_startup_app_access_policy_converge'):       # every console start
         assert '_atlas_signed_identity_converge(' in _app_func(name), name
+
+
+def test_a_new_key_says_what_an_administrator_already_signed_in_must_do(sid, monkeypatch):
+    """✅ Seen on a box, Nov 24, 2026: a session made before the key was set gets 401 from
+    ATLAS on every page ("your sign-in could not be verified") until it ends. The update
+    log is where the operator who pressed Update is looking."""
+    fake, log = Authentik(signing_key=None), []
+
+    _switch(sid, monkeypatch, fake, log)
+
+    said = [line for line in log if 'already signed in' in line]
+    assert len(said) == 1
+    assert 'sign out of Authentik and sign in again' in said[0]
+
+
+def test_a_key_that_was_already_there_says_nothing_about_sessions(sid, monkeypatch):
+    fake, log = Authentik(), []
+
+    _switch(sid, monkeypatch, fake, log)
+
+    assert not [line for line in log if 'already signed in' in line]

@@ -274,6 +274,14 @@ def ensure(ctx, inst, dirpath, write_env_value, plog, host, opener=None,
         changed = write_env_value(env, ENV_SOURCE, 'jwt') or changed
         plog('  ✓ Administrator sign-in uses the signed token (key %s, %s on the '
              'provider)' % (key_note, on_provider))
+        if on_provider == 'set':
+            # ops #1151: a session made before the key was set carries a token
+            # signed the old way, and ATLAS refuses it until that session ends.
+            # ✅ Seen on a box, Nov 24, 2026 (Ubuntu 22.04, Authentik 2026.8.5):
+            # 401 on every page for the old session; a new sign-in works.
+            plog('  ⚠ An administrator who was already signed in to ATLAS sees "your '
+                 'sign-in could not be verified" until that session ends. To end it '
+                 'now: sign out of Authentik and sign in again.')
         return {'env_changed': changed, 'source': 'jwt'}
     except Exception as exc:
         # ⚠️ **Left as it was, not switched back to headers.** A timeout during
