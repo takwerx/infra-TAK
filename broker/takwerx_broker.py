@@ -9108,6 +9108,16 @@ def _converge_nosuid_unit(run=None):
     return changed
 
 
+def _converge_nosuid_logged():
+    try:
+        if _converge_nosuid_unit():
+            AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
+                                   'summary': 'nosuid boot unit written and enabled (ops #645)'}))
+    except Exception as e:  # noqa: BLE001 — never let this stop the broker
+        AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'ERROR',
+                               'summary': 'nosuid unit converge failed: %s' % e}))
+
+
 def serve():
     global AUDIT, ENFORCE, ENFORCE_INFO, _MTX_SRV
     if os.geteuid() != 0:
@@ -9165,13 +9175,10 @@ def serve():
     except Exception as e:  # noqa: BLE001 — never let a unit tidy-up stop the broker
         AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'ERROR',
                                'summary': 'own unit converge failed: %s' % e}))
-    try:
-        if _converge_nosuid_unit():
-            AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
-                                   'summary': 'nosuid boot unit written and enabled (ops #645)'}))
-    except Exception as e:  # noqa: BLE001 — never let this stop the broker
-        AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'ERROR',
-                               'summary': 'nosuid unit converge failed: %s' % e}))
+    # ops #645 W2.5: in a thread. systemctl daemon-reload/enable took 12 s on a loaded
+    # test6 (load 10), and the main loop must answer the console's boot ping first.
+    threading.Thread(target=_converge_nosuid_logged, daemon=True,
+                     name='nosuid-converge').start()
     # ops #645 W1: a broker still started from the console repo moves itself to
     # the root-owned layout (after the socket is up; a fetch can take a while).
     if not RUNNING_FROM_ROOT:
