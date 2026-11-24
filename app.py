@@ -64990,7 +64990,7 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
             _wa_users = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
             _wa = next((u for u in _wa_users if u.get('username') == 'webadmin'), None)
             if _wa and not (_wa.get('email') or '').strip():
-                _wa_email = f'webadmin@{fqdn.split(":")[0]}'
+                _wa_email = _ak_admin_account_email('webadmin', settings or load_settings())
                 req = _urlreq.Request(f'{_ak_url}/api/v3/core/users/{_wa["pk"]}/',
                     data=json.dumps({'email': _wa_email}).encode(),
                     headers=_ak_headers, method='PATCH')
@@ -85377,7 +85377,7 @@ entries:
                                 # Step 11 — including the real-outpost-token swap into compose — was
                                 # skipped: the LDAP outpost stayed on AUTHENTIK_TOKEN: placeholder and
                                 # 403'd forever. Field-hit 2026-07-08 (NUC redeploy with leftover /opt/tak).
-                                'email': f'webadmin@{(settings.get("fqdn") or "tak.local").split(":")[0]}',
+                                'email': _ak_admin_account_email('webadmin', settings),
                                 'groups': [group_pk] if group_pk else []}
                             req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
                                 data=json.dumps(user_data).encode(), headers=ak_headers, method='POST')
@@ -88806,7 +88806,7 @@ def _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=True):
                 'path': 'users',
                 # Synthetic email — WebODM's OIDC login (and any OIDC consumer
                 # requiring an email claim) fails on an email-less user.
-                'email': f'webadmin@{((settings.get("fqdn") or "tak.local").strip() or "tak.local").split(":")[0]}',
+                'email': _ak_admin_account_email('webadmin', settings),
                 'groups': [group_pk] if group_pk else []
             }
             req_local = _req.Request(f'{url}/api/v3/core/users/', data=json.dumps(ud).encode(), headers=headers, method='POST')
@@ -89642,11 +89642,29 @@ def _ak_admin_email_is_placeholder(username, email, settings=None):
     dom = e.rsplit('@', 1)[1]
     if dom in ('localhost', 'tak.local') or dom.endswith('.local') or dom.endswith('.localhost'):
         return True
-    if username == 'webadmin' and e.split('@', 1)[0] == 'webadmin':
+    if username in _AUTHENTIK_RECOVERABLE_USERS and e.split('@', 1)[0] == username:
+        # <user>@<TAK FQDN>: infra-TAK made it up and the FQDN has no MX (GH #687).
         fq = ((settings or load_settings()).get('fqdn') or '').strip().split(':')[0].lower()
         if fq and dom == fq:
             return True
     return False
+
+
+def _ak_admin_account_email(username, settings=None):
+    """Email to give a NEW infra-TAK-made admin account (GH #687). Authentik needs some
+    email (WebODM's OIDC login fails on an empty claim) and TAK Portal mails every admin
+    group member's email when a user asks for access. So: the first Guard Dog alert
+    address when one is set (a real inbox), else the made-up <user>@<fqdn> form, which
+    cannot receive mail. Never raises."""
+    try:
+        s = settings if settings is not None else load_settings()
+        for addr in _safe_alert_emails(s.get('guarddog_alert_email')):
+            if not _ak_admin_email_is_placeholder(username, addr, s):
+                return addr
+        fq = (s.get('fqdn') or '').strip().split(':')[0] or 'tak.local'
+        return f'{username}@{fq}'
+    except Exception:
+        return f'{username}@tak.local'
 
 
 def _ak_admin_recovery_email_notes():
