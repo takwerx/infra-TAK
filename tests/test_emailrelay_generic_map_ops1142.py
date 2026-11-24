@@ -240,3 +240,24 @@ def test_a_name_that_is_not_a_host_name_never_reaches_a_map(monkeypatch, tmp_pat
     monkeypatch.setattr(er.subprocess, 'run', runner)
     names = er.postfix_local_names({'fqdn': FQDN})
     assert names == [FQDN, 'tak-host.lan', 'tak-host']
+
+
+def test_a_literal_myorigin_reaches_both_maps_after_the_last_write(monkeypatch, tmp_path):
+    """The reporter's merge warning: with two writers, the one that runs last wins. A
+    myorigin set to a plain domain (not /etc/mailname) must still be in both maps once
+    sync_root_alias has run after the deploy's own write."""
+    runner = _Run('tak-host', {'myorigin': 'lit.example.org', 'myhostname': 'tak-host.lan'})
+    monkeypatch.setattr(er.subprocess, 'run', runner)
+    monkeypatch.setattr(er, '_read_name_file', lambda path: '', raising=False)
+    writes = []
+    ctx = {'_safe_alert_emails': _safe_emails, '_sudo_wrap': lambda c: list(c),
+           '_read_priv': lambda p: 'relayhost =\n',
+           '_write_priv': lambda p, text, perm=None, **k: writes.append((p, text))}
+    ok, _ = er.sync_root_alias(
+        ctx, {'fqdn': FQDN, 'guarddog_alert_email': 'ops@real.example'},
+        from_addr=FROM, reload=False)
+    assert ok
+    for path in ('/etc/postfix/generic', er.ROOT_ALIAS_MAP):
+        text = [t for p, t in writes if p == path][-1]
+        assert 'root@lit.example.org' in _keys(text), (path, text)
+        assert f'root@{FQDN}' in _keys(text) and 'root@tak-host.lan' in _keys(text)
