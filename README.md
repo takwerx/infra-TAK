@@ -459,7 +459,7 @@ overrides, so treat that list as authoritative over this table.
 
 ## Changelog
 
-### v10.4.6-alpha — 2026-11-25 — CloudTAK 14, sign-ins that last 24 hours, safer ATLAS and Authentik sign-in, Email Relay fixes
+### v10.4.6-alpha — 2026-11-24 — CloudTAK 14, sign-ins that last 24 hours, safer ATLAS and Authentik sign-in, Email Relay fixes
 
 **Headline: CloudTAK 14 is now tested and offered, Authentik sign-ins last the 24 hours they were meant to, ATLAS identifies its administrators from Authentik's signed token, and Email Relay delivers root mail again. Update from the Console page, Update Now.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.6-alpha))
 
@@ -498,6 +498,7 @@ overrides, so treat that list as authoritative over this table.
 
 **Guard Dog.**
 - After a boot, Guard Dog waits for Authentik to be ready before it checks LDAP groups, and waits 10 minutes before it emails that LDAP cannot resolve groups.
+- The "no channel" email lists up to 5 devices that have no channel, so you can see which device is behind each row (device ID, client, minutes silent).
 
 **Fixes.**
 - NetBird setup works on a non-root console (the STUN port opens through the firewall helpers).
