@@ -435,7 +435,12 @@ def test_headers_from_a_peer_that_is_not_the_proxy_are_ignored(site, authentik):
 
 # --- Part 2: Caddy and the overlay hold the same contract -----------------------------------
 
+_APP_NS = {}
+
+
 def _app_ns():
+    if _APP_NS:              # app.py is parsed once for the file, not once per test
+        return _APP_NS
     names = ('_emit_mediamtx_site', '_caddy_vhost_block', '_mediamtx_vhost_is_safe',
              '_mediamtx_vhost_needs_regen')
     consts = ('MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER', '_CADDY_STRIP_AUTHENTIK_HEADERS',
@@ -448,7 +453,8 @@ def _app_ns():
             exec(ast.get_source_segment(APP, node), ns)
     missing = [n for n in names + consts if n not in ns]
     assert not missing, missing
-    return ns
+    _APP_NS.update(ns)
+    return _APP_NS
 
 
 def _vhost(ns, ak_up='127.0.0.1:9090', hls=None, **kw):
