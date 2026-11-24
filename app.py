@@ -39201,6 +39201,13 @@ def _get_mediamtx_hls_upstream(settings):
 # needs a login. /hls-proxy/ is deliberately NOT here — streams are login-only.
 MEDIAMTX_OPEN_PATHS = ('/watch/*', '/shared/*', '/shared-hls/*')
 _MEDIAMTX_VHOST_MARKER = '# MediaMTX Web Console'
+# ops #1153: the stream site's overlay reads the person's name from Authentik's signed token
+# when Caddy passes it. These two lines are that contract, and the overlay holds the same
+# header name and value (IDENTITY_MARKER_HEADER, IDENTITY_MARKER_SIGNED; a test keeps them
+# equal). `request_header NAME VALUE` replaces whatever a client sent under that name.
+_MEDIAMTX_AK_COPY_HEADERS = ('copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email '
+                             'X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt')
+_MEDIAMTX_IDENTITY_MARKER = 'request_header X-Infratak-Identity signed'
 
 
 def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue, login_ok=False):
@@ -39233,6 +39240,13 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
            answers admin/admin (ops #649); False answers 503 instead of the editor.
     Every route starts with _CADDY_STRIP_AUTHENTIK_HEADERS (ops #648/#649): no client
     X-Authentik-* header of any name reaches the editor.
+
+    ops #1153: with Authentik, forward_auth also copies X-Authentik-Jwt, the token Authentik
+    signed for the sign-in, and every route to the editor carries _MEDIAMTX_IDENTITY_MARKER.
+    The marker tells the overlay that this proxy passes the token, so the overlay takes
+    the person's name from the token it has checked and not from the plain name header.
+    The two lines are written together here and nowhere else: an editor never sees the
+    marker from a Caddyfile that does not pass the token.
     """
     lines.append(_MEDIAMTX_VHOST_MARKER)
     lines.append(f"{mtx_host} {{")
@@ -39256,18 +39270,20 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
             lines.append(f"    route {path} {{")
             lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
             emit_strip("        ")
+            lines.append(f"        {_MEDIAMTX_IDENTITY_MARKER}")
             lines.append(f"        reverse_proxy {mtx_up}")
             lines.append("    }")
         lines.append("    route {")
         lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
         emit_strip("        ")
+        lines.append(f"        {_MEDIAMTX_IDENTITY_MARKER}")
         if not hls:
             lines.append("        request_header /hls-proxy/* -Authorization")
         emit_rescue(f"{_pub_url(mtx_host)}/")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
         lines.append(f"        forward_auth {ak_up} {{")
         lines.append("            uri /outpost.goauthentik.io/auth/caddy")
-        lines.append("            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+        lines.append(f"            {_MEDIAMTX_AK_COPY_HEADERS}")
         lines.append("            trusted_proxies private_ranges")
         lines.append("        }")
         lines.append(f"        reverse_proxy {mtx_up}")
@@ -39584,8 +39600,13 @@ def _mediamtx_vhost_needs_regen(generated, login_ok):
     blk = _caddy_vhost_block(generated, _MEDIAMTX_VHOST_MARKER)
     if not _mediamtx_vhost_is_safe(generated):
         return True
-    if not blk or 'forward_auth' in blk:
+    if not blk:
         return False
+    if 'forward_auth' in blk:
+        # ops #1153: a vhost from before the signed token was passed to the editor. The
+        # marker is on every route to the editor: each open path and the catch-all.
+        return not (_MEDIAMTX_AK_COPY_HEADERS in blk
+                    and blk.count(_MEDIAMTX_IDENTITY_MARKER) == len(MEDIAMTX_OPEN_PATHS) + 1)
     return (' 503' not in blk) != bool(login_ok)
 
 
@@ -39624,6 +39645,7 @@ def _mediamtx_editor_login_converge_run(s):
         return
     if not _mediamtx_vhost_needs_regen(before, _mediamtx_editor_login_ok(s)):
         return
+    _was_safe = _mediamtx_vhost_is_safe(before)
     generate_caddyfile(s)
     if not _CADDY_REGISTRY_READY.is_set():
         print('Startup migration: MediaMTX vhost queued — written with the post-registry '
@@ -39638,6 +39660,12 @@ def _mediamtx_editor_login_converge_run(s):
     except Exception:
         return
     _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    if _was_safe:
+        # ops #1153: nothing was open. The vhost only gained the signed-token lines.
+        print('Startup migration: ✓ MediaMTX web console vhost updated (Authentik\'s signed '
+              'token now goes to the stream site) and Caddy %s.'
+              % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
+        return
     print('Startup migration: ✓ MediaMTX web console vhost secured and Caddy %s (ops #649). '
           'If you find a path, user or share link you did not add, treat the box as taken '
           'over and rebuild it.' % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]),

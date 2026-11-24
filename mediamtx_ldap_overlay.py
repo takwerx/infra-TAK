@@ -25,6 +25,9 @@ Patches the vanilla MediaMTX config editor Flask app to:
   5. Future: filter streams in /viewer by path-to-group mapping (vid_public vs vid_private determines which streams each user sees)
 """
 
+import base64
+import hashlib
+import hmac
 import os
 import re
 import json
@@ -183,6 +186,184 @@ def _authentik_groups(username):
             return _answer(hit)
         return _answer((None, started))
 
+
+# Who the signed-in person is (ops #1153).
+#
+# Authentik's outpost sends the name twice: as plain text (X-Authentik-Username) and inside
+# the token Authentik signed for this sign-in (X-Authentik-Jwt). Only the token proves the
+# name, so when the proxy in front passes it, the name is read from the token and from
+# nothing else. Caddy says that it passes the token with IDENTITY_MARKER_HEADER, written
+# in the same vhost block as the copy of X-Authentik-Jwt (app.py, _emit_mediamtx_site), so
+# the two always arrive together. Without that line (a Caddyfile from before this change)
+# the plain name header is used as before.
+#
+# The token is checked with this site's own key: Authentik signs a proxy provider's tokens
+# with HS256 and the provider's client secret (authentik/providers/oauth2/models.py,
+# OAuth2Provider.jwt_key; authentik/providers/proxy/models.py, set_oauth_defaults, read at
+# version/2026.8.6). The outpost passes that token as X-authentik-jwt
+# (internal/outpost/proxyv2/application/mode_common.go). The secret is read from
+# Authentik's API with the token this editor already holds, for the provider of the
+# application STREAM_APP_SLUG and no other, so a token made for another application is
+# refused. Standard library only: the editor's venv gets no new package.
+# https://docs.goauthentik.io/add-secure-apps/providers/proxy/header_authentication/
+IDENTITY_MARKER_HEADER = 'X-Infratak-Identity'
+IDENTITY_MARKER_SIGNED = 'signed'
+STREAM_APP_SLUG = 'stream'
+TOKEN_KEY_RECHECK_SECONDS = 300        # read the key from Authentik again at most this often
+TOKEN_KEY_RETRY_SECONDS = 20           # after no answer, or a token the key does not fit
+TOKEN_KEY_TIMEOUT_SECONDS = 4          # one API call
+TOKEN_CLOCK_LEEWAY_SECONDS = 60
+TOKEN_MAX_BYTES = 16384
+_IDENTITY_SESSION_KEYS = ('username', 'logged_in', 'role', 'ldap_groups', 'ldap_mode',
+                          'identity_source')
+
+_token_key_lock = threading.Lock()
+_token_key = {'key': None, 'checked': 0.0, 'tried': 0.0}   # key: (client_id, secret bytes)
+_token_warned = {}      # reason -> time of the last log line
+
+
+def _stream_token_key_lookup():
+    """(client_id, secret as bytes) of this site's Authentik provider, asked from Authentik
+    now, or None for no usable answer. Never raises."""
+    try:
+        if not AK_TOKEN:
+            return None
+
+        def _get(path):
+            r = urllib.request.Request(f'{AK_URL}/api/v3/{path}', headers=_ak_headers())
+            return json.loads(urllib.request.urlopen(
+                r, timeout=TOKEN_KEY_TIMEOUT_SECONDS).read().decode())
+
+        app = _get('core/applications/%s/' % urllib.parse.quote(STREAM_APP_SLUG, safe=''))
+        if not isinstance(app, dict) or app.get('slug') != STREAM_APP_SLUG:
+            return None
+        pk = app.get('provider')
+        if not isinstance(pk, int) or isinstance(pk, bool):
+            return None
+        prov = _get('providers/oauth2/%d/' % pk)
+        if not isinstance(prov, dict) or prov.get('pk') != pk:
+            return None
+        if prov.get('signing_key'):
+            return None     # not HS256 then; this check knows HS256 only
+        client_id, secret = prov.get('client_id'), prov.get('client_secret')
+        if not (isinstance(client_id, str) and client_id
+                and isinstance(secret, str) and len(secret) >= 16):
+            return None
+        return client_id, secret.encode('utf-8')
+    except Exception:
+        return None
+
+
+def _stream_token_key(refresh=False):
+    """Cached _stream_token_key_lookup(). The last good key stays in use while Authentik
+    gives no answer. `refresh` asks again now (at most once per TOKEN_KEY_RETRY_SECONDS),
+    for a token the cached key does not fit: the secret may have been changed."""
+    now = time.time()
+    with _token_key_lock:
+        key = _token_key['key']
+        age = now - _token_key['checked']
+        since_try = now - _token_key['tried']
+        if key is not None and not refresh and 0 <= age < TOKEN_KEY_RECHECK_SECONDS:
+            return key
+        if 0 <= since_try < TOKEN_KEY_RETRY_SECONDS:
+            return key
+        _token_key['tried'] = now
+        if key is None:
+            # No key yet: the other requests wait here for this one answer.
+            fresh = _stream_token_key_lookup()
+            if fresh is not None:
+                _token_key['key'] = fresh
+                _token_key['checked'] = now
+            return fresh
+    # A key is in use: ask again without holding the others up (video segments come
+    # through here too). They keep the key they have until this answer is in.
+    fresh = _stream_token_key_lookup()
+    with _token_key_lock:
+        if fresh is not None:
+            _token_key['key'] = fresh
+            _token_key['checked'] = time.time()
+        return _token_key['key']
+
+
+def _b64url_bytes(text):
+    """The bytes of one base64url part of a token (no padding in a token). Raises on
+    anything that is not base64url."""
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', text):
+        raise ValueError('not base64url')
+    return base64.urlsafe_b64decode(text + '=' * (-len(text) % 4))
+
+
+def _token_fits(token_parts, key):
+    """True when the signature of the token is the HS256 of its first two parts with
+    `key` and its audience is this site's provider. Returns (fits, claims)."""
+    client_id, secret = key
+    signed = (token_parts[0] + '.' + token_parts[1]).encode('ascii')
+    want = hmac.new(secret, signed, hashlib.sha256).digest()
+    if not hmac.compare_digest(want, _b64url_bytes(token_parts[2])):
+        return False, None
+    claims = json.loads(_b64url_bytes(token_parts[1]).decode('utf-8'))
+    if not isinstance(claims, dict):
+        return False, None
+    aud = claims.get('aud')
+    if not (aud == client_id or (isinstance(aud, list) and client_id in aud)):
+        return False, None
+    return True, claims
+
+
+def _signed_username(token):
+    """The username inside Authentik's signed token, or (None, reason) when the token does
+    not prove one. Returns (username, None) for a good token. Never raises."""
+    try:
+        if not token or len(token) > TOKEN_MAX_BYTES:
+            return None, 'no-token'
+        parts = token.split('.')
+        if len(parts) != 3:
+            return None, 'not-a-token'
+        head = json.loads(_b64url_bytes(parts[0]).decode('utf-8'))
+        # One algorithm, named here: a token never picks how it is checked.
+        if not isinstance(head, dict) or head.get('alg') != 'HS256':
+            return None, 'algorithm'
+        key = _stream_token_key()
+        if key is None:
+            return None, 'no-key'
+        fits, claims = _token_fits(parts, key)
+        if not fits:
+            newer = _stream_token_key(refresh=True)
+            if newer is None or newer == key:
+                return None, 'signature'
+            fits, claims = _token_fits(parts, newer)
+            if not fits:
+                return None, 'signature'
+        now = time.time()
+        exp = claims.get('exp')
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+            return None, 'expired'
+        if exp + TOKEN_CLOCK_LEEWAY_SECONDS < now:
+            return None, 'expired'
+        nbf = claims.get('nbf')
+        if (isinstance(nbf, (int, float)) and not isinstance(nbf, bool)
+                and nbf - TOKEN_CLOCK_LEEWAY_SECONDS > now):
+            return None, 'expired'
+        name = claims.get('preferred_username')
+        if not isinstance(name, str) or not name:
+            return None, 'no-name'
+        return name, None
+    except Exception:
+        return None, 'not-a-token'
+
+
+_TOKEN_REASONS = {
+    'no-token': 'the proxy sent no signed token for this sign-in',
+    'not-a-token': 'the signed token could not be read',
+    'algorithm': 'the signed token is not HS256',
+    'no-key': ('Authentik did not give the key to check it (API %s, application "%s"). '
+               'Check AUTHENTIK_TOKEN in the editor env file and that Authentik is up'
+               % (AK_URL, STREAM_APP_SLUG)),
+    'signature': 'the signature or the audience of the token is not this site\'s',
+    'expired': 'the token is past its end time',
+    'no-name': 'the token names no user',
+}
+
 # v10.2.4 (GH #82): MediaMTX stream paths may be nested — OBS and DJI publish to
 # rtmp://host/live/<name>. One path segment: MediaMTX's path-name characters (plus ':').
 _PATH_SEGMENT_RE = re.compile(r'^[A-Za-z0-9_.~:-]+$')
@@ -260,10 +441,16 @@ def apply_ldap_overlay(app):
 
     _untrusted_seen = set()
 
+    def _forget_identity():
+        for key in _IDENTITY_SESSION_KEYS:
+            session.pop(key, None)
+
     @app.before_request
     def _authentik_auto_auth():
         ak_user = request.headers.get('X-Authentik-Username', '')
-        if not ak_user:
+        ak_token = request.headers.get('X-Authentik-Jwt', '')
+        marker = request.headers.get(IDENTITY_MARKER_HEADER, '')
+        if not (ak_user or ak_token or marker):
             return
         # Peer pin (v10.1.48). Believe identity headers only from a peer that is
         # supposed to be able to set them. Anyone else is treated as if they sent
@@ -278,6 +465,27 @@ def apply_ldap_overlay(app):
                       'peer %s (trusted: %s). If this is the console/proxy address, set '
                       'INFRATAK_TRUSTED_PROXIES in mediamtx-webeditor.service.'
                       % (peer or '<unknown>', ','.join(sorted(TRUSTED_PROXIES))), flush=True)
+            return
+        # ops #1153: the proxy passes Authentik's signed token (see IDENTITY_MARKER_HEADER).
+        # The name is then the one in the token; the plain name header proves nothing and
+        # is not read. A sign-in kept from before the token was checked is not kept.
+        signed_mode = marker == IDENTITY_MARKER_SIGNED
+        if signed_mode:
+            if session.get('ldap_mode') and session.get('identity_source') != IDENTITY_MARKER_SIGNED:
+                _forget_identity()
+            if not (ak_user or ak_token):
+                return      # a path outside the login (share link, watch page): no change
+            ak_user, why = _signed_username(ak_token)
+            if ak_user is None:
+                _forget_identity()
+                now = time.time()
+                if now - _token_warned.get(why, 0) > 300:
+                    _token_warned[why] = now
+                    print('[infratak-overlay] a sign-in through Authentik was not accepted: '
+                          '%s. This person is not signed in to the stream site.'
+                          % _TOKEN_REASONS.get(why, why), flush=True)
+                return
+        elif not ak_user:
             return
         # ops #1082: the groups come from Authentik's own list, never from the groups
         # header (see _authentik_groups). No answer means no groups and no admin role.
@@ -297,6 +505,7 @@ def apply_ldap_overlay(app):
         session['role'] = role
         session['ldap_groups'] = groups
         session['ldap_mode'] = True
+        session['identity_source'] = IDENTITY_MARKER_SIGNED if signed_mode else 'header'
         # Redirect away from standalone auth pages
         if request.path in ('/login', '/register', '/forgot-password', '/reset-password'):
             return redirect('/')
