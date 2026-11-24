@@ -1,0 +1,15 @@
+name: throwaway 1189
+on:
+  push:
+    branches: ['claude/issue-1189001']
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  slow:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo "sha ${{ github.sha }}"; sleep 45
