@@ -146,8 +146,9 @@ jobs:
   #    this public repo: they live in the private takwerx/infra-TAK-notes repo (claude-skills/).
   #    This job runs on a GitHub-hosted runner (ops #1192; it used to need a Studio runner that
   #    was never registered for this repo, so the job sat queued and had to be switched off).
-  #    It reads the scanners from the notes repo with a read-only deploy key that lives in the
-  #    repo secret SCANNERS_READ_KEY, used for that one checkout and nothing else.
+  #    It reads the scanners from the notes repo with a fine-grained, read-only token (only the
+  #    notes repo, Contents: read) that lives in the repo secret SCANNERS_READ_TOKEN, used for
+  #    that one checkout and the check before it, nothing else. The token lasts one year.
   #
   #    The scanners are static: they read app.py, modules/ and templates/ as text (smoke.py and
   #    scan.py parse with ast, check-template-js.py renders Jinja and runs `node --check`, which
@@ -166,12 +167,17 @@ jobs:
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
-      - name: Stop with a clear message when the read key is missing
+      - name: Stop with a clear message when the read token is missing or cannot read the notes repo
         env:
-          SCANNERS_READ_KEY: ${{ secrets.SCANNERS_READ_KEY }}
+          SCANNERS_READ_TOKEN: ${{ secrets.SCANNERS_READ_TOKEN }}
         run: |
-          if [ -z "$SCANNERS_READ_KEY" ]; then
-            echo "::error::secret SCANNERS_READ_KEY is not set. Add a read-only deploy key for takwerx/infra-TAK-notes as that secret (repo Settings > Secrets and variables > Actions), or set TIER1_SCANNERS to false."
+          if [ -z "$SCANNERS_READ_TOKEN" ]; then
+            echo "::error::secret SCANNERS_READ_TOKEN is not set. Make a fine-grained read-only token for takwerx/infra-TAK-notes (https://github.com/settings/personal-access-tokens/new) and save it as that secret (https://github.com/${GITHUB_REPOSITORY}/settings/secrets/actions), or set TIER1_SCANNERS to false."
+            exit 1
+          fi
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $SCANNERS_READ_TOKEN" -H "Accept: application/vnd.github+json" https://api.github.com/repos/takwerx/infra-TAK-notes || true)
+          if [ "$code" != "200" ]; then
+            echo "::error::secret SCANNERS_READ_TOKEN cannot read takwerx/infra-TAK-notes (GitHub answered HTTP ${code}). It has probably expired (it lasts one year) or was made for another repo. Make a new one at https://github.com/settings/personal-access-tokens/new and replace the secret."
             exit 1
           fi
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -184,7 +190,7 @@ jobs:
         with:
           repository: takwerx/infra-TAK-notes
           ref: main
-          ssh-key: ${{ secrets.SCANNERS_READ_KEY }}
+          token: ${{ secrets.SCANNERS_READ_TOKEN }}
           path: notes
           sparse-checkout: |
             claude-skills/redteam-selfaudit
