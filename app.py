@@ -61220,8 +61220,9 @@ def _cloudtak_update_space_lines(problem):
         f"✗ Not enough free disk space to update CloudTAK: {problem['free'] / gb:.1f} GB free for "
         f"{problem['what']} ({problem['where']}); the update needs about {problem['need'] / gb:.0f} GB.",
         "  Nothing was changed. CloudTAK is still running as before.",
-        "  Free some space, then press Update again. Safe ways: run `docker builder prune -f` and",
-        "  `docker image prune -f` on this server (old build cache and unused image layers), and",
+        "  Free some space, then press Update again. Safe ways: run `docker builder prune -af` and",
+        "  `docker image prune -af` on this server (all unused build cache and unused images; the",
+        "  -a is needed, without it Docker removes only a small part), and",
         "  delete old logs or backups. Do not delete Docker volumes: they hold your data.",
         "  " + _FREE_SPACE_BACKUPS_HINT,
     ]

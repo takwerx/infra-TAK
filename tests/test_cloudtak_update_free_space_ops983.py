@@ -168,7 +168,7 @@ def test_message_says_nothing_changed_and_what_to_do():
     text = '\n'.join(lines)
     assert '3.0 GB free' in text and 'about 25 GB' in text
     assert 'Nothing was changed' in text and 'press Update again' in text
-    assert 'docker builder prune -f' in text and 'Do not delete Docker volumes' in text
+    assert 'docker builder prune -af' in text and 'Do not delete Docker volumes' in text
 
 
 # --------------------------------------------------------------------------- #
