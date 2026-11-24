@@ -220,6 +220,15 @@ class FakeAuthentik:
         if coll == 'core/users':
             return {'results': []}
 
+        if base.startswith('policies/reputation/scores/'):
+            if method == 'GET':
+                return {'results': [{'pk': 'score-' + name, 'identifier': name, 'score': score}
+                                    for name, score in self.scores.items()
+                                    if q.get('identifier', name) == name]}
+            if method == 'DELETE':
+                del self.scores[parts[3][len('score-'):]]
+                return None
+
         if coll in ('policies/reputation', 'policies/expression'):
             kind = parts[1]
             if method == 'GET':
@@ -592,3 +601,30 @@ def test_older_console_cannot_break_the_limit_after_a_rollback(monkeypatch):
     rep = next(p for p in ak.policies.values() if p['kind'] == 'reputation')
     assert not [b for b in ak.pbindings.values() if b['policy'] == rep['pk']], \
         'infratak-brute-force is bound directly; the released console would negate that binding'
+
+
+# --------------------------------------------------------------------------- one name's count
+
+def test_clear_name_forgets_only_that_name(monkeypatch):
+    ak = FakeAuthentik()
+    con = Console(ak, monkeypatch)
+    con.setup()
+    _guess(ak, 'alice', 5)
+    _guess(ak, 'bob', 5)
+    ak.scores['carol'] = 3
+    assert con.ns['_ak_ldap_gate_clear_name']('http://ak', {}, 'alice') == 1
+    assert ak.sign_in('alice', good_password=True) == 'ok'
+    assert ak.sign_in('bob', good_password=True) == 'denied'
+    assert ak.scores['carol'] == 3
+    assert con.ns['_ak_ldap_gate_clear_name']('http://ak', {}, 'carol') == 0
+
+
+def test_webadmin_sync_lifts_the_limit_before_it_would_delete_the_user():
+    """Sync webadmin deletes and recreates the user when its bind is refused. A name held
+    by the limit is refused with the right password, and the count is kept by name, so
+    the count is cleared and the bind probed again before that path."""
+    fn = _fn('_ensure_authentik_webadmin')
+    clear = fn.index("_ak_ldap_gate_clear_name(url, headers, 'webadmin')")
+    delete = fn.index("method='DELETE'")
+    assert clear < delete
+    assert "_test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', webadmin_pass)" in fn[clear:delete]

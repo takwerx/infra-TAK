@@ -83837,6 +83837,21 @@ def _ak_ldap_gate_binding_ok(bindings, gate_policy_pk):
             and b.get('negate') is False and b.get('failure_result') is False)
 
 
+def _ak_ldap_gate_clear_name(url, headers, username):
+    """Forget the failed sign-ins counted against one username (what Clear scores on the
+    Authentik page does for every name). Returns how many below-zero scores were removed."""
+    import urllib.parse as _up
+    rows = _ak_ldap_gate_call(
+        url, headers, 'GET',
+        f'policies/reputation/scores/?identifier={_up.quote(username)}&page_size=100').get('results', [])
+    cleared = 0
+    for row in rows:
+        if row.get('identifier') == username and (row.get('score') or 0) < 0:
+            _ak_ldap_gate_call(url, headers, 'DELETE', f"policies/reputation/scores/{row['pk']}/")
+            cleared += 1
+    return cleared
+
+
 def _ak_ldap_gate_remove(url, headers, plog):
     """Take the limit off the LDAP flow. The stage binding goes first, so sign-ins are
     never left with a deny stage that has no policy. Returns True if anything was removed."""
@@ -89199,6 +89214,21 @@ def _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=True):
             except Exception:
                 pass
             return True, None
+        if verdict == 'fail':
+            # The password was set a moment ago, so a refused bind can also be the sign-in
+            # limit holding the name (failed sign-ins counted against "webadmin"). That count
+            # is kept by name: deleting and recreating the user would not lift it. The
+            # operator asked for a working webadmin, so forget the count and probe again.
+            try:
+                if _ak_ldap_gate_clear_name(url, headers, 'webadmin'):
+                    print("Sync webadmin: webadmin was held by the sign-in limit — "
+                          "cleared its failed sign-ins, probing again", flush=True)
+                    time.sleep(3)
+                    verdict = _test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', webadmin_pass)
+            except Exception as _lim_e:
+                print(f"Sync webadmin: sign-in limit check error (non-fatal): {str(_lim_e)[:120]}", flush=True)
+            if verdict == 'inconclusive':
+                return True, None
         if verdict == 'fail':
             try:
                 req_del = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/', headers=headers, method='DELETE')
