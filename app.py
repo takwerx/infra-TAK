@@ -409,8 +409,16 @@ def _sudo_wrap(cmd):
         return [_sys.executable] + _BROKER_CLIENT_PYFLAGS + [_BROKER_CLIENT, 'exec', '--'] + cmd
     if os.getuid() != 0 and cmd and cmd[0] != 'sudo':
         return ['sudo', '-n'] + cmd
+    if cmd and cmd[0] == 'ufw' and shutil.which('flock'):
+        # Root console, no broker: take the box-wide ufw lock the broker takes
+        # (broker UFW_LOCK_PATH — two unlocked ufw writers drop rules).
+        return ['flock', '-w', '90', _UFW_LOCK_PATH] + cmd
     return cmd
 
+
+# The one lock every ufw call on the box holds — broker/takwerx_broker.py UFW_LOCK_PATH
+# carries the test6 incident; fail2ban takes it through the infratak-ufw action.
+_UFW_LOCK_PATH = '/run/infratak-ufw.lock'
 
 _BROKER_SHIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.shims')
 
@@ -23226,8 +23234,154 @@ def _f2b_banaction():
     Works on Rocky 9 via nft-backed iptables, with OR without firewalld active
     (firewalld is off on cloud boxes that rely on the security group). The
     infratak-guarddog notify action is appended on top by each jail. (Firewalld-
-    native banaction — firewallcmd-* — is part of the broader firewall-parity work.)"""
-    return 'iptables-allports' if _distro_family() == 'rhel' else 'ufw'
+    native banaction — firewallcmd-* — is part of the broader firewall-parity work.)
+
+    Debian → 'infratak-ufw' since v10.4.6: the stock ufw action with every ufw call
+    under the box-wide ufw lock (see _F2B_UFW_ACTION_CONF) — but only once the box has
+    been moved to it (_startup_f2b_ufw_lock_switch), or on a box with no jail of ours
+    yet. Until then 'ufw': a jail writer that changed the action and reloaded would
+    unban through the old, unlocked action outside the locked move. Never a name whose
+    file is not on disk — that stops the WHOLE fail2ban daemon."""
+    if _distro_family() == 'rhel':
+        return 'iptables-allports'
+    if os.path.exists(_F2B_UFW_ACTION_PATH):
+        return 'infratak-ufw'
+    try:
+        import glob as _glob
+        fresh = not _glob.glob('/etc/fail2ban/jail.d/infratak-*.conf')
+    except Exception:
+        fresh = False
+    if fresh and _f2b_ensure_ufw_action():
+        return 'infratak-ufw'
+    return 'ufw'
+
+
+_F2B_UFW_ACTION_PATH = '/etc/fail2ban/action.d/infratak-ufw.conf'
+# fail2ban's stock ufw action, defined in full here so it reads the same on fail2ban
+# 0.11 (Ubuntu 22.04) and 1.0 (24.04), whose stock ufw.conf differ. The only change
+# is `flock`: fail2ban runs its jails in parallel and restores every ban at boot, and
+# unlocked ufw writers drop rules from /etc/ufw/user.rules. On test6 (2026-11-21) the
+# recidive restore raced the console's boot `ufw delete` calls and 31 IPv4 rules —
+# 22/80/443/8089 among them — were lost; the box answered ping and nothing else. The
+# comment format matches the stock 1.0 action so the console's ban list reads the same.
+_F2B_UFW_ACTION_CONF = (
+    "# Managed by infra-TAK — rewritten on console start. fail2ban's stock ufw action\n"
+    "# with every ufw call holding /run/infratak-ufw.lock, the lock the console's\n"
+    "# privilege broker holds for its own ufw calls.\n"
+    "[Definition]\n"
+    "actionstart =\n"
+    "actionstop =\n"
+    "actioncheck =\n"
+    f"actionban = flock -w 90 {_UFW_LOCK_PATH} ufw insert <insertpos> <blocktype> from <ip> to <destination> comment \"<comment>\"\n"
+    f"actionunban = flock -w 90 {_UFW_LOCK_PATH} ufw delete <blocktype> from <ip> to <destination>\n"
+    "\n"
+    "[Init]\n"
+    "insertpos = 1\n"
+    "blocktype = reject\n"
+    "destination = any\n"
+    "comment = by Fail2Ban after <failures> attempts against <name>\n"
+    "# above flock's 90 s wait, so fail2ban does not kill a ban that is waiting its turn\n"
+    "timeout = 120\n"
+)
+
+
+def _f2b_ensure_ufw_action():
+    """Write the infratak-ufw fail2ban action if it is missing or different.
+    True when the file on disk is ours afterwards."""
+    try:
+        try:
+            with open(_F2B_UFW_ACTION_PATH) as f:
+                if f.read() == _F2B_UFW_ACTION_CONF:
+                    return True
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            pass
+        if not os.path.isdir('/etc/fail2ban/action.d') or not shutil.which('flock'):
+            return False
+        _write_priv(_F2B_UFW_ACTION_PATH, _F2B_UFW_ACTION_CONF)
+        return True
+    except Exception:
+        return False
+
+
+_F2B_STALE_UFW_RE = re.compile(r'(?m)^(\s*action\s*=\s*)ufw(?=\s|$)')
+
+
+def _f2b_stale_ufw_jails():
+    """Our jail.d/infratak-*.conf files still on the stock `action = ufw`, as
+    [(path, text)]. Only an `action = ufw` line counts; a guard-dog notify line under
+    it is kept when the line is rewritten."""
+    import glob as _glob
+    stale = []
+    for path in sorted(_glob.glob('/etc/fail2ban/jail.d/infratak-*.conf')):
+        try:
+            with open(path) as f:
+                txt = f.read()
+        except Exception:
+            continue
+        if _F2B_STALE_UFW_RE.search(txt):
+            stale.append((path, txt))
+    return stale
+
+
+# Same "To" values ufw prints for a plain port rule: 22, 22/tcp, 60000:61000/udp.
+_UFW_STATUS_ROW_RE = re.compile(
+    r'^(?P<to>\d+(?::\d+)?(?:/(?:tcp|udp))?)(?P<v6> \(v6\))?\s+'
+    r'(?P<action>ALLOW|DENY|REJECT|LIMIT)(?: IN)?\s+'
+    r'(?P<src>Anywhere(?: \(v6\))?)\s*(?:#.*)?$')
+
+
+def _ufw_ipv4_parity_heal(plog=None):
+    """Add back any IPv4 port rule whose IPv6 twin exists ("22/tcp (v6) ALLOW
+    Anywhere (v6)" with no "22/tcp ALLOW Anywhere"). `ufw allow 22/tcp` always writes
+    both families, so an IPv6-only port rule means the IPv4 copy was lost — the test6
+    failure (2026-11-21), where unlocked ufw writers dropped 31 IPv4 rules and the box
+    dropped every TCP port. fail2ban bans are IPv4 and rewrite only user.rules, which
+    is why IPv6 is the side that survives and the side this trusts.
+
+    One direction only: an IPv4-only rule is left alone, so this can never re-add a
+    rule the console removed. Only "Anywhere" port rules; source-scoped, interface,
+    app-profile and routed rules are not compared. Returns the rules it added."""
+    _log = plog or (lambda m: None)
+    if _fw_backend() != 'ufw':
+        return []
+    r = subprocess.run(_sudo_wrap(['ufw', 'status']), capture_output=True, text=True, timeout=120)
+    out = r.stdout or ''
+    if r.returncode != 0 or not out.lower().startswith('status: active'):
+        return []
+    v4, v6 = [], set()
+    for ln in out.splitlines():
+        m = _UFW_STATUS_ROW_RE.match(ln.strip())
+        if not m:
+            continue
+        key = (m.group('action').lower(), m.group('to'))
+        if m.group('v6'):
+            if m.group('src').endswith('(v6)'):
+                v6.add(key)
+        elif not m.group('src').endswith('(v6)'):
+            v4.append(key)
+    added = []
+    for action, to in sorted(v6 - set(v4)):
+        rr = subprocess.run(_sudo_wrap(['ufw', action, to]), capture_output=True, text=True, timeout=120)
+        if rr.returncode == 0:
+            added.append(f'{action} {to}')
+        else:
+            _log(f"ufw parity: could not add IPv4 {action} {to}: {(rr.stderr or rr.stdout or '').strip()[:120]}")
+    if added:
+        _log(f"ufw parity: {len(added)} IPv4 rule(s) were missing and are back: {', '.join(added)}")
+    return added
+
+
+def _startup_ufw_ipv4_parity():
+    """FIRST startup firewall step: repair IPv4 rules lost to an earlier ufw race
+    (_ufw_ipv4_parity_heal) before the console's own boot firewall calls run. The
+    fail2ban move to the locked action is later (_startup_f2b_ufw_lock_switch), after
+    the broker has converged onto this checkout's code."""
+    try:
+        _ufw_ipv4_parity_heal(lambda m: print(f"Startup migration: {m}", flush=True))
+    except Exception as e:
+        print(f"Startup migration: ufw parity error (non-fatal): {str(e)[:160]}", flush=True)
 
 
 # MediaMTX / TAK Video Restreamer listeners, from the mediamtx.yml we generate
@@ -113941,6 +114095,7 @@ def _start_guarddog_background_at_boot():
 
 
 _start_guarddog_background_at_boot()
+_startup_ufw_ipv4_parity()   # v10.4.6: FIRST firewall step — repair IPv4 rules lost to a ufw race
 _fw_remove_blanket_internal_ports()   # before the 8080 source-scope below
 _auto_harden_guarddog_8080()   # v0.9.12 A6: source-scope UFW for port 8080
 
@@ -125282,6 +125437,74 @@ def _startup_broker_converge():
 
 
 _startup_broker_converge()
+
+
+def _startup_f2b_ufw_lock_switch():
+    """Move fail2ban's jails from the stock `ufw` action to the locked `infratak-ufw`
+    action, once per box, then repair IPv4 again (now and 3 minutes later).
+
+    Runs AFTER _startup_broker_converge(), so the broker already holds the ufw lock for
+    its own ufw calls, and BEFORE _startup_migrations(), whose jail writers would
+    otherwise change the action with a plain reload. The stop is the only unsafe part:
+    it unbans every IP through the OLD, unlocked action. So the console stops fail2ban
+    while holding the ufw lock (one exact argv the broker allows), and no other ufw
+    writer can run until every one of those unbans is done. If that stop is refused or
+    fails, nothing is changed and the next start tries again."""
+    _log = lambda m: print(f"Startup migration: {m}", flush=True)
+    try:
+        if _distro_family() == 'rhel' or _fw_backend() != 'ufw':
+            return
+        if not os.path.isdir('/etc/fail2ban/action.d'):
+            return
+        stale = _f2b_stale_ufw_jails()
+        if stale:
+            act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                                 capture_output=True, text=True, timeout=15).stdout.strip()
+            if act == 'active':
+                r = subprocess.run(
+                    # Literal path on purpose: broker/scan_enforce_coverage.py (and the broker's
+                    # one exact allowed argv, FLOCK_F2B_STOP_ARGV) read the argv shape, and a
+                    # variable shows up as <var> and is reported as a denied call site.
+                    # tests/test_ufw_lock_and_parity.py keeps it equal to _UFW_LOCK_PATH.
+                    _sudo_wrap(['flock', '-w', '90', '/run/infratak-ufw.lock', 'systemctl', 'stop', 'fail2ban']),
+                    capture_output=True, text=True, timeout=300)
+                if r.returncode != 0:
+                    _log(f"fail2ban: could not stop it under the ufw lock (rc {r.returncode}: "
+                         f"{(r.stderr or r.stdout or '').strip()[:120]}) — jails stay on the stock "
+                         f"ufw action; the next console start tries again")
+                    return
+            if not _f2b_ensure_ufw_action():
+                _log("fail2ban: could not write the infratak-ufw action — jails stay on ufw")
+                if act == 'active':
+                    subprocess.run(_sudo_wrap(['systemctl', 'start', 'fail2ban']),
+                                   capture_output=True, text=True, timeout=120)
+                return
+            for path, txt in stale:
+                _write_priv(path, _F2B_STALE_UFW_RE.sub(r'\g<1>infratak-ufw', txt))
+            names = ', '.join(os.path.basename(p) for p, _ in stale)
+            if act == 'active':
+                r2 = subprocess.run(_sudo_wrap(['systemctl', 'start', 'fail2ban']),
+                                    capture_output=True, text=True, timeout=120)
+                how = 'restarted' if r2.returncode == 0 else f'start FAILED (rc {r2.returncode})'
+            else:
+                how = f'not running ({act or "unknown"}), left stopped'
+            _log(f"fail2ban: jails moved to the locked infratak-ufw action ({names}); fail2ban {how}")
+        else:
+            _f2b_ensure_ufw_action()          # keep the file current (a later release may change it)
+        _ufw_ipv4_parity_heal(_log)
+
+        def _later():
+            time.sleep(180)
+            try:
+                _ufw_ipv4_parity_heal(_log)
+            except Exception as e:
+                _log(f"ufw parity (delayed) error (non-fatal): {str(e)[:160]}")
+        threading.Thread(target=_later, daemon=True, name='ufw-parity-later').start()
+    except Exception as e:
+        _log(f"fail2ban infratak-ufw move error (non-fatal): {str(e)[:160]}")
+
+
+_startup_f2b_ufw_lock_switch()
 
 
 # v10.1.18 (SELinux enforce-the-domain): verify the box's
