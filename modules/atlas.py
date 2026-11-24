@@ -1198,6 +1198,13 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
         # `settings` is passed by the page's route; a caller that does not
         # pass it is not asking about the group, and gets None.
         'admin_group_problem': agency_group_problem(settings, inst),
+        # ops #1151: a deployment behind Authentik that does not read the signed
+        # token yet says so on its row. Asked only by the page's route (it
+        # passes `settings`), and only of a built deployment: two file reads.
+        'admin_signin_problem': (
+            atlas_signed_identity.card_note(instance_paths(ctx, inst)['dir'],
+                                            env_keys_compose_passes)
+            if built and settings is not None else None),
     }
 
 
@@ -1210,7 +1217,8 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
 #: rely on; `test_atlas_route_contract.py` holds both halves to it.
 INSTANCE_FIELDS = ('slug', 'name', 'mode', 'size_gb', 'port', 'built',
                    'running', 'stranded', 'version', 'running_version',
-                   'agency_name', 'renewal_enabled', 'admin_group_problem', 'latest',
+                   'agency_name', 'renewal_enabled', 'admin_group_problem',
+                   'admin_signin_problem', 'latest',
                    'update_available', 'paths')
 
 

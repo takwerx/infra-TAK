@@ -258,6 +258,50 @@ def env_source(dirpath):
     return ''
 
 
+#: Written to `.env` by the module only when the Caddy vhost attaches the
+#: proxy-auth header, which Caddy does only behind Authentik's forward_auth.
+ENV_PROXY_AUTH = 'TAKMDM_PROXY_AUTH_SECRET'
+
+
+def card_note(dirpath, compose_passes):
+    """What the ATLAS card says about administrator sign-in, or None (ops #1151).
+
+    ⚠️ **On the row, not only in the update log.** A deployment that stays on
+    the plain identity headers is the case the signed token exists to end:
+    ATLAS cannot check those headers. The reason used to be one `⚠` line in a
+    log that otherwise read as success.
+
+    None when the deployment reads the signed token, when Authentik is not in
+    front of it (no proxy-auth secret in `.env`), and when the files cannot be
+    read: "could not look" is not a warning. Two file reads, no network call:
+    the page polls this. Never raises.
+    """
+    try:
+        with open(os.path.join(dirpath, '.env'), encoding='utf-8') as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    try:
+        values = dict(line.split('=', 1) for line in lines
+                      if '=' in line and not line.lstrip().startswith('#'))
+        if values.get(ENV_SOURCE, '').strip() == 'jwt':
+            return None
+        if not values.get(ENV_PROXY_AUTH, '').strip():
+            return None
+        passed = compose_passes(dirpath)
+        if passed is None:
+            return None
+        if ENV_SOURCE not in passed:
+            return ('Administrator sign-in still reads the plain identity headers. '
+                    'ATLAS 2.10.0 or newer reads Authentik\'s signed token instead. '
+                    'Press Update when that release is offered.')
+        return ('Administrator sign-in is still on the plain identity headers. '
+                'Press Update to move it to Authentik\'s signed token. The update '
+                'log says what is missing.')
+    except Exception:
+        return None
+
+
 def key_lost(ctx, inst, opener=None):
     """Is this deployment's provider without its signing key? (ops #1151)
 
