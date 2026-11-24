@@ -527,12 +527,14 @@ def test_the_module_offers_both_calls_to_the_console():
     assert "'before_console_rollback': before_console_rollback," in ATLAS_SRC
 
 
-def test_the_five_minute_loop_checks_the_key():
-    loop = ATLAS_SRC[ATLAS_SRC.index('def _start_revocation_loop(ctx):'):]
+def test_a_loop_of_the_module_checks_the_key():
+    """ops #1186 moved the check from the five-minute loop to its own minute loop;
+    tests/test_atlas_key_check_minute_ops1186.py holds the timing."""
+    loop = ATLAS_SRC[ATLAS_SRC.index('def _start_signing_key_loop(ctx):'):]
     loop = loop[:loop.index('\ndef ', 10)]
     assert 'converge_signed_identity(ctx,' in loop
     assert loop.index('converge_signed_identity(ctx,') < loop.index(
-        'time.sleep(atlas_renewal.REVOCATION_INTERVAL_S)')
+        'time.sleep(SIGNING_KEY_CHECK_INTERVAL_S)')
 
 
 def test_rollback_asks_atlas_before_the_checkout():
