@@ -51,6 +51,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 # ⚠️ Module level. `ensure_authentik_app` sleeps between attempts while it
 # waits for Authentik's authorization flow; in app.py that name came from a
 # module-level import, and moving the function here left it unbound. It only
@@ -5239,6 +5240,17 @@ def _reconcile_signed_identity(ctx, inst, plog, regenerate=False):
         return False
 
 
+#: ops #1186: how often the console looks for a lost signing key.
+#: ✅ Seen on a box (Rocky 9, Authentik 2026.8.5): a restart of Authentik's
+#: worker takes the key off 15 seconds later, and ATLAS refused administrators
+#: until the five-minute check (276 s, 291 s, 4 min 35 s). The check is three
+#: small reads of the local Authentik per deployment on `jwt`, and nothing
+#: when no deployment is on `jwt`, so one minute costs almost nothing.
+SIGNING_KEY_CHECK_INTERVAL_S = 60
+
+_converge_lock = threading.Lock()
+
+
 def converge_signed_identity(ctx, log):
     """ops #1151: put a lost signing key back on every deployment that reads the
     signed token. {deployment name: 'healed' | 'headers' | 'failed'}; a
@@ -5254,12 +5266,23 @@ def converge_signed_identity(ctx, log):
     Called through the module spec by the console (boot converge, and after it
     writes the proxy providers) and every five minutes by this module's own
     loop, so a save nobody told us about is repaired within that time.
+    (ops #1186: the loop is now `_start_signing_key_loop`, every 60 seconds.)
 
     ⚠️ **Only a deployment already on `jwt`, and only when the key is gone.**
     The move from headers to the signed token stays with Deploy and Update,
     which regenerate the vhost first. Here the usual answer is two Authentik
     reads and no write.
+
+    ⚠️ **One run at a time (ops #1186).** The 60-second loop, the console's
+    own calls and a slow repair can meet; two runs would restart `api` twice
+    and write `.env` at the same time. The second waits for the first, then
+    reads the key again, so it sees what the first one did.
     """
+    with _converge_lock:
+        return _converge_signed_identity_locked(ctx, log)
+
+
+def _converge_signed_identity_locked(ctx, log):
     out = {}
     try:
         instances = load_instances(ctx)
@@ -5935,15 +5958,37 @@ def _start_revocation_loop(ctx):
                 revocation_tick(ctx, lambda m: print('[' + KEY + '] revocations:' + m, flush=True))
             except Exception as exc:
                 print('[' + KEY + '] revocations: tick failed: ' + str(exc)[:160], flush=True)
-            # ops #1151: the same five minutes. A box with no deployment on
-            # `jwt` reads its settings and stops there.
+            time.sleep(atlas_renewal.REVOCATION_INTERVAL_S)
+
+    threading.Thread(target=loop, daemon=True, name='atlas-revocations').start()
+
+
+_signing_key_loop_started = False
+
+
+def _start_signing_key_loop(ctx):
+    """ops #1186: look for a lost signing key every minute, not every five.
+
+    Once per console process. A failed tick is logged and the next one runs.
+    A box with no deployment on `jwt` reads its settings and stops there.
+    """
+    global _signing_key_loop_started
+    if _signing_key_loop_started:
+        return
+    _signing_key_loop_started = True
+
+    def loop():
+        # Later than the revocation loop's 30 seconds: the console's own
+        # converge at start has the first word.
+        time.sleep(45)
+        while True:
             try:
                 converge_signed_identity(ctx, lambda m: print('[' + KEY + '] ' + m, flush=True))
             except Exception as exc:
                 print('[' + KEY + '] signed sign-in: tick failed: ' + str(exc)[:160], flush=True)
-            time.sleep(atlas_renewal.REVOCATION_INTERVAL_S)
+            time.sleep(SIGNING_KEY_CHECK_INTERVAL_S)
 
-    threading.Thread(target=loop, daemon=True, name='atlas-revocations').start()
+    threading.Thread(target=loop, daemon=True, name='atlas-signing-key').start()
 
 
 def _run_update_all(ctx):
@@ -6449,6 +6494,8 @@ def register(ctx):
 
     # ATLAS W461: renewal refuses a revoked-certificate list an hour old.
     _start_revocation_loop(ctx)
+    # ops #1186: and the signing key, every minute.
+    _start_signing_key_loop(ctx)
 
     def _requested_instance(default_first=False):
         """The deployment a request is about, from `?slug=` or a JSON body.
