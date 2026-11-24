@@ -70,6 +70,7 @@ NAMES = (
     # what it builds on
     'MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER', '_CADDY_STRIP_AUTHENTIK_HEADERS',
     '_emit_mediamtx_site', '_caddy_vhost_block', 'CADDYFILE_USER_BLOCKS_MARKER',
+    '_MEDIAMTX_IDENTITY_MARKER', '_MEDIAMTX_AK_COPY_HEADERS',
 )
 
 
