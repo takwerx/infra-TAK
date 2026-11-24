@@ -33407,6 +33407,7 @@ def cloudtak_page():
                     containers.append({'name': parts[0], 'status': parts[1] if len(parts) > 1 else ''})
         container_info['containers'] = containers
     ct_vinfo = _get_cloudtak_version_info() if cloudtak.get('installed') else {}
+    ct_vinfo = _with_release_notes_url('cloudtak', ct_vinfo)   # infra-TAK #627: "What's new" link
     ct_version = ct_vinfo.get('version', '')
     ct_update_available = ct_vinfo.get('update_available', False)
     ct_latest = ct_vinfo.get('latest', '')
@@ -46520,6 +46521,82 @@ def _safe_module_version_info(key, info):
     return out
 
 
+# infra-TAK #627: a "What's new" link next to an update notice. Per module key: the upstream
+# GitHub repo and how that repo names a release tag. The link is built here from a fixed repo
+# plus a version that passed _RELEASE_VERSION_RE, never from text a container or a remote host
+# sent, so it can only ever point at github.com/<these repos>. Tag formats checked with
+# `git ls-remote --tags` on 2026-11-21: Authentik `version/2026.5.6`, NetBird `v0.82.1`,
+# NetBird dashboard `v2.96.1`, WebODM `v4.0.1`, MediaMTX `v1.21.4`, CloudTAK `v13.117.2`.
+# TAK Portal tags carry no `v` and its update target is always upstream's newest release, so
+# it uses GitHub's own `releases/latest`.
+_RELEASE_VERSION_RE = re.compile(r'\d+(?:\.\d+){1,3}')
+_RELEASE_NOTES_REPOS = {
+    'cloudtak': ('dfpc-coe/CloudTAK', 'v'),
+    'authentik': ('goauthentik/authentik', 'version/'),
+    'mediamtx': ('bluenviron/mediamtx', 'v'),
+    'netbird': ('netbirdio/netbird', 'v'),
+    'netbird_dashboard': ('netbirdio/dashboard', 'v'),
+    'webodm': ('OpenDroneMap/WebODM', 'v'),
+}
+
+
+def _release_page_url(repo_key, version):
+    """https://github.com/<repo>/releases/tag/<tag> for a clean version, else ''."""
+    entry = _RELEASE_NOTES_REPOS.get(repo_key)
+    ver = version.strip() if isinstance(version, str) else ''
+    if not entry or not _RELEASE_VERSION_RE.fullmatch(ver):
+        return ''
+    repo, prefix = entry
+    return 'https://github.com/%s/releases/tag/%s' % (repo, urllib.parse.quote(prefix + ver, safe=''))
+
+
+def _module_release_notes_url(key, info):
+    """Link to the release notes of the version this module's Update will install, or ''.
+
+    Only while an update is on offer, and only when we know the page: a module that updates
+    from an OS package (Caddy, fail2ban) or from tak.gov (TAK Server, Federation Hub) has no
+    public release page for the target, so it gets no link rather than a wrong one.
+    """
+    if not isinstance(info, dict) or not info.get('update_available'):
+        return ''
+    if key == 'takportal':
+        # On the beta channel Update follows the main branch, not a published release.
+        if info.get('channel') == 'beta':
+            return ''
+        return 'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/latest'
+    if key in ('cloudtak', 'authentik', 'webodm'):
+        return _release_page_url(key, info.get('latest'))
+    if key == 'mediamtx':
+        if info.get('binary_update_available'):
+            return _release_page_url('mediamtx', info.get('latest'))
+        # Only the web editor is behind: its releases live in takwerx/mediamtx-installer.
+        return 'https://github.com/takwerx/mediamtx-installer/releases' if info.get('editor_update_available') else ''
+    if key == 'netbird':
+        # `latest` reads "0.82.1", "dash 2.96.1" or "0.82.1 · dash 2.96.1": link the server
+        # release first, the dashboard when only it is behind.
+        parts = [p.strip() for p in str(info.get('latest') or '').split('·')]
+        for part in parts:
+            if part.startswith('dash '):
+                continue
+            url = _release_page_url('netbird', part)
+            if url:
+                return url
+        for part in parts:
+            if part.startswith('dash '):
+                url = _release_page_url('netbird_dashboard', part[5:])
+                if url:
+                    return url
+    return ''
+
+
+def _with_release_notes_url(key, info):
+    """A copy of one module's version info with its "What's new" link (a copy: the helpers may
+    cache their dict). Returned as is when it is empty or not a dict."""
+    if not isinstance(info, dict) or not info:
+        return info
+    return {**info, 'release_notes_url': _module_release_notes_url(key, info)}
+
+
 def _guarddog_needs_update(settings, installed):
     """True when the Guard Dog page offers "Update Guard Dog" (ops #972, infra-TAK #590).
 
@@ -46615,7 +46692,14 @@ def get_all_module_versions():
     except Exception as e:
         print(f"version-info: node security flag failed (non-fatal): {e}", flush=True)
     # ops #827: last step, so every module and every field goes through the same check.
-    return {key: _safe_module_version_info(key, info) for key, info in result.items()}
+    result = {key: _safe_module_version_info(key, info) for key, info in result.items()}
+    # infra-TAK #627: "What's new" link, built from the CHECKED values above.
+    for key, info in result.items():
+        if isinstance(info, dict):
+            url = _module_release_notes_url(key, info)
+            if url:
+                info['release_notes_url'] = url
+    return result
 
 
 @app.route('/api/modules/version')
@@ -46684,6 +46768,7 @@ def takportal_page():
     portal_version = vinfo['version'] or ''
     portal_update_available = vinfo['update_available']
     portal_latest = vinfo['latest']
+    portal_release_notes_url = _module_release_notes_url('takportal', vinfo)
     # Which channel Update will follow (TAK Portal's own BETA_MODE). Only read when the
     # container is up: the reader's docker-cp fallback can spend 15s on a stopped one,
     # and this is an inline page render. Stable is also the correct answer when we cannot
@@ -46706,6 +46791,7 @@ def takportal_page():
         settings=settings, portal=portal, container_info=container_info,
         portal_port=portal_port, portal_version=portal_version,
         portal_update_available=portal_update_available, portal_latest=portal_latest,
+        portal_release_notes_url=portal_release_notes_url,
         portal_beta_mode=portal_beta_mode,
         takportal_deploy_cfg=takportal_deploy_cfg,
         authentik_base_url=_get_authentik_base_url(settings),
@@ -69596,7 +69682,7 @@ def authentik_page():
         settings=settings, ak=ak, container_info=container_info,
         ak_port=ak_port, authentik_base_url=_get_authentik_base_url(settings),
         takserver_base_url=_get_takserver_base_url(settings), version=VERSION,
-        ak_version_info=_get_authentik_version_info(),
+        ak_version_info=_with_release_notes_url('authentik', _get_authentik_version_info()),
         deploying=authentik_deploy_status.get('running', False),
         deploy_done=authentik_deploy_status.get('complete', False),
         deploy_error=authentik_deploy_status.get('error', False),
