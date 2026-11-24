@@ -79,6 +79,16 @@ class Authentik:
                 'cookie_domain': cookie_domain, 'signing_key': None},
         }
         self.keys = {'key-1': {'pk': 'key-1', 'name': KEY_NAME}} if signing_key else {}
+        # The embedded outpost serves both providers; a second proxy outpost serves only
+        # TAK Portal's; the LDAP outpost is not a sign-in service for either.
+        self.outposts = {
+            'op-emb': {'pk': 'op-emb', 'name': 'authentik Embedded Outpost', 'type': 'proxy',
+                       'providers': [7, 49]},
+            'op-other': {'pk': 'op-other', 'name': 'Other proxy', 'type': 'proxy',
+                         'providers': [7]},
+            'op-ldap': {'pk': 'op-ldap', 'name': 'LDAP', 'type': 'ldap', 'providers': [49]},
+        }
+        self.outposts_fail = False
         self.writes = []
         self.fail = False
 
@@ -120,6 +130,15 @@ class Authentik:
             key = {'pk': 'key-%d' % (len(self.keys) + 1), 'name': body['common_name']}
             self.keys[key['pk']] = key
             return key
+        if path.startswith('outposts/instances/'):
+            if self.outposts_fail:
+                raise urllib.error.URLError('timed out')
+            if path == 'outposts/instances/':
+                return {'results': [dict(o) for o in self.outposts.values()]}
+            pk = path.split('/')[2]
+            if method == 'PATCH':
+                self.outposts[pk].update(body)
+            return dict(self.outposts[pk])
         raise AssertionError('unexpected %s %s' % (method, path))
 
 
@@ -242,8 +261,97 @@ def test_the_switch_puts_a_lost_key_back_and_stays_on_the_signed_token(sid, monk
                         compose_passes=lambda d: {sid.ENV_SOURCE})
     assert result == {'env_changed': False, 'source': 'jwt'}
     assert fake.providers[49]['signing_key'] == 'key-1'
-    assert fake.writes == [('PATCH', 'providers/oauth2/49/', {'signing_key': 'key-1'})]
+    # ops #1151: the key, then the outpost that serves this provider is told (below).
+    assert fake.writes == [
+        ('PATCH', 'providers/oauth2/49/', {'signing_key': 'key-1'}),
+        ('PATCH', 'outposts/instances/op-emb/', {'name': 'authentik Embedded Outpost'})]
     assert sid.key_lost(ctx(), CORONA, opener=fake) is False
+
+
+# ---------------------------------------------------------------------------
+# Authentik's sign-in service is told about a new key (ops #1151)
+#
+# ✅ Seen on a box, Nov 24, 2026 (Rocky 9, Authentik 2026.8.5): the key was set through the
+# OAuth2 endpoint at 08:36:18 and every ATLAS sign-in ended in a redirect loop until the
+# embedded outpost's own five-minute refresh at 08:40:53. A save of the outpost with the
+# name it already has made it refresh one second later.
+# ---------------------------------------------------------------------------
+
+def _switch(sid, monkeypatch, fake, log=None):
+    monkeypatch.setattr('modules.atlas_roster.authentik_public_url', lambda c, s: PUBLIC)
+    env = {}
+
+    def write(path, key, value):
+        changed = env.get(key) != value
+        env[key] = value
+        return changed
+
+    def jwks(req, timeout=None):
+        published = bool(fake.providers[49]['signing_key'])
+        return io.BytesIO(json.dumps({'keys': [{'kid': 'k'}]} if published else {}).encode())
+
+    lines = log if log is not None else []
+    return sid.ensure(ctx(), CORONA, '/opt/atlas-corona', write, lines.append, HOST,
+                      opener=fake, jwks_opener=jwks, caddyfile=CADDY_READY,
+                      compose_passes=lambda d: {sid.ENV_SOURCE})
+
+
+def test_a_new_key_is_told_to_the_outpost_that_serves_the_provider(sid, monkeypatch):
+    fake = Authentik(signing_key=None)
+
+    result = _switch(sid, monkeypatch, fake)
+
+    assert result['source'] == 'jwt'
+    told = [w for w in fake.writes if w[1].startswith('outposts/')]
+    # ⚠️ The name it already has, and nothing else: never its provider list.
+    assert told == [('PATCH', 'outposts/instances/op-emb/',
+                     {'name': 'authentik Embedded Outpost'})]
+    # After the key is on the provider, or the outpost would read the old state again.
+    order = [w[1] for w in fake.writes]
+    assert order.index('providers/oauth2/49/') < order.index('outposts/instances/op-emb/')
+    assert fake.outposts['op-emb']['providers'] == [7, 49]
+
+
+def test_telling_the_outpost_never_saves_a_proxy_provider(sid, monkeypatch):
+    """A save through the proxy provider API is what takes the key off."""
+    fake = Authentik(signing_key=None)
+
+    _switch(sid, monkeypatch, fake)
+
+    assert not [w for w in fake.writes if w[1].startswith('providers/proxy/')]
+    assert fake.providers[49]['signing_key'] == 'key-1'
+
+
+def test_a_key_that_is_already_on_the_provider_tells_nobody(sid, monkeypatch):
+    """The usual Update: two reads, no write. The outpost already knows this key."""
+    fake = Authentik()
+
+    result = _switch(sid, monkeypatch, fake)
+
+    assert result['source'] == 'jwt'
+    assert fake.writes == []
+
+
+def test_an_outpost_that_cannot_be_told_does_not_stop_the_switch(sid, monkeypatch):
+    """Its own five-minute refresh still comes; the log says what to expect."""
+    fake, log = Authentik(signing_key=None), []
+    fake.outposts_fail = True
+
+    result = _switch(sid, monkeypatch, fake, log)
+
+    assert result['source'] == 'jwt'
+    assert any('was not told' in line and 'five minutes' in line for line in log)
+
+
+def test_no_outpost_for_the_provider_is_said(sid, monkeypatch):
+    fake, log = Authentik(signing_key=None), []
+    fake.outposts['op-emb']['providers'] = [7]
+
+    result = _switch(sid, monkeypatch, fake, log)
+
+    assert result['source'] == 'jwt'
+    assert not [w for w in fake.writes if w[1].startswith('outposts/')]
+    assert any('No Authentik outpost serves this provider' in line for line in log)
 
 
 def test_env_source_reads_the_line(sid, tmp_path):

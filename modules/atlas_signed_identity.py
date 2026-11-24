@@ -151,6 +151,37 @@ def ensure_key_on_provider(api, provider_pk, key_pk):
     return 'set'
 
 
+def refresh_outposts(api, provider_pk):
+    """Tell Authentik's sign-in service to read this provider again, now.
+    Returns how many outposts were told. (ops #1151)
+
+    ⚠️ **Without this, nobody can sign in to ATLAS for up to five minutes
+    after the key is set.** The key goes on through `providers/oauth2/<pk>/`,
+    and Authentik tells its outposts about a change only when the proxy
+    provider or the outpost itself is saved. The outpost goes on checking
+    sign-ins with the old key (the client secret) until its own five-minute
+    refresh, and every sign-in ends in a redirect loop.
+    ✅ Seen on a box, Nov 24, 2026 (Rocky 9, Authentik 2026.8.5): key set at
+    08:36:18, sign-in failed 132 times until the outpost's refresh at 08:40:53.
+
+    A save of the outpost with the name it already has is the smallest write
+    that makes Authentik send the update. ✅ Same box: HTTP 200, the outpost
+    logged "received update trigger" one second later, a new sign-in worked
+    seven seconds later, the provider list and the signing key did not change.
+    ⚠️ Never a save of the proxy provider: that takes the key off (`key_lost`).
+    """
+    told = 0
+    for outpost in api.results('outposts/instances/'):
+        if outpost.get('type') != 'proxy' or not outpost.get('pk'):
+            continue
+        if str(provider_pk) not in [str(pk) for pk in (outpost.get('providers') or [])]:
+            continue
+        api.call('outposts/instances/%s/' % outpost['pk'],
+                 {'name': outpost.get('name') or ''}, method='PATCH')
+        told += 1
+    return told
+
+
 def jwks_has_key(url, opener=None):
     """Does the provider's JWKS publish at least one key?"""
     open_ = opener or urllib.request.urlopen
@@ -218,6 +249,17 @@ def ensure(ctx, inst, dirpath, write_env_value, plog, host, opener=None,
         if not key.get('pk'):
             return keep_headers('the signing key was not made')
         on_provider = ensure_key_on_provider(api, provider['pk'], key['pk'])
+        if on_provider == 'set':
+            # ops #1151: or every sign-in fails until the outpost's own
+            # five-minute refresh. Not fatal: that refresh still comes.
+            try:
+                if not refresh_outposts(api, provider['pk']):
+                    plog('  ⚠ No Authentik outpost serves this provider yet; a new '
+                         'sign-in can fail for up to five minutes')
+            except Exception as exc:
+                plog("  ⚠ Authentik's sign-in service was not told about the new "
+                     'key (%s); a new sign-in can fail for up to five minutes'
+                     % str(exc)[:80])
 
         url = jwks_url(public, names['app_slug'])
         if not jwks_has_key(url, jwks_opener):

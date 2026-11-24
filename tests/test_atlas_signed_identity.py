@@ -114,6 +114,13 @@ class FakeAuthentik:
         if path.startswith('crypto/certificatekeypairs/') and method == 'DELETE':
             self.keys.pop(path.split('/')[2])
             return None
+        if path == 'outposts/instances/':
+            # ops #1151: the embedded outpost serves every provider here.
+            return {'results': [{'pk': 'op-1', 'name': 'authentik Embedded Outpost',
+                                 'type': 'proxy', 'providers': list(self.providers)}]}
+        if path == 'outposts/instances/op-1/' and method == 'PATCH':
+            assert body == {'name': 'authentik Embedded Outpost'}, body
+            return {'pk': 'op-1'}
         raise AssertionError('unexpected %s %s' % (method, path))
 
 
@@ -189,7 +196,9 @@ def test_the_key_goes_on_through_the_oauth2_endpoint_only():
         run(fake, env, monkeypatch=mp)
     finally:
         mp.undo()
-    patches = [(m, p) for m, p, b in fake.calls if m == 'PATCH']
+    # ops #1151: the outpost is saved too (to make it read the new key); this test is
+    # about which provider endpoint carries the key.
+    patches = [(m, p) for m, p, b in fake.calls if m == 'PATCH' and p.startswith('providers/')]
     assert patches == [('PATCH', 'providers/oauth2/49/')]
 
 
