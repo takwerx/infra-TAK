@@ -81,18 +81,18 @@ def _family(v):
     return tuple(int(x) for x in re.findall(r'\d+', v))[:2]
 
 
-def test_pins_promoted_to_2026_8_5():
-    # v10.2.29 (ops #207): same-minor bugfix bump, no DB migrations, so no new upgrade step.
+def test_pins_promoted_to_2026_8_6():
+    # ops #1087: same-minor bugfix bump (8.5 -> 8.6), no migration named in the notes, so no new upgrade step.
     ns = _ns()
-    assert ns['AUTHENTIK_VETTED_RELEASE'] == '2026.8.5'
-    assert ns['AUTHENTIK_DEV_RELEASE'] == '2026.8.5'
+    assert ns['AUTHENTIK_VETTED_RELEASE'] == '2026.8.6'
+    assert ns['AUTHENTIK_DEV_RELEASE'] == '2026.8.6'
     assert ns['AUTHENTIK_UPGRADE_STEPS'] == ('2026.5.7',)
 
 
-@pytest.mark.parametrize('installed', ['2026.8.4', '2026.8.1', '2026.5.7'])
-def test_update_reaches_2026_8_5_in_one_press(installed):
+@pytest.mark.parametrize('installed', ['2026.8.5', '2026.8.4', '2026.8.1', '2026.5.7'])
+def test_update_reaches_2026_8_6_in_one_press(installed):
     main = _ns({'update_channel': 'main'})['_get_authentik_target_release']
-    assert main(installed=installed) == '2026.8.5'
+    assert main(installed=installed) == '2026.8.6'
 
 
 @pytest.mark.parametrize('installed,expected', [
@@ -134,14 +134,14 @@ def test_every_hop_chain_satisfies_upstream_skip_guard(start):
 
 def test_target_release_main_and_dev_channels():
     main = _ns({'update_channel': 'main'})['_get_authentik_target_release']
-    assert main() == '2026.8.5'                           # fresh install: the pin itself
+    assert main() == '2026.8.6'                           # fresh install: the pin itself
     assert main(installed='2026.2.7') == '2026.5.7'
-    assert main(installed='2026.5.7') == '2026.8.5'
+    assert main(installed='2026.5.7') == '2026.8.6'
     dev = _ns({'update_channel': 'dev'}, latest='2026.8.6')['_get_authentik_target_release']
     assert dev() == '2026.8.6'                            # dev tracks upstream latest, not the pin
     assert dev(installed='2026.2.7') == '2026.5.7'
     offline = _ns({'update_channel': 'dev'}, latest=None)['_get_authentik_target_release']
-    assert offline() == '2026.8.5'
+    assert offline() == '2026.8.6'
 
 
 def test_steps_are_ascending_and_below_the_pin():

@@ -24,8 +24,8 @@ whose overlay applies per-stream visibility — streams stay login-only. The adm
 Client X-Authentik-* is stripped on every route: the overlay believes those headers from
 Caddy's address, and a forged admin group on /watch/ earned an admin session.
 
-Split boxes keep /hls-proxy/* straight to MediaMTX — a console update cannot reach their
-remote overlay — and so does a box without Authentik.
+A box without Authentik keeps /hls-proxy/* straight to MediaMTX. So does a split box until
+the console has checked that the stream site on the remote host serves it (ops #1110).
 
 app.py cannot be imported in a test, so `_emit_mediamtx_site` is cut out of it and run:
 the code under test is the shipped text. The emitted text is pinned whole — this file is
@@ -41,7 +41,7 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 _WANT = {'MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER', '_CADDY_STRIP_AUTHENTIK_HEADERS',
-         '_emit_mediamtx_site'}
+         '_MEDIAMTX_AK_COPY_HEADERS', '_MEDIAMTX_IDENTITY_MARKER', '_emit_mediamtx_site'}
 
 
 def _load():
@@ -83,8 +83,13 @@ STRIP8 = '\n'.join(['        request_header -X-Authentik-*']
 NSTRIP = len(STRIP8.split('\n'))
 
 
+# ops #1153: with Authentik, every route to the editor then says that this proxy passes
+# Authentik's signed token (the overlay reads the person's name from it).
+MARKER = '        request_header X-Infratak-Identity signed'
+
+
 def _open_route(path, up):
-    return f'    route {path} {{\n{STRIP8}\n        reverse_proxy {up}\n    }}'
+    return f'    route {path} {{\n{STRIP8}\n{MARKER}\n        reverse_proxy {up}\n    }}'
 
 
 def _expected_ak(up, direct_hls=None):
@@ -97,12 +102,13 @@ def _expected_ak(up, direct_hls=None):
         _open_route('/shared-hls/*', up),
         '    route {',
         STRIP8,
+        MARKER,
         *([] if direct_hls else ['        request_header /hls-proxy/* -Authorization']),
         f'        #rescue https://{HOST}/',
         '        reverse_proxy /outpost.goauthentik.io/* 127.0.0.1:9090',
         '        forward_auth 127.0.0.1:9090 {',
         '            uri /outpost.goauthentik.io/auth/caddy',
-        '            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid',
+        '            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt',
         '            trusted_proxies private_ranges',
         '        }',
         f'        reverse_proxy {up}',
@@ -137,8 +143,8 @@ def test_the_admin_players_basic_header_is_dropped_before_the_login_check():
 
 @pytest.mark.parametrize('enc', [True, False])
 def test_split_box_keeps_hls_straight_to_mediamtx(enc):
-    # A console update cannot reach the remote overlay, and an old one drops ?session=.
-    # The header strip still applies.
+    # Until the console has checked the remote stream site (ops #1110): an old one drops
+    # ?session=. The header strip still applies.
     out = site(mtx_up='10.0.0.5:5080', hls=('10.0.0.5:8888', enc))
     assert out == _expected_ak('10.0.0.5:5080', direct_hls=_direct('10.0.0.5:8888', enc))
     assert '-Authorization' not in out
@@ -193,8 +199,9 @@ def test_generate_caddyfile_passes_its_real_strip_and_authentik_only_when_instal
     assert '_emit_ak_header_strip, _emit_outpost_callback_rescue' in call
     # ops #649: a failed Authentik probe keeps the Authentik block already on disk.
     assert "_mtx_ak = _vhost_uses_sso(ak, _mtx_existing, _MEDIAMTX_VHOST_MARKER)" in src
-    # Straight to MediaMTX without Authentik or when the editor is not the local one.
-    assert "_mtx_direct = not _mtx_ak or mtx_up != '127.0.0.1:5080'" in src
+    # Straight to MediaMTX without Authentik, or for a remote editor the console has not
+    # checked yet (ops #1110: test_mediamtx_remote_hls_road_ops1110.py runs the rule).
+    assert "_mtx_direct = _mediamtx_hls_direct(settings, _mtx_ak, mtx_up)" in src
 
 
 def test_tvr_vhost_is_unchanged():

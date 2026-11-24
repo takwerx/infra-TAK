@@ -43,6 +43,7 @@ TREE = ast.parse(APP)
 _NAMES = ('_emit_mediamtx_site', '_caddy_vhost_block', '_vhost_uses_sso',
           '_mediamtx_vhost_is_safe', '_mediamtx_vhost_needs_regen')
 _CONSTS = ('MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER', '_CADDY_STRIP_AUTHENTIK_HEADERS',
+           '_MEDIAMTX_AK_COPY_HEADERS', '_MEDIAMTX_IDENTITY_MARKER',
            'CADDYFILE_USER_BLOCKS_MARKER', '_MEDIAMTX_EDITOR_LOGIN_SCRIPT')
 AK_HEADERS = ('X-Authentik-Username', 'X-Authentik-Groups', 'X-Authentik-Email',
               'X-Authentik-Name', 'X-Authentik-Uid', 'X-Infratak-Proxy-Auth')
