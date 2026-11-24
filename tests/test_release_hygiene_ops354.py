@@ -16,8 +16,9 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Release hygiene (ops #354): the version in app.py, the newest tag and the release notes agree.
 
-The console shows `VERSION` in app.py and the Update card reads the README changelog, so a release
-whose number or notes lag behind the tag tells operators the wrong thing.
+The console shows `VERSION` in app.py and operators read the release notes in CHANGELOG.md (moved out of
+README.md in ops #1164, GitHub #683), so a release whose number or notes lag behind the tag tells
+operators the wrong thing.
 
 `dev` runs ahead of the last tag while the next release is being built (VERSION 10.3.4-alpha, newest
 tag v10.3.3-alpha), so the rule is not "VERSION equals the newest tag". It is:
@@ -53,7 +54,7 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
 _VERSION_RE = re.compile(r'^(\d+(?:\.\d+)+)(-[A-Za-z0-9.]+)?$')
-_HEADING_RE = re.compile(r'^### v(\d+(?:\.\d+)+(?:-[A-Za-z0-9.]+)?) — (\d{4}-\d{2}-\d{2}) — (\S.*)$', re.M)
+_HEADING_RE = re.compile(r'^#{2,3} v(\d+(?:\.\d+)+(?:-[A-Za-z0-9.]+)?) — (\d{4}-\d{2}-\d{2}) — (\S.*)$', re.M)
 _CURRENT_RE = re.compile(r'^\*\*Current release: \[v([^\]]+)\]\(([^)]+)\)\*\*', re.M)
 
 
@@ -76,14 +77,17 @@ def _readme():
     return (REPO / 'README.md').read_text(encoding='utf-8')
 
 
-def _newest_section(readme):
-    """(version, date, title, body) of the first changelog section after '## Changelog'."""
-    head = readme.index('\n## Changelog')
-    sections = list(_HEADING_RE.finditer(readme, head))
-    assert sections, 'README.md has no "### vX.Y.Z-alpha — date — summary" changelog section'
+def _changelog():
+    return (REPO / 'CHANGELOG.md').read_text(encoding='utf-8')
+
+
+def _newest_section(changelog):
+    """(version, date, title, body) of the first release section in CHANGELOG.md."""
+    sections = list(_HEADING_RE.finditer(changelog))
+    assert sections, 'CHANGELOG.md has no "## vX.Y.Z-alpha — date — summary" release section'
     first = sections[0]
-    end = sections[1].start() if len(sections) > 1 else len(readme)
-    return first.group(1), first.group(2), first.group(3), readme[first.end():end]
+    end = sections[1].start() if len(sections) > 1 else len(changelog)
+    return first.group(1), first.group(2), first.group(3), changelog[first.end():end]
 
 
 def _tags():
@@ -266,7 +270,7 @@ def test_this_tree_is_consistent_with_the_newest_tag():
             pytest.fail('CI checkout has no v* tags; the pytest job must fetch them (see pr-checks.yml)')
         pytest.skip('no v* tags in this checkout')
     readme = _readme()
-    notes_version = _newest_section(readme)[0]
+    notes_version = _newest_section(_changelog())[0]
     current = _CURRENT_RE.search(readme)
     assert current, 'README.md lost its "**Current release: [vX.Y.Z-alpha](...)**" line'
     # A PR is held to its base branch. A push run (ops #691: PR checks also run on the merged tip of
@@ -283,7 +287,7 @@ def test_current_release_link_points_at_its_own_tag():
 
 
 def test_newest_notes_are_written_for_users():
-    version, _date, _title, body = _newest_section(_readme())
+    version, _date, _title, body = _newest_section(_changelog())
     assert re.match(r'\s*\*\*Headline:', body), (
         f'v{version} notes must open with a "**Headline: ...**" paragraph a customer can read')
     assert not re.search(r'\b[0-9a-f]{40}\b', body), f'v{version} notes contain a full commit hash'
