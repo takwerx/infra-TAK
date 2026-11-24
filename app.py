@@ -80140,6 +80140,216 @@ def _ak_directory_watch_tick(plog):
     return did
 
 
+# A sign-in the LDAP outpost refused stays refused after the reason is gone (ops #1185, nuc
+# 2026-11-24, Authentik 2026.8.6). The outpost (bind_mode: cached) keeps every bind result per
+# name and password, refusals too (internal/outpost/ldap/bind/memory/memory.go). The entry lives as
+# long as the name's stored session; for a name with no good sign-in in the last hour that session
+# has no end date, so the entry never expires (ttlcache keeps an entry with a ttl <= 0 for ever).
+# Two admin actions then leave a user locked out of TAK 8446, 8089 and every LDAP client with the
+# CORRECT password, until the outpost restarts, while Authentik's own flow accepts that password:
+#   - an account is disabled, the user (or a TAK client with a saved password) tries, the account is
+#     enabled again;
+#   - a password is set to a value that was tried before.
+# A restart is no fix: it drops TAK's pooled LDAP connection (lessons: 8443 gives LDAP users no
+# groups until takserver-api restarts). The outpost builds a NEW cache only when the binder type
+# changes (NewSessionBinder keeps the old cache when the old binder is a SessionBinder), so the
+# console saves the LDAP provider with bind_mode direct and then cached again: no restart, no
+# dropped connection, a few seconds of direct (slower) binds. Proven on nuc: stuck 49 before, 0 after.
+# The watch reads every user's active flag and password_change_date from Authentik's database
+# every tick; a user that was inactive and is active now, or whose password changed, queues a flush.
+_AK_LDAP_CACHE_FLUSH_MIN_GAP_S = 60
+_AK_LDAP_CACHE_APPLY_WAIT_S = 30
+_AK_LDAP_CACHE_FLUSH_TRIES = 3
+_ak_ldap_cache_watch = {'snap': None, 'pending': set(), 'last_flush': 0.0, 'tries': 0}
+
+
+def _ak_user_credential_snapshot():
+    """{username: (is_active, password_change_date text)} for every Authentik user, from
+    Authentik's database (one query). None when it can't be read (no Authentik here,
+    container down)."""
+    sql = ("SELECT coalesce(json_object_agg(username, json_build_array(is_active, password_change_date::text)), "
+           "'{}') FROM authentik_core_user;")
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                                       '-d', 'authentik', '-tA', '-c', sql]),
+                           capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads((r.stdout or '').strip() or '{}')
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {str(u): (bool(v[0]), str(v[1])) for u, v in data.items() if isinstance(v, list) and len(v) == 2}
+
+
+def _ak_ldap_cache_changed_users(old, new):
+    """Names the outpost may hold a stale refusal for: a user that was inactive and is active
+    now, or an active user whose password changed. New users are left out (nobody tried a
+    password for a name that did not exist), and so are users that were removed."""
+    out = set()
+    for u, (active, pw_date) in new.items():
+        prev = old.get(u)
+        if prev is None or not active:
+            continue
+        if not prev[0] or prev[1] != pw_date:
+            out.add(u)
+    return out
+
+
+def _ak_ldap_binders_built(since_epoch):
+    """How many times the LDAP outpost logged 'initialized direct binder' since since_epoch.
+    It logs that when it builds a direct binder AND when it builds a new bind cache (a cache
+    is built on top of a new direct binder); it logs nothing when it keeps the old cache.
+    None when the log can't be read."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', '--since', str(int(since_epoch)), 'authentik-ldap-1']),
+                           capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return sum(1 for ln in ((r.stdout or '') + (r.stderr or '')).splitlines() if '"initialized direct binder"' in ln)
+
+
+def _ak_ldap_set_bind_mode(base, headers, pks, mode):
+    """Save the LDAP providers with this bind_mode. True when every save worked."""
+    ok = True
+    for pk in pks:
+        try:
+            with _ak_api_call(f'{base}/api/v3/providers/ldap/{pk}/', method='PATCH', headers=headers,
+                              data=json.dumps({'bind_mode': mode}).encode(), max_retries=2):
+                pass
+        except Exception:
+            ok = False
+    return ok
+
+
+def _ak_ldap_flush_state(**kv):
+    """Keep what a flush needs to undo itself, so a console restart in the middle of one
+    still ends with bind_mode cached. A None value removes the key."""
+    try:
+        s = load_settings()
+        cur = dict(s.get('ak_ldap_cache_flush') or {})
+        for k, v in kv.items():
+            if v is None:
+                cur.pop(k, None)
+            else:
+                cur[k] = v
+        s['ak_ldap_cache_flush'] = cur
+        save_settings(s)
+    except Exception:
+        pass
+
+
+def _ak_flush_ldap_bind_cache(plog):
+    """Make the LDAP outpost forget every bind result it holds, without restarting it:
+    bind_mode direct, wait until the outpost applied it, bind_mode cached, wait until it built a
+    new cache. Returns True when the outpost confirmed both steps."""
+    settings = load_settings()
+    token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+             or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '')
+    if not token:
+        return False
+    base = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    try:
+        with _ak_api_call(f'{base}/-/health/ready/', max_retries=1, timeout=5) as r:
+            if r.status != 200:
+                return False
+        with _ak_api_call(f'{base}/api/v3/providers/ldap/?page_size=100', headers=headers, max_retries=1) as r:
+            providers = json.loads(r.read().decode()).get('results', [])
+    except Exception as e:
+        plog(f"  LDAP sign-in cache flush: couldn't read the LDAP provider: {str(e)[:120]}")
+        return False
+    pks = [p['pk'] for p in providers if p.get('pk') and p.get('bind_mode') == 'cached']
+    if not pks:
+        return False          # direct mode keeps no cache; nothing to flush
+    _ak_ldap_flush_state(restore=pks, started=time.time())
+    t0 = time.time() - 1
+    built = False
+    try:
+        if not _ak_ldap_set_bind_mode(base, headers, pks, 'direct'):
+            plog("  LDAP sign-in cache flush: couldn't save the LDAP provider; putting it back")
+            return False
+        deadline = time.time() + _AK_LDAP_CACHE_APPLY_WAIT_S
+        while True:
+            n = _ak_ldap_binders_built(t0)
+            if n is not None and n >= len(pks):
+                break
+            if time.time() >= deadline:
+                plog(f"  LDAP sign-in cache flush: the outpost didn't apply bind_mode direct within "
+                     f"{_AK_LDAP_CACHE_APPLY_WAIT_S} s; putting it back")
+                return False
+            time.sleep(1)
+    finally:
+        back = _ak_ldap_set_bind_mode(base, headers, pks, 'cached')
+        if back:
+            _ak_ldap_flush_state(restore=None, started=None)
+        else:
+            plog("  LDAP sign-in cache flush: couldn't put bind_mode back to cached; will retry")
+    deadline = time.time() + _AK_LDAP_CACHE_APPLY_WAIT_S
+    while True:
+        n = _ak_ldap_binders_built(t0)
+        if n is not None and n >= 2 * len(pks):
+            built = True
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(1)
+    if not built:
+        plog(f"  LDAP sign-in cache flush: the outpost didn't confirm a new cache within "
+             f"{_AK_LDAP_CACHE_APPLY_WAIT_S} s")
+    return built
+
+
+def _ak_ldap_cache_watch_tick(plog):
+    """One pass: put back bind_mode cached if an earlier flush was cut off, then flush the
+    outpost's bind cache when an admin enabled a user again or set a password."""
+    st = _ak_ldap_cache_watch
+    if _console_update_in_progress():
+        return False
+    left = (load_settings().get('ak_ldap_cache_flush') or {}).get('restore')
+    if left:
+        settings = load_settings()
+        token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                 or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '')
+        if token and _ak_ldap_set_bind_mode(_get_authentik_api_url(settings),
+                                            {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+                                            list(left), 'cached'):
+            _ak_ldap_flush_state(restore=None, started=None)
+            plog("  LDAP sign-in cache flush: bind_mode put back to cached after an unfinished flush")
+    snap = _ak_user_credential_snapshot()
+    if snap is not None:
+        old, st['snap'] = st['snap'], snap
+        if old is not None:
+            st['pending'] |= _ak_ldap_cache_changed_users(old, snap)
+    if not st['pending'] or snap is None:
+        return False
+    if time.time() - st['last_flush'] < _AK_LDAP_CACHE_FLUSH_MIN_GAP_S:
+        return False
+    if _authentik_busy_reason():
+        return False
+    users, st['pending'] = sorted(st['pending']), set()
+    st['last_flush'] = time.time()
+    if _ak_flush_ldap_bind_cache(plog):
+        st['tries'] = 0
+        plog(f"  LDAP sign-in cache flushed (user enabled or password set: {_ak_log_names(users)}); "
+             f"an earlier refused sign-in with the right password works now")
+        return True
+    st['tries'] += 1
+    if st['tries'] >= _AK_LDAP_CACHE_FLUSH_TRIES:
+        st['tries'] = 0
+        plog(f"  LDAP sign-in cache flush gave up after {_AK_LDAP_CACHE_FLUSH_TRIES} tries "
+             f"({_ak_log_names(users)}); restarting the LDAP outpost clears a stuck sign-in")
+        return False
+    st['pending'] |= set(users)           # try again after the gap
+    return False
+
+
 def _ak_directory_watch_loop():
     log = lambda m: print(f"[ak-directory-watch] {m}", flush=True)
     while True:
@@ -80147,6 +80357,10 @@ def _ak_directory_watch_loop():
             _ak_directory_watch_tick(log)
         except Exception as e:
             log(f"error (non-fatal): {str(e)[:200]}")
+        try:
+            _ak_ldap_cache_watch_tick(log)
+        except Exception as e:
+            log(f"LDAP sign-in cache watch error (non-fatal): {str(e)[:200]}")
         time.sleep(_AK_DIR_WATCH_TICK_S)
 
 
