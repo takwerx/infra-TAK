@@ -75,46 +75,55 @@ MAIN_CF = '/etc/postfix/main.cf'
 _HOSTNAME_RE = re.compile(r'^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$')
 
 
-def _read_mailname():
-    """/etc/mailname (world-readable). '' when absent. A function so tests can stub it."""
-    try:
-        with open('/etc/mailname', encoding='utf-8') as fh:
-            return fh.read().strip()
-    except OSError:
-        return ''
-
-
-def postfix_local_names(settings):
-    """Every name Postfix may put after `root@` for mail the host sends itself."""
-    names = []
-
-    def add(n):
-        n = (n or '').strip().lower()
-        if n and _HOSTNAME_RE.match(n) and n not in names:
-            names.append(n)
-
-    for argv in (['hostname', '-f'], ['postconf', '-h', 'myhostname']):
-        try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=15)
-            if r.returncode == 0:
-                add(r.stdout)
-        except Exception:
-            pass
-    add(_read_mailname())
-    add((settings or {}).get('fqdn'))
-    return names
+NOTIFY_KEY = 'system_notify_email'
 
 
 def root_destination(ctx, settings, from_addr=''):
-    """Who reads the host's own mail: Guard Dog's alert address(es) when set (an
-    address somebody already monitors), else the relay From address (what the generic
-    map always used, so nothing changes for a box with no Guard Dog address)."""
+    """Who reads the host's own mail, first match wins (ops #1140):
+    1. the "Send system notifications to" box on the Email Relay page,
+    2. Guard Dog's alert address(es), an address somebody already monitors,
+    3. the relay From address (what the generic map always used, so nothing changes
+       for a box that sets neither)."""
     safe = ctx['_safe_alert_emails']
-    gd = safe((settings or {}).get('guarddog_alert_email'))
-    if gd:
-        return gd
+    for key in (NOTIFY_KEY, 'guarddog_alert_email'):
+        got = safe((settings or {}).get(key))
+        if got:
+            return got
     fa = from_addr or ((settings or {}).get('email_relay') or {}).get('from_addr') or ''
     return safe(fa)[:1]
+
+
+def root_destination_source(ctx, settings):
+    """Which of the three places root_destination() reads from: 'notify', 'guarddog'
+    or 'from' (the page says it in words)."""
+    safe = ctx['_safe_alert_emails']
+    if safe((settings or {}).get(NOTIFY_KEY)):
+        return 'notify'
+    if safe((settings or {}).get('guarddog_alert_email')):
+        return 'guarddog'
+    return 'from'
+
+
+_ADDR_SPLIT_RE = re.compile(r'[,;\s]+')
+NOTIFY_MAX_ADDRESSES = 5
+
+
+def parse_notify_to(ctx, value):
+    """Validate the box. Returns (comma_joined_addresses, error). An empty value is
+    valid and clears the setting. Every address goes through the same allowlist as
+    Guard Dog's alert address (ctx['_safe_alert_emails']); one bad entry rejects the
+    whole save, so a typo never silently drops an address."""
+    value = (value or '').strip()
+    if len(value) > 1000:
+        return None, 'Too long'
+    good = ctx['_safe_alert_emails'](value)
+    keep = {g.lower() for g in good}
+    bad = [t for t in _ADDR_SPLIT_RE.split(value) if t and t.lower() not in keep]
+    if bad:
+        return None, 'Invalid email address: ' + ', '.join(bad[:3])
+    if len(good) > NOTIFY_MAX_ADDRESSES:
+        return None, f'At most {NOTIFY_MAX_ADDRESSES} addresses'
+    return ','.join(good), None
 
 
 def render_root_alias_map(names, dests):
@@ -140,19 +149,18 @@ def with_root_alias_map(cf):
     return (cf or '').rstrip('\n') + f'\nvirtual_alias_maps = {merged}\n', True
 
 
-def sync_root_alias(ctx, settings, plog=None, from_addr='', reload=True):
+def sync_root_alias(ctx, settings, plog=None, from_addr='', reload=True, names=None):
     """Write the root alias map and make main.cf use it. Safe to repeat. Never raises:
     mail for root is a convenience and must not fail a deploy or a settings save.
     Returns (ok, message)."""
     plog = plog or (lambda m: None)
     try:
-        names = postfix_local_names(settings)
+        names = names if names is not None else postfix_local_names(settings)
         dests = root_destination(ctx, settings, from_addr)
         # Sender rewrite for every host name (a box deployed before GH #667 only had one).
         sender = (from_addr or ((settings or {}).get('email_relay') or {}).get('from_addr') or '').strip()
         if sender and ctx['_safe_alert_emails'](sender):
-            ctx['_write_priv']('/etc/postfix/generic',
-                               ''.join(f"root@{n}    {sender}\n" for n in names))
+            ctx['_write_priv']('/etc/postfix/generic', _generic_map_text(sender, *names)[0])
             _postmap(ctx, '/etc/postfix/generic', plog)
         # Map first, then main.cf: main.cf must never name a table that does not exist.
         ctx['_write_priv'](ROOT_ALIAS_MAP, render_root_alias_map(names, dests))
@@ -194,6 +202,91 @@ def _postmap(ctx, path, plog):
     return True
 
 
+def _resolve_fqdn(settings):
+    """The mail name this relay uses, plus what `hostname -f` says right now.
+
+    Prefer the administrator-saved FQDN; fall back to `hostname -f`, then `hostname`.
+    `hostname -f` can return an unresolvable name on some VPS configs, causing mydomain
+    to be derived as "0" and the postfix install to fail with
+    "meter mydomain: bad parameter value: 0". Returns (fqdn, hostname_f).
+    """
+    r = subprocess.run(['hostname', '-f'], capture_output=True, text=True)
+    hostname_f = (r.stdout or '').strip() if r.returncode == 0 else ''
+    if not hostname_f:
+        r2 = subprocess.run(['hostname'], capture_output=True, text=True)
+        hostname_f = (r2.stdout or '').strip()
+    fqdn = ((settings or {}).get('fqdn') or hostname_f or 'localhost').strip()
+    if not fqdn or fqdn == '0':
+        fqdn = (settings or {}).get('fqdn', 'localhost')
+    return fqdn, hostname_f
+
+
+def _generic_map_text(from_addr, *origins):
+    """Body of /etc/postfix/generic: one `root@<name>  <from_addr>` line per distinct name.
+
+    ops #1142 (infra-TAK GH #665). Postfix stamps local mail from root with whatever its
+    origin is: /etc/mailname on Debian/Ubuntu (the saved FQDN), $myhostname elsewhere
+    (`hostname -f`). The map used to be keyed only on a bare `hostname -f`, so on a host
+    where that differs from the saved FQDN the key never matched and the sender was never
+    rewritten, with no message. Key every name Postfix could stamp; duplicates and blanks
+    are dropped, order is kept (first = the saved FQDN).
+    """
+    seen, lines = set(), []
+    for name in origins:
+        name = (name or '').strip()
+        if not name or name == '0' or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        lines.append(f"root@{name}    {from_addr}")
+    return '\n'.join(lines) + '\n', sorted(seen)
+
+
+def _read_name_file(path):
+    """First line of a name file such as /etc/mailname; '' when absent or unreadable."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            return (f.readline() or '').strip()
+    except OSError:
+        return ''
+
+
+def _postfix_origins():
+    """The names Postfix itself will stamp on root's mail: `postconf -hx myorigin` (a file
+    path such as /etc/mailname is read) and `myhostname`. Asking Postfix beats guessing:
+    on Rocky `myhostname` is `<host>.localdomain`, which neither the saved FQDN nor
+    `hostname -f` ever equals. A failed query just returns fewer names."""
+    names = []
+    for param in ('myorigin', 'myhostname'):
+        try:
+            r = subprocess.run(['postconf', '-hx', param], capture_output=True,
+                               text=True, timeout=15)
+            val = (r.stdout or '').strip() if r.returncode == 0 else ''
+        except (OSError, subprocess.SubprocessError):
+            val = ''
+        if val.startswith('/'):
+            val = _read_name_file(val)
+        names.append(val)
+    return names
+
+
+def postfix_local_names(settings):
+    """THE list of names Postfix may put after `root@` for mail the host sends itself.
+
+    One discovery for both maps: the sender rewrite (/etc/postfix/generic) and the root
+    recipient map (/etc/postfix/virtual_root) are built from this list, so they can never
+    disagree (GH #665 and GH #667). Order: the saved FQDN first, then what Postfix reports
+    (`postconf -hx myorigin`, which reads /etc/mailname, and `myhostname`), then
+    `hostname -f`. Names that are not plain host names are dropped, because they go into a
+    Postfix table."""
+    fqdn, hostname_f = _resolve_fqdn(settings)
+    names = []
+    for n in (fqdn, *_postfix_origins(), hostname_f):
+        n = (n or '').strip().lower()
+        if n and n != '0' and _HOSTNAME_RE.match(n) and n not in names:
+            names.append(n)
+    return names
+
+
 def deploy_validate(data):
     """Request-side validation for /deploy and /swap (the byte-identical clone
     collapsed onto one view). Resolves the relay host/port here so the custom
@@ -230,16 +323,8 @@ def deploy(ctx, job, params):
         plog("📧 Step 1/5 — Installing Postfix...")
         if ctx['os_type']() == 'debian':
             ctx['wait_for_apt_lock'](plog, job['log'])
-            # Resolve mailname: prefer saved FQDN, fall back to hostname -f, hard-fallback to hostname
-            # hostname -f can return an unresolvable name on some VPS configs, causing
-            # mydomain to be derived as "0" and postfix install to fail with
-            # "meter mydomain: bad parameter value: 0"
-            fqdn_result = subprocess.run(['hostname', '-f'], capture_output=True, text=True)
-            if fqdn_result.returncode != 0 or not fqdn_result.stdout.strip():
-                fqdn_result = subprocess.run(['hostname'], capture_output=True, text=True)
-            fqdn = (settings.get('fqdn') or fqdn_result.stdout.strip() or 'localhost').strip()
-            if not fqdn or fqdn == '0':
-                fqdn = settings.get('fqdn', 'localhost')
+            # Mail name: see _resolve_fqdn (ops #1142 shares it with the generic map below).
+            fqdn, _ = _resolve_fqdn(settings)
             # `fqdn` comes from settings.json — an administrator types it into the
             # console. It used to be interpolated into a root shell string here
             # (v10.1.48 W2). The pre-seed lines go in on STDIN instead: no shell,
@@ -327,15 +412,21 @@ smtp_generic_maps = hash:/etc/postfix/generic
             return
         subprocess.run(ctx['_sudo_wrap'](['chmod', '600', '/etc/postfix/sasl_passwd', '/etc/postfix/sasl_passwd.db']), capture_output=True)
 
-        # Generic map for from address rewriting. GH #667: the sender can be root@ any of the
-        # host's names, not only `hostname -f`; sync_root_alias writes it for all of them.
-        hostname = subprocess.run(['hostname', '-f'], capture_output=True, text=True).stdout.strip()
-        ctx['_write_priv']('/etc/postfix/generic', f"root@{hostname}    {from_addr}\n")
+        # Generic map for from address rewriting. One list of names feeds this map and the
+        # root recipient map (sync_root_alias below): the saved FQDN, what Postfix says it
+        # stamps (myorigin, e.g. /etc/mailname, and myhostname) and `hostname -f`.
+        # ops #1142 (GH #665) and GH #667.
+        names = postfix_local_names(settings)
+        generic_text, generic_names = _generic_map_text(from_addr, *names)
+        if len(generic_names) > 1:
+            plog(f"⚠ Host names disagree ({', '.join(generic_names)}); "
+                 "sender rewrite covers each of them")
+        ctx['_write_priv']('/etc/postfix/generic', generic_text)
         _postmap(ctx, '/etc/postfix/generic', plog)
         plog("✓ Credentials written and hashed")
         # GH #667: mail the host sends to root reaches a person. Postfix restarts in
         # Step 4, so no reload here.
-        sync_root_alias(ctx, settings, plog, from_addr=from_addr, reload=False)
+        sync_root_alias(ctx, settings, plog, from_addr=from_addr, reload=False, names=names)
 
         plog("📧 Step 4/5 — Enabling and starting Postfix...")
         subprocess.run(ctx['_sudo_wrap'](['systemctl', 'enable', 'postfix']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -413,6 +504,7 @@ def uninstall(ctx, job, params):
     ctx['_pkg_remove']('postfix', timeout=120)
     settings = ctx['load_settings']()
     settings.pop('email_relay', None)
+    settings.pop(NOTIFY_KEY, None)
     ctx['save_settings'](settings)
     return {'success': True, 'steps': ['Postfix stopped and removed', 'SMTP credentials removed', 'Configuration cleared']}
 
@@ -443,6 +535,32 @@ def register(ctx):
             return jsonify({'success': True, 'output': accepted_message(settings, to_addr)})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:200]})
+
+    def notify_to_view():
+        """Save the "Send system notifications to" box and apply it at once (ops #1140).
+        Empty clears it: root's mail then follows Guard Dog's alert address, else the
+        relay From address."""
+        data = request.get_json(silent=True) or {}
+        value, err = parse_notify_to(ctx, data.get('notify_to'))
+        if err:
+            return jsonify({'success': False, 'error': err}), 400
+        settings = ctx['load_settings']()
+        if not settings.get('email_relay'):
+            return jsonify({'success': False,
+                            'error': 'Email Relay is not set up. Deploy the relay first.'}), 400
+        if value:
+            settings[NOTIFY_KEY] = value
+        else:
+            settings.pop(NOTIFY_KEY, None)
+        ctx['save_settings'](settings)
+        ok, msg = sync_root_alias(ctx, settings)
+        resp = {'success': bool(ok), 'saved': value,
+                'source': root_destination_source(ctx, settings),
+                'goes_to': ','.join(root_destination(ctx, settings)), 'message': msg}
+        if not ok:
+            resp['error'] = 'Saved, but the server could not apply it: ' + msg
+            return jsonify(resp), 500
+        return jsonify(resp)
 
     def configure_authentik_view():
         """Push Email Relay settings into Authentik and set up recovery flow (SMTP + Forgot password?)."""
@@ -497,11 +615,13 @@ def register(ctx):
         'extra_routes': [
             {'url': '/api/emailrelay/test', 'methods': ['POST'],
              'endpoint': 'emailrelay_test', 'view': test_view},
+            {'url': '/api/emailrelay/notify-to', 'methods': ['POST'],
+             'endpoint': 'emailrelay_notify_to', 'view': notify_to_view},
             {'url': '/api/emailrelay/configure-authentik', 'methods': ['POST'],
              'endpoint': 'emailrelay_configure_authentik', 'view': configure_authentik_view},
         ],
         # facts (data for later waves — recorded so 10.1.23+ don't re-survey)
         'ports': [],                    # opens no firewall ports (SMTP is localhost:25)
         'service_units': ['postfix'],
-        'settings_keys': ['email_relay'],
+        'settings_keys': ['email_relay', NOTIFY_KEY],
     })

@@ -1716,7 +1716,7 @@ def inject_source_url():
 # Dev-channel boxes (update_channel = 'dev' in settings.json) use AUTHENTIK_DEV_RELEASE —
 # the version currently under validation.  When vetting passes, promote DEV → VETTED and
 # bump VERSION to a new infra-TAK release.
-AUTHENTIK_VETTED_RELEASE = "2026.8.5"   # v10.2.29: same-minor bugfix release, no DB migrations (ops #207). Its certifi 2026.10.19 drops the distrusted eMudhra root (emSign ECC Root CA - G3) that 2026.8.4 still trusted inside the container (ops #202). Validated on test12: console Update 8.4 -> 8.5, LDAP SA bind + outpost restart, SSO on every module, pgbouncer reconnect, no Guard Dog restarts, and a clean rollback to 8.4. Previous: 2026.8.4 — v10.2.25: promoted to the 2026.8 line (there is no 2026.6/2026.7 upstream). 8.4 is the first 8.x that parses list env vars (our AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS) correctly (#26081), and it carries the 8.2 security backports plus the LDAP cached-searcher memory-leak fix (8.3). 2026.8 only honours X-Forwarded-* from trusted proxies, so remote-Authentik installs now also trust the console IP (_authentik_trusted_proxy_cidrs). Previous: 2026.5.7 — v10.2.7: SECURITY — 2026.5.7 fixes five HIGH advisories published 2026-09-09 (CVE-2026-94606 email-authenticator MFA bypass, -94609 delegated group/user privilege escalation, -94611 credentials readable with view permission, -94612 SAML source auth bypass, -94613 SAML DoS). Same-minor patch release.
+AUTHENTIK_VETTED_RELEASE = "2026.8.6"   # ops #1087: PENDING gated T&E (do not merge before it is green on every box): same-minor bugfix release, no security fix, no migration named in the notes; batches the task purge, limits task fetching, refreshes outpost channel groups on hello. Previous: 2026.8.5 — v10.2.29: same-minor bugfix release, no DB migrations (ops #207). Its certifi 2026.10.19 drops the distrusted eMudhra root (emSign ECC Root CA - G3) that 2026.8.4 still trusted inside the container (ops #202). Validated on test12: console Update 8.4 -> 8.5, LDAP SA bind + outpost restart, SSO on every module, pgbouncer reconnect, no Guard Dog restarts, and a clean rollback to 8.4. Previous: 2026.8.4 — v10.2.25: promoted to the 2026.8 line (there is no 2026.6/2026.7 upstream). 8.4 is the first 8.x that parses list env vars (our AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS) correctly (#26081), and it carries the 8.2 security backports plus the LDAP cached-searcher memory-leak fix (8.3). 2026.8 only honours X-Forwarded-* from trusted proxies, so remote-Authentik installs now also trust the console IP (_authentik_trusted_proxy_cidrs). Previous: 2026.5.7 — v10.2.7: SECURITY — 2026.5.7 fixes five HIGH advisories published 2026-09-09 (CVE-2026-94606 email-authenticator MFA bypass, -94609 delegated group/user privilege escalation, -94611 credentials readable with view permission, -94612 SAML source auth bypass, -94613 SAML DoS). Same-minor patch release.
 
 # Operator-vetted MediaMTX binary (bluenviron/mediamtx).  Same contract as
 # AUTHENTIK_VETTED_RELEASE: update this ONLY after T&E on the new upstream version.
@@ -1740,7 +1740,7 @@ MEDIAMTX_VETTED_RELEASE = "1.21.4"      # ops #817: 1.21.3 → 1.21.4 (RTSP-over
 # takes it the rest of the way (_ak_upgrade_hop). Each entry is the last vetted patch of a
 # family. Add the outgoing family's last vetted patch here whenever a new family is promoted.
 AUTHENTIK_UPGRADE_STEPS = ("2026.5.7",)
-AUTHENTIK_DEV_RELEASE    = "2026.8.5"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
+AUTHENTIK_DEV_RELEASE    = "2026.8.6"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 # CloudTAK version target. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
 # ConfigStateless contract. v10.1.4 migrated the dispatcher plugin + the installer to that
@@ -1757,12 +1757,13 @@ CLOUDTAK_VETTED_RELEASE = "13.127.0"    # OFFLINE FALLBACK ONLY since v10.1.17 �
                                         # ops #826: 13.117.1 -> 13.127.0 (update, rollback and forward again tested on Ubuntu,
                                         # Rocky 9 and ARM). A box with the Replay plugin stays on its old build: see PLATFORM_REFERENCE.md.
                                         # tests/test_cloudtak_fallback_pin_ops392.py keeps it from going stale.
-# ops #1074: CloudTAK 14.0.0 (Nov 22, 2026) is a MAJOR release we have not tested: it refuses to start
-# while the old MinIO store folder exists, drops the basemap and font routes, and needs newer ETL
-# images. Every channel installs "upstream latest", so without a cap one press of Update (or a fresh
-# Deploy) would put an untested major on a customer's box. The cap offers the newest 13.x until a
-# test passes; raise it (and the fallback pin) only after one does. tests/test_cloudtak_major_cap_ops1074.py
-CLOUDTAK_MAX_MAJOR = 13
+# ops #1074: CloudTAK 14.0.0 (Nov 22, 2026) is a MAJOR release. Every channel installs "upstream latest",
+# so the cap keeps the next untested major (15) off a customer's box until a test passes. 14 was tested
+# (Ubuntu 22.04, Rocky 9, ARM: fresh Deploy, Update from 13.128.0, video, all 17 Marketplace plugins,
+# console rollback, a v11 ETL layer); raise it only after the same test passes for the next major.
+# A box that still has the old MinIO folder stops at the newest 13.x first: _cloudtak_tag_for_minio_store().
+# tests/test_cloudtak_major_cap_ops1074.py
+CLOUDTAK_MAX_MAJOR = 14
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Caddy's certificate store, and the issuer subdirectory Let's Encrypt lands in.
 # Caddy namespaces the store by the ACME directory URL, so the issuer name is NOT a
@@ -12248,7 +12249,7 @@ def update_apply():
             'free_bytes': _free_b,
             'error': (f'Update Now needs ~1 GB free to fetch and check out; this filesystem '
                       f'has {_free_b // (1024 * 1024)} MB. Free disk first — see Guard Dog '
-                      '> Database maintenance (CoT) > Diagnose.'),
+                      '> Database maintenance (CoT) > Diagnose. ' + _FREE_SPACE_BACKUPS_HINT),
         }), 400
 
     # v0.9.24 Item 1: Update Now single-flight lock.
@@ -33425,6 +33426,7 @@ def cloudtak_page():
                     containers.append({'name': parts[0], 'status': parts[1] if len(parts) > 1 else ''})
         container_info['containers'] = containers
     ct_vinfo = _get_cloudtak_version_info() if cloudtak.get('installed') else {}
+    ct_vinfo = _with_release_notes_url('cloudtak', ct_vinfo)   # infra-TAK #627: "What's new" link
     ct_version = ct_vinfo.get('version', '')
     ct_update_available = ct_vinfo.get('update_available', False)
     ct_latest = ct_vinfo.get('latest', '')
@@ -39221,6 +39223,45 @@ def _get_mediamtx_hls_upstream(settings):
 # needs a login. /hls-proxy/ is deliberately NOT here — streams are login-only.
 MEDIAMTX_OPEN_PATHS = ('/watch/*', '/shared/*', '/shared-hls/*')
 _MEDIAMTX_VHOST_MARKER = '# MediaMTX Web Console'
+# ops #1153: the stream site's overlay reads the person's name from Authentik's signed token
+# when Caddy passes it. These two lines are that contract, and the overlay holds the same
+# header name and value (IDENTITY_MARKER_HEADER, IDENTITY_MARKER_SIGNED; a test keeps them
+# equal). `request_header NAME VALUE` replaces whatever a client sent under that name.
+_MEDIAMTX_AK_COPY_HEADERS = ('copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email '
+                             'X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt')
+_MEDIAMTX_IDENTITY_MARKER = 'request_header X-Infratak-Identity signed'
+
+# ops #1110: the remote MediaMTX host whose stream site the console has checked serves
+# /hls-proxy/ (one line: the host). A file in CONFIG_DIR, not a settings key: the check runs
+# in a background thread at console start, where a settings save could undo another one.
+_MEDIAMTX_REMOTE_HLS_ROAD_FILE = 'mediamtx_remote_hls_via_editor'
+
+
+def _mediamtx_remote_hls_via_editor(settings):
+    """ops #1110: True when MediaMTX is on a remote host and the console has checked that the
+    stream site there serves /hls-proxy/ (_mediamtx_remote_hls_road). Caddy then sends video
+    through the sign-in to that editor, as on one box, and never straight to MediaMTX."""
+    try:
+        cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+        host = ((cfg.get('remote') or {}).get('host') or '').strip()
+        if cfg.get('target_mode') != 'remote' or not host:
+            return False
+        with open(os.path.join(CONFIG_DIR, _MEDIAMTX_REMOTE_HLS_ROAD_FILE)) as f:
+            return f.read().strip() == host
+    except Exception:
+        return False
+
+
+def _mediamtx_hls_direct(settings, use_sso, mtx_up):
+    """Does Caddy send the stream site's /hls-proxy/* straight to MediaMTX (True), or through
+    the login to the editor (False)? Straight without Authentik (no stream site deciding
+    anything). With Authentik: through the editor on the console's own box, and through the
+    editor on a remote host once the console has checked that it serves video (ops #1110)."""
+    if not use_sso:
+        return True
+    if mtx_up == '127.0.0.1:5080':
+        return False
+    return not _mediamtx_remote_hls_via_editor(settings)
 
 
 def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue, login_ok=False):
@@ -39246,13 +39287,21 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
     ak_up: Authentik upstream, or None when Authentik is not installed.
     hls:   (upstream, tls) from _get_mediamtx_hls_upstream to keep /hls-proxy/* going
            straight to MediaMTX — without Authentik (no overlay deciding anything), and
-           on a split box, whose remote overlay a console update cannot reach. None
-           sends it through the login to the local editor.
+           for a remote host until the console has checked that the stream site there
+           serves it (ops #1110, _mediamtx_remote_hls_via_editor). None sends it through
+           the login to the editor (`mtx_up`: the local one, or the one on the remote host).
     emit_strip(indent) / emit_rescue(root_url): generate_caddyfile's own emitters.
     login_ok: no Authentik only. True when the console has made sure the editor no longer
            answers admin/admin (ops #649); False answers 503 instead of the editor.
     Every route starts with _CADDY_STRIP_AUTHENTIK_HEADERS (ops #648/#649): no client
     X-Authentik-* header of any name reaches the editor.
+
+    ops #1153: with Authentik, forward_auth also copies X-Authentik-Jwt, the token Authentik
+    signed for the sign-in, and every route to the editor carries _MEDIAMTX_IDENTITY_MARKER.
+    The marker tells the overlay that this proxy passes the token, so the overlay takes
+    the person's name from the token it has checked and not from the plain name header.
+    The two lines are written together here and nowhere else: an editor never sees the
+    marker from a Caddyfile that does not pass the token.
     """
     lines.append(_MEDIAMTX_VHOST_MARKER)
     lines.append(f"{mtx_host} {{")
@@ -39276,18 +39325,20 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
             lines.append(f"    route {path} {{")
             lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
             emit_strip("        ")
+            lines.append(f"        {_MEDIAMTX_IDENTITY_MARKER}")
             lines.append(f"        reverse_proxy {mtx_up}")
             lines.append("    }")
         lines.append("    route {")
         lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
         emit_strip("        ")
+        lines.append(f"        {_MEDIAMTX_IDENTITY_MARKER}")
         if not hls:
             lines.append("        request_header /hls-proxy/* -Authorization")
         emit_rescue(f"{_pub_url(mtx_host)}/")
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
         lines.append(f"        forward_auth {ak_up} {{")
         lines.append("            uri /outpost.goauthentik.io/auth/caddy")
-        lines.append("            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+        lines.append(f"            {_MEDIAMTX_AK_COPY_HEADERS}")
         lines.append("            trusted_proxies private_ranges")
         lines.append("        }")
         lines.append(f"        reverse_proxy {mtx_up}")
@@ -39618,8 +39669,13 @@ def _mediamtx_vhost_needs_regen(generated, login_ok):
     blk = _caddy_vhost_block(generated, _MEDIAMTX_VHOST_MARKER)
     if not _mediamtx_vhost_is_safe(generated):
         return True
-    if not blk or 'forward_auth' in blk:
+    if not blk:
         return False
+    if 'forward_auth' in blk:
+        # ops #1153: a vhost from before the signed token was passed to the editor. The
+        # marker is on every route to the editor: each open path and the catch-all.
+        return not (_MEDIAMTX_AK_COPY_HEADERS in blk
+                    and blk.count(_MEDIAMTX_IDENTITY_MARKER) == len(MEDIAMTX_OPEN_PATHS) + 1)
     return (' 503' not in blk) != bool(login_ok)
 
 
@@ -39658,6 +39714,7 @@ def _mediamtx_editor_login_converge_run(s):
         return
     if not _mediamtx_vhost_needs_regen(before, _mediamtx_editor_login_ok(s)):
         return
+    _was_safe = _mediamtx_vhost_is_safe(before)
     generate_caddyfile(s)
     if not _CADDY_REGISTRY_READY.is_set():
         print('Startup migration: MediaMTX vhost queued — written with the post-registry '
@@ -39672,6 +39729,23 @@ def _mediamtx_editor_login_converge_run(s):
     except Exception:
         return
     _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    if _was_safe:
+        # ops #1153: nothing was open. The vhost only gained the signed-token lines.
+        try:
+            _still = _mediamtx_vhost_needs_regen(
+                _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0],
+                _mediamtx_editor_login_ok(s))
+        except Exception:
+            _still = True
+        if _still:
+            print('Startup migration: ⚠ MediaMTX web console vhost was NOT updated (the '
+                  'regenerated Caddyfile was rejected and rolled back). The stream site '
+                  'works as before; the next console start tries again.', flush=True)
+            return
+        print('Startup migration: ✓ MediaMTX web console vhost updated (Authentik\'s signed '
+              'token now goes to the stream site) and Caddy %s.'
+              % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
+        return
     print('Startup migration: ✓ MediaMTX web console vhost secured and Caddy %s (ops #649). '
           'If you find a path, user or share link you did not add, treat the box as taken '
           'over and rebuild it.' % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]),
@@ -43452,8 +43526,9 @@ def generate_caddyfile(settings=None):
         except Exception:
             _mtx_existing = ''
         _mtx_ak = _vhost_uses_sso(ak, _mtx_existing, _MEDIAMTX_VHOST_MARKER)
-        # /hls-proxy/ through the login to the local editor only — see _emit_mediamtx_site.
-        _mtx_direct = not _mtx_ak or mtx_up != '127.0.0.1:5080'
+        # /hls-proxy/ through the login to the editor, local or (ops #1110) on a remote host
+        # that serves it — see _mediamtx_hls_direct and _emit_mediamtx_site.
+        _mtx_direct = _mediamtx_hls_direct(settings, _mtx_ak, mtx_up)
         _emit_mediamtx_site(
             lines, mtx_host, mtx_up,
             ak_up if _mtx_ak else None,
@@ -46561,6 +46636,82 @@ def _safe_module_version_info(key, info):
     return out
 
 
+# infra-TAK #627: a "What's new" link next to an update notice. Per module key: the upstream
+# GitHub repo and how that repo names a release tag. The link is built here from a fixed repo
+# plus a version that passed _RELEASE_VERSION_RE, never from text a container or a remote host
+# sent, so it can only ever point at github.com/<these repos>. Tag formats checked with
+# `git ls-remote --tags` on 2026-11-21: Authentik `version/2026.5.6`, NetBird `v0.82.1`,
+# NetBird dashboard `v2.96.1`, WebODM `v4.0.1`, MediaMTX `v1.21.4`, CloudTAK `v13.117.2`.
+# TAK Portal tags carry no `v` and its update target is always upstream's newest release, so
+# it uses GitHub's own `releases/latest`.
+_RELEASE_VERSION_RE = re.compile(r'\d+(?:\.\d+){1,3}')
+_RELEASE_NOTES_REPOS = {
+    'cloudtak': ('dfpc-coe/CloudTAK', 'v'),
+    'authentik': ('goauthentik/authentik', 'version/'),
+    'mediamtx': ('bluenviron/mediamtx', 'v'),
+    'netbird': ('netbirdio/netbird', 'v'),
+    'netbird_dashboard': ('netbirdio/dashboard', 'v'),
+    'webodm': ('OpenDroneMap/WebODM', 'v'),
+}
+
+
+def _release_page_url(repo_key, version):
+    """https://github.com/<repo>/releases/tag/<tag> for a clean version, else ''."""
+    entry = _RELEASE_NOTES_REPOS.get(repo_key)
+    ver = version.strip() if isinstance(version, str) else ''
+    if not entry or not _RELEASE_VERSION_RE.fullmatch(ver):
+        return ''
+    repo, prefix = entry
+    return 'https://github.com/%s/releases/tag/%s' % (repo, urllib.parse.quote(prefix + ver, safe=''))
+
+
+def _module_release_notes_url(key, info):
+    """Link to the release notes of the version this module's Update will install, or ''.
+
+    Only while an update is on offer, and only when we know the page: a module that updates
+    from an OS package (Caddy, fail2ban) or from tak.gov (TAK Server, Federation Hub) has no
+    public release page for the target, so it gets no link rather than a wrong one.
+    """
+    if not isinstance(info, dict) or not info.get('update_available'):
+        return ''
+    if key == 'takportal':
+        # On the beta channel Update follows the main branch, not a published release.
+        if info.get('channel') == 'beta':
+            return ''
+        return 'https://github.com/ValleyTacticalSolutions/TAK-Portal/releases/latest'
+    if key in ('cloudtak', 'authentik', 'webodm'):
+        return _release_page_url(key, info.get('latest'))
+    if key == 'mediamtx':
+        if info.get('binary_update_available'):
+            return _release_page_url('mediamtx', info.get('latest'))
+        # Only the web editor is behind: its releases live in takwerx/mediamtx-installer.
+        return 'https://github.com/takwerx/mediamtx-installer/releases' if info.get('editor_update_available') else ''
+    if key == 'netbird':
+        # `latest` reads "0.82.1", "dash 2.96.1" or "0.82.1 · dash 2.96.1": link the server
+        # release first, the dashboard when only it is behind.
+        parts = [p.strip() for p in str(info.get('latest') or '').split('·')]
+        for part in parts:
+            if part.startswith('dash '):
+                continue
+            url = _release_page_url('netbird', part)
+            if url:
+                return url
+        for part in parts:
+            if part.startswith('dash '):
+                url = _release_page_url('netbird_dashboard', part[5:])
+                if url:
+                    return url
+    return ''
+
+
+def _with_release_notes_url(key, info):
+    """A copy of one module's version info with its "What's new" link (a copy: the helpers may
+    cache their dict). Returned as is when it is empty or not a dict."""
+    if not isinstance(info, dict) or not info:
+        return info
+    return {**info, 'release_notes_url': _module_release_notes_url(key, info)}
+
+
 def _guarddog_needs_update(settings, installed):
     """True when the Guard Dog page offers "Update Guard Dog" (ops #972, infra-TAK #590).
 
@@ -46656,7 +46807,14 @@ def get_all_module_versions():
     except Exception as e:
         print(f"version-info: node security flag failed (non-fatal): {e}", flush=True)
     # ops #827: last step, so every module and every field goes through the same check.
-    return {key: _safe_module_version_info(key, info) for key, info in result.items()}
+    result = {key: _safe_module_version_info(key, info) for key, info in result.items()}
+    # infra-TAK #627: "What's new" link, built from the CHECKED values above.
+    for key, info in result.items():
+        if isinstance(info, dict):
+            url = _module_release_notes_url(key, info)
+            if url:
+                info['release_notes_url'] = url
+    return result
 
 
 @app.route('/api/modules/version')
@@ -46725,6 +46883,7 @@ def takportal_page():
     portal_version = vinfo['version'] or ''
     portal_update_available = vinfo['update_available']
     portal_latest = vinfo['latest']
+    portal_release_notes_url = _module_release_notes_url('takportal', vinfo)
     # Which channel Update will follow (TAK Portal's own BETA_MODE). Only read when the
     # container is up: the reader's docker-cp fallback can spend 15s on a stopped one,
     # and this is an inline page render. Stable is also the correct answer when we cannot
@@ -46747,6 +46906,7 @@ def takportal_page():
         settings=settings, portal=portal, container_info=container_info,
         portal_port=portal_port, portal_version=portal_version,
         portal_update_available=portal_update_available, portal_latest=portal_latest,
+        portal_release_notes_url=portal_release_notes_url,
         portal_beta_mode=portal_beta_mode,
         takportal_deploy_cfg=takportal_deploy_cfg,
         authentik_base_url=_get_authentik_base_url(settings),
@@ -50701,12 +50861,13 @@ paths:
     ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
     ldap_env_lines = ''
     remote_secret_env = ''
+    _mtx_overlay_shipped = False     # ops #1110: this deploy put the current stream site file on the host
     if ak_installed:
         overlay_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
         if os.path.exists(overlay_src):
             ok_ov, _ = _module_copy(deploy_cfg, overlay_src, '/tmp/mediamtx_ldap_overlay.py', log_fn=plog)
             if ok_ov:
-                _module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)
+                _mtx_overlay_shipped = bool(_module_run_root(deploy_cfg, 'mv /tmp/mediamtx_ldap_overlay.py /opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', timeout=10)[0])
                 patcher = (
                     "import sys\n"
                     "EDITOR = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'\n"
@@ -50857,6 +51018,15 @@ paths:
     save_settings(settings)
     # ops #649: never leave the remote editor on admin/admin. Before Caddy publishes it.
     _mediamtx_editor_secure_login(settings, log_fn=plog)
+    # ops #1110: with Authentik, video goes through the sign-in to the editor on this host.
+    # The host is asked first; Caddy leaves the direct road out only when that editor serves
+    # it, and only when this deploy put the current stream site file there (a failed copy
+    # is left to the next console start, which ships the file and checks again).
+    if ak_installed and _mtx_overlay_shipped:
+        try:
+            _mediamtx_remote_hls_road(settings, cfg, plog)
+        except Exception as _road_e:
+            plog(f"⚠ Could not check the video road on the remote host: {str(_road_e)[:160]}")
     generate_caddyfile(settings)
     domain = settings.get('fqdn', '')
     mtx_domain = _get_service_domain(settings, 'mediamtx') if domain else ''
@@ -56718,6 +56888,37 @@ def _cloudtak_print_drift(ct_dir):
             if not _cloudtak_print_set_up(files, ports)]
 
 
+def _cloudtak_print_image_missing(ct_dir):
+    """True when TAK Portal's Print file builds cloudtak-print and docker says that image does not
+    exist (ops #1161: a failed Marketplace install leaves docker-compose.plugin-print.yml behind
+    with no image; `up --no-build` then fails at every console restart). False when the image is
+    there, the service is not built from source (a start may pull it), or docker can't tell: then
+    the start is tried as before. Never raises."""
+    try:
+        import yaml as _yaml
+        with open(os.path.join(ct_dir, _CLOUDTAK_PRINT_PLUGIN_COMPOSE), encoding='utf-8') as f:
+            svc = ((_yaml.safe_load(f) or {}).get('services') or {}).get(CLOUDTAK_PRINT_SERVICE) or {}
+        if not isinstance(svc, dict) or not svc.get('build'):
+            return False
+        if svc.get('image'):
+            names = [_cloudtak_compose_interpolate(svc['image'], _cloudtak_env_read(os.path.join(ct_dir, '.env')))]
+        else:
+            # Compose names a built image <project>-<service> (v2) or <project>_<service> (v1)
+            proj = (_ct_docker_out(['inspect', 'cloudtak-api-1', '--format',
+                                    '{{index .Config.Labels "com.docker.compose.project"}}']) or '').strip()
+            names = [f'{proj}-{CLOUDTAK_PRINT_SERVICE}', f'{proj}_{CLOUDTAK_PRINT_SERVICE}'] if proj else []
+        names = [n for n in names if n]
+        if not names:
+            return False
+        for n in names:
+            got = _ct_docker_out(['images', '-q', n])
+            if got is None or got.strip():       # docker failed (can't tell) or the image is there
+                return False
+        return True
+    except Exception:
+        return False
+
+
 def _cloudtak_print_converge(ct_dir, plog=None):
     """ops #222: make TAK Portal's Print reachable through infra-TAK's Caddy, or tidy up after it
     is gone. Idempotent; returns 'absent', 'unusable', 'ok' or 'failed'. Never raises.
@@ -56760,6 +56961,13 @@ def _cloudtak_print_converge(ct_dir, plog=None):
             used = any(CLOUDTAK_PRINT_OVERLAY in {os.path.basename(f) for f in files}
                        for _n, files, _p in (rows or []))
             result = 'ok'
+            if rows is not None and not rows and _cloudtak_print_image_missing(ct_dir):
+                # ops #1161: no container and no image: Print was never built (a failed Marketplace
+                # install left its file). Nothing to restart, so it is not a repair failure.
+                _log("  Print's image was never built (a failed Marketplace install?): not starting it. "
+                     "Install Print again from the TAK Portal Marketplace.")
+                rows = None
+                result = 'unusable'
             if rows is not None and ((changed and used) or stale or not rows):
                 base = 'docker-compose.yml'
                 if not os.path.exists(os.path.join(ct_dir, base)) and os.path.exists(os.path.join(ct_dir, 'compose.yaml')):
@@ -58754,6 +58962,7 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             out.append('')
             out.append('Likely cause: the disk filled up during the build.')
             out.append('  Free space and retry - see the Disk card on the dashboard.')
+            out.append('  ' + _FREE_SPACE_BACKUPS_HINT)
         elif out_of_memory:
             out.append('')
             out.append('Likely cause: the build ran out of memory (the step was killed).')
@@ -60767,6 +60976,15 @@ _CLOUDTAK_UPDATE_MEASURED_GB = 16
 _CLOUDTAK_UPDATE_MIN_FREE = _CLOUDTAK_UPDATE_MEASURED_GB * 1024 ** 3
 _CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT = 1024 ** 3   # the checkout itself: the new tag's files, ~0.3 GB
 
+# ops #1146 (infra-TAK #670): a user with a full disk asked which old backups are safe to remove.
+# Every "not enough free disk" message of an update says where the big files are, in these words
+# (the page and section names are the ones on screen: Guard Dog > "Full-stack backups", TAK Server
+# > "Snapshots & Recovery" > "TAK Server Snapshots"). Backups live on the console server.
+_FREE_SPACE_BACKUPS_HINT = (
+    'The biggest files are usually old backups. On the console server, open the Guard Dog page, '
+    '"Full-stack backups", and press Delete on old ones (the console password is asked). '
+    'Then open the TAK Server page, "Snapshots & Recovery", and delete old TAK Server snapshots.')
+
 
 def _cloudtak_fs_free_local(path):
     """(filesystem id, free bytes a non-root process may use) for the filesystem holding `path`,
@@ -60844,6 +61062,7 @@ def _cloudtak_update_space_lines(problem):
         "  Free some space, then press Update again. Safe ways: run `docker builder prune -f` and",
         "  `docker image prune -f` on this server (old build cache and unused image layers), and",
         "  delete old logs or backups. Do not delete Docker volumes: they hold your data.",
+        "  " + _FREE_SPACE_BACKUPS_HINT,
     ]
 
 
@@ -61446,8 +61665,14 @@ def emailrelay_page():
     relay_config = settings.get('email_relay', {})
     authentik_smtp_configured = modules.get('authentik', {}).get('installed') and _authentik_smtp_configured()
     _em_job = mod_registry.job_state('emailrelay')
+    # ops #1140: the "Send system notifications to" box. When it is empty, root's mail
+    # follows Guard Dog's alert address, else the relay From address: show which.
+    _gd_to = _safe_alert_email_list(settings.get('guarddog_alert_email'))
     return render_template('email_relay.html',
         settings=settings, modules=modules, email=email,
+        notify_to=_safe_alert_email_list(settings.get(mod_registry.emailrelay.NOTIFY_KEY)),
+        notify_default=_gd_to or relay_config.get('from_addr', ''),
+        notify_default_is_guarddog=bool(_gd_to),
         relay_config=relay_config, providers=mod_registry.emailrelay.PROVIDERS,
         authentik_smtp_configured=authentik_smtp_configured,
         metrics=get_system_metrics(), version=VERSION,
@@ -62925,7 +63150,8 @@ def _webodm_db_room_check(plog):
     plog(f'  Database {used_kb // 1024} MB, free disk {free_kb // 1024} MB, needed {need_kb // 1024} MB')
     if free_kb < need_kb:
         raise RuntimeError(f'not enough free disk for the WebODM database upgrade ({need_kb // 1024} MB '
-                           f'needed, {free_kb // 1024} MB free). Nothing was changed: free some disk and press Update again.')
+                           f'needed, {free_kb // 1024} MB free). Nothing was changed: free some disk and press Update again. '
+                           + _FREE_SPACE_BACKUPS_HINT)
 
 
 def _webodm_backup_db_95():
@@ -69666,7 +69892,7 @@ def authentik_page():
         settings=settings, ak=ak, container_info=container_info,
         ak_port=ak_port, authentik_base_url=_get_authentik_base_url(settings),
         takserver_base_url=_get_takserver_base_url(settings), version=VERSION,
-        ak_version_info=_get_authentik_version_info(),
+        ak_version_info=_with_release_notes_url('authentik', _get_authentik_version_info()),
         deploying=authentik_deploy_status.get('running', False),
         deploy_done=authentik_deploy_status.get('complete', False),
         deploy_error=authentik_deploy_status.get('error', False),
@@ -97035,8 +97261,9 @@ def _tak_58_preflight():
                 blockers.append(
                     'Not enough disk for a rollback-safe migration: %s free on %s, %s needed '
                     '(1.5x the %s database). pg_upgrade runs in copy mode so the PostgreSQL 15 '
-                    'cluster survives — that is the only way back if the upgrade fails.'
-                    % (_cotdb_fmt_bytes(avail), target_parent, _cotdb_fmt_bytes(need), _cotdb_fmt_bytes(used)))
+                    'cluster survives — that is the only way back if the upgrade fails. '
+                    % (_cotdb_fmt_bytes(avail), target_parent, _cotdb_fmt_bytes(need), _cotdb_fmt_bytes(used))
+                    + _FREE_SPACE_BACKUPS_HINT)
         else:
             # Say that the CHECK did not run, not merely that a number is missing.
             # The old wording read like a cosmetic gap; it meant the safety gate was off.
@@ -100219,7 +100446,7 @@ def _stack_backup(label=None, plog=None):
     need, free = _stack_backup_space_needed(), _stack_backup_free_bytes()
     if free is not None and free < need:
         return False, (f'not enough free disk for a full-stack backup: {free // 1024 ** 2} MB free, '
-                       f'{need // 1024 ** 2} MB needed (2x the last backup)')
+                       f'{need // 1024 ** 2} MB needed (2x the last backup). ' + _FREE_SPACE_BACKUPS_HINT)
     plog(f"  stack backup [{label}]: creating at {dest}")
     try:
         # Root 0711: the console can pass through to its own .dl-* staging dirs
@@ -115827,6 +116054,145 @@ def _mediamtx_remote_overlay_held(settings, host, url, word, tag):
         f"trusts). Then restart the infra-TAK console. It tries again at every start.")
     return 'held'
 
+
+# ops #1110. Runs ON the remote MediaMTX host as the SSH user, standard library only: one
+# request for a stream that does not exist, to the editor on loopback, the road Caddy on the
+# console will use for video. The stream site (mediamtx_ldap_overlay.py hls_proxy) passes
+# MediaMTX's own answer on as 502 "HTTP Error <code>...". 404 from MediaMTX is the proof:
+# the route is loaded, it reached MediaMTX with the right protocol (plain http to a TLS
+# listener is 400) and MediaMTX let it in from loopback (401 when it did not). 200 (a
+# publisher uses that very name) proves the same. An editor without the stream site code
+# has no such route (404 from the editor itself). Prints one word.
+_MEDIAMTX_REMOTE_HLS_ROAD_CHECK_PY = r'''import re, socket, urllib.error, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **k):
+        return None
+def say(word):
+    print('INFRATAK_HLS_ROAD=' + word)
+    raise SystemExit(0)
+try:
+    r = urllib.request.build_opener(NoRedirect).open(
+        'http://127.0.0.1:5080/hls-proxy/infratak-road-check/index.m3u8', timeout=20)
+    code, body = r.getcode(), ''
+except urllib.error.HTTPError as e:
+    code, body = e.code, e.read(200).decode('latin-1')
+except Exception as e:
+    why = getattr(e, 'reason', e)
+    if isinstance(why, ConnectionRefusedError):
+        say('no-editor')
+    say('timeout' if isinstance(why, (socket.timeout, TimeoutError)) else 'other')
+if code == 200:
+    say('ok')       # someone publishes a stream with this name: the road served it
+if code != 502:
+    say('no-route')
+m = re.match(r'HTTP Error (\d{3})\b', body)
+if not m:
+    say('mediamtx-down')
+say('ok' if m.group(1) == '404' else 'mediamtx-' + m.group(1))
+'''
+
+# The host's word in plain text. The log carries only these, never text from the host.
+_MEDIAMTX_REMOTE_HLS_ROAD_REASONS = {
+    'unreached': 'the console could not ask that box',
+    'no-editor': 'the web editor there does not answer on port 5080',
+    'no-route': 'the stream site code is not loaded in the editor there',
+    'mediamtx-down': 'the editor there got no answer from MediaMTX on port 8888',
+    'mediamtx-400': 'MediaMTX there refused the request of the editor (HTTP 400)',
+    'mediamtx-401': 'MediaMTX there asked the editor on its own box for a password',
+    'timeout': 'no reply in time',
+}
+
+
+def _mediamtx_remote_hls_road_check(cfg):
+    """Ask the remote host if its stream site serves /hls-proxy/. 'ok', or a word for why
+    not (_MEDIAMTX_REMOTE_HLS_ROAD_REASONS)."""
+    ok, out = _module_run(cfg, 'python3 -c ' + shlex.quote(_MEDIAMTX_REMOTE_HLS_ROAD_CHECK_PY), timeout=60)
+    m = re.search(r'^INFRATAK_HLS_ROAD=([a-z0-9-]{1,20})$', out or '', re.M)
+    return m.group(1) if (ok and m) else 'unreached'
+
+
+def _mediamtx_remote_hls_road(settings, cfg, log):
+    """ops #1110: video on the stream site of a REMOTE MediaMTX host goes through the sign-in.
+
+    Caddy on the console sent /hls-proxy/* straight to MediaMTX on a remote host: outside
+    the Authentik sign-in and outside the private rule, and a viewer got MediaMTX's password
+    prompt. The same road as on one box (through the sign-in to the editor, whose stream
+    site applies the rule) needs the current stream site file on that host, which a console
+    start now keeps there (ops #1107). ORDER: the host is asked first. Only when its editor
+    serves /hls-proxy/ is the host written to _MEDIAMTX_REMOTE_HLS_ROAD_FILE, which makes
+    generate_caddyfile leave the direct road out. A later failed check never removes that
+    file, so it does not put the direct road back. (A console whose CONFIG_DIR lost the
+    file, or whose remote host changed, is back on the old road until the next check.)
+
+    Does not touch Caddy (the caller regenerates). Returns 'switched' (just marked), 'on'
+    (marked before, serves), 'kept' (marked before, does not serve now), 'direct' (not
+    marked, does not serve: the old road stays) or 'none' (no remote host)."""
+    host = ((cfg.get('remote') or {}).get('host') or '').strip()
+    if cfg.get('target_mode') != 'remote' or not host:
+        return 'none'
+    marked = _mediamtx_remote_hls_via_editor(settings)
+    word = _mediamtx_remote_hls_road_check(cfg)
+    if word == 'ok':
+        if marked:
+            return 'on'
+        path = os.path.join(CONFIG_DIR, _MEDIAMTX_REMOTE_HLS_ROAD_FILE)
+        fd, tmp = tempfile.mkstemp(prefix='.mediamtx-hls-road-', dir=CONFIG_DIR)   # 0600
+        with os.fdopen(fd, 'w') as f:
+            f.write(host + '\n')
+        os.replace(tmp, path)
+        log(f"✓ The stream site on {host} serves video. Video there now goes through the "
+            "sign-in and the private/public rule, no longer straight to MediaMTX.")
+        return 'switched'
+    why = _MEDIAMTX_REMOTE_HLS_ROAD_REASONS.get(word, 'no usable answer')
+    if marked:
+        log(f"✗ The stream site on {host} does not serve video now ({why}). Video stays "
+            "behind the sign-in and plays again when the editor there serves it. The next "
+            "console start checks again.")
+        return 'kept'
+    log(f"⚠ The stream site on {host} does not serve video yet ({why}). Video there still "
+        "goes straight to MediaMTX (viewers get a password prompt). The next console start "
+        "checks again.")
+    return 'direct'
+
+
+def _startup_converge_mediamtx_remote_hls_road(after=None):
+    """ops #1110, console start: the remote pass for the stream site file (ops #1107), then
+    the video road. Caddy changes last, and only when the editor on the host serves video.
+    `after` is the firewall check's thread. Returns the word of the overlay pass when that
+    pass did not find the file current, else the word of _mediamtx_remote_hls_road."""
+    tag = 'Startup migration: [MediaMTX remote video]'
+    try:
+        res = _startup_converge_mediamtx_overlay_remote(after)
+        if res not in ('current', 'updated'):
+            return res      # the file on the host is not known to be current: no change
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+        road = _mediamtx_remote_hls_road(settings, cfg, lambda ln: print(f"{tag} {ln}", flush=True))
+        if road not in ('switched', 'on') or not (settings.get('fqdn') or '').strip():
+            return road
+        # 'on' too: a Caddyfile from before the mark (a restore, a refused reload) is put right.
+        live = _caddy_vhost_block(_read_priv(CADDYFILE_PATH) or '', _MEDIAMTX_VHOST_MARKER)
+        if 'forward_auth' not in live or 'handle_path /hls-proxy/*' not in live:
+            return road
+        generate_caddyfile()        # reads the settings itself: the check on the host took a while
+        if not _CADDY_REGISTRY_READY.is_set():
+            print(f"{tag} Caddy change queued: written with the Caddyfile after the modules load",
+                  flush=True)
+            return road
+        live = _caddy_vhost_block(_read_priv(CADDYFILE_PATH) or '', _MEDIAMTX_VHOST_MARKER)
+        if 'handle_path /hls-proxy/*' in live:
+            print(f"{tag} ✗ the Caddyfile still has the direct road to MediaMTX (new file "
+                  "refused and restored?). The next console start tries again.", flush=True)
+            return road
+        ok, detail = _caddy_reload_if_changed(timeout=60)
+        print(f"{tag} " + ("✓ Caddy loaded the stream site without the direct road to MediaMTX"
+                           if ok else f"✗ Caddy did not load the new stream site: {str(detail)[:160]}"),
+              flush=True)
+        return road
+    except Exception as e:
+        print(f"{tag} error (non-fatal): {e}", flush=True)
+        return 'failed'
+
 def _startup_converge_mediamtx_unit_nonroot():
     """v10.1.33: move a legacy `User=root` mediamtx.service onto takwerx.
 
@@ -120395,7 +120761,10 @@ def _startup_migrations():
         # ops #1107 — the stream site file (and the editor's Authentik token and address) on a
         # remote MediaMTX box, the same pass _startup_converge_mediamtx_overlay() does for a
         # local one. After the firewall check, never beside it: that check may stop the editor.
-        threading.Thread(target=_startup_converge_mediamtx_overlay_remote, args=(_mtx_remote_fw_t,),
+        # ops #1110 — then the video road: once the editor there serves /hls-proxy/, Caddy
+        # sends video through the sign-in (_startup_converge_mediamtx_remote_hls_road runs
+        # _startup_converge_mediamtx_overlay_remote first, in the same thread).
+        threading.Thread(target=_startup_converge_mediamtx_remote_hls_road, args=(_mtx_remote_fw_t,),
                          daemon=True, name='startup-mediamtx-remote-overlay').start()
 
         try:
