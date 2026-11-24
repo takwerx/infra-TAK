@@ -16,6 +16,11 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """README shape (GitHub #683, ops #1164).
 
+Round two (the reporter asked for it on the public issue): install, recovery, ports and the button
+reference moved out of the README into docs/INSTALL.md, docs/RECOVERY.md, docs/PORTS.md and
+docs/CONSOLE-ACTIONS.md, so the README is a short landing page that links to them. The checks at the
+bottom keep those pages linked, their links alive and their heading outlines clean.
+
 A reporter who uses a screen reader found the README too long to move around in: 2,380 lines, of which
 1,900 were the release history. The history now lives in CHANGELOG.md and the README opens with a
 table of contents. These checks keep it that way:
@@ -128,3 +133,72 @@ def test_changelog_still_holds_the_whole_history():
     assert len(releases) >= 160, f'only {len(releases)} releases left in CHANGELOG.md; history was lost'
     assert any(t.startswith('v0.9.40-alpha') for t in releases), 'the oldest entries are gone from CHANGELOG.md'
     assert releases[0].startswith('v10.'), 'newest release must come first'
+
+
+# ---- round two: the README is a landing page, the detail lives in docs/ -------------------------------
+
+DOC_PAGES = ['docs/INSTALL.md', 'docs/RECOVERY.md', 'docs/PORTS.md', 'docs/CONSOLE-ACTIONS.md']
+
+
+def _read(rel):
+    path = REPO / rel
+    assert path.exists(), f'{rel} is missing: the README sends readers there (GitHub #683)'
+    return path.read_text(encoding='utf-8')
+
+
+def _strip_fences(text):
+    out, fence = [], False
+    for line in text.split('\n'):
+        if line.startswith('```'):
+            fence = not fence
+            continue
+        if not fence:
+            out.append(line)
+    return '\n'.join(out)
+
+
+def test_readme_is_a_short_landing_page_that_links_every_docs_page():
+    assert len(README.split('\n')) < 300, 'README.md should stay a landing page: move detail into docs/'
+    for rel in DOC_PAGES:
+        assert f']({rel})' in README, f'README.md does not link to {rel}'
+
+
+def test_docs_pages_hold_the_moved_sections():
+    assert 'sudo ./start.sh' in _read('docs/INSTALL.md')
+    assert '## Deployment Order' in _read('docs/INSTALL.md')
+    assert '## Universal recovery (SSH)' in _read('docs/RECOVERY.md')
+    assert '## Tier 1' in _read('docs/PORTS.md')
+    assert '**Update Config**' in _read('docs/CONSOLE-ACTIONS.md')
+    for heading in ('## Universal recovery (SSH)', '## Deployment Order', '## Actions Reference', '### Tier 1'):
+        assert heading not in README, f'"{heading}" moved to docs/; do not paste it back into the README'
+
+
+def test_docs_pages_have_a_clean_heading_outline():
+    for rel in DOC_PAGES:
+        levels = [level for level, _t in _headings(_read(rel))]
+        assert levels and levels[0] == 1 and levels.count(1) == 1, f'{rel} needs exactly one "# " title, first'
+        for prev, cur in zip(levels, levels[1:]):
+            assert cur <= prev + 1, f'{rel} skips a heading level (h{prev} then h{cur})'
+
+
+def test_every_relative_link_lands_on_a_file_and_a_heading():
+    broken = []
+    for rel in ['README.md'] + DOC_PAGES:
+        base = (REPO / rel).parent
+        for target in re.findall(r'\]\(([^)\s]+)\)', _strip_fences(_read(rel))):
+            if re.match(r'^[a-z][a-z0-9+.-]*:', target):
+                continue
+            path, _, anchor = target.partition('#')
+            dest = (base / path).resolve() if path else (REPO / rel)
+            if not dest.exists():
+                broken.append(f'{rel} -> {target} (no such file)')
+            elif anchor and dest.suffix == '.md' and anchor not in _anchors(dest.read_text(encoding='utf-8')):
+                broken.append(f'{rel} -> {target} (no such heading)')
+    assert not broken, 'dead links: ' + '; '.join(broken)
+
+
+def test_new_docs_pages_are_not_gitignored():
+    """docs/* is ignored by default in this repo; a page not on the allow-list never reaches GitHub."""
+    ignore = (REPO / '.gitignore').read_text(encoding='utf-8').split('\n')
+    for rel in DOC_PAGES:
+        assert f'!{rel}' in ignore, f'{rel} is not on the docs/ allow-list in .gitignore'
