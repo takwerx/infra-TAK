@@ -3,8 +3,8 @@ on:
   push:
     branches: ['claude/issue-1189001']
 concurrency:
-  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'pull_request' && format('pr-checks-{0}', github.event.pull_request.number) || format('pr-checks-push-{0}', github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 permissions:
   contents: read
 jobs:
