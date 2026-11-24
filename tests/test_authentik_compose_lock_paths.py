@@ -36,6 +36,7 @@ import ast
 import contextlib
 import fcntl
 import os
+import re
 import pathlib
 import subprocess
 import sys
@@ -201,9 +202,12 @@ def test_no_write_open_or_chmod_of_the_lock_left():
 # ── the console's lock helper ────────────────────────────────────────────────
 
 _LOCK_FUNCS = ('_ak_compose_lock_path', '_authentik_compose_lock', '_ak_compose_run_locked',
-               '_ak_compose_lock_busy_msg', '_ak_compose_subprocess', '_ak_module_compose')
+               '_ak_compose_lock_busy_msg', '_ak_compose_subprocess', '_ak_module_compose',
+               '_compose_argv_may_start', '_compose_starts_only_ldap', '_ldap_core_gate',
+               '_ldap_core_not_ready_msg')
 _LOCK_CONSTS = ('_AK_COMPOSE_LOCK_PATH', '_AK_COMPOSE_LOCK_WAIT_S', '_AK_COMPOSE_LOCK_WAIT_LONG_S',
-                '_AK_COMPOSE_LOCK_HELD', '_AK_COMPOSE_LOCK_BUSY_RC')
+                '_AK_COMPOSE_LOCK_HELD', '_AK_COMPOSE_LOCK_BUSY_RC',
+                '_COMPOSE_START_VERBS', '_COMPOSE_LDAP_START_RE', '_LDAP_START_CORE_WAIT_S')
 
 
 @pytest.fixture
@@ -250,7 +254,22 @@ def console(tmp_path):
             except OSError:
                 return True
 
-    ns = {'os': os, 'contextlib': contextlib, 'time': time, 'threading': threading,
+    hooks = []
+
+    @contextlib.contextmanager
+    def watch(reason, plog=None):
+        # v10.4.3 W1: the real watch compares the outpost's StartedAt; here we record that
+        # the wrapper put the command under it, and whether the lock was held around it.
+        hooks.append(('watch', reason, _held()))
+        yield
+
+    ns = {'os': os, 're': re, 'contextlib': contextlib, 'time': time, 'threading': threading,
+          '_ldap_outpost_restart_watch': watch,
+          # v10.4.3 W7: the core-ready answer is switchable per test (console.core_ready)
+          '_authentik_core_ready': lambda wait_s=0: (hooks.append(('core_ready', wait_s,
+                                                                   lock.exists() and _held()))
+                                                     or console.core_ready),
+          '_after_ldap_outpost_restart': lambda reason, plog=None: hooks.append(('hook', reason, None)),
           '_sudo_wrap': lambda c: list(c), '_module_run': module_run,
           'subprocess': types.SimpleNamespace(run=run, PIPE=-1, STDOUT=-2,
                                               TimeoutExpired=subprocess.TimeoutExpired,
@@ -259,7 +278,7 @@ def console(tmp_path):
     exec(compile('\n\n'.join(parts), 'app.py', 'exec'), ns)
     ns['_AK_COMPOSE_LOCK_PATH'] = str(lock)
     console = types.SimpleNamespace(ns=ns, lock=lock, ran=ran, logged=logged, raise_in_run=False,
-                                    plog=logged.append, held=_held)
+                                    plog=logged.append, held=_held, hooks=hooks, core_ready=True)
     return console
 
 

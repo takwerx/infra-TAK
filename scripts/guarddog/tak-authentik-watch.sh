@@ -50,6 +50,20 @@ _log() {
   echo "$(_ts) | authentik-watch | $1" >> /var/log/takguard/restarts.log
 }
 
+# v10.4.3 W7: never (re)start the LDAP outpost into an Authentik core that is not ready.
+# An outpost started while /-/health/ready/ is not 200 comes up not ready and leaves TAK
+# with no groups (akres E2b/E2f). Waits up to $1 s (default 60). 0 = ready.
+_ak_core_ready() {
+  local waited=0 max="${1:-60}" code
+  while :; do
+    code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 \
+           "http://127.0.0.1:9090/-/health/ready/" 2>/dev/null)
+    [ "$code" = "200" ] && return 0
+    [ "$waited" -ge "$max" ] && return 1
+    sleep 5; waited=$(( waited + 5 ))
+  done
+}
+
 _alert() {
   local subj="$1" body="$2"
   echo -e "$body" | /opt/tak-guarddog/send-alert-email.sh "$subj" "ALERT_EMAIL_PLACEHOLDER" 2>/dev/null
@@ -271,8 +285,12 @@ _ak_restart() {
     # resolve groups, restart it too (the order the LDAP alert below recommends).
     _ak_verify_ldap_groups "server-worker-restart"
     if [ $? -eq 1 ]; then
-      cd "$AK_DIR" && _ak_compose_locked "ldap-restart" restart ldap
-      _ak_verify_ldap_groups "ldap-restart" || true
+      if _ak_core_ready 90; then
+        cd "$AK_DIR" && _ak_compose_locked "ldap-restart" restart ldap
+        _ak_verify_ldap_groups "ldap-restart" || true
+      else
+        _log "skip | ldap-restart: Authentik core not ready — outpost not touched (v10.4.3 W7)"
+      fi
     fi
   else
     # v10.1.55 (W3): down+up is ONE critical section — see _ak_compose_restart_locked.
@@ -550,7 +568,10 @@ if [ "$HTTP_OK" -eq 1 ]; then
     LDAP_FAILS=$(( $(cat "$FAIL_LDAP" 2>/dev/null || echo 0) + 1 ))
     echo "$LDAP_FAILS" > "$FAIL_LDAP"
 
-    if [ "$LDAP_FAILS" -ge "$MAX_FAILS" ] && _cooldown_ok "$COOLDOWN_LDAP"; then
+    if [ "$LDAP_FAILS" -ge "$MAX_FAILS" ] && _cooldown_ok "$COOLDOWN_LDAP" && ! _ak_core_ready 60; then
+      # v10.4.3 W7: fail count and cooldown are left as they are, so the next check retries.
+      _log "skip | LDAP outpost down for $LDAP_FAILS checks, but Authentik core not ready — outpost not touched (v10.4.3 W7)"
+    elif [ "$LDAP_FAILS" -ge "$MAX_FAILS" ] && _cooldown_ok "$COOLDOWN_LDAP"; then
       _log "restart | LDAP outpost down for $LDAP_FAILS checks — recreating LDAP container"
       SUBJ="Guard Dog: Authentik LDAP restarted on $SERVER_IDENTIFIER"
       BODY="Authentik LDAP outpost (port 389) failed health check for $LDAP_FAILS consecutive checks.

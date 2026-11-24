@@ -136,9 +136,13 @@ def _run(tmp_path, image, pull_rc=0, up_rc=0, inspect=None, ldap=healthy, sa_pas
     # ops #178: the compose calls go through the locked runner; the lock is stubbed above.
     ns['_ak_compose_subprocess'] = lambda cmd, holder, plog=None, wait=None, **kw: ns['subprocess'].run(cmd, **kw)
     ns['_AK_COMPOSE_LOCK_BUSY_RC'] = 75
-    for name in ('_ensure_authentik_pgbouncer_image', '_authentik_ldap_sa_group_probe',
+    ns['_ldap_outpost_restart_watch'] = lambda reason, plog=None: contextlib.nullcontext()   # v10.4.3 W1
+    ns['_ldap_core_gate'] = lambda *a, **k: True                                              # v10.4.3 W7
+    for name in ('_ensure_authentik_pgbouncer_image', '_authentik_ldap_sa_search', '_authentik_ldap_sa_group_probe',
                  '_authentik_ldap_sa_groups_settle', '_compose_set_service_image'):
         exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
+    # L4 (v10.4.3): after the execs — _src() of the function before it carries the real class
+    ns['_ldap_pw_file'] = lambda pw: contextlib.nullcontext('/run/fake/ldap-pw')
     out = ns['_ensure_authentik_pgbouncer_image'](log.append)
     on_disk = yaml.safe_load((ak / 'docker-compose.yml').read_text())
     return out, on_disk, calls, settings, log, live
@@ -308,7 +312,7 @@ def test_sa_password_is_never_logged(tmp_path):
 
 
 def test_probe_reads_memberof_the_way_tak_server_does():
-    src = _src('_authentik_ldap_sa_group_probe')
+    src = _src('_authentik_ldap_sa_search')    # v10.4.3 W5: the search moved here
     assert "'cn=adm_ldapservice,ou=users,dc=takldap'" in src
     assert "'ldap://127.0.0.1:389'" in src
     assert "'memberOf'" in src
@@ -381,8 +385,9 @@ def test_line_edit_failure_changes_nothing_and_never_redumps(tmp_path):
 def test_harden_step_does_not_recreate_on_a_formatting_only_diff():
     # The post-update harden step re-dumps compose at the default width; v10.2.22's
     # width=200 file differed only in line wrapping and still recreated server/ldap.
-    i = APP.index('print("Post-update: Authentik compose hardened — recreating worker/server, then ldap")')
-    block = APP[i - 1500:i]
+    # v10.4.3 W2: the line now says whether ldap is recreated too (only if its section changed)
+    i = APP.index('print("Post-update: Authentik compose hardened — recreating worker/server"')
+    block = APP[i - 3000:i]
     assert '_ak_recreate = _ak != _ak_orig' in block
     assert 'safe_load(_ak) == _yaml_cmp.safe_load(_ak_orig)' in block
     assert block.rstrip().endswith('if _ak_recreate:')

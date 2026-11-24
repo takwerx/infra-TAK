@@ -81,6 +81,7 @@ def _run(step_warnings=(), status=None, heal_lines=()):
         '_get_module_deployment_config': lambda s, k: {'target_mode': 'remote', 'remote': {'host': 'ak.example'}},
         '_module_run': lambda *a, **k: None,
         '_remote_authentik_port_guard': lambda *a, **k: (True, False),   # ops #631
+        '_after_ldap_outpost_restart': lambda *a, **k: None,             # v10.4.3 W1
         '_get_authentik_env_value': lambda s, k: 'tok',
         '_get_authentik_api_url': lambda s: 'http://ak',
         '_wait_for_authentik_api': lambda *a, **k: True,

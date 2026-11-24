@@ -24412,8 +24412,9 @@ def _f2b_selfheal_authentik_log_level(plog=None, detail=None):
         with _authentik_compose_lock('fail2ban-loglevel', plog=_log) as _locked:  # v10.1.55 W3
             if not _locked:
                 raise RuntimeError('another healer holds the Authentik compose lock')
-            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
-                               capture_output=True, text=True, timeout=300)
+            with _ldap_outpost_restart_watch('_f2b_selfheal_authentik_log_level'):   # v10.4.3 W1
+                r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                                   capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
             ok = False
             _log('fail2ban: Authentik apply returned %s — the new log level takes effect at '
@@ -36414,11 +36415,14 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                     _f.write(comp)
                 _log(f"✓ docker-compose.yml: LDAP AUTHENTIK_HOST → {_ldap_internal} (internal)")
                 with _authentik_compose_lock('ldap-internal-host', plog=_log) as _locked:  # v10.1.55 W3
-                    if _locked:
-                        subprocess.run(
-                            _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=60
-                        )
-                _log("✓ LDAP container recreated with internal host")
+                    _ldap_ran = bool(_locked) and _ldap_core_gate(['docker', 'compose', 'up', 'ldap'], 'ldap-internal-host', _log, wait_s=30)   # v10.4.3 W7
+                    if _ldap_ran:
+                        with _ldap_outpost_restart_watch('ldap-internal-host', _log):   # v10.4.3 W1
+                            subprocess.run(
+                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'ldap']), cwd=ak_dir, capture_output=True, text=True, timeout=60
+                            )
+                if _ldap_ran:
+                    _log("✓ LDAP container recreated with internal host")
             else:
                 _log(f"✓ docker-compose.yml: LDAP AUTHENTIK_HOST already internal — no change")
         except Exception as e:
@@ -36558,7 +36562,8 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
                 if not _locked:
                     raise RuntimeError('another healer holds the Authentik compose lock — '
                                        'env change NOT applied, retry')
-                _run_priv_chain([['docker', 'compose', 'down', '--timeout', '20'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=ak_dir)
+                with _ldap_outpost_restart_watch('_authentik_sync_all_domain_refs'):   # v10.4.3 W1
+                    _run_priv_chain([['docker', 'compose', 'down', '--timeout', '20'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=ak_dir)
             _log("✓ Authentik restarted with new env")
         except Exception as e:
             _log(f"⚠ Authentik restart: {e}")
@@ -63641,8 +63646,9 @@ def _authentik_recover_compose_conflict(ak_dir, err, plog):
     with _authentik_compose_lock('conflict-recovery', plog=plog) as _locked:  # v10.1.55 W3
         if not _locked:
             raise RuntimeError('Authentik recovery deferred: another healer holds the compose lock')
-        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--remove-orphans']),
-                           cwd=ak_dir, capture_output=True, text=True, timeout=300)
+        with _ldap_outpost_restart_watch('_authentik_recover_compose_conflict'):   # v10.4.3 W1
+            r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--remove-orphans']),
+                               cwd=ak_dir, capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         raise RuntimeError(f'Authentik recovery up -d failed: {(r.stderr or r.stdout)[:400]}')
     plog("  ✓ Authentik stack recovered (conflicting containers removed, full up -d)")
@@ -69895,17 +69901,19 @@ def _wait_for_authentik_stack_healthy(plog, timeout=240):
             plog(f"  ⚠ Authentik stack: {', '.join(stopped)} not running — starting the stack (docker compose up -d)…")
             with _authentik_compose_lock('stack-down-heal', plog=plog) as _locked:  # v10.1.55 W3
                 if _locked:
-                    subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+                    with _ldap_outpost_restart_watch('_wait_for_authentik_stack_healthy'):   # v10.4.3 W1
+                        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             healed = True
             time.sleep(10)
             continue
         # Server reporting healthy? (or up with no healthcheck defined)
         hr = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Health.Status}}', 'authentik-server-1']), capture_output=True, text=True, timeout=10)
         status = (hr.stdout or '').strip()
-        if status == 'healthy':
+        # v10.4.3 W7: healthy AND /-/health/ready/ 200 (E3c: 2026.8.5 sat at ready=503).
+        if (status == 'healthy' or (status in ('', '<no value>') and not stopped)) and _authentik_core_ready(0):
             return True
-        if status in ('', '<no value>') and not stopped:
-            return True  # running, no healthcheck — best signal we have
+        if status == 'healthy':
+            status = 'healthy, but /-/health/ready/ is not 200 yet'
         if time.time() - last_log > 25:
             plog(f"  … waiting for Authentik server to become healthy (status: {status or 'unknown'})")
             last_log = time.time()
@@ -70124,11 +70132,13 @@ def authentik_control():
                                          f'or Guard Dog) is still running docker compose. '
                                          f'Try {action} again in a minute.'}), 409
             if action == 'start':
-                subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, capture_output=True, text=True, timeout=120)
+                with _ldap_outpost_restart_watch('authentik_control'):   # v10.4.3 W1
+                    subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir, capture_output=True, text=True, timeout=120)
             elif action == 'stop':
                 subprocess.run(_sudo_wrap(['docker', 'compose', 'down']), cwd=ak_dir, capture_output=True, text=True, timeout=60)
             else:
-                _run_priv_chain([['docker', 'compose', 'down'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=ak_dir)
+                with _ldap_outpost_restart_watch('authentik_control'):   # v10.4.3 W1
+                    _run_priv_chain([['docker', 'compose', 'down'], ['docker', 'compose', 'up', '-d']], 'and', timeout=120, cwd=ak_dir)
     elif action == 'update':
         # v10.1.39 (COPIX field report): this used to rewrite ONLY the compose
         # `${AUTHENTIK_TAG:-<tag>}` default, which Docker Compose ignores whenever .env
@@ -70243,10 +70253,11 @@ def authentik_control():
                                              f'compose, so the update did not start '
                                              f'({_restore_pin()}). Try again in a minute.'}), 409
                 _mod_result_step('authentik', 'pull + recreate')
-                _last = _run_priv_chain([['docker', 'compose', 'pull'],
-                                         ['docker', 'compose', 'down', '--timeout', '30'],
-                                         ['docker', 'compose', 'up', '-d']],
-                                        'and', timeout=360, cwd=ak_dir)
+                with _ldap_outpost_restart_watch('authentik_control'):   # v10.4.3 W1
+                    _last = _run_priv_chain([['docker', 'compose', 'pull'],
+                                             ['docker', 'compose', 'down', '--timeout', '30'],
+                                             ['docker', 'compose', 'up', '-d']],
+                                            'and', timeout=360, cwd=ak_dir)
                 if _last is None or _last.returncode != 0:
                     _err = (((_last.stdout or '') + '\n' + (_last.stderr or '')) if _last else '').strip()
                     _which = ' '.join(_last.args[-3:]) if _last is not None and isinstance(_last.args, list) else 'pull/recreate'
@@ -70259,7 +70270,8 @@ def authentik_control():
                     _rp = _restore_pin()
                     if _last is not None and isinstance(_last.args, list) and _last.args[-2:] == ['up', '-d']:
                         _mod_result_step('authentik', 'roll back: start the previous version')
-                        _rb = _run_priv_chain([['docker', 'compose', 'up', '-d']], 'and', timeout=360, cwd=ak_dir)
+                        with _ldap_outpost_restart_watch('authentik_control'):   # v10.4.3 W1
+                            _rb = _run_priv_chain([['docker', 'compose', 'up', '-d']], 'and', timeout=360, cwd=ak_dir)
                         _rp += ('; restarted on the previous version' if _rb is not None and _rb.returncode == 0
                                 else '; the previous version did NOT come back up either — check the Authentik containers')
                     return jsonify({'error': f'Authentik pull/recreate failed ({_which}): '
@@ -70591,6 +70603,7 @@ def authentik_fix_ldap_token():
                 return jsonify({'success': False, 'error': (out or 'Script failed').strip()[:500]}), 500
             if 'OK' not in (out or ''):
                 return jsonify({'success': False, 'error': (out or 'No OK from script').strip()[:500]}), 500
+            _after_ldap_outpost_restart('fix-ldap-token (remote Authentik)')   # v10.4.3 W1
             return jsonify({'success': True, 'message': 'LDAP token injected and container recreated. LDAP may take 30–60s to show healthy.'})
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
@@ -72663,6 +72676,8 @@ networks:
     if not ok:
         plog(f"  ⚠ Pull had issues: {(out or '').strip()[:200]}")
     ok, out = _module_run(deploy_cfg, 'cd ~/authentik && docker compose up -d 2>&1', timeout=600, log_fn=plog)
+    # v10.4.3 W1: the remote outpost can be (re)created here; a local StartedAt can't see it.
+    _after_ldap_outpost_restart('remote Authentik deploy compose up', plog)
     if not ok:
         plog(f"✗ Docker Compose failed")
         # Show diagnostic output so operator doesn't need to SSH to debug
@@ -72769,6 +72784,7 @@ networks:
             plog("  ✓ Injected LDAP token into docker-compose on remote")
             plog("  Recreating LDAP container...")
             _module_run(deploy_cfg, 'cd ~/authentik && docker compose stop ldap 2>&1; docker compose rm -f ldap 2>&1; docker compose up -d ldap 2>&1', timeout=90, log_fn=plog)
+            _after_ldap_outpost_restart('remote deploy token recreate', plog)   # v10.4.3 W1
             plog("  ✓ LDAP container recreated with correct token")
             try:
                 os.remove('/tmp/authentik_remote_compose.yml')
@@ -72924,6 +72940,7 @@ def _run_authentik_reconfigure_remote(settings, deploy_cfg, plog, issues=None, n
     # ops #631: (re)lock 9090 and LDAP 389/636 to the console before compose up.
     _remote_authentik_port_guard(deploy_cfg, settings, log_fn=plog)
     _module_run(deploy_cfg, 'cd ~/authentik && docker compose up -d 2>&1', timeout=120, log_fn=plog)
+    _after_ldap_outpost_restart('remote Authentik reconfigure compose up', plog)   # v10.4.3 W1
     plog("  Ensured containers are up on remote")
     fqdn = settings.get('fqdn', '')
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
@@ -73515,8 +73532,9 @@ def _apply_authentik_pg_tuning(ak_dir, plog):
                 plog(f"  ✓ PostgreSQL recreated with {_tier_lbl} tuning ({_authentik_pg_tuning_summary(_tier_cmd)}, statement_timeout=120s, idle_session_timeout=300s)")
                 # The patch may also have ADDED services (redis) — a targeted recreate
                 # doesn't start those; full up -d is an idempotent no-op otherwise.
-                subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+                with _ldap_outpost_restart_watch('_apply_authentik_pg_tuning'):   # v10.4.3 W1
+                    subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
         else:
             _run_priv_chain([['docker', 'compose', 'exec', '-T', 'postgresql', 'psql', '-U', 'authentik', '-d', 'authentik', '-c', 'SELECT pg_reload_conf();']], 'and', timeout=15, cwd=ak_dir)
             plog("  ✓ PostgreSQL: tuning already current, config reloaded")
@@ -75909,18 +75927,194 @@ def _authentik_compose_lock(holder, plog=None, timeout=_AK_COMPOSE_LOCK_WAIT_S):
 _AK_COMPOSE_LOCK_WAIT_LONG_S = 420
 
 
+# --- v10.4.3 W1: heal TAK right after every LDAP outpost (re)start (#549) ----------------
+# akres E3c: for ~2 s after `up --force-recreate ldap` the new outpost accepts TCP and then
+# closes it. A TAK LDAP request landing in that gap (TAK's connection pool on) leaves TAK
+# answering EVERY user with no groups until TAK restarts — 3 of 5 recreates under 2 auth/s.
+# Waiting for the 10-min monitor and then a 15-min hold kept Data Sync broken for 66 min.
+# So every console path that (re)starts the outpost ends here: the request is persisted,
+# and one debounced worker runs the TAK check (_tak_recycle_after_ldap_outage) as soon as
+# the restarts stop. Local outpost: _ldap_outpost_restart_watch() compares StartedAt
+# before/after, so it fires only when the outpost really started. Remote Authentik: the
+# caller invokes _after_ldap_outpost_restart() itself.
+_LDAP_OUTPOST_HOOK_DEBOUNCE_S = 20
+_ldap_outpost_hook = {'last': 0.0, 'running': False, 'seen_start': None, 'seen_gd': None}
+_LDAP_OUTPOST_POLL_S = 30
+_ldap_outpost_hook_lock = threading.Lock()
+_COMPOSE_START_VERBS = ('up', 'restart', 'start', 'create')
+_COMPOSE_LDAP_START_RE = re.compile(r'\bdocker compose (?:up|restart|start|create)\b[^;&|\n]*\bldap\b')
+
+
+def _after_ldap_outpost_restart(reason, plog=None):
+    """The LDAP outpost was (re)started: make sure TAK still gives users their groups.
+    Never blocks and never raises; the check runs on a background worker."""
+    try:
+        (plog or (lambda m: print(m, flush=True)))(
+            f"  TAK LDAP recycle: LDAP outpost restarted ({reason}) — TAK is checked once it settles")
+    except Exception:
+        pass
+    try:
+        _tak_ldap_recycle_request(f"LDAP outpost restarted: {reason}")
+    except Exception:
+        pass
+    with _ldap_outpost_hook_lock:
+        _ldap_outpost_hook['last'] = time.time()
+        if _ldap_outpost_hook['running']:
+            return    # the running worker sees the new stamp and checks again
+        _ldap_outpost_hook['running'] = True
+    try:
+        threading.Thread(target=_ldap_outpost_hook_worker, daemon=True, name='tak-ldap-outpost-hook').start()
+    except Exception:
+        with _ldap_outpost_hook_lock:
+            _ldap_outpost_hook['running'] = False
+
+
+def _ldap_outpost_hook_worker():
+    log = lambda m: print(f"LDAP outpost hook:{m}", flush=True)
+    try:
+        while True:
+            while True:   # debounce: deploys recreate the outpost several times in a row
+                with _ldap_outpost_hook_lock:
+                    quiet = time.time() - _ldap_outpost_hook['last']
+                if quiet >= _LDAP_OUTPOST_HOOK_DEBOUNCE_S:
+                    break
+                time.sleep(_LDAP_OUTPOST_HOOK_DEBOUNCE_S - quiet + 0.5)
+            started = time.time()
+            try:
+                _tak_recycle_after_ldap_outage(log, 'LDAP outpost restart', check_outpost=True)
+            except Exception as e:
+                log(f"  TAK LDAP recycle error (non-fatal): {str(e)[:200]}")
+            with _ldap_outpost_hook_lock:
+                if _ldap_outpost_hook['last'] < started:
+                    _ldap_outpost_hook['running'] = False
+                    return
+    except Exception:
+        with _ldap_outpost_hook_lock:
+            _ldap_outpost_hook['running'] = False
+
+
+@contextlib.contextmanager
+def _ldap_outpost_restart_watch(reason, plog=None):
+    """Wrap a command that may (re)start the LOCAL LDAP outpost; runs the W1 hook when the
+    outpost's StartedAt moved (or it came up from not running)."""
+    before = _docker_started_epoch('authentik-ldap-1')
+    try:
+        yield
+    finally:
+        try:
+            after = _docker_started_epoch('authentik-ldap-1')
+            if after is not None and (before is None or after > before + 0.5):
+                with _ldap_outpost_hook_lock:
+                    _ldap_outpost_hook['seen_start'] = after   # the poller below need not fire again
+                _after_ldap_outpost_restart(reason, plog)
+        except Exception:
+            pass
+
+
+def _ldap_outpost_restart_poller():
+    """W1 for restarts the console did not make: Guard Dog's tak-authentik-watch.sh (outpost
+    restart/recreate, server+worker restart — GH #207), the docker restart policy, an OOM
+    kill, a manual `docker restart`. Every _LDAP_OUTPOST_POLL_S: when the local outpost's
+    StartedAt or Guard Dog's last Authentik restart moved, run the same hook. The first
+    look only records (a box boot is handled by the startup / monitor paths)."""
+    first = True
+    while True:
+        try:
+            start = _docker_started_epoch('authentik-ldap-1')
+            gd = _guarddog_authentik_restart_epoch() if start is not None else None
+            fire = None
+            with _ldap_outpost_hook_lock:
+                seen_s, seen_g = _ldap_outpost_hook['seen_start'], _ldap_outpost_hook['seen_gd']
+                if start is not None:
+                    if not first and (seen_s is None or start > seen_s + 0.5):
+                        fire = 'outpost restarted outside the console (Guard Dog, docker or by hand)'
+                    _ldap_outpost_hook['seen_start'] = max(start, seen_s or 0)
+                if gd is not None:
+                    if not first and fire is None and (seen_g is None or gd > seen_g + 0.5):
+                        fire = 'Guard Dog restarted Authentik'
+                    _ldap_outpost_hook['seen_gd'] = max(gd, seen_g or 0)
+            first = False
+            if fire:
+                _after_ldap_outpost_restart(fire)
+        except Exception:
+            pass
+        time.sleep(_LDAP_OUTPOST_POLL_S)
+
+
+def _compose_argv_may_start(argv):
+    """True for a `docker compose up|restart|start|create …` argv (any services)."""
+    toks = [str(t) for t in (argv or [])]
+    if 'compose' not in toks:
+        return False
+    return any(t in _COMPOSE_START_VERBS for t in toks[toks.index('compose') + 1:])
+
+
+# --- v10.4.3 W7: never (re)start the outpost into a core that is not ready -----------------
+# akres E2b/E2f: an outpost started while the core was down came up not ready and left TAK
+# with no groups, first try. A RUNNING outpost serves from its cache for >= 15 min (E2a), so
+# skipping its restart is the smaller harm; the caller sees "not run" (the lock-busy result)
+# and retries on its own schedule. Only commands whose sole named service is ldap are gated —
+# a whole-stack `up -d` is what starts the core. Covers E2b/E2f only, NOT the E3c window.
+_LDAP_START_CORE_WAIT_S = 90
+
+
+def _compose_starts_only_ldap(cmd):
+    """True for a compose up|restart|start|create (argv list or shell string) whose only
+    named service is ldap."""
+    if isinstance(cmd, str):
+        for m in re.finditer(r'\bdocker compose (?:up|restart|start|create)\b([^;&|\n]*)', cmd):
+            words = [w for w in m.group(1).split()
+                     if not w.startswith('-') and not w.isdigit() and '>' not in w]
+            if words == ['ldap']:
+                return True
+        return False
+    toks = [str(t) for t in (cmd or [])]
+    if 'compose' not in toks:
+        return False
+    rest = toks[toks.index('compose') + 1:]
+    vi = next((i for i, t in enumerate(rest) if t in _COMPOSE_START_VERBS), None)
+    if vi is None:
+        return False
+    return [t for t in rest[vi + 1:] if not t.startswith('-') and not t.isdigit()] == ['ldap']
+
+
+def _ldap_core_gate(cmd, holder, plog=None, wait_s=_LDAP_START_CORE_WAIT_S):
+    """W7: True = go ahead. False (logged) = an ldap-only start while the LOCAL core is not
+    ready after `wait_s`; the command must not run."""
+    if not _compose_starts_only_ldap(cmd):
+        return True
+    if _authentik_core_ready(wait_s):
+        return True
+    (plog or (lambda m: print(m, flush=True)))(
+        f"  ⚠ Authentik core not ready — outpost not touched ({holder}): /-/health/ready/ is not 200. "
+        f"The running outpost keeps serving from its cache; this runs again on the next attempt.")
+    return False
+
+
+def _ldap_core_not_ready_msg(holder):
+    return (f"Authentik core not ready — outpost not touched ({holder}); "
+            f"it runs again on the next attempt")
+
+
 def _ak_compose_run_locked(args, holder, plog, cwd, timeout=120, wait=_AK_COMPOSE_LOCK_WAIT_S):
     """`docker compose <args>` in `cwd` under the compose lock (ops #173). Returns the
     CompletedProcess, or None when the lock was not taken: the command did NOT run, and
     a ⚠ line saying so is logged for the caller's issue list."""
+    argv = ['docker', 'compose'] + list(args)
+    if not _ldap_core_gate(argv, holder, plog):          # v10.4.3 W7 (waits outside the lock)
+        return None
     with _authentik_compose_lock(holder, plog=plog, timeout=wait) as _locked:
         if not _locked:
             plog(f"  ⚠ Skipped `docker compose {' '.join(args)}`: another Authentik operation "
                  f"held the compose lock for {wait}s. Run it again once that finishes.")
             return None
-        return subprocess.run(_sudo_wrap(['docker', 'compose'] + list(args)), cwd=cwd,
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                              timeout=timeout)
+        if not _ldap_core_gate(argv, holder, plog, wait_s=0):
+            return None
+        with (_ldap_outpost_restart_watch(holder, plog) if _compose_argv_may_start(argv)
+              else contextlib.nullcontext()):
+            return subprocess.run(_sudo_wrap(argv), cwd=cwd,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                  timeout=timeout)
 
 
 _AK_COMPOSE_LOCK_BUSY_RC = 75   # EX_TEMPFAIL: not run, try again later
@@ -75937,10 +76131,18 @@ def _ak_compose_subprocess(cmd, holder, plog=None, wait=_AK_COMPOSE_LOCK_WAIT_S,
     the command does NOT run and a failed CompletedProcess comes back (returncode 75, the
     reason on stdout and stderr), so the caller's own failure handling reports it. With
     check=True that is a CalledProcessError instead. Never runs unlocked."""
-    with _authentik_compose_lock(holder, plog=plog, timeout=wait) as _locked:
-        if _locked:
-            return subprocess.run(cmd, **kw)
-    msg = _ak_compose_lock_busy_msg(holder, wait)
+    msg = None
+    if not _ldap_core_gate(cmd, holder, plog):           # v10.4.3 W7 (waits outside the lock)
+        msg = _ldap_core_not_ready_msg(holder)
+    else:
+        with _authentik_compose_lock(holder, plog=plog, timeout=wait) as _locked:
+            if _locked:
+                if _ldap_core_gate(cmd, holder, plog, wait_s=0):
+                    with (_ldap_outpost_restart_watch(holder, plog) if _compose_argv_may_start(cmd)
+                          else contextlib.nullcontext()):
+                        return subprocess.run(cmd, **kw)
+                msg = _ldap_core_not_ready_msg(holder)
+    msg = msg or _ak_compose_lock_busy_msg(holder, wait)
     out = msg if (kw.get('text') or kw.get('universal_newlines') or kw.get('encoding')) else msg.encode()
     if kw.get('check'):
         raise subprocess.CalledProcessError(_AK_COMPOSE_LOCK_BUSY_RC, cmd, output=out, stderr=out)
@@ -75953,10 +76155,18 @@ def _ak_module_compose(ak_cfg, cmd, holder, plog=None, wait=_AK_COMPOSE_LOCK_WAI
     (a lock here would not exclude anything there), so remote runs exactly as before.
     Returns (ok, output); (False, reason) without running when the lock stays busy."""
     if ak_cfg.get('target_mode') == 'remote':
-        return _module_run(ak_cfg, cmd, **kw)
+        res = _module_run(ak_cfg, cmd, **kw)
+        if _COMPOSE_LDAP_START_RE.search(cmd or ''):
+            _after_ldap_outpost_restart(f'{holder} (remote Authentik)', plog)   # v10.4.3 W1
+        return res
+    if not _ldap_core_gate(cmd, holder, plog):           # v10.4.3 W7
+        return False, _ldap_core_not_ready_msg(holder)
     with _authentik_compose_lock(holder, plog=plog, timeout=wait) as _locked:
         if _locked:
-            return _module_run(ak_cfg, cmd, **kw)
+            with (_ldap_outpost_restart_watch(holder, plog)
+                  if re.search(r'\bdocker compose (?:up|restart|start|create)\b', cmd or '')
+                  else contextlib.nullcontext()):
+                return _module_run(ak_cfg, cmd, **kw)
     return False, _ak_compose_lock_busy_msg(holder, wait)
 
 
@@ -75977,6 +76187,63 @@ def _ak_module_compose(ak_cfg, cmd, holder, plog=None, wait=_AK_COMPOSE_LOCK_WAI
 _GD_AUTHENTIK_UPDATE_MARKER = '/var/lib/takguard/authentik_update_in_progress'
 _GD_AUTHENTIK_UPDATE_MAX_S = 1800        # tak-authentik-watch.sh UPDATE_MAX_SECS
 _AK_LOCAL_HEALTH_URL = 'http://127.0.0.1:9090/-/health/live/'
+# v10.4.3 W6/W7: `ready` (not `live`) — 200 only once the core can serve requests (database
+# reachable, migrations done). akres E2b/E2f: an outpost started while this said no came up
+# not ready and left TAK stuck; E3c: `live` passed while `ready` was 503 on 2026.8.5.
+_AK_LOCAL_READY_URL = 'http://127.0.0.1:9090/-/health/ready/'
+_LDAP_DRIFT_MIN_UP_S = 60
+
+
+def _authentik_core_ready(timeout_s=0):
+    """True once the LOCAL Authentik core answers /-/health/ready/ with 200, polling for
+    up to `timeout_s`. No local ~/authentik (remote Authentik, not installed): True — there
+    is nothing local to gate."""
+    if not os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+        return True
+    deadline = time.time() + max(0, timeout_s)
+    while True:
+        try:
+            with urllib.request.urlopen(_AK_LOCAL_READY_URL, timeout=5) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        left = deadline - time.time()
+        if left <= 0:
+            return False
+        time.sleep(min(5.0, max(0.5, left)))
+
+
+def _ldap_drift_gate_ok():
+    """v10.4.3 W6: may a failed adm_ldapservice bind be read as PASSWORD drift? Only when
+    the core is ready AND the outpost is running, healthy and up at least
+    _LDAP_DRIFT_MIN_UP_S. Otherwise it is an availability fault, and the drift heal
+    (set_password + outpost recreate — itself an E3c risk) must not run. Logs the reason."""
+    why = None
+    if not _authentik_core_ready(0):
+        why = 'Authentik core not ready (/-/health/ready/ is not 200)'
+    else:
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f',
+                                           '{{.State.Running}} {{.State.StartedAt}} '
+                                           '{{if .State.Health}}{{.State.Health.Status}}{{end}}',
+                                           'authentik-ldap-1']),
+                               capture_output=True, text=True, timeout=10)
+            parts = (r.stdout or '').split()
+        except Exception:
+            parts = []
+        started = _epoch_from_rfc3339(parts[1]) if len(parts) >= 2 else None
+        if not parts or parts[0] != 'true' or started is None:
+            why = 'LDAP outpost not running'
+        elif len(parts) >= 3 and parts[2] != 'healthy':
+            why = f'LDAP outpost {parts[2]}'
+        elif time.time() - started < _LDAP_DRIFT_MIN_UP_S:
+            why = f'LDAP outpost up only {int(time.time() - started)}s'
+    if why:
+        print(f"[ldap-sa-watchdog] adm_ldapservice bind failed, but LDAP not ready — not a "
+              f"password drift ({why}); re-checking next tick", flush=True)
+        return False
+    return True
 _AK_UPDATE_INPROC = {'since': 0.0}       # ops #214: this console's own Update, marker or not
 
 
@@ -78340,8 +78607,13 @@ def _ensure_authentik_pgbouncer_image(plog):
             rr = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'server', 'worker']),
                                 cwd=ak_dir, capture_output=True, text=True, timeout=300)
             _wait_for_authentik_stack_healthy(plog, timeout=180)
-            rl = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']),
-                                cwd=ak_dir, capture_output=True, text=True, timeout=120)
+            if _ldap_core_gate(['docker', 'compose', 'up', 'ldap'], 'pgbouncer-image-restart', plog, wait_s=30):   # v10.4.3 W7
+                with _ldap_outpost_restart_watch('pgbouncer-image-restart', plog):   # v10.4.3 W1
+                    rl = subprocess.run(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']),
+                                        cwd=ak_dir, capture_output=True, text=True, timeout=120)
+            else:
+                # not run: the running outpost keeps serving; not a failed restart
+                rl = subprocess.CompletedProcess(['docker', 'compose', 'restart', 'ldap'], 0, stdout='', stderr='')
         for res in (rr, rl):
             if res.returncode != 0:
                 plog(f"  ✗ pgbouncer image: restart failed: {((res.stderr or '') + (res.stdout or ''))[-300:]}")
@@ -78546,32 +78818,91 @@ _PGB_SWAP_LDAP_STABLE_S = 45
 _PGB_SWAP_LDAP_EVERY_S = 5
 
 
-def _authentik_ldap_sa_group_probe(ldap_pass):
-    """One live LDAP check through the LOCAL outpost, the way TAK Server uses it: bind as
-    adm_ldapservice and read every user's memberOf. Password is never logged.
+class _ldap_pw_file:
+    """Security review L4 (v10.4.3): `with _ldap_pw_file(pw) as path:` — a 0600 temp file
+    holding the password verbatim, for `ldapsearch -y`, so the password is not in argv
+    (/proc/<pid>/cmdline, readable by every local user). Removed on exit."""
 
-    Returns (bound, tak_groups, detail): `bound` is a real bind + search (rc 0, or 4 =
-    size limit hit, which still means both worked); `tak_groups` counts memberOf values
-    naming a tak_ group.
-    """
+    def __init__(self, password):
+        self._password, self._path = password, None
+
+    def __enter__(self):
+        fd, self._path = tempfile.mkstemp(prefix='ldap-pw-')
+        with os.fdopen(fd, 'w') as f:
+            f.write(self._password)            # -y reads the file verbatim: no newline
+        return self._path
+
+    def __exit__(self, *exc):
+        try:
+            os.unlink(self._path)
+        except (OSError, TypeError):
+            pass
+        return False
+
+
+def _authentik_ldap_sa_search(ldap_pass, flt, size_limit):
+    """One ldapsearch as adm_ldapservice through the LOCAL outpost (users OU, memberOf only).
+    Returns (rc, users, tak_memberof, detail); rc None when ldapsearch could not run.
+    The password is never logged."""
+    # Security review L4: password via a 0600 file (`-y`), not argv (`-w`) — this probe now
+    # runs every 10 min (W3).
     try:
-        r = subprocess.run(
-            ['ldapsearch', '-x', '-H', 'ldap://127.0.0.1:389',
-             '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
-             '-b', 'ou=users,dc=takldap', '-s', 'one', '-z', '500', '(objectClass=*)', 'memberOf'],
-            capture_output=True, text=True, timeout=20)
+        with _ldap_pw_file(ldap_pass) as pw_path:
+            r = subprocess.run(
+                ['ldapsearch', '-x', '-H', 'ldap://127.0.0.1:389',
+                 '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-y', pw_path,
+                 '-b', 'ou=users,dc=takldap', '-s', 'one', '-z', str(size_limit), flt, 'memberOf'],
+                capture_output=True, text=True, timeout=20)
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired) as e:
-        return False, 0, f"ldapsearch {type(e).__name__}"
+        return None, 0, 0, f"ldapsearch {type(e).__name__}"
     lines = (r.stdout or '').splitlines()
     users = sum(1 for l in lines if l.startswith('dn: '))
     groups = sum(1 for l in lines if l.lower().startswith('memberof: cn=tak_'))
-    bound = r.returncode in (0, 4)
-    detail = f"ldapsearch rc={r.returncode}, {users} users, {groups} tak_ memberOf"
-    if not bound:
+    detail = f"ldapsearch {flt} rc={r.returncode}, {users} users, {groups} tak_ memberOf"
+    if r.returncode not in (0, 4):
         err = (r.stderr or '').strip().splitlines()
         if err:
             detail += f" ({err[-1][:80]})"
-    return bound, groups, detail
+    return r.returncode, users, groups, detail
+
+
+# v10.4.3 W5: the probe asks for a KNOWN member instead of "the first 500 users". akres E3:
+# on a box with >500 users the -z 500 page held no tak_ member (sort order), so the probe said
+# "LDAP has no groups" and the TAK heal refused to run for 25 min while LDAP was fine.
+_LDAP_PROBE_STEPS = (
+    ('(cn=webadmin)', 1, 'webadmin'),                 # infra-TAK's own admin: tak_ROLE_ADMIN
+    ('(memberOf=cn=tak_*)', 1, 'server-side filter'),  # any tak_ member, if the outpost filters
+    ('(objectClass=*)', 500, 'first 500 users'),       # the pre-W5 scan, last resort
+)
+
+
+def _authentik_ldap_sa_group_probe(ldap_pass):
+    """One live LDAP check through the LOCAL outpost, the way TAK Server uses it: bind as
+    adm_ldapservice and look for a user with tak_ groups. Password is never logged.
+
+    Returns (bound, tak_groups, detail): `bound` is a real bind + search (rc 0, or 4 =
+    size limit hit, which still means both worked); `tak_groups` counts memberOf values
+    naming a tak_ group on the first search that found any.
+
+    v10.4.3 W5: tries `_LDAP_PROBE_STEPS` in order and stops at the first with tak_ groups.
+    A failed bind on the first step is the answer (LDAP not good). A later step that errors
+    (e.g. an outpost that does not do substring matching on memberOf) is skipped, not taken
+    for a failed bind."""
+    tried = []
+    bound_any = False
+    for i, (flt, limit, what) in enumerate(_LDAP_PROBE_STEPS):
+        rc, users, groups, detail = _authentik_ldap_sa_search(ldap_pass, flt, limit)
+        if rc is None:
+            return False, 0, detail
+        ok = rc in (0, 4)
+        if not ok and (i == 0 or rc == 49):
+            return False, 0, detail          # bind / search failing: LDAP is not good
+        if ok:
+            bound_any = True
+            if groups:
+                return True, groups, f"{what}: {detail}"
+        tried.append(f"{what}: {detail}")
+    return bound_any, 0, '; '.join(tried)
 
 
 def _authentik_ldap_sa_groups_settle(ldap_pass, need_groups, plog, label, tag='pgbouncer image', stats=None):
@@ -78646,6 +78977,13 @@ _TAK_RECYCLE_API_TIMEOUT_S = 300        # Guard Dog's api wait (_MAX_API)
 # heal keeps re-checking on every monitor tick, and restarts TAK once it has been broken this
 # long: broken Data Sync for everyone is worse than one reconnect.
 _TAK_HTTPS_BROKEN_RESTART_S = 900
+# v10.4.3 W1 (operator decision 2026-11-19): with LDAP verified good, a TAK HTTPS side that
+# still gives the check user no groups this long after the LDAP outpost started is stuck
+# (akres E3c: every user, until TAK restarts) and TAK is restarted at once. 240 s covers the
+# longest self-recovery seen (ops #316: 75-204 s) and the API reconnect (ops #158: ~54 s).
+# The 900 s hold above is kept only for the PARTIAL case (another user gets groups, clients
+# connected). Fleet constant.
+_TAK_HTTPS_STUCK_AFTER_OUTPOST_S = 240
 # GH #549: at box boot TAK and the outpost start together, so the outpost-start test above
 # never fires, and a TAK that came up while Authentik answered 502 was never checked. Once
 # per TAK start, this long after it, the HTTPS side is checked once (one login, quiet if OK).
@@ -78813,11 +79151,12 @@ def _ldap_users_tak_groups(ldap_pass, cns=None):
                     for i in range(0, len(cns), 50)]
     for search in searches:
         try:
-            r = subprocess.run(
-                ['ldapsearch', '-LLL', '-x', '-o', 'ldif-wrap=no', '-H', 'ldap://127.0.0.1:389',
-                 '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-w', ldap_pass,
-                 '-b', 'ou=users,dc=takldap', '-s', 'one'] + search + ['memberOf'],
-                capture_output=True, text=True, timeout=20)
+            with _ldap_pw_file(ldap_pass) as pw_path:    # L4: not in argv (runs every 10 min, W3)
+                r = subprocess.run(
+                    ['ldapsearch', '-LLL', '-x', '-o', 'ldif-wrap=no', '-H', 'ldap://127.0.0.1:389',
+                     '-D', 'cn=adm_ldapservice,ou=users,dc=takldap', '-y', pw_path,
+                     '-b', 'ou=users,dc=takldap', '-s', 'one'] + search + ['memberOf'],
+                    capture_output=True, text=True, timeout=20)
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
             return None
         if r.returncode not in (0, 4):
@@ -79344,9 +79683,10 @@ def _tak_user_marti_req(cert, key, url, method='GET', timeout=20):
     return code, data
 
 
-def _tak_api_user_check_once(cn, ldap_groups):
+def _tak_api_user_check_once(cn, ldap_groups, groups_only=False):
     """One HTTPS login as `cn` (see `_tak_api_user_check`). Returns (verdict, summary);
-    verdict 'nocert' = no test cert could be made (trying again won't change that)."""
+    verdict 'nocert' = no test cert could be made (trying again won't change that).
+    `groups_only` (v10.4.3 W3): stop after groups/all — no mission list, no test mission."""
     workdir = tempfile.mkdtemp(prefix='tak-api-check-')
     try:
         try:
@@ -79366,6 +79706,8 @@ def _tak_api_user_check_once(cn, ldap_groups):
         if not have:
             return 'broken', (f"TAK's API gave {cn} {'no groups' if code == 200 else f'HTTP {code}'} on "
                               f"groups/all, while LDAP gives {len(ldap_groups)} ({', '.join(sorted(ldap_groups)[:5])})")
+        if groups_only:
+            return 'ok', f"HTTPS as {cn}: groups/all gives {len(got)} group(s)"
         code, data = req('missions')
         if code == 0 or code >= 500:
             return 'unknown', f"TAK's API didn't answer {cn}'s mission list ({f'HTTP {code}' if code else 'no answer'})"
@@ -79395,7 +79737,8 @@ def _tak_api_user_check_once(cn, ldap_groups):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, early=False):
+def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, early=False, exclude=(), info=None,
+                        groups_only=False):
     """Does TAK's HTTPS/API side give cert users their LDAP groups? (ops #139)
 
     Picks a real non-admin LDAP user with a read/write TAK group (one connected right now if
@@ -79410,8 +79753,11 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
     plainly not asking LDAP for the user while it asks for others (`_tak_api_check_stuck`).
     Returns (verdict, summary): 'ok'; 'broken' (TAK's API gave the user no groups, or
     refused the list or the create, while LDAP gives it groups); 'unknown' (no user to
-    check with, or the cert or the API couldn't be used)."""
+    check with, or the cert or the API couldn't be used).
+    v10.4.3 W1: `exclude` = user names not to pick (a second check with ANOTHER user tells
+    "every user" from "this user"); `info`, a dict, gets the checked user as info['cn']."""
     file_users = _tak_file_users()
+    skip = {str(x).lower() for x in (exclude or ())}
 
     def _pick(groups):
         for cn in sorted(groups or {}, key=str.lower):
@@ -79421,6 +79767,7 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
             # write-only Node-RED feed user would always read as "no groups" (ops #278).
             g = [x for x in all_g if not re.search(r'_(?:read|write)$', x, re.I)]
             if (g and 'ROLE_ADMIN' not in all_g and cn.lower() not in file_users
+                    and cn.lower() not in skip
                     and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', cn)):
                 return cn, g
         return None
@@ -79436,6 +79783,8 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
     if not pick:
         return 'unknown', "no non-admin LDAP user with read/write TAK groups to check with"
     cn, ldap_groups = pick
+    if info is not None:
+        info['cn'] = cn
     t0 = time.time()
     delay, rnd = _TAK_API_CHECK_RETRY_S, 0
     logins, said = [], None
@@ -79443,7 +79792,7 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
         rnd += 1
         for n in range(1, _TAK_API_CHECK_TRIES + 1):
             logins.append(time.time())
-            verdict, summary = _tak_api_user_check_once(cn, ldap_groups)
+            verdict, summary = _tak_api_user_check_once(cn, ldap_groups, groups_only=groups_only)
             if verdict != 'broken':
                 break   # ok, or the API / cert can't be used: logging in again right away won't help
         if verdict == 'ok':
@@ -79530,8 +79879,8 @@ def _tak_https_broken_alert(plog, outcome, detail):
             return
         ident = _guarddog_server_identifier(settings) or socket.gethostname()
         subj = f"⚠ TAK Server restarted: Data Sync had no groups ({ident})"
-        body = (f"TAK Server's HTTPS side gave users no groups for over "
-                f"{_TAK_HTTPS_BROKEN_RESTART_S // 60} minutes after Authentik's LDAP was restarted. "
+        body = (f"TAK Server's HTTPS side gave users no groups after Authentik's LDAP was "
+                f"restarted, while LDAP itself gave them their groups. "
                 f"While that lasts, ATAK shows Data Sync feeds as removed and CloudTAK shows empty "
                 f"mission lists.\n\nThe console restarted TAK Server to fix it. Connected clients "
                 f"reconnected by themselves.\n\nResult: {outcome}\nDetail: {detail}\n\n"
@@ -79731,8 +80080,24 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             sessions = _tak_client_sessions()
             grouped = None if sessions is None else sum(1 for x in sessions if x['groups'])
             # ops #139: the 8089 connections say nothing about TAK's HTTPS side; check it too.
+            # v10.4.3 W1 (#549, akres E3c): with LDAP verified good, a TAK still giving the check
+            # user no groups once the outpost has been up _TAK_HTTPS_STUCK_AFTER_OUTPOST_S is the
+            # stuck state (every user, until TAK restarts) — not the 75-204 s self-recovery of
+            # ops #316 or the ~54 s API reconnect of ops #158. Those keep the normal rounds.
+            api_info = {}
             try:
-                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass, early=grouped == 0)
+                api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass, early=grouped == 0,
+                                                               info=api_info)
+                if api_verdict == 'broken':
+                    ref = _docker_started_epoch('authentik-ldap-1') or req_at or 0
+                    left = _TAK_HTTPS_STUCK_AFTER_OUTPOST_S - (time.time() - ref) if ref else 0
+                    if left > 0:
+                        plog(f"  {tag}: HTTPS check: {api_summary} — the LDAP outpost started "
+                             f"{int(time.time() - ref)}s ago and TAK can recover by itself in that window "
+                             f"(ops #316); checking once more in {int(left)}s")
+                        time.sleep(left)
+                        api_verdict, api_summary = _tak_api_user_check(plog, tag, ldap_pass, wait_s=0,
+                                                                       info=api_info)
             except Exception as e:
                 api_verdict, api_summary = 'unknown', f"HTTPS check error: {str(e)[:120]}"
             outcome ='clients healed, no restart' if verdict == 'healed' else 'clients fine, no restart'
@@ -79744,7 +80109,38 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 plog(f"  {tag}: {summary}; HTTPS/API side NOT checked: {api_summary} — no TAK Server restart")
                 _finish(outcome + ' (HTTPS not checked)', healed_ldap_start=ldap_start, healed_gd_restart=gd_restart)
                 return False
-            if grouped != 0:
+            # Broken twice, LDAP good. Every user, or only this one? Only the partial case (another
+            # user gets groups AND there are connected clients to drop) keeps the old hold.
+            partial = False
+            if grouped != 0 and api_info.get('cn'):
+                try:
+                    other_v, other_s = _tak_api_user_check(plog, tag, ldap_pass, wait_s=0,
+                                                           exclude={api_info['cn']})
+                except Exception as e:
+                    other_v, other_s = 'unknown', str(e)[:120]
+                partial = other_v == 'ok'
+                if partial:
+                    api_summary = f"{api_summary}; another user is fine ({other_s})"
+            if grouped != 0 and not partial:
+                try:
+                    _bound, _tg, _pd = _authentik_ldap_sa_group_probe(ldap_pass)
+                except Exception as e:
+                    _bound, _tg, _pd = False, 0, str(e)[:120]
+                if not _bound or (need_groups and not _tg):
+                    plog(f"  ✗ {tag}: LDAP stopped answering during the TAK check ({_pd}) — TAK Server NOT "
+                         f"restarted. Kept pending: the console retries within 10 min.")
+                    _finish('deferred: LDAP not healthy', keep=reasons)
+                    return False
+                who = (f"{grouped} connected client(s) will reconnect" if grouped
+                       else "TAK's client list can't be read")
+                escalated = True
+                plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side still gives users no groups "
+                     f"{_TAK_HTTPS_STUCK_AFTER_OUTPOST_S // 60}+ min after the LDAP outpost started, while LDAP "
+                     f"gives them groups: {api_summary}. ATAK Data Sync and CloudTAK are broken for everyone "
+                     f"until TAK restarts — restarting TAK Server now ({who})")
+                summary = (f"HTTPS/API side gave users no groups {_TAK_HTTPS_STUCK_AFTER_OUTPOST_S // 60}+ min "
+                           f"after the LDAP outpost started ({api_summary})")
+            elif grouped != 0:
                 who = (f"{grouped} connected client(s) have their groups" if grouped
                        else "TAK's client list can't be read")
                 # GH #549: never marked healed while broken. Kept pending, so every monitor tick
@@ -79809,6 +80205,71 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
             _alert(f'TAK Server restarted, but users STILL get no groups: {api_summary}')
             _finish('restarted, HTTPS still broken')
         return True
+
+
+# Security review M1: a cause a TAK restart does not fix (e.g. one user's groups mapped wrong
+# in TAK) would otherwise restart TAK on every tick after its boot window, ~every 20 min.
+_TAK_GROUPS_WATCH_RESTART_EVERY_S = 21600   # 6 h
+
+
+def _tak_ldap_groups_watch(plog):
+    """v10.4.3 W3: continuous check for "TAK gives no groups while LDAP does" — the stuck
+    state of akres E3c after an outpost restart the console did not see at all (or saw while
+    TAK was in a state the W1 hook did not catch). Runs on the spiral monitor's 10-min tick.
+    One known LDAP user: LDAP memberOf (W5 probe) vs TAK's HTTPS groups/all (groups only, no
+    test mission). Mismatch with LDAP good -> a recycle request and the W1 heal path
+    (_tak_recycle_after_ldap_outage: normal rounds, 240 s window, restart). Quiet when fine.
+    Returns True only when TAK was restarted."""
+    tag = 'TAK groups watch'
+    try:
+        if not os.path.exists('/opt/tak/CoreConfig.xml') or not _coreconfig_has_ldap():
+            return False
+        tak_start = _tak_started_epoch()
+        if tak_start is None or time.time() - tak_start < _TAK_BOOT_HTTPS_CHECK_AFTER_S:
+            return False                       # not running / still in its boot window
+        if _console_update_in_progress() or _authentik_busy_reason():
+            return False
+        if (load_settings().get('tak_ldap_recycle') or {}).get('pending'):
+            return False                       # the recycle already owns this outage
+        ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+        if not ldap_pass or not _ensure_ldapsearch():
+            return False
+        bound, tak_groups, _ = _authentik_ldap_sa_group_probe(ldap_pass)
+        if not bound or not tak_groups:
+            return False                       # LDAP not good: not TAK's fault, not ours to fix here
+        verdict, summary = _tak_api_user_check(lambda m: None, tag, ldap_pass, wait_s=0, groups_only=True)
+    except Exception as e:
+        plog(f"  {tag}: check error (non-fatal): {str(e)[:160]}")
+        return False
+    if verdict != 'broken':
+        return False
+    st = load_settings().get('tak_ldap_recycle') or {}
+    last = float(st.get('groups_watch_restart_epoch') or 0)
+    if time.time() - last < _TAK_GROUPS_WATCH_RESTART_EVERY_S:
+        if not st.get('groups_watch_held_said'):
+            plog(f"  ✗ {tag}: {summary} — TAK gives no groups while LDAP does, but this check already "
+                 f"restarted TAK {int((time.time() - last) // 60)} min ago and a restart did not fix it. "
+                 f"Not restarting again within {_TAK_GROUPS_WATCH_RESTART_EVERY_S // 3600} h: check this "
+                 f"user's groups in TAK Portal and CoreConfig's <ldap> settings")
+            _tak_groups_watch_mark(groups_watch_held_said=True)
+        return False
+    plog(f"  ✗ {tag}: {summary} — TAK gives no groups while LDAP does; running the TAK LDAP heal")
+    _tak_ldap_recycle_request('TAK gives no groups while LDAP does (continuous check)')
+    restarted = _tak_recycle_after_ldap_outage(plog, tag, check_outpost=True)
+    if restarted:
+        _tak_groups_watch_mark(groups_watch_restart_epoch=time.time(), groups_watch_held_said=False)
+    return restarted
+
+
+def _tak_groups_watch_mark(**kv):
+    try:
+        s = load_settings()
+        cur = dict(s.get('tak_ldap_recycle') or {})
+        cur.update(kv)
+        s['tak_ldap_recycle'] = cur
+        save_settings(s)
+    except Exception:
+        pass
 
 
 def _ak_ldap_path_starts():
@@ -83074,6 +83535,8 @@ def _authentik_ldap_sa_bind_watchdog_loop():
                     else:
                         print(f"[ldap-sa-watchdog] LDAP outpost token repair FAILED: {_tok_msg}", flush=True)
                         _record_ldap_sa_heal_failure(f'outpost token repair failed: {_tok_msg}')
+                elif not _ldap_drift_gate_ok():
+                    pass    # v10.4.3 W6: availability fault, not drift — logged by the gate
                 else:
                     print("[ldap-sa-watchdog] adm_ldapservice bind drift DETECTED — auto-resyncing", flush=True)
                     try:
@@ -84575,8 +85038,9 @@ def _authentik_fix_pg_idle_timeout(plog):
         # the targeted postgresql recreate doesn't start it (seen live: console restart
         # brought up pgbouncer but not redis). Full up -d is an idempotent no-op otherwise.
         try:
-            subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+            with _ldap_outpost_restart_watch('_authentik_fix_pg_idle_timeout'):   # v10.4.3 W1
+                subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), cwd=ak_dir,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
             plog("  ✓ pg idle timeout: compose up -d — any newly declared services (redis) started")
         except Exception as _up_e:
             plog(f"  ⚠ pg idle timeout: full compose up -d failed (non-fatal): {str(_up_e)[:120]}")
@@ -84796,10 +85260,18 @@ def _authentik_spiral_monitor():
             # authentik-watch restarts Authentik on its own, and a request kept because LDAP
             # wasn't healthy yet waited for the next console start. Silent and cheap when
             # there is nothing to heal (two start times, one file).
+            _tak_restarted = False
             try:
-                _tak_recycle_after_ldap_outage(_mon_log, 'periodic LDAP outage check', check_outpost=True)
+                _tak_restarted = _tak_recycle_after_ldap_outage(_mon_log, 'periodic LDAP outage check', check_outpost=True)
             except Exception as _tr_e:
                 print(f"[spiral monitor] TAK LDAP recycle error (non-fatal): {_tr_e}", flush=True)
+            # v10.4.3 W3: TAK stuck with no groups while LDAP gives them — whatever restarted
+            # the outpost (or nothing did). Quiet and cheap when fine (one LDAP search, one login).
+            if not _tak_restarted:
+                try:
+                    _tak_ldap_groups_watch(_mon_log)
+                except Exception as _gw_e:
+                    print(f"[spiral monitor] TAK groups watch error (non-fatal): {_gw_e}", flush=True)
             # ops #565: a client TAK never looked up (no outage to trigger the heal above)
             try:
                 _tak_drop_stuck_unnamed_sessions(_mon_log)
@@ -86121,10 +86593,14 @@ entries:
                                             plog(f"  Recreating LDAP container with new token...")
                                             with _authentik_compose_lock('deploy-ldap-token-recreate', plog=plog,
                                                                          timeout=_AK_COMPOSE_LOCK_WAIT_LONG_S) as _locked:
-                                                if _locked:
-                                                    _run_priv_chain([['docker', 'compose', 'stop', 'ldap'], ['docker', 'compose', 'rm', '-f', 'ldap'], ['docker', 'compose', 'up', '-d', 'ldap']], 'and', timeout=60, cwd=ak_dir)
-                                            if _locked:
+                                                _ldap_gate_ok = bool(_locked) and _ldap_core_gate(['docker', 'compose', 'up', 'ldap'], 'deploy-ldap-token-recreate', plog, wait_s=30)   # v10.4.3 W7
+                                                if _ldap_gate_ok:
+                                                    with _ldap_outpost_restart_watch('deploy-ldap-token-recreate', plog):   # v10.4.3 W1
+                                                        _run_priv_chain([['docker', 'compose', 'stop', 'ldap'], ['docker', 'compose', 'rm', '-f', 'ldap'], ['docker', 'compose', 'up', '-d', 'ldap']], 'and', timeout=60, cwd=ak_dir)
+                                            if _locked and _ldap_gate_ok:
                                                 plog(f"  ✓ LDAP container recreated with injected token")
+                                            elif _locked:
+                                                pass   # W7 gate logged it: core not ready, outpost not touched
                                             else:
                                                 plog(f"  ⚠ LDAP recreate skipped: {_ak_compose_lock_busy_msg('deploy-ldap-token-recreate', _AK_COMPOSE_LOCK_WAIT_LONG_S)}")
                                             time.sleep(10)
@@ -86544,14 +87020,18 @@ entries:
             plog("")
             plog("🔑 Ensuring password-recovery flow (no Email Relay configured)...")
             _ensure_recovery_flow_standalone(env_path, plog)
-        # Final LDAP restart: ensure container has the injected token and internal URL (after SMTP/recreate)
+        # Final LDAP step: ensure the container has the injected token and internal URL (after
+        # SMTP/recreate). v10.4.3 W2: `up -d --no-deps ldap`, not `restart` — `restart` never
+        # applied a compose change anyway (same container config), and it restarted the outpost
+        # on every deploy/Reconfigure (each one a ~3-in-5 TAK risk under load, akres E3c).
+        # `up` recreates it only when its compose config changed.
         try:
-            _r = _ak_compose_subprocess(_sudo_wrap(['docker', 'compose', 'restart', 'ldap']), 'deploy-ldap-final-restart', plog,
+            _r = _ak_compose_subprocess(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', 'ldap']), 'deploy-ldap-final-restart', plog,
                                         wait=_AK_COMPOSE_LOCK_WAIT_LONG_S, cwd=ak_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
             if _r.returncode == _AK_COMPOSE_LOCK_BUSY_RC:
                 plog(f"  ⚠ LDAP final restart {_r.stdout}")
             else:
-                plog("  ✓ LDAP container restarted (final)")
+                plog("  ✓ LDAP container up to date (final; recreated only if its config changed)")
         except Exception:
             pass
         if not ldap_svc_pass:
@@ -123047,6 +123527,107 @@ def _post_update_service_recovery_sweep(plog):
     }
 
 
+# v10.4.3 W4: one orphan-postgres killer for the three post-update passes. The old
+# shm-recreate pass killed (PIDs before) ∩ (PIDs after) of EVERY UID-70 postgres —
+# tak-portal-postgres is UID 70 too, so on a root console it killed TAK Portal's
+# database; on a non-root console the bare `kill` failed and it still logged
+# "killed orphaned postgres" ×21. Rules now: a PID is an orphan only when its cgroup
+# names exactly one container AND that container is not running (and, when the
+# caller names owners, is one of them). The kill goes through _sudo_wrap (the broker
+# re-proves the same thing in _check_kill) and "killed" is logged only on rc 0.
+_PG_CGROUP_CONTAINER_RE = re.compile(r'(?:docker-|/docker/|libpod-|/libpod/)([0-9a-f]{64})')
+
+
+def _pg_proc_container_id(pid):
+    """Container id named by a UID-70 `postgres` PID's cgroup, else None."""
+    try:
+        with open(f'/proc/{pid}/status') as f:
+            status = f.read()
+        with open(f'/proc/{pid}/comm') as f:
+            comm = f.read().strip()
+        with open(f'/proc/{pid}/cgroup') as f:
+            cgroup = f.read()
+    except OSError:
+        return None
+    uid_line = next((ln for ln in status.splitlines() if ln.startswith('Uid:')), '')
+    uids = uid_line.split()[1:]
+    if not uids or uids[0] != '70' or not comm.startswith('postgres'):
+        return None
+    ids = set(_PG_CGROUP_CONTAINER_RE.findall(cgroup))
+    return ids.pop() if len(ids) == 1 else None
+
+
+def _container_postgres_pids():
+    """{pid: container_id} for every UID-70 postgres process inside a container."""
+    out = {}
+    try:
+        names = os.listdir('/proc')
+    except OSError:
+        return out
+    for n in names:
+        if n.isdigit():
+            cid = _pg_proc_container_id(n)
+            if cid:
+                out[n] = cid
+    return out
+
+
+def _docker_container_full_id(name):
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.Id}}', name]),
+                           capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    cid = (r.stdout or '').strip()
+    return cid if r.returncode == 0 and re.fullmatch(r'[0-9a-f]{64}', cid) else None
+
+
+def _kill_orphan_postgres(log, label='', owner_ids=None):
+    """Kill container postgres processes whose container is gone. Returns killed PIDs.
+
+    owner_ids: optional set of full container ids — only orphans of those containers
+    are touched (the shm pass passes authentik-postgresql-1's pre-stop id).
+    /proc is scanned BEFORE `docker ps`, so a container that starts between the two
+    is already in the running set and its postgres is never taken for an orphan."""
+    pfx = f'{label} — ' if label else ''
+    candidates = _container_postgres_pids()
+    if not candidates:
+        return []
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-q', '--no-trunc']),
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        log(f'{pfx}orphan postgres check skipped — docker ps failed: {e}')
+        return []
+    if r.returncode != 0:
+        log(f'{pfx}orphan postgres check skipped — docker ps rc={r.returncode}')
+        return []
+    running = {c.strip() for c in r.stdout.split() if c.strip()}
+    if not running:
+        # Never kill blind: an empty list here is far more likely a docker hiccup
+        # than "every container on the box is gone".
+        return []
+    killed = []
+    for pid, cid in sorted(candidates.items(), key=lambda kv: int(kv[0])):
+        if cid in running:
+            continue
+        if owner_ids is not None and cid not in owner_ids:
+            continue
+        try:
+            k = subprocess.run(_sudo_wrap(['kill', '-9', pid]), capture_output=True, text=True, timeout=15)
+        except Exception as e:
+            log(f'{pfx}could not kill orphaned postgres PID {pid} (container {cid[:12]} gone): {e}')
+            continue
+        if k.returncode == 0:
+            killed.append(pid)
+            log(f'{pfx}killed orphaned postgres PID {pid} (container {cid[:12]} is gone)')
+        else:
+            err = ((k.stderr or '') + (k.stdout or '')).strip().splitlines()
+            log(f'{pfx}could not kill orphaned postgres PID {pid} (container {cid[:12]} gone): '
+                f'rc={k.returncode} {err[-1][:200] if err else ""}'.rstrip())
+    return killed
+
+
 def _post_update_auto_deploy():
     """After a console update, automatically re-deploy Guard Dog and reconfigure Authentik.
 
@@ -123879,15 +124460,13 @@ def _post_update_auto_deploy():
                                 for _svc in _deduped:
                                     print(f"Post-update: Authentik — removed duplicate cap_drop in {_svc} section")
                         if _shm_needs_pg_recreate:
-                            # Record all UID-70 postgres PIDs before stopping so we can kill
-                            # any that survive the container recreate (docker's default 10s stop
-                            # timeout is too short for a loaded postgres checkpoint — the process
-                            # can outlive the container and continue pegging CPU as an orphan).
-                            _old_pg_pids_r = subprocess.run(
-                                "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
-                                shell=True, capture_output=True, text=True, timeout=5
-                            )
-                            _old_pg_pids = set(_old_pg_pids_r.stdout.split()) if _old_pg_pids_r.returncode == 0 else set()
+                            # Record authentik-postgresql-1's container id before stopping so
+                            # we can kill ITS postgres processes that survive the recreate
+                            # (docker's default 10s stop timeout is too short for a loaded
+                            # postgres checkpoint — the process can outlive the container and
+                            # keep pegging CPU as an orphan). v10.4.3 W4: by container id, not
+                            # by UID 70 — tak-portal-postgres is UID 70 too.
+                            _old_pg_cid = _docker_container_full_id('authentik-postgresql-1')
                             # Stop with a longer timeout so postgres can finish its checkpoint cleanly.
                             # ops #178: stop + up in one compose-lock hold, so Guard Dog cannot
                             # land a down+up between them.
@@ -123903,18 +124482,12 @@ def _post_update_auto_deploy():
                                     print("Post-update: Postgres shm recreate skipped — compose lock busy; it applies on the next stack recreate", flush=True)
                             import time as _shm_t
                             _shm_t.sleep(5)
-                            # Kill any postgres processes that survived the container stop.
-                            # Only after a stop that actually ran: skipped, every one of these
-                            # PIDs is the LIVE postgres.
-                            if _locked and _old_pg_pids:
-                                _surviving_r = subprocess.run(
-                                    "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
-                                    shell=True, capture_output=True, text=True, timeout=5
-                                )
-                                _surviving = set(_surviving_r.stdout.split()) if _surviving_r.returncode == 0 else set()
-                                for _orphan_pid in (_old_pg_pids & _surviving):
-                                    subprocess.run(['kill', '-9', _orphan_pid], capture_output=True, timeout=5)
-                                    print(f"Post-update: killed orphaned postgres process PID {_orphan_pid}")
+                            # Kill old-container postgres processes that survived the stop.
+                            # Only after a stop that actually ran, and only the old
+                            # authentik-postgresql-1 container's — never another container's.
+                            if _locked and _old_pg_cid:
+                                _kill_orphan_postgres(lambda m: print(f"Post-update: {m}", flush=True),
+                                                      owner_ids={_old_pg_cid})
                         # ops #123: recreate only when the compose MEANS something different.
                         # A formatting-only diff (v10.2.22's width=200 dump re-wrapped long
                         # lines) recreated worker/server/ldap on every updating box: each LDAP
@@ -123929,8 +124502,22 @@ def _post_update_auto_deploy():
                                     print("Post-update: Authentik compose — formatting-only change, no container recreate")
                             except Exception:
                                 pass
+                        # v10.4.3 W2: every outpost recreate is a ~3-in-5 risk of TAK getting stuck
+                        # under load (akres E3c), while server/worker recreates were 0/9. So ldap is
+                        # recreated only when ITS OWN service section changed (in E3 it did: cap_drop).
+                        _ldap_section_changed = True
                         if _ak_recreate:
-                            print("Post-update: Authentik compose hardened — recreating worker/server, then ldap")
+                            try:
+                                import yaml as _yaml_ldap
+                                _ldap_section_changed = (
+                                    ((_yaml_ldap.safe_load(_ak) or {}).get('services') or {}).get('ldap')
+                                    != ((_yaml_ldap.safe_load(_ak_orig) or {}).get('services') or {}).get('ldap'))
+                            except Exception:
+                                _ldap_section_changed = True    # can't tell: recreate as before
+                        if _ak_recreate:
+                            print("Post-update: Authentik compose hardened — recreating worker/server"
+                                  + (", then ldap" if _ldap_section_changed
+                                     else " (ldap section unchanged — LDAP outpost NOT recreated)"))
                             # ops #30: LDAP after the server is healthy, never in the same
                             # `up` (an outpost that starts against the old server panics
                             # when that server goes away mid start-up).
@@ -123942,9 +124529,12 @@ def _post_update_auto_deploy():
                                         _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', 'worker', 'server']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=120
                                     )
                                     _wait_for_authentik_stack_healthy(lambda m: print(f"Post-update: {m}"), timeout=180)
-                                    subprocess.run(
-                                        _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=90
-                                    )
+                                    if _ldap_section_changed and _ldap_core_gate(['docker', 'compose', 'up', 'ldap'], 'post-update-hardening-recreate',
+                                                       lambda m: print(f"Post-update:{m}", flush=True), wait_s=30):   # v10.4.3 W2 + W7
+                                        with _ldap_outpost_restart_watch('post-update-hardening-recreate'):   # v10.4.3 W1
+                                            subprocess.run(
+                                                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'ldap']), cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=90
+                                            )
                                 else:
                                     print("Post-update: Authentik hardening recreate skipped — compose lock busy; "
                                           "the hardened compose applies on the next stack recreate", flush=True)
@@ -123973,24 +124563,7 @@ def _post_update_auto_deploy():
                         # authentik-postgresql-1 but live in their own container, and killing them
                         # restarts CloudTAK on every update.
                         try:
-                            _running_r = subprocess.run(
-                                _sudo_wrap(['docker', 'ps', '-q', '--no-trunc']),
-                                capture_output=True, text=True, timeout=10
-                            )
-                            _running_ids = {c[:12] for c in _running_r.stdout.split() if c}
-                            if _running_ids:
-                                _all_pg_r = subprocess.run(
-                                    "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
-                                    shell=True, capture_output=True, text=True, timeout=5
-                                )
-                                for _pid in _all_pg_r.stdout.split():
-                                    try:
-                                        _cg = open(f'/proc/{_pid}/cgroup').read()
-                                        if not any(_rid in _cg for _rid in _running_ids):
-                                            subprocess.run(['kill', '-9', _pid], capture_output=True, timeout=5)
-                                            print(f"Post-update: killed orphaned postgres PID {_pid} (cgroup matches no running container)")
-                                    except Exception:
-                                        pass
+                            _kill_orphan_postgres(lambda m: print(f"Post-update: {m}", flush=True))
                         except Exception as _orp_e:
                             print(f"Post-update: orphan postgres check error (non-fatal): {_orp_e}")
                 except Exception as _e:
@@ -125008,24 +125581,7 @@ def _post_update_auto_deploy():
             # killed by previously broken "not in authentik-postgresql-1" check that took down
             # cloudtak-postgis-1 processes on every update.
             try:
-                _final_running_r = subprocess.run(
-                    _sudo_wrap(['docker', 'ps', '-q', '--no-trunc']),
-                    capture_output=True, text=True, timeout=10
-                )
-                _final_running_ids = {c[:12] for c in _final_running_r.stdout.split() if c}
-                if _final_running_ids:
-                    _final_pg_r = subprocess.run(
-                        "ps -eo uid,pid,comm | awk '$1==70 && $3~/postgres/ {print $2}'",
-                        shell=True, capture_output=True, text=True, timeout=5
-                    )
-                    for _final_pid in _final_pg_r.stdout.split():
-                        try:
-                            _final_cg = open(f'/proc/{_final_pid}/cgroup').read()
-                            if not any(_rid in _final_cg for _rid in _final_running_ids):
-                                subprocess.run(['kill', '-9', _final_pid], capture_output=True, timeout=5)
-                                print(f"Post-update: final pass — killed orphaned postgres PID {_final_pid} (cgroup matches no running container)")
-                        except Exception:
-                            pass
+                _kill_orphan_postgres(lambda m: print(f"Post-update: {m}", flush=True), label='final pass')
             except Exception as _final_orp_e:
                 print(f"Post-update: final orphan check error (non-fatal): {_final_orp_e}")
 
@@ -125414,6 +125970,15 @@ try:
     _threading_spiral.Thread(target=_authentik_spiral_monitor, daemon=True, name='authentik-spiral-monitor').start()
 except Exception as _e:
     print(f"[startup] failed to start spiral monitor (non-fatal): {_e}", flush=True)
+
+# v10.4.3 W1: run the TAK check right after an LDAP outpost restart the console did not make
+# (Guard Dog, docker restart policy, OOM, by hand) — not on the next 10-min monitor tick.
+try:
+    import threading as _threading_ldap_poll
+    _threading_ldap_poll.Thread(target=_ldap_outpost_restart_poller, daemon=True,
+                                name='ldap-outpost-restart-poller').start()
+except Exception as _e:
+    print(f"[startup] failed to start LDAP outpost restart poller (non-fatal): {_e}", flush=True)
 
 # New-user enrollment race (ops #565 root cause): reload the LDAP outpost when a user or a tak_
 # membership changes, and drop the TAK connections that came in before the reload with no user.
