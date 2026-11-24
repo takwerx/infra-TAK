@@ -49560,7 +49560,7 @@ def run_takportal_deploy():
                             data=json_mod.dumps({'name': 'TAK Portal Proxy', 'authorization_flow': flow_pk,
                                 'invalidation_flow': inv_flow_pk,
                                 'external_host': _tp_host, 'mode': 'forward_single',
-                                'token_validity': 'hours=24', 'cookie_domain': _tp_cookie}).encode(),
+                                'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': _tp_cookie}).encode(),
                             headers=_ak_headers, method='POST')
                         resp = _urlreq.urlopen(req, timeout=10)
                         provider_pk = json_mod.loads(resp.read().decode())['pk']
@@ -64574,7 +64574,7 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 data=json.dumps({'name': 'Node-RED Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': _nr_host, 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                    'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': _cookie}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -64683,7 +64683,7 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
                 data=json.dumps({'name': 'WebODM Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': _wo_host, 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                    'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': _cookie}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -64922,7 +64922,7 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                 data=json.dumps({'name': 'TAK Video Restreamer Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': _tvr_host, 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                    'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': _cookie}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -65019,7 +65019,7 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
                 data=json.dumps({'name': 'Federation Hub Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': f'https://{_pub_hostport(fedhub_domain)}', 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
+                    'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -65169,7 +65169,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                         data=json.dumps({'name': name, 'authorization_flow': flow_pk,
                             'invalidation_flow': inv_flow_pk,
                             'external_host': host, 'mode': 'forward_single',
-                            'token_validity': 'hours=24', 'cookie_domain': cookie_domain}).encode(),
+                            'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': cookie_domain}).encode(),
                         method='POST', headers=_ak_headers, max_retries=3, timeout=30
                     ).read().decode())['pk']
                     provider_pks.append(pk)
@@ -66640,6 +66640,99 @@ def _run_netbird_deploy(settings):
         _netbird_deploy_status.update({'running': False, 'error': True})
 
 
+# How long a sign-in through Authentik lasts for the apps behind it (ops #1159).
+# The outpost ends the session when the provider's ACCESS token ends, so the field
+# is `access_token_validity`. (The key `token_validity` that this code used to send
+# does not exist in Authentik's proxy provider API; Authentik ignored it and every
+# provider kept its default, `hours=1`.)
+_PROXY_SESSION_VALIDITY = 'hours=24'
+_AUTHENTIK_DEFAULT_ACCESS_TOKEN_VALIDITY = 'hours=1'
+
+# The proxy providers infra-TAK creates. Only these are repaired: any other proxy
+# provider on the box belongs to the operator.
+_INFRATAK_PROXY_PROVIDER_NAMES = frozenset({
+    'infra-TAK', 'TAK Portal Proxy', 'Node-RED Proxy', 'MediaMTX', 'Federation Hub Proxy',
+    'WebODM Proxy', 'TAK Video Restreamer Proxy', 'ATLAS MDM Proxy',
+})
+
+
+def _is_infratak_proxy_provider_name(name):
+    name = (name or '').strip()
+    return name in _INFRATAK_PROXY_PROVIDER_NAMES or name.startswith('ATLAS MDM Proxy (')
+
+
+def _proxy_session_validity_to_write(current):
+    """What a provider write should send for access_token_validity: the fleet value
+    when the provider still has Authentik's default (nobody chose it), else the value
+    it already has (an operator chose it in Authentik's admin page)."""
+    cur = (current or '').strip()
+    if not cur or cur == _AUTHENTIK_DEFAULT_ACCESS_TOKEN_VALIDITY:
+        return _PROXY_SESSION_VALIDITY
+    return cur
+
+
+def _ensure_proxy_providers_session_length(ak_url, ak_headers, plog=None):
+    """ops #1159: give the infra-TAK proxy providers that still have Authentik's
+    one-hour default the 24-hour sign-in infra-TAK always meant to give them.
+
+    Only providers named in _INFRATAK_PROXY_PROVIDER_NAMES, and only when the value is
+    exactly Authentik's default, so a length the operator set is never overwritten.
+    PATCH sends `mode` and `internal_host` with the field: Authentik refuses a PATCH
+    without them (HTTP 400, internal_host check, seen on 2026.8.5). Returns the number
+    of providers changed. Idempotent: the next run finds nothing to do."""
+    import urllib.request as _req
+    import urllib.error
+    _log = plog or (lambda m: None)
+    changed = 0
+    try:
+        r = _req.Request(f'{ak_url}/api/v3/providers/proxy/?page_size=200', headers=ak_headers)
+        providers = json.loads(_req.urlopen(r, timeout=15).read().decode()).get('results', []) or []
+    except Exception as e:
+        _log(f"  ⚠ proxy session length: could not list providers ({str(e)[:80]})")
+        return 0
+    for prov in providers:
+        name = (prov.get('name') or '').strip()
+        pk = prov.get('pk')
+        if not pk or not _is_infratak_proxy_provider_name(name):
+            continue
+        cur = (prov.get('access_token_validity') or '').strip()
+        if cur != _AUTHENTIK_DEFAULT_ACCESS_TOKEN_VALIDITY:
+            continue
+        body = {'mode': prov.get('mode') or 'forward_single',
+                'internal_host': prov.get('internal_host') or '',
+                'access_token_validity': _PROXY_SESSION_VALIDITY}
+        try:
+            _req.urlopen(_req.Request(f'{ak_url}/api/v3/providers/proxy/{pk}/',
+                                      data=json.dumps(body).encode(), headers=ak_headers,
+                                      method='PATCH'), timeout=15)
+            changed += 1
+            _log(f"  ✓ {name}: sign-in length {cur} → {_PROXY_SESSION_VALIDITY}")
+        except urllib.error.HTTPError as he:
+            _log(f"  ⚠ {name}: sign-in length PATCH failed HTTP {he.code} (will retry next start)")
+        except Exception as e:
+            _log(f"  ⚠ {name}: sign-in length PATCH failed ({str(e)[:80]}) (will retry next start)")
+    return changed
+
+
+def _ensure_authentik_proxy_session_length(plog):
+    """ops #1159: settings and token lookup for _ensure_proxy_providers_session_length.
+    Safe to call on every console start and after every update; never raises."""
+    try:
+        if not os.path.exists(os.path.expanduser('~/authentik/.env')):
+            return 0
+        _s = load_settings()
+        _tok = (_get_authentik_env_value(_s, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+                _get_authentik_env_value(_s, 'AUTHENTIK_TOKEN'))
+        _url = _get_authentik_api_url(_s)
+        if not _tok or not _url:
+            return 0
+        return _ensure_proxy_providers_session_length(
+            _url, {'Authorization': f'Bearer {_tok}', 'Content-Type': 'application/json'}, plog)
+    except Exception as e:
+        plog(f"  ⚠ proxy session length: skipped ({str(e)[:80]})")
+        return 0
+
+
 def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
     """Set cookie_domain on all proxy providers so session is shared across subdomains (avoids stream. redirect loop)."""
     if not fqdn:
@@ -66958,7 +67051,7 @@ def _sync_authentik_takportal_provider_url(settings, plog=None):
             if flow_pk and inv_flow_pk:
                 try:
                     body = json.dumps({'name': 'TAK Portal Proxy', 'authorization_flow': flow_pk, 'invalidation_flow': inv_flow_pk,
-                        'external_host': desired_host, 'mode': 'forward_single', 'token_validity': 'hours=24', 'cookie_domain': desired_cookie})
+                        'external_host': desired_host, 'mode': 'forward_single', 'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': desired_cookie})
                     pr = _req.Request(f'{ak_url}/api/v3/providers/proxy/', data=body.encode(), headers=ak_headers, method='POST')
                     provider_pk = json.loads(_req.urlopen(pr, timeout=10).read().decode()).get('pk')
                 except urllib.error.HTTPError as e:
@@ -80638,7 +80731,7 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                     'invalidation_flow': inv_flow_pk,
                     'external_host': desired_host,
                     'mode': 'forward_single',
-                    'token_validity': 'hours=24',
+                    'access_token_validity': _PROXY_SESSION_VALIDITY,
                     'cookie_domain': desired_cookie,
                 }
                 try:
@@ -80704,7 +80797,8 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                         'invalidation_flow': inv_flow_pk,
                         'external_host': desired_host,
                         'mode': 'forward_single',
-                        'token_validity': 'hours=24',
+                        'access_token_validity': _proxy_session_validity_to_write(
+                            existing.get('access_token_validity')),
                         'cookie_domain': desired_cookie,
                         # Preserve operator-meaningful fields from the existing
                         # record (Authentik only validates internal_host when
@@ -81050,7 +81144,8 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
                     'invalidation_flow': _full.get('invalidation_flow'),
                     'external_host': _want_clean,
                     'mode': _full.get('mode') or 'forward_single',
-                    'token_validity': _full.get('token_validity') or 'hours=24',
+                    'access_token_validity': _proxy_session_validity_to_write(
+                        _full.get('access_token_validity')),
                     'cookie_domain': _cookie_domain,
                     'internal_host': _full.get('internal_host') or '',
                     'internal_host_ssl_validation': _full.get(
@@ -85679,7 +85774,7 @@ entries:
                                 'invalidation_flow': inv_flow_pk or flow_pk,
                                 'external_host': f"https://{_pub_hostport(_get_service_domain(settings, 'takportal'))}",
                                 'mode': 'forward_single',
-                                'token_validity': 'hours=24',
+                                'access_token_validity': _PROXY_SESSION_VALIDITY,
                                 'cookie_domain': f'.{base_domain}'
                             }
                             req = urllib.request.Request(f'{ak_url}/api/v3/providers/proxy/',
@@ -121793,6 +121888,11 @@ def _startup_migrations():
         except Exception as ak_ph_err:
             print(f"Startup migration: proxy external_hosts canonical check error (non-fatal): {ak_ph_err}")
 
+        # ops #1159: the sign-in length infra-TAK always asked for (24 hours) never
+        # reached Authentik, so existing providers sit on its one-hour default.
+        _ensure_authentik_proxy_session_length(
+            lambda m: print(f"Startup migration: {m}", flush=True))
+
         # v0.9.31: Fleet-uniform self-heal for the FULL Authentik forward_auth chain
         # (proxy provider + application + embedded-outpost membership) for every
         # deployed service. Supersedes the per-service band-aid era — closes the
@@ -122733,6 +122833,9 @@ def _post_update_auto_deploy():
                                         )
                                     except Exception as _chain_e:
                                         print(f"Post-update: proxy chain heal skipped: {_chain_e}")
+                                    # ops #1159: sign-in length (see startup migration)
+                                    _ensure_authentik_proxy_session_length(
+                                        lambda m: print(f"Post-update: {m}", flush=True))
                         except Exception as _akph_e:
                             print(f"Post-update: proxy external_hosts canonicalization skipped: {_akph_e}")
                         # v0.9.12: self-heal LDAP service account password drift.

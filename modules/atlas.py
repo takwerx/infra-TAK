@@ -4531,7 +4531,7 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                 data=json.dumps({'name': _names['provider'], 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': _atlas_host, 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                    'access_token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
