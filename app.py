@@ -79610,7 +79610,13 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 # ops #1117: a `restart` saved by an older console for nothing but the
                 # outpost-recreate request (a fresh install, hours before its first update)
                 # was a young-TAK restart: treat it like `restart_if_young`.
-                _young_only = all(str(p_).startswith(_TAK_RECYCLE_YOUNG_REASON) for p_ in pending)
+                # Reasons that never ask for a restart themselves: that request, and the two the
+                # outage check adds below (an outpost / Guard Dog start after TAK's). A deferred
+                # call that kept them next to it must not make the saved flag a hard one (10.4.6 T&E).
+                _young_only = all(str(p_).startswith((
+                    _TAK_RECYCLE_YOUNG_REASON,
+                    'LDAP outpost restarted while TAK Server was running',
+                    'Guard Dog restarted Authentik while TAK Server was running')) for p_ in pending)
                 must_restart = (bool(st.get('restart')) and not _young_only) or (
                     bool(st.get('restart') or st.get('restart_if_young'))
                     and time.time() - tak_start < _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S)
