@@ -140,12 +140,14 @@ def release_problems(version, tag, notes_version, current_release):
     problems = []
     if notes_version not in allowed:
         problems.append(
-            f'newest changelog section is v{notes_version}; expected '
-            + (f'v{version}' if v == t else f'v{tag} or v{version}'))
+            f'newest section at the top of CHANGELOG.md is v{notes_version}; expected '
+            + (f'v{version}' if v == t else f'v{tag} or v{version}')
+            + ' (add the release entry at the top of CHANGELOG.md, not in README.md)')
     if current_release not in allowed:
         problems.append(
             f'README "Current release" is v{current_release}; expected '
-            + (f'v{version}' if v == t else f'v{tag} or v{version}'))
+            + (f'v{version}' if v == t else f'v{tag} or v{version}')
+            + ' (bump only that one line in README.md)')
     return problems
 
 
@@ -292,3 +294,62 @@ def test_newest_notes_are_written_for_users():
         f'v{version} notes must open with a "**Headline: ...**" paragraph a customer can read')
     assert not re.search(r'\b[0-9a-f]{40}\b', body), f'v{version} notes contain a full commit hash'
     assert 'claude/issue-' not in body, f'v{version} notes mention an internal branch name'
+
+
+# ---- no instruction tells a release to put its entry in README.md (ops #1164, GitHub #683) ----------
+#
+# Release notes moved to CHANGELOG.md. CLAUDE.md and the /ship skill used to say "bump Current release
+# and add a `## Changelog` entry" in the README; a release made that way puts a release heading back into
+# README.md and the test above goes red mid-release. CLAUDE.md and .claude/ are not tracked (they are in
+# .gitignore), so CI cannot read them; a local run on a clone that has them does.
+
+_STALE_README_ENTRY_RE = re.compile(r'\badd\b[^\n]{0,40}`?(?:##\s*)?Changelog`?\s+entry', re.I)
+
+INSTRUCTION_FILES = (
+    ['README.md', 'CONTRIBUTING.md', 'CLAUDE.md']
+    + [str(p.relative_to(REPO)) for p in sorted((REPO / 'docs').glob('*.md'))]
+    + [str(p.relative_to(REPO)) for p in sorted((REPO / '.claude').glob('**/*.md'))]
+)
+
+
+def stale_readme_entry_lines(text):
+    """Lines that tell a release to add its changelog entry to README.md (and do not name CHANGELOG.md)."""
+    return [
+        line.strip() for line in text.splitlines()
+        if 'README' in line and 'CHANGELOG.md' not in line and _STALE_README_ENTRY_RE.search(line)
+    ]
+
+
+def test_detector_flags_the_old_release_step_wording():
+    # the two lines as they read before this change: CLAUDE.md ("Release procedure" step 1) and the ship skill
+    claude_md = ('1. **README on dev** — bump `**Current release:**` and add a `## Changelog` entry '
+                 '(product-focused headline, dated).')
+    ship_skill = ('1. **README on dev** — bump `**Current release:**`, add a `## Changelog` entry '
+                  '(product-focused headline, dated).')
+    assert stale_readme_entry_lines(claude_md) == [claude_md]
+    assert stale_readme_entry_lines(ship_skill) == [ship_skill]
+
+
+def test_detector_accepts_the_new_wording():
+    new = ('1. **CHANGELOG.md and README on dev** — add the `## vX.Y.Z-alpha — date — title` entry at the top of '
+           'CHANGELOG.md and bump only `**Current release:**` in the README.')
+    assert stale_readme_entry_lines(new) == []
+    assert stale_readme_entry_lines('Every release, newest first, is in **[CHANGELOG.md](CHANGELOG.md)**.') == []
+
+
+@pytest.mark.parametrize('name', INSTRUCTION_FILES)
+def test_no_file_tells_a_release_to_add_its_entry_to_readme(name):
+    path = REPO / name
+    if not path.is_file():
+        pytest.skip(f'{name} is not in this checkout (CLAUDE.md and .claude/ are gitignored)')
+    stale = stale_readme_entry_lines(path.read_text(encoding='utf-8', errors='replace'))
+    assert not stale, (
+        f'{name} still says to add the release entry to README.md; release notes go at the top of '
+        f'CHANGELOG.md and only "Current release" is bumped in the README: {stale}')
+
+
+def test_failure_messages_name_the_changelog_and_the_one_readme_line():
+    problems = release_problems('10.4.7-alpha', '10.4.7-alpha', '10.4.6-alpha', '10.4.6-alpha')
+    assert len(problems) == 2
+    assert 'CHANGELOG.md' in problems[0] and 'not in README.md' in problems[0]
+    assert 'only that one line' in problems[1]
