@@ -65,7 +65,11 @@ CONSTS = ('CLOUDTAK_CUSTOM_COMPOSE', '_CLOUDTAK_PRINT_PLUGIN_COMPOSE', 'CLOUDTAK
           'CLOUDTAK_PRINT_SERVICE', 'CLOUDTAK_PRINT_PORT', '_CLOUDTAK_PRINT_OVERLAY_YML',
           '_CT_ENV_LINE_RE', '_CLOUDTAK_COMPOSE_VAR_RE')
 FUNCS = ('_cloudtak_env_read', '_cloudtak_compose_interpolate', '_cloudtak_print_problem',
-         '_cloudtak_print_containers', '_cloudtak_print_set_up', '_cloudtak_print_drift', '_cloudtak_print_converge')
+         '_cloudtak_print_containers', '_cloudtak_print_set_up', '_cloudtak_print_drift',
+         '_cloudtak_print_converge')
+# ops #1161's helper. Left out of the load when absent so that on the base code the new tests fail
+# on what converge does (it starts a Print that was never built), not on a missing name.
+FUNCS += tuple(f for f in ('_cloudtak_print_image_missing',) if f in _NODES)
 
 # CloudTAK v13.113.0's docker-compose.yml, trimmed to what matters here.
 BASE = ('services:\n  api:\n    image: cloudtak-api\n  tiles:\n    image: cloudtak-tiles\n'
@@ -119,7 +123,7 @@ class Stack:
     """~/CloudTAK on disk, docker faked: `rows` is the running cloudtak-print containers as
     (name, [config files]); None means CloudTAK isn't running."""
 
-    def __init__(self, tmp_path, plugin=PLUGIN_OK, rows=(), compose_rc=0, custom=True):
+    def __init__(self, tmp_path, plugin=PLUGIN_OK, rows=(), compose_rc=0, custom=True, image=True):
         self.ct = tmp_path / 'CloudTAK'
         self.ct.mkdir()
         (self.ct / 'docker-compose.yml').write_text(BASE)
@@ -129,6 +133,7 @@ class Stack:
             (self.ct / PLUGIN).write_text(plugin)
         self.rows = None if rows is None else list(rows)
         self.compose_rc = compose_rc
+        self.image = image          # True: built; False: never built; None: docker can't tell
         self.compose, self.caddy, self.logs = [], [], []
 
     def docker_out(self, args, timeout=20, stdin=None):
@@ -138,10 +143,16 @@ class Stack:
             assert 'label=com.docker.compose.service=cloudtak-print' in args
             return ''.join(f'{n}|{",".join(f)}|cloudtak-print|{(r[2:] or [""])[0]}\n'
                            for r in self.rows or [] for n, f in [r[:2]])
+        if args[0] == 'images':             # `docker images -q NAME`: '' when there is none
+            return None if self.image is None else ('sha256:abc123\n' if self.image else '')
         raise AssertionError(args)
 
     def compose_run(self, ct_dir, args, timeout=600):
         self.compose.append(list(args))
+        built_here = 'build:' in ((self.ct / PLUGIN).read_text() if (self.ct / PLUGIN).exists() else '')
+        if self.image is False and built_here and not self.rows and '--no-build' in args:
+            # what the console journal showed (ops #1161): nothing to start from, no image to run
+            return 1, 'Error response from daemon: No such image: cloudtak-cloudtak-print:latest'
         if self.compose_rc == 0:
             files = [args[i + 1] for i, a in enumerate(args) if a == '-f']
             self.rows = [('cloudtak-print', [f'{self.ct}/{f}' for f in files])]
@@ -361,6 +372,54 @@ def test_print_that_is_not_running_is_started_while_cloudtak_is_up(tmp_path):
     st = Stack(tmp_path, rows=[])
     assert st.converge() == 'ok'
     assert len(st.compose) == 1
+
+
+# ops #1161: a failed Marketplace install leaves docker-compose.plugin-print.yml but never built
+# the image, so `up --no-build` failed at every console restart ("No such image:
+# cloudtak-cloudtak-print:latest") and autorepair reported a repair failure each time.
+def test_print_that_was_never_built_is_not_started_and_not_a_failure(tmp_path):
+    st = Stack(tmp_path, rows=[], image=False)
+    assert st.converge() == 'unusable'                    # never 'failed': that is what autorepair alarms on
+    assert st.compose == []
+    assert any('never built' in l for l in st.logs), st.logs
+    assert not any('Could not start' in l for l in st.logs)
+
+
+def test_built_print_that_is_not_running_is_still_started(tmp_path):
+    st = Stack(tmp_path, rows=[], image=True)
+    assert st.converge() == 'ok'
+    assert len(st.compose) == 1
+
+
+def test_docker_that_cannot_tell_about_the_image_still_tries_the_start(tmp_path):
+    st = Stack(tmp_path, rows=[], image=None)
+    assert st.converge() == 'ok'
+    assert len(st.compose) == 1
+
+
+def test_print_from_a_pulled_image_is_started_without_an_image_check(tmp_path):
+    pulled = PLUGIN_OK.replace("      build:\n        context: ./cloudtak-marketplace-plugins/print/service\n"
+                               "        dockerfile: Dockerfile\n", "      image: example/print:1\n")
+    assert 'build:' not in pulled
+    st = Stack(tmp_path, plugin=pulled, rows=[], image=False)
+    assert st.converge() == 'ok'
+    assert len(st.compose) == 1
+
+
+def test_image_named_in_the_file_is_the_one_checked(tmp_path):
+    named = PLUGIN_OK.replace("      restart:", "      image: cloudtak-print:local\n      restart:")
+    seen = []
+    st = Stack(tmp_path, plugin=named, rows=[], image=False)
+    real = st.docker_out
+    st.docker_out = lambda args, timeout=20, stdin=None: (seen.append(args), real(args))[1]
+    assert st.converge() == 'unusable'
+    assert ['images', '-q', 'cloudtak-print:local'] in seen
+
+
+def test_running_print_never_costs_an_image_check(tmp_path):
+    st = Stack(tmp_path, image=False)
+    st.takportal_started()
+    assert st.converge() == 'ok'                          # a container is there, so its image is
 
 
 def test_nothing_is_started_while_cloudtak_is_down(tmp_path):

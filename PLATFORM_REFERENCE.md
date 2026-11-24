@@ -77,6 +77,7 @@ Official: [docs.goauthentik.io](https://docs.goauthentik.io/), [LDAP provider](h
 - After restarting `authentik-worker`, blueprints have to re-apply before LDAP queries work.
 - **Authentik does not limit the characters in a username or a group name.** Its API (`POST /api/v3/core/users/`, `POST /api/v3/core/groups/`) stored names with spaces, quotes, `<`, `>` and `&` exactly as sent. Treat every name that comes from Authentik as free text: escape it for the place it goes (a page, a shell command, an LDAP filter). ✅ verified 2026-11-17, test6, Authentik 2026.8.5 (ops #827).
 - **For a person's exact groups, ask the API. Do not split the proxy header.** The proxy outpost gives the app behind it the groups as one header, `X-authentik-groups`, with the names joined by `|` (📖 [proxy provider](https://docs.goauthentik.io/add-secure-apps/providers/proxy/)). A group name is free text and can hold `|`, `;` or `,` (the groups API stored all three, HTTP 201), so a split of the header does not give back the names that went in. The exact list is `groups_obj` from `GET /api/v3/core/users/?username=NAME&include_groups=true`: one entry per group. Compare the returned `username` too, because Authentik ignores a filter it does not know and then returns every user. The header and `groups_obj` come from the same list, the person's own groups (📖 source at `version/2026.8.5`: `blueprints/system/providers-oauth2.yaml` profile scope, `authentik/core/api/users.py`). ✅ verified 2026-11-22, fresh-install box (Ubuntu 22.04), Authentik 2026.8.5: roles taken from the API list matched the header for normal names (ops #1082).
+- **Authentik does not require a user's email to be unique.** Two users created through the API with the same address both got HTTP 201. So several infra-TAK admin accounts can share one operator address. ✅ verified 2026-11-23, fresh-install box (Ubuntu 22.04), Authentik 2026.8.x (ops #1169). **TAK Portal mails the `email` of every member of its required group (`authentik Admins`) when a user asks for access** (📖 read in TAK Portal's `userRequests.service.js` by the reporter of infra-TAK #687; mail delivery itself not re-run here). An address on the TAK domain has no MX, so those mails bounce; new infra-TAK admin accounts take the first Guard Dog alert address (`_ak_admin_account_email`).
 - Two things at once on one box can starve it. A first-time Authentik deploy next to a TAK Server, Node-RED and MediaMTX deploy has produced `127.0.0.1:9090: connection refused` (502) from Caddy. Space deploys out. 👁 observed.
 
 ## TAK Portal
@@ -269,6 +270,19 @@ Official: [sharp, installation](https://sharp.pixelplumbing.com/install) (the im
   - The usual cause is a VM set to a generic or "basic" CPU type (TrueNAS, KVM and Proxmox defaults), which hides the features the real CPU has. The fix is in the hypervisor: set the VM's CPU mode to host passthrough (or host model). No reinstall; the reporter confirmed it fixed both. 👁 observed 2026-10-31.
   - The flags the v2 level adds that we check: `popcnt`, `sse4_1`, `sse4_2` (in `/proc/cpuinfo`). ARM boxes are not affected.
   - Official docs and what we saw differ on detail: the sharp install page lists only "CPU with SSE4.2" for Linux x64 and does not mention x86-64-v2 or POPCNT, while the error text above names v2. We check the whole v2 set to be safe. The error text was seen; whether sharp enforces every v2 flag was not tested.
+
+## GitHub release pages (the "What's new" link)
+
+Official: [GitHub, linking to a release](https://docs.github.com/repositories/releasing-projects-on-github/linking-to-releases)
+
+- A release page is `https://github.com/OWNER/REPO/releases/tag/TAG`, and `.../releases/latest` redirects to the newest published release. Each upstream names its tags differently, so the console builds the TAG itself and never takes a URL from a module. ✅ verified 2026-11-21 (`git ls-remote --tags`; the Authentik link also opened on a test box console):
+  - Authentik: `version/2026.8.6` (the slash goes in the URL as `%2F`).
+  - CloudTAK `v13.117.2`, NetBird `v0.82.1`, NetBird dashboard `v2.96.1`, WebODM `v4.0.1`, MediaMTX `v1.21.4`: a `v` in front of the version.
+  - TAK Portal: no `v` (`2.0.29`), so the console links `releases/latest`.
+- Caddy and fail2ban update from OS packages, and TAK Server and Federation Hub from tak.gov, so there is no public release page for the version they will install. No link is shown for them.
+- The dashboard module card is itself a link (`<a class="module-card">`). A link inside it makes the browser close the card's link early and push the inner link out of the card. ✅ verified 2026-11-21, Chrome, a test12 console page. The card's "What's new" is a span that opens the page from a click handler.
+
+---
 
 ## Adding to this file
 
