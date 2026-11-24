@@ -96,6 +96,7 @@ import modules as mod_registry
 from modules import atlas_access as _atlas_access
 from modules import etlrunner as _etl
 from modules import takportal_verified as _tpv
+from modules import takserver_tested as _tst
 
 # v10.2.23 (ops #109): a client that reset TCP before its TLS handshake killed the
 # whole gunicorn worker (gthread wraps TLS on its event loop with nothing catching),
@@ -1883,7 +1884,8 @@ NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.96.0"
 # Authentik's redis service (legacy: Authentik itself stopped needing Redis in 2025.10, but the compose
 # keeps the service). ops #637: the tag used to be the bare `alpine` one, which jumps majors
 # whenever Docker Hub moves it. Pinned to the same tested release WebODM's broker runs (WEBODM_IMAGES).
-AUTHENTIK_REDIS_IMAGE = 'docker.io/library/redis:8.10.2-alpine'
+# ops #1089: 8.10.2 -> 8.10.3 (Oct 26): a cluster-bus fix; we run no cluster. Rollback: re-pin both to 8.10.2.
+AUTHENTIK_REDIS_IMAGE = 'docker.io/library/redis:8.10.3-alpine'
 # ops #819: 0.82.0 -> 0.82.1 (Nov 10): the account id is enforced on a proxy update (an account-scope
 # check). No config or store change. Rollback: re-pin the dev server image to 0.82.0.
 NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.82.1"  # UNDER TRIAL (ops #427, #819)
@@ -13051,6 +13053,10 @@ def takserver_page():
     if tak.get('installed') and tak.get('running') and not deploy_status.get('running', False):
         deploy_status.update({'complete': False, 'error': False})
     tak_version = _get_takserver_version_info().get('version', '') if tak.get('installed') else ''
+    try:
+        _tak_tested = _takserver_tested_page_state(tak_version) if tak_version else None
+    except Exception:
+        _tak_tested = None
     _tak_jvm = _running_tak_jvm_version() if tak.get('installed') else ''
     _settings = load_settings()
     _tak_cfg = _get_tak_deployment_config(_settings)
@@ -13075,7 +13081,7 @@ def takserver_page():
     return render_template('takserver.html',
         tak58=_tak58, tak_db_refresh=_tak_dbr_page(tak.get('installed')),
         settings=_settings, modules=modules, tak=tak, tak_version=tak_version,
-        tak_jvm=_tak_jvm,
+        tak_tested=_tak_tested, tak_jvm=_tak_jvm,
         tak_installed=tak.get('installed', False),
         show_connect_ldap=show_connect_ldap, ldap_connected=ldap_connected,
         authentik_base_url=_get_authentik_base_url(_settings),
@@ -19587,6 +19593,97 @@ def _takportal_expected_commit(tag):
     return ''
 
 
+# --- Latest tested TAK Server (ops #1119) ---------------------------------------------------
+# tak.gov needs a login, so a box cannot ask which TAK Server is newest. We publish the newest
+# version that passed our fresh install AND our update test in a small signed file (modules/
+# takserver_tested.py has the rules). The TAK Server page shows it next to the installed version,
+# and Guard Dog mails it once per version to boxes that run an older one. It never decides what a
+# box installs: the package still comes from the operator's own tak.gov download.
+_TAKSERVER_TESTED_CACHE = os.path.join(CONFIG_DIR, 'takserver-tested')
+_TAKSERVER_TESTED_LOCK = threading.Lock()
+_takserver_tested_attempt = {'ts': 0.0}
+
+
+def _takserver_tested_refresh(fresh=False):
+    """Fetch the signed tested-version file at the current commit of the catalog repo's main branch
+    and cache it when it verifies. Never raises. Same rules as _takportal_verified_refresh: `ts` is
+    the last ATTEMPT, both files come from one commit sha, and the signature decides."""
+    now = time.time()
+    if not fresh and _takserver_tested_attempt['ts'] and \
+            now - _takserver_tested_attempt['ts'] < _tst.TESTED_CHECK_SEC:
+        return False
+    if not _TAKSERVER_TESTED_LOCK.acquire(blocking=False):
+        return False
+    try:
+        _takserver_tested_attempt['ts'] = now
+        try:
+            _ref = f'refs/heads/{_tst.TESTED_BRANCH}'
+            sha = str((_git_ls_remote(_ref, repo=_tst.TESTED_REPO) or {}).get(_ref) or '')
+            if not _tst.COMMIT_RE.fullmatch(sha):
+                raise ValueError('GitHub returned no commit for the tested-version file')
+            base = f'https://raw.githubusercontent.com/{_tst.TESTED_REPO}/{sha}/{_tst.TESTED_FILE}'
+            raw = _takportal_verified_http(base, _tst.TESTED_MAX_BYTES)
+            sig = _takportal_verified_http(base + '.sig', 4096)
+            have = _tst.cached(_TAKSERVER_TESTED_CACHE)
+            try:
+                seen = int((load_settings() or {}).get('takserver_tested_serial') or 0)
+            except Exception:
+                seen = 0
+            d, why = _tst.accept_fetched(raw, sig, max(_tst.serial_of(have), seen))
+            if d is None:
+                print(f"[takserver-tested] {sha[:12]} refused: {why}", flush=True)
+                return False
+            if have is not None and _tst.serial_of(d) == _tst.serial_of(have):
+                return False
+            # sig first: a cached file with no matching sig is never trusted
+            _etlcat_cache_write(_tst.TESTED_FILE + '.sig', sig, cache_dir=_TAKSERVER_TESTED_CACHE)
+            _etlcat_cache_write(_tst.TESTED_FILE, raw, cache_dir=_TAKSERVER_TESTED_CACHE)
+            s = load_settings()
+            s['takserver_tested_serial'] = max(seen, _tst.serial_of(d))
+            save_settings(s)
+            print(f"[takserver-tested] now {d.get('version')} (serial {_tst.serial_of(d)})", flush=True)
+            return True
+        except Exception as e:
+            print(f"[takserver-tested] check failed (non-fatal): {str(e)[:160]}", flush=True)
+            return False
+    finally:
+        _TAKSERVER_TESTED_LOCK.release()
+
+
+def _takserver_tested_record(fresh=False):
+    """The verified tested-version record, or None (no signed file yet, or offline). Never raises."""
+    try:
+        _takserver_tested_refresh(fresh=fresh)
+        return _tst.cached(_TAKSERVER_TESTED_CACHE)
+    except Exception:
+        return None
+
+
+def _takserver_tested_page_state(installed_version):
+    """What the TAK Server page shows: {tested, tested_date, state} (see takserver_tested.page_state)."""
+    return _tst.page_state(installed_version, _takserver_tested_record())
+
+
+def _takserver_tested_items(unknown):
+    """Guard Dog pending items (0 or 1): this box runs an older TAK Server than the one we tested.
+    A box with no TAK Server, or one whose version cannot be read, gets none; an unreadable source
+    goes in `unknown` so its dedup state is carried instead of dropped."""
+    try:
+        if not detect_modules().get('takserver', {}).get('installed'):
+            return []
+        installed = (_get_takserver_version_info() or {}).get('version') or ''
+        if not installed:
+            unknown.add('takserver-tested')
+            return []
+        item = _tst.pending_item(installed, _takserver_tested_record(),
+                                 'TAK Server page → Update TAK Server.')
+        return [item] if item else []
+    except Exception as e:
+        unknown.add('takserver-tested')
+        print(f"[update-notify] TAK Server tested-version check failed: {e}", flush=True)
+        return []
+
+
 def _takportal_latest_tag(plog=None):
     """The TAK Portal release tag a deploy installs: the verified one, else the pinned floor.
     Never raises. (Name kept from when this read GitHub `releases/latest`; it no longer does.)
@@ -20967,6 +21064,21 @@ def _alert_email_rejects(value):
             if t and not _safe_alert_email(t)]
 
 
+def _emailrelay_sync_root_alias(settings=None):
+    """GH #667: point the host's mail for root at Guard Dog's alert address (else the relay
+    From address). Best effort: a failure here never fails the caller's save or update."""
+    try:
+        settings = settings if settings is not None else load_settings()
+        if not settings.get('email_relay'):
+            return None
+        if subprocess.run(['which', 'postfix'], capture_output=True, timeout=10).returncode != 0:
+            return None
+        return mod_registry.emailrelay.sync_root_alias(_MODULE_CTX, settings)
+    except Exception as e:
+        print(f"[emailrelay] root alias sync skipped: {e}", flush=True)
+        return None
+
+
 @app.route('/api/guarddog/deploy', methods=['POST'])
 @login_required
 def guarddog_deploy_api():
@@ -20986,6 +21098,7 @@ def guarddog_deploy_api():
     nickname = (data.get('server_nickname') or '').strip()
     settings['guarddog_server_nickname'] = nickname
     save_settings(settings)
+    _emailrelay_sync_root_alias(settings)
     guarddog_deploy_log.clear()
     guarddog_deploy_status.update({'running': True, 'complete': False, 'error': False})
     threading.Thread(target=run_guarddog_deploy, args=(alert_email,), daemon=True).start()
@@ -31762,6 +31875,12 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
     except Exception as e:
         print(f"[update-notify] WebODM check failed: {e}", flush=True)
     try:
+        # ops #1119: a TAK Server version we tested and this box does not run yet
+        pending.extend(_takserver_tested_items(unknown))
+    except Exception as e:
+        unknown.add('takserver-tested')
+        print(f"[update-notify] TAK Server tested-version check failed: {e}", flush=True)
+    try:
         # ops #608: the other modules with a console Update button.
         pending.extend(_module_update_items(unknown))
     except Exception as e:
@@ -31961,6 +32080,8 @@ def _update_notify_check_once(fast=False):
                     + (' (reminder)' if reminder else ''))
         elif sec_items:
             subj = f"🔒 Security update pending on {server_id} — update this machine"
+        elif all(p.get('tested_new') for p in new_items):
+            subj = f"✅ TAK Server {new_items[0]['target']} tested: ready to update on {server_id}"
         elif all(p.get('etl_new') for p in new_items):
             subj = (f"🆕 New ETL available on {server_id}" if len(new_items) == 1
                     else f"🆕 {len(new_items)} new ETLs available on {server_id}")
@@ -32258,6 +32379,7 @@ def guarddog_test_email():
     if data.get('save'):
         settings['guarddog_alert_email'] = to_addr
         save_settings(settings)
+        _emailrelay_sync_root_alias(settings)
     try:
         _guarddog_send_alert_email_via_relay(
             to_addr, 'Guard Dog Test Alert',
@@ -32295,6 +32417,7 @@ def guarddog_notifications_save():
     settings['guarddog_alert_email'] = email
     settings['guarddog_server_nickname'] = nickname
     save_settings(settings)
+    _emailrelay_sync_root_alias(settings)
     if os.path.exists('/opt/tak-guarddog'):
         try:
             ident = _guarddog_server_identifier(settings)
@@ -33907,18 +34030,16 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         if cert_pass and cert_pass != 'atakatak':
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
-        # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
-        if is_remote:
-            ok_sudo, sudo_out = _module_run(cfg, 'sudo -n true 2>&1', timeout=10)
-            if not ok_sudo or 'password' in (sudo_out or '').lower():
-                plog('✗ Certificate generation failed — SSH user requires a sudo password')
-                plog('  Fix on the Federation Hub host:')
-                plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
-                plog('  Or SSH as root. Then retry.')
-                status_dict.update({'running': False, 'complete': True, 'error': True})
-                return
-
+        # gh #666: no `sudo -n true` probe here. It asks "may this account run /usr/bin/true as
+        # root?", which is not the question, and it answered no for accounts whose sudoers list the
+        # real commands. The first privileged step below is the check: if sudo refuses it, stop
+        # before any certificate file is touched.
         ok_meta, meta_out = _module_run(cfg, meta_cmds, timeout=30)
+        if not ok_meta and _fedhub_sudo_refused(meta_out):
+            for _ln in _fedhub_sudo_refusal_lines('Certificate generation', 'patching cert-metadata.sh'):
+                plog(_ln)
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
         if not ok_meta:
             plog(f'⚠ cert-metadata.sh patch warning: {meta_out}')
         else:
@@ -34278,6 +34399,34 @@ def fedhub_update_log_api():
     })
 
 
+# gh #666 — what sudo prints when it refuses a command for want of a password. The Federation Hub
+# steps run over SSH with no terminal, so a refused `sudo` ends with one of these lines.
+_FEDHUB_SUDO_REFUSED_RE = re.compile(
+    r'a password is required|a terminal is required to read the password|no tty present and no askpass'
+    r'|no askpass program|is not in the sudoers file|may not run sudo', re.I)
+
+
+def _fedhub_sudo_refused(out):
+    """True when `out` is sudo refusing for want of a password (not any other failure)."""
+    return bool(out and _FEDHUB_SUDO_REFUSED_RE.search(out))
+
+
+def _fedhub_sudo_refusal_lines(action, step):
+    """Log lines for a refused sudo on the Federation Hub host. The old text told the admin to
+    grant `NOPASSWD: ALL`, which a CJIS deployment cannot do. These steps run apt-get, find, rm,
+    mv, sed, chmod, systemctl and the certificate scripts (as user tak), so no short command list
+    covers them: say that plainly instead of printing a list that would be wrong."""
+    return [
+        f'✗ {action} stopped: sudo on the Federation Hub host asked for a password while {step}.',
+        '  No certificate file was changed.',
+        '  Federation Hub setup runs many commands as root (apt-get, find, rm, mv, sed, chmod, systemctl)',
+        '  and the certificate scripts as user tak, over SSH with no terminal for a password prompt.',
+        '  The SSH user needs those commands allowed without a password, or use root for the SSH login.',
+        '  Allowing them is close to full root. If your policy cannot allow that, SSH as root for this task only.',
+        '  Then retry.',
+    ]
+
+
 def _fedhub_ca_lockdown(cfg, fh_dir, plog=None):
     """ops #839 — the CA signing keystores and CA keys of a Federation Hub (on this box or a
     remote host) are for the Federation Hub account only.
@@ -34436,18 +34585,15 @@ def run_fedhub_remote_rotate_ca(new_root_ca=None, new_int_ca=None):
         if cert_pass and cert_pass != 'atakatak':
             meta_cmds += f" && sudo sed -i 's/^CAPASS=.*/CAPASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
             meta_cmds += f" && sudo sed -i 's/^PASS=.*/PASS={shlex.quote(cert_pass)}/' cert-metadata.sh"
-        # Pre-flight: passwordless sudo required — SSH sessions have no TTY for password prompts
-        if is_remote:
-            ok_sudo, sudo_out = _module_run(cfg, 'sudo -n true 2>&1', timeout=10)
-            if not ok_sudo or 'password' in (sudo_out or '').lower():
-                plog('✗ Certificate rotation failed — SSH user requires a sudo password')
-                plog('  Fix on the Federation Hub host:')
-                plog('    echo "$(whoami) ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/infra-tak-nopasswd')
-                plog('  Or SSH as root. Then retry.')
-                fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
-                return
-
+        # gh #666: no `sudo -n true` probe (see the deploy path). The first privileged step is the
+        # check; the old certificate files are only moved aside after it, so a refusal here leaves
+        # them exactly as they were.
         ok_meta, meta_out = _module_run(cfg, meta_cmds, timeout=30)
+        if not ok_meta and _fedhub_sudo_refused(meta_out):
+            for _ln in _fedhub_sudo_refusal_lines('Certificate rotation', 'patching cert-metadata.sh'):
+                plog(_ln)
+            fedhub_rotate_status.update({'running': False, 'complete': True, 'error': True})
+            return
         if not ok_meta:
             plog(f'⚠ cert-metadata patch warning: {(meta_out or "")[:240]}')
         else:
@@ -45655,31 +45801,36 @@ def _get_nodered_version_info():
 
 _cloudtak_release_cache = {'tag': None, 'ts': 0}
 
-def _cloudtak_newest_allowed_tag(tags):
+def _cloudtak_newest_allowed_tag(tags, max_major=None):
     """Newest plain-version CloudTAK tag ('v13.128.0') whose major is at or under
-    CLOUDTAK_MAX_MAJOR, or None. Pre-releases ('v14.0.0-rc.1') and other names never match
-    (ops #1074)."""
+    CLOUDTAK_MAX_MAJOR (or the lower `max_major` when given), or None. Pre-releases
+    ('v14.0.0-rc.1') and other names never match (ops #1074)."""
+    _cap = CLOUDTAK_MAX_MAJOR if max_major is None else min(max_major, CLOUDTAK_MAX_MAJOR)
     best = None
     for t in tags or []:
         m = re.fullmatch(r'v?(\d+)\.(\d+)\.(\d+)', (t or '').strip())
         if not m:
             continue
         key = tuple(int(x) for x in m.groups())
-        if key[0] > CLOUDTAK_MAX_MAJOR:
+        if key[0] > _cap:
             continue
         if best is None or key > best[0]:
             best = (key, m.group(0))
     return best[1] if best else None
 
 
-def _get_cloudtak_latest_release_tag(use_cache=True):
+def _get_cloudtak_latest_release_tag(use_cache=True, max_major=None):
     """Newest stable release tag from GitHub that is allowed on this fleet (e.g. 'v13.128.0').
     Never above CLOUDTAK_MAX_MAJOR (ops #1074): GitHub's 'latest' is 14.0.0, which we have not
     tested, so the whole release list is read and filtered instead of asking for 'latest'.
     Cached for 4 hours to avoid hitting GitHub API on every page load.
     Pass use_cache=False during deploy to get a fresh result.
+    `max_major` asks for the newest tag at or under a lower major (ops #1074: the 13.x stop a box
+    with an old MinIO store must make before 14); that answer is never cached.
     Returns the tag string, or None if the API call fails."""
     import time as _time
+    if max_major is not None:
+        use_cache = False
     if use_cache and _cloudtak_release_cache['tag'] and (_time.time() - _cloudtak_release_cache['ts'] < 14400):
         return _cloudtak_release_cache['tag']
     try:
@@ -45692,27 +45843,32 @@ def _get_cloudtak_latest_release_tag(use_cache=True):
             raise ValueError('GitHub did not return a release list')
         tag = _cloudtak_newest_allowed_tag(
             [r.get('tag_name') for r in data
-             if isinstance(r, dict) and not r.get('draft') and not r.get('prerelease')])
+             if isinstance(r, dict) and not r.get('draft') and not r.get('prerelease')],
+            max_major=max_major)
         if not tag:
             # The first page held no allowed release: ask git, which lists every tag.
             raise ValueError('no allowed release on the first page')
-        _cloudtak_release_cache['tag'] = tag
-        _cloudtak_release_cache['ts'] = _time.time()
+        if max_major is None:
+            _cloudtak_release_cache['tag'] = tag
+            _cloudtak_release_cache['ts'] = _time.time()
         return tag
     except Exception:
         # gh #365: the API answers 403 "rate limit exceeded" to shared home/CGNAT addresses.
         # git over https isn't rate limited that way, so ask it for the newest tag first.
-        tag = _cloudtak_latest_tag_from_git()
+        tag = _cloudtak_latest_tag_from_git(max_major=max_major)
         if tag:
-            _cloudtak_release_cache['tag'] = tag
-            _cloudtak_release_cache['ts'] = _time.time()
+            if max_major is None:
+                _cloudtak_release_cache['tag'] = tag
+                _cloudtak_release_cache['ts'] = _time.time()
             return tag
+        if max_major is not None:
+            return None
         # Stale cache is better than nothing — return it regardless of use_cache so that
         # a GitHub rate-limit or cold-start doesn't hard-block the update flow.
         return _cloudtak_release_cache.get('tag') or None
 
 
-def _cloudtak_latest_tag_from_git():
+def _cloudtak_latest_tag_from_git(max_major=None):
     """Newest allowed plain-version CloudTAK tag ('v13.117.0') via `git ls-remote`, or None.
     Second source for the release lookup when api.github.com refuses us (gh #365).
     Never above CLOUDTAK_MAX_MAJOR (ops #1074)."""
@@ -45729,7 +45885,44 @@ def _cloudtak_latest_tag_from_git():
         m = re.search(r'refs/tags/(v?\d+\.\d+\.\d+)$', line.strip())
         if m:
             tags.append(m.group(1))
-    return _cloudtak_newest_allowed_tag(tags)
+    return _cloudtak_newest_allowed_tag(tags, max_major=max_major)
+
+
+# ops #1074: CloudTAK 14.0.0 removed `cloudtak.sh migrate-store` and the MinIO services that
+# infra-TAK's MinIO -> Garage move runs from the checked-out tree. A box that still holds
+# ~/CloudTAK/.docker-store must therefore stop at the newest 13.x first (it moves the files into
+# Garage and archives the folder); the next Update then goes on to 14. Without this the update to
+# 14 builds for about 10 minutes, fails at "Garage store setup failed" and rolls back.
+CLOUDTAK_MINIO_HOP_MAJOR = 13
+
+
+def _cloudtak_tag_major(tag):
+    m = re.match(r'v?(\d+)\.\d+\.\d+', (tag or '').strip())
+    return int(m.group(1)) if m else None
+
+
+def _cloudtak_needs_minio_hop(release_tag):
+    """True when `release_tag` is a major the old-MinIO move cannot run from (14 and up)."""
+    major = _cloudtak_tag_major(release_tag)
+    return major is not None and major > CLOUDTAK_MINIO_HOP_MAJOR
+
+
+def _cloudtak_minio_hop_tag():
+    """The newest 13.x tag (a box with the old MinIO folder goes there first), or None when the
+    lookup fails. Never cached as the latest."""
+    return _get_cloudtak_latest_release_tag(use_cache=False, max_major=CLOUDTAK_MINIO_HOP_MAJOR)
+
+
+def _cloudtak_tag_for_minio_store(release_tag, store_present):
+    """Tag to install on a box whose target is `release_tag`.
+
+    Returns (tag, hopped). Same tag when the target is 13.x or lower or the box has no MinIO store.
+    On a box that still has .docker-store and a target of 14 or higher: the newest 13.x tag, hopped
+    True. (None, True) when that 13.x tag cannot be looked up (the caller stops before any change).
+    """
+    if not store_present or not _cloudtak_needs_minio_hop(release_tag):
+        return release_tag, False
+    return _cloudtak_minio_hop_tag(), True
 
 
 def _get_cloudtak_target_release_tag(settings=None, use_cache=True, allow_fallback=True):
@@ -45810,6 +46003,15 @@ def _get_cloudtak_version_info():
     _up = None
     try:
         _up = _get_cloudtak_latest_release_tag()
+    except Exception:
+        pass
+    # ops #1074: a box that still has the old MinIO folder goes to the newest 13.x first (the
+    # update would otherwise fail at the Garage step), so the card must name that version.
+    try:
+        _hop, _hopped = _cloudtak_tag_for_minio_store(
+            _up, bool(_up) and os.path.isdir(os.path.join(ct_dir, '.docker-store')))
+        if _hopped and _hop:
+            _up = _hop
     except Exception:
         pass
     out['latest'] = (_up or '').lstrip('vV') or CLOUDTAK_VETTED_RELEASE
@@ -58738,6 +58940,16 @@ def run_cloudtak_deploy(cfg=None):
             plog("")
             plog("━━━ Step 3/6: Cloning/Updating CloudTAK on remote ━━━")
             remote_release_tag = _get_cloudtak_target_release_tag(use_cache=False)
+            # ops #1074: an old MinIO folder on the remote host stops at 13.x first (14 cannot move it).
+            _rs_ok, _ = _ssh_probe(remote_cfg, "test -d ~/CloudTAK/.docker-store", timeout=20)
+            if _rs_ok and _cloudtak_needs_minio_hop(remote_release_tag):
+                _rt = _cloudtak_minio_hop_tag()
+                if not _rt:
+                    plog("✗ The remote host still has the old MinIO folder and the newest 13.x release could not be looked up. Nothing was changed.")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
+                plog(f"  Old MinIO folder on the remote host: installing {_rt} first (CloudTAK 14 cannot move it into Garage).")
+                remote_release_tag = _rt
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
             else:
@@ -58941,6 +59153,17 @@ def run_cloudtak_deploy(cfg=None):
         plog("")
         plog("━━━ Step 2/7: Cloning CloudTAK ━━━")
         release_tag = _get_cloudtak_target_release_tag(use_cache=False)
+        # ops #1074: Deploy over an existing tree that still has the old MinIO folder stops at 13.x
+        # first (CloudTAK 14 cannot move it into Garage).
+        _dh_tag, _dh_hop = _cloudtak_tag_for_minio_store(
+            release_tag, os.path.isdir(os.path.join(cloudtak_dir, '.docker-store')))
+        if _dh_hop:
+            if not _dh_tag:
+                plog("✗ This box still has the old MinIO folder and the newest 13.x release could not be looked up. Nothing was changed.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            plog(f"  Old MinIO folder found: installing {_dh_tag} first (CloudTAK 14 cannot move it into Garage).")
+            release_tag = _dh_tag
         if os.path.exists(cloudtak_dir):
             # A real checkout needs a VALID repo, not merely a .git directory — a deleted or
             # interrupted CloudTAK can leave a HOLLOW .git (objects/ + info/ but no HEAD/config),
@@ -59199,13 +59422,12 @@ def run_cloudtak_deploy(cfg=None):
         except Exception as _me:
             plog(f"  WARNING: arm64 media-infra build step errored (media may be unavailable): {_me}")
 
-        api_url = ''
-        media_url = ''
-        for _line in env_content.splitlines():
-            if _line.startswith('API_URL='):
-                api_url = _line.split('=', 1)[1].strip()
-            elif _line.startswith('CLOUDTAK_Config_media_url='):
-                media_url = _line.split('=', 1)[1].strip()
+        # Read the two URLs back from the .env just written, not from env_content: env_content holds the
+        # generated secrets, and a value taken out of it is flagged by CodeQL as a secret in the log
+        # (alert #29, a false positive: only the API and media URLs are logged here).
+        _written_env = _cloudtak_env_read(env_path)
+        api_url = (_written_env.get('API_URL') or '').strip()
+        media_url = (_written_env.get('CLOUDTAK_Config_media_url') or '').strip()
         plog(f"✓ .env written")
         if api_url:
             plog(f"  API URL: {api_url}")
@@ -60714,6 +60936,24 @@ def run_cloudtak_update():
             plog("  Nothing was changed and CloudTAK is still running as before. Check this box's DNS/internet and try again in a few minutes.")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
+        # ops #1074: a box that still holds the old MinIO folder (.docker-store) stops at the newest
+        # 13.x before 14 (14 removed the MinIO -> Garage move). Decide BEFORE any build.
+        if is_remote:
+            _store_now = bool(remote_host) and bool(_ssh_probe(remote_cfg, "test -d ~/CloudTAK/.docker-store && echo yes", timeout=20)[0])
+        else:
+            _store_now = os.path.isdir(os.path.expanduser('~/CloudTAK/.docker-store'))
+        # (branches, not a returned value: the remote probe above carries SSH details, and a value that
+        # came out of it must not end up in the log line below)
+        if _store_now and _cloudtak_needs_minio_hop(release_tag):
+            _hop_tag = _cloudtak_minio_hop_tag()
+            if not _hop_tag:
+                plog(f"✗ {release_tag} needs your old MinIO files moved into Garage first, and the newest 13.x release could not be looked up.")
+                plog("  Nothing was changed and CloudTAK is still running as before. Try again in a few minutes.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            plog(f"  This box still has the old MinIO folder (~/CloudTAK/.docker-store). CloudTAK 14 cannot move it into Garage.")
+            plog(f"  Updating to {_hop_tag} first, which moves your files. Press Update again afterwards to go on to {release_tag}.")
+            release_tag = _hop_tag
         plog(f"  Target: {release_tag} (upstream latest — CloudTAK tracks dfpc-coe releases directly)")
         # ops #129: record from/to on the update result (the card and Diagnostics said "? -> ?").
         from_ver = ''
@@ -61798,7 +62038,7 @@ WEBODM_OVERLAY_REF = 'v0.8.9'
 WEBODM_OVERLAY_SHA = '3f0efb383a9f1bd022eac15ac4b3da83e643fccc'  # commit of tag v0.8.9 (was the default branch's tip)
 WEBODM_IMAGES = {
     'wo_db':      'webodm/webodm_db:18@sha256:6d43e32ec24c388c5d5975bf6462d21abd6959af3c43d146a2473c1db4d5019c',
-    'wo_broker':  'redis:8.10.2-alpine',
+    'wo_broker':  'redis:8.10.3-alpine',
     'wo_webapp':  'webodm/webodm_webapp:' + WEBODM_VERSION,
     'wo_worker':  'webodm/webodm_webapp:' + WEBODM_VERSION,
     'wo_nodeodm': 'webodm/nodeodx:2.4.0',
@@ -105074,36 +105314,30 @@ def run_takserver_deploy(config):
             f'<nameEntry name="OU" value="{config["cert_ou"]}"/>\n</nameEntries>\n'
             f'</certificateConfig>\n{ca_cfg_line}\n'
             '</certificateSigning>\n<vbm enabled="false"/>')
+        # ops #1118: TAK Server holds CoreConfig in memory (loaded at the Step-5 first start,
+        # stock) and writes that copy back to disk when it shuts down — the same race the
+        # external-DB re-assert below measured (Azure 2026-09-19). Step 8 and the LDAP
+        # connect below used to edit the file while TAK ran, so the LDAP restart's
+        # shutdown put the stock config (plus serverId) back over them: no truststore-
+        # INTERMEDIATE-CA, no enrollment block, CloudTAK setup died UND_ERR_SOCKET
+        # (fresh Ubuntu 22.04, 10.4.4). Stop TAK FIRST so nothing can overwrite the edits,
+        # and so the next start loads them (its own shutdown write is then correct).
+        log_step("Stopping TAK Server so CoreConfig edits cannot be overwritten on its shutdown...")
+        run_cmd('systemctl stop takserver', check=False); time.sleep(10)
+        run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
         try:
             _cc = _read_priv('/opt/tak/CoreConfig.xml')
-            log_step("Enabling X.509 auth on 8089...")
-            # Pre-RELEASE43 5.7 artifacts ship an anonymous 8087 tcp input — flip it.
-            _cc = _cc.replace('<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>',
-                              '<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>')
-            # 5.7-RELEASE43+ stock CoreConfig ships the 8089 tls input directly (the 8087
-            # line survives only as a comment) — add auth="x509" to the live input. Both
-            # replaces no-op when their pattern is absent, so this is version-agnostic.
-            _cc = _cc.replace('<input _name="stdssl" protocol="tls" port="8089"',
-                              '<input auth="x509" _name="stdssl" protocol="tls" port="8089"')
-            log_step("Setting intermediate CA truststore...")
-            _cc = _cc.replace('truststoreFile="certs/files/truststore-root.jks',
-                              f'truststoreFile="certs/files/truststore-{int_ca}.jks')
-            log_step("Enabling certificate enrollment...")
-            # RELEASE43+ artifacts write `<vbm enabled="false" />` (space before the
-            # self-close); older ones have no space. Normalize so one replace serves
-            # both artifact generations. Guarded so a re-run over an already-patched
-            # file can't insert a duplicate certificateSigning block (cert_block
-            # re-appends the vbm anchor).
-            if ca_cfg_line not in _cc:
-                _cc = _cc.replace('<vbm enabled="false" />', '<vbm enabled="false"/>')
-                _cc = _cc.replace('<vbm enabled="false"/>', cert_block)
-            _cc = _cc.replace('<auth>', '<auth x509useGroupCache="true">')
-            if config.get('enable_admin_ui') or config.get('enable_webtak'):
-                admin_ui = str(config.get('enable_admin_ui', False)).lower()
-                webtak = str(config.get('enable_webtak', False)).lower()
-                log_step(f"WebTAK: AdminUI={admin_ui}, WebTAK={webtak}")
-                _cc = _cc.replace('"cert_https"/',
-                                  f'"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/')
+            if isinstance(_cc, (bytes, bytearray)):
+                _cc = _cc.decode('utf-8', 'replace')
+            log_step("Enabling X.509 auth on 8089, intermediate truststore and certificate enrollment...")
+            _wt = bool(config.get('enable_admin_ui') or config.get('enable_webtak'))
+            if _wt:
+                log_step(f"WebTAK: AdminUI={str(config.get('enable_admin_ui', False)).lower()}, "
+                         f"WebTAK={str(config.get('enable_webtak', False)).lower()}")
+            _cc = _coreconfig_step8_apply(
+                _cc, int_ca, ca_cfg_line, cert_block,
+                admin_ui=str(config.get('enable_admin_ui', False)).lower() if _wt else None,
+                webtak=str(config.get('enable_webtak', False)).lower() if _wt else None)
             _write_priv('/opt/tak/CoreConfig.xml', _cc)
             # v10.1.14 (W6): verify the edits actually landed. These failures used to be
             # swallowed (one log line, deploy still "succeeded") — a broker hiccup left
@@ -105114,15 +105348,7 @@ def run_takserver_deploy(config):
             _cc_check = _read_priv('/opt/tak/CoreConfig.xml')
             if isinstance(_cc_check, (bytes, bytearray)):
                 _cc_check = _cc_check.decode('utf-8', 'replace')
-            _missing = [_m for _m, _ok in (
-                (f'intermediate truststore (truststore-{int_ca}.jks)', f'truststore-{int_ca}.jks' in _cc_check),
-                # v10.1.23: match OUR single-line inserted block, not the bare element
-                # name — RELEASE43's stock example ships a commented-out multi-line
-                # certificateSigning template containing "TAKServerCAConfig" and
-                # "intermediate-signing.jks", which spoofed this check on unpatched files.
-                ('certificateSigning enrollment block', ca_cfg_line in _cc_check),
-                ('x509 auth input on 8089', 'auth="x509"' in _cc_check),
-            ) if not _ok]
+            _missing = _coreconfig_step8_missing(_cc_check, int_ca, ca_cfg_line)
             if _missing:
                 raise RuntimeError(f"post-write verification failed — missing: {', '.join(_missing)}")
         except Exception as _cce:
@@ -105218,6 +105444,31 @@ def run_takserver_deploy(config):
             log_step(f"LDAP resync: {resync_msg}")
         run_cmd('systemctl stop takserver'); time.sleep(10)
         run_cmd('pkill -9 -f takserver 2>/dev/null; true', check=False); time.sleep(5)
+
+        # ops #1118: belt and braces — with TAK stopped, confirm the Step-8 edits are still
+        # in the file and put them back if anything rewrote them (nothing is running now
+        # that could undo it). The earlier stop makes this a no-op on a healthy deploy.
+        try:
+            _cc_s8 = _read_priv('/opt/tak/CoreConfig.xml')
+            if isinstance(_cc_s8, (bytes, bytearray)):
+                _cc_s8 = _cc_s8.decode('utf-8', 'replace')
+            _s8_gone = _coreconfig_step8_missing(_cc_s8 or '', int_ca, ca_cfg_line)
+            if _s8_gone:
+                log_step(f"  CoreConfig lost its Step-8 edits ({', '.join(_s8_gone)}) — re-applying with TAK stopped...")
+                _wt2 = bool(config.get('enable_admin_ui') or config.get('enable_webtak'))
+                _cc_s8 = _coreconfig_step8_apply(
+                    _cc_s8, int_ca, ca_cfg_line, cert_block,
+                    admin_ui=str(config.get('enable_admin_ui', False)).lower() if _wt2 else None,
+                    webtak=str(config.get('enable_webtak', False)).lower() if _wt2 else None)
+                _write_priv('/opt/tak/CoreConfig.xml', _cc_s8)
+                _patch_coreconfig_passwords(cert_pass, log_fn=log_step)
+                _still = _coreconfig_step8_missing(_read_priv('/opt/tak/CoreConfig.xml') or '', int_ca, ca_cfg_line)
+                if _still:
+                    raise RuntimeError(f"still missing after re-apply: {', '.join(_still)}")
+                log_step("✓ Step-8 CoreConfig edits re-asserted")
+        except Exception as _s8e:
+            log_step(f"  ✗ CoreConfig Step-8 re-check FAILED: {_s8e} — not starting a misconfigured TAK Server.")
+            deploy_status.update({'error': True, 'running': False}); return
 
         # For external_db: re-assert the JDBC target now that TAK is STOPPED.
         #
@@ -118962,6 +119213,48 @@ def _ensure_console_cert_docker_san(settings):
         return f"console cert SAN check error (non-fatal): {str(e)[:100]}"
 
 
+def _coreconfig_step8_apply(cc, int_ca, ca_cfg_line, cert_block, admin_ui=None, webtak=None):
+    """Pure text transform for TAK deploy Step 8 (ops #1118): X.509 on 8089, the
+    intermediate truststore, the certificateSigning enrollment block, x509useGroupCache
+    and (optionally) the WebTAK flags. Idempotent over an already-patched file."""
+    # Pre-RELEASE43 5.7 artifacts ship an anonymous 8087 tcp input — flip it.
+    cc = cc.replace('<input auth="anonymous" _name="stdtcp" protocol="tcp" port="8087"/>',
+                    '<input auth="x509" _name="stdssl" protocol="tls" port="8089"/>')
+    # 5.7-RELEASE43+ stock CoreConfig ships the 8089 tls input directly (the 8087
+    # line survives only as a comment) — add auth="x509" to the live input. Both
+    # replaces no-op when their pattern is absent, so this is version-agnostic.
+    cc = cc.replace('<input _name="stdssl" protocol="tls" port="8089"',
+                    '<input auth="x509" _name="stdssl" protocol="tls" port="8089"')
+    cc = cc.replace('truststoreFile="certs/files/truststore-root.jks',
+                    f'truststoreFile="certs/files/truststore-{int_ca}.jks')
+    # RELEASE43+ artifacts write `<vbm enabled="false" />` (space before the
+    # self-close); older ones have no space. Normalize so one replace serves
+    # both artifact generations. Guarded so a re-run over an already-patched
+    # file can't insert a duplicate certificateSigning block (cert_block
+    # re-appends the vbm anchor).
+    if ca_cfg_line not in cc:
+        cc = cc.replace('<vbm enabled="false" />', '<vbm enabled="false"/>')
+        cc = cc.replace('<vbm enabled="false"/>', cert_block)
+    cc = cc.replace('<auth>', '<auth x509useGroupCache="true">')
+    if admin_ui is not None and webtak is not None:
+        cc = cc.replace('"cert_https"/',
+                        f'"cert_https" enableAdminUI="{admin_ui}" enableWebtak="{webtak}" enableNonAdminUI="false"/')
+    return cc
+
+
+def _coreconfig_step8_missing(cc, int_ca, ca_cfg_line):
+    """Names of the Step-8 edits that are NOT in this CoreConfig text (empty = all there)."""
+    return [_m for _m, _ok in (
+        (f'intermediate truststore (truststore-{int_ca}.jks)', f'truststore-{int_ca}.jks' in cc),
+        # v10.1.23: match OUR single-line inserted block, not the bare element
+        # name — RELEASE43's stock example ships a commented-out multi-line
+        # certificateSigning template containing "TAKServerCAConfig" and
+        # "intermediate-signing.jks", which spoofed this check on unpatched files.
+        ('certificateSigning enrollment block', ca_cfg_line in cc),
+        ('x509 auth input on 8089', 'auth="x509"' in cc),
+    ) if not _ok]
+
+
 def _heal_takserver_coreconfig_step8():
     """v10.1.14 (W6): repair CoreConfigs damaged by silently-swallowed Step-8 writes.
 
@@ -122292,6 +122585,10 @@ def _post_update_auto_deploy():
             if _tak_is_container():
                 _tak_repair_container_healthchecks(lambda m: print(f"Post-update:{m}", flush=True))
 
+            # GH #667: a relay deployed before this fix sends mail for root nowhere.
+            # Idempotent; no-op without a relay.
+            _emailrelay_sync_root_alias()
+
             # v10.2.8 W11d — CloudTAK whose cert came from a CA this TAK no longer has (a
             # container upgrade or CA replacement) cannot log anyone in; re-issue it from the
             # current CA. Own thread: it waits ~2 min to be sure the connection is really dead.
@@ -124758,6 +125055,7 @@ _MODULE_CTX = {
     '_fw_allow': _fw_allow,
     '_fw_remove': _fw_remove,
     '_sudo_wrap': _sudo_wrap,
+    '_safe_alert_emails': _safe_alert_emails,   # GH #667: emailrelay reads Guard Dog's address
     'run_cmd': run_cmd,
     'os_type': _distro_family,      # callable -> 'debian' | 'rhel'
     '_host_arch': _host_arch,
