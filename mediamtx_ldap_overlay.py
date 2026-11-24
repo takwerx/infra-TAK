@@ -571,8 +571,11 @@ def apply_ldap_overlay(app):
                         m = _re.search(r'/([a-z0-9.-]+\.[a-z]{2,})/\1\.crt', cert)
                         if m:
                             domain = m.group(1)
-            if domain:
-                return {'domain': domain, 'protocol': 'https' if hls_enc else 'http'}
+            # ops #1110: the protocol is MediaMTX's own hlsEncryption, with or without a
+            # domain in the certificate path. A remote host keeps its certificate at
+            # /etc/mediamtx/certs/stream.crt (no domain in the path), and plain http to a
+            # TLS listener is answered 400: no video through /hls-proxy/ there.
+            return {'domain': domain, 'protocol': 'https' if hls_enc else 'http'}
         except Exception:
             pass
         return {'domain': None, 'protocol': 'http'}
