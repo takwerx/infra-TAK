@@ -82,6 +82,17 @@ MAX_TIMEOUT = 7200                            # seconds; ceiling for caller-requ
                                               # 20-60+ min; clamping requests to 600s killed every
                                               # non-root CloudTAK rebuild at exactly 10 min
                                               # (test12, 2026-07-17 — exit 125 mid-build).
+# One lock for EVERY ufw call on the box. ufw rewrites /etc/ufw/user.rules (and
+# user6.rules) with no lock of its own, so two ufw processes at once can each read the
+# file, change it, and write it back over the other. On test6 (2026-11-21 04:34 UTC)
+# fail2ban restored its recidive bans at boot (`ufw insert`) in the same seconds the
+# console ran `ufw --force delete allow 8080/tcp` and `5001/tcp`: 31 IPv4 rules were
+# lost, 22/80/443/8089 among them, and the box dropped every TCP port until it was
+# repaired from the provider's VNC console. The other writers take the SAME lock:
+# fail2ban through the `infratak-ufw` action (`flock`), selfheal_ip.py and the root
+# console through `flock` too. /run is root-only and cleared at boot.
+UFW_LOCK_PATH = '/run/infratak-ufw.lock'
+UFW_LOCK_WAIT = 90                            # seconds; a ufw write takes ~1 s
 SELF_PATH = os.path.realpath(__file__)
 # v10.1.13: sha of the source THIS daemon process was started from, captured at
 # import time (the on-disk file may be newer — a console update replaces the repo
@@ -3907,6 +3918,38 @@ def _recv_all(conn):
 BROKER_TRUSTED_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
 
 
+def _run_maybe_ufw_locked(argv, **kw):
+    """subprocess.run(argv, **kw), holding UFW_LOCK_PATH when argv is ufw (see the
+    constant for why). Waits up to UFW_LOCK_WAIT s for the lock; if it is still held
+    the command is NOT run, and the caller gets exit 75 (EX_TEMPFAIL). Running anyway
+    is the race this lock exists to stop, and a failed ufw call is visible where a
+    clobbered rules file is not."""
+    if os.path.basename(str(argv[0])) != 'ufw':
+        return subprocess.run(argv, **kw)
+    import fcntl
+    fd = os.open(UFW_LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        # fail2ban's `flock` creates the file 644 if it gets there first, and any user
+        # who can open a file can flock it — keep it root-only.
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        deadline = time.monotonic() + UFW_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    msg = f'ufw lock {UFW_LOCK_PATH} still held after {UFW_LOCK_WAIT}s; not run\n'
+                    return subprocess.CompletedProcess(argv, 75, b'', msg.encode())
+                time.sleep(0.1)
+        return subprocess.run(argv, **kw)
+    finally:
+        os.close(fd)                              # closing the fd releases the lock
+
+
 def _do_exec(req):
     # NB: the allow/deny decision is made in _dispatch (so permissive mode can
     # execute-and-log). Do NOT re-validate the ALLOWLIST here or permissive mode
@@ -3983,8 +4026,8 @@ def _do_exec(req):
         # root-checked copy (TAK release key, or Caddy's published SHA-512).
         argv, pkg_stage = _pkg_stage_verified(argv, cwd, timeout)
         try:
-            proc = subprocess.run(argv, input=input_bytes, capture_output=True,
-                                  timeout=timeout, cwd=cwd, env=env)
+            proc = _run_maybe_ufw_locked(argv, input=input_bytes, capture_output=True,
+                                         timeout=timeout, cwd=cwd, env=env)
         finally:
             if pkg_stage:
                 shutil.rmtree(pkg_stage, ignore_errors=True)
@@ -7495,8 +7538,8 @@ def _mtx_run(argv, timeout, as_user):
         env.setdefault('DEBIAN_FRONTEND', 'noninteractive')
         env.setdefault('NEEDRESTART_MODE', 'l')
         env.setdefault('DPKG_FORCE', 'confdef,confold')
-    proc = subprocess.run([resolved] + list(argv[1:]), capture_output=True,
-                          timeout=timeout, cwd='/', env=env, **kw)
+    proc = _run_maybe_ufw_locked([resolved] + list(argv[1:]), capture_output=True,
+                                 timeout=timeout, cwd='/', env=env, **kw)
     return {
         'ok': True,
         'returncode': proc.returncode,
