@@ -93,6 +93,7 @@ MAX_TIMEOUT = 7200                            # seconds; ceiling for caller-requ
 # console through `flock` too. /run is root-only and cleared at boot.
 UFW_LOCK_PATH = '/run/infratak-ufw.lock'
 UFW_LOCK_WAIT = 90                            # seconds; a ufw write takes ~1 s
+FLOCK_F2B_STOP_ARGV = ['flock', '-w', '90', UFW_LOCK_PATH, 'systemctl', 'stop', 'fail2ban']
 SELF_PATH = os.path.realpath(__file__)
 # v10.1.13: sha of the source THIS daemon process was started from, captured at
 # import time (the on-disk file may be newer — a console update replaces the repo
@@ -2126,6 +2127,15 @@ def check_exec(argv, cwd=None):
     # uses sudo internally so it must run as root. Allow ONLY that exact script.
     if base == 'bash':
         _check_bash(argv)
+        return argv
+    # `flock` runs any command it is given, so it is not on the allow-list. ONE exact
+    # argv: stop fail2ban while holding the ufw lock. The console sends it once per box,
+    # when it moves fail2ban's jails from the stock unlocked `ufw` action to the locked
+    # `infratak-ufw` action: that stop unbans every IP through the OLD action, and holding
+    # the lock keeps every other ufw writer out while it does.
+    if base == 'flock':
+        if argv != FLOCK_F2B_STOP_ARGV:
+            raise Denied('flock: only the fail2ban stop under the ufw lock is allowed')
         return argv
     if base in EXEC_DENY:
         raise Denied(f'binary is denied: {base}')
