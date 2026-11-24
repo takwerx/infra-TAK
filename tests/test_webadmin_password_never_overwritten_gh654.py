@@ -175,6 +175,8 @@ def ensure(monkeypatch):
         glb = {
             'os': os, 'json': json, 'time': _time, 'subprocess': __import__('subprocess'),
             'load_settings': lambda: {'webadmin_password': stored_password, 'fqdn': 'tak.example.org'},
+            # GH #687: the function body now asks this helper for a new webadmin's email.
+            '_ak_admin_account_email': lambda u, s=None: f'{u}@tak.example.org',
             '_get_authentik_env_value': lambda s, k: 'token',
             '_get_authentik_api_url': lambda s: 'http://authentik.test',
             '_get_module_deployment_config': lambda s, k: {},

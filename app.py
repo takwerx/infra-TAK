@@ -12249,7 +12249,7 @@ def update_apply():
             'free_bytes': _free_b,
             'error': (f'Update Now needs ~1 GB free to fetch and check out; this filesystem '
                       f'has {_free_b // (1024 * 1024)} MB. Free disk first — see Guard Dog '
-                      '> Database maintenance (CoT) > Diagnose.'),
+                      '> Database maintenance (CoT) > Diagnose. ' + _FREE_SPACE_BACKUPS_HINT),
         }), 400
 
     # v0.9.24 Item 1: Update Now single-flight lock.
@@ -58921,6 +58921,7 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
             out.append('')
             out.append('Likely cause: the disk filled up during the build.')
             out.append('  Free space and retry - see the Disk card on the dashboard.')
+            out.append('  ' + _FREE_SPACE_BACKUPS_HINT)
         elif out_of_memory:
             out.append('')
             out.append('Likely cause: the build ran out of memory (the step was killed).')
@@ -60934,6 +60935,15 @@ _CLOUDTAK_UPDATE_MEASURED_GB = 16
 _CLOUDTAK_UPDATE_MIN_FREE = _CLOUDTAK_UPDATE_MEASURED_GB * 1024 ** 3
 _CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT = 1024 ** 3   # the checkout itself: the new tag's files, ~0.3 GB
 
+# ops #1146 (infra-TAK #670): a user with a full disk asked which old backups are safe to remove.
+# Every "not enough free disk" message of an update says where the big files are, in these words
+# (the page and section names are the ones on screen: Guard Dog > "Full-stack backups", TAK Server
+# > "Snapshots & Recovery" > "TAK Server Snapshots"). Backups live on the console server.
+_FREE_SPACE_BACKUPS_HINT = (
+    'The biggest files are usually old backups. On the console server, open the Guard Dog page, '
+    '"Full-stack backups", and press Delete on old ones (the console password is asked). '
+    'Then open the TAK Server page, "Snapshots & Recovery", and delete old TAK Server snapshots.')
+
 
 def _cloudtak_fs_free_local(path):
     """(filesystem id, free bytes a non-root process may use) for the filesystem holding `path`,
@@ -61011,6 +61021,7 @@ def _cloudtak_update_space_lines(problem):
         "  Free some space, then press Update again. Safe ways: run `docker builder prune -f` and",
         "  `docker image prune -f` on this server (old build cache and unused image layers), and",
         "  delete old logs or backups. Do not delete Docker volumes: they hold your data.",
+        "  " + _FREE_SPACE_BACKUPS_HINT,
     ]
 
 
@@ -63098,7 +63109,8 @@ def _webodm_db_room_check(plog):
     plog(f'  Database {used_kb // 1024} MB, free disk {free_kb // 1024} MB, needed {need_kb // 1024} MB')
     if free_kb < need_kb:
         raise RuntimeError(f'not enough free disk for the WebODM database upgrade ({need_kb // 1024} MB '
-                           f'needed, {free_kb // 1024} MB free). Nothing was changed: free some disk and press Update again.')
+                           f'needed, {free_kb // 1024} MB free). Nothing was changed: free some disk and press Update again. '
+                           + _FREE_SPACE_BACKUPS_HINT)
 
 
 def _webodm_backup_db_95():
@@ -65072,7 +65084,7 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
             _wa_users = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
             _wa = next((u for u in _wa_users if u.get('username') == 'webadmin'), None)
             if _wa and not (_wa.get('email') or '').strip():
-                _wa_email = f'webadmin@{fqdn.split(":")[0]}'
+                _wa_email = _ak_admin_account_email('webadmin', settings or load_settings())
                 req = _urlreq.Request(f'{_ak_url}/api/v3/core/users/{_wa["pk"]}/',
                     data=json.dumps({'email': _wa_email}).encode(),
                     headers=_ak_headers, method='PATCH')
@@ -85459,7 +85471,7 @@ entries:
                                 # Step 11 — including the real-outpost-token swap into compose — was
                                 # skipped: the LDAP outpost stayed on AUTHENTIK_TOKEN: placeholder and
                                 # 403'd forever. Field-hit 2026-07-08 (NUC redeploy with leftover /opt/tak).
-                                'email': f'webadmin@{(settings.get("fqdn") or "tak.local").split(":")[0]}',
+                                'email': _ak_admin_account_email('webadmin', settings),
                                 'groups': [group_pk] if group_pk else []}
                             req = urllib.request.Request(f'{ak_url}/api/v3/core/users/',
                                 data=json.dumps(user_data).encode(), headers=ak_headers, method='POST')
@@ -88888,7 +88900,7 @@ def _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=True):
                 'path': 'users',
                 # Synthetic email — WebODM's OIDC login (and any OIDC consumer
                 # requiring an email claim) fails on an email-less user.
-                'email': f'webadmin@{((settings.get("fqdn") or "tak.local").strip() or "tak.local").split(":")[0]}',
+                'email': _ak_admin_account_email('webadmin', settings),
                 'groups': [group_pk] if group_pk else []
             }
             req_local = _req.Request(f'{url}/api/v3/core/users/', data=json.dumps(ud).encode(), headers=headers, method='POST')
@@ -89724,11 +89736,29 @@ def _ak_admin_email_is_placeholder(username, email, settings=None):
     dom = e.rsplit('@', 1)[1]
     if dom in ('localhost', 'tak.local') or dom.endswith('.local') or dom.endswith('.localhost'):
         return True
-    if username == 'webadmin' and e.split('@', 1)[0] == 'webadmin':
+    if username in _AUTHENTIK_RECOVERABLE_USERS and e.split('@', 1)[0] == username:
+        # <user>@<TAK FQDN>: infra-TAK made it up and the FQDN has no MX (GH #687).
         fq = ((settings or load_settings()).get('fqdn') or '').strip().split(':')[0].lower()
         if fq and dom == fq:
             return True
     return False
+
+
+def _ak_admin_account_email(username, settings=None):
+    """Email to give a NEW infra-TAK-made admin account (GH #687). Authentik needs some
+    email (WebODM's OIDC login fails on an empty claim) and TAK Portal mails every admin
+    group member's email when a user asks for access. So: the first Guard Dog alert
+    address when one is set (a real inbox), else the made-up <user>@<fqdn> form, which
+    cannot receive mail. Never raises."""
+    try:
+        s = settings if settings is not None else load_settings()
+        for addr in _safe_alert_emails(s.get('guarddog_alert_email')):
+            if not _ak_admin_email_is_placeholder(username, addr, s):
+                return addr
+        fq = (s.get('fqdn') or '').strip().split(':')[0] or 'tak.local'
+        return f'{username}@{fq}'
+    except Exception:
+        return f'{username}@tak.local'
 
 
 def _ak_admin_recovery_email_notes():
@@ -97179,8 +97209,9 @@ def _tak_58_preflight():
                 blockers.append(
                     'Not enough disk for a rollback-safe migration: %s free on %s, %s needed '
                     '(1.5x the %s database). pg_upgrade runs in copy mode so the PostgreSQL 15 '
-                    'cluster survives — that is the only way back if the upgrade fails.'
-                    % (_cotdb_fmt_bytes(avail), target_parent, _cotdb_fmt_bytes(need), _cotdb_fmt_bytes(used)))
+                    'cluster survives — that is the only way back if the upgrade fails. '
+                    % (_cotdb_fmt_bytes(avail), target_parent, _cotdb_fmt_bytes(need), _cotdb_fmt_bytes(used))
+                    + _FREE_SPACE_BACKUPS_HINT)
         else:
             # Say that the CHECK did not run, not merely that a number is missing.
             # The old wording read like a cosmetic gap; it meant the safety gate was off.
@@ -100363,7 +100394,7 @@ def _stack_backup(label=None, plog=None):
     need, free = _stack_backup_space_needed(), _stack_backup_free_bytes()
     if free is not None and free < need:
         return False, (f'not enough free disk for a full-stack backup: {free // 1024 ** 2} MB free, '
-                       f'{need // 1024 ** 2} MB needed (2x the last backup)')
+                       f'{need // 1024 ** 2} MB needed (2x the last backup). ' + _FREE_SPACE_BACKUPS_HINT)
     plog(f"  stack backup [{label}]: creating at {dest}")
     try:
         # Root 0711: the console can pass through to its own .dl-* staging dirs
