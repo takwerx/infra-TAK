@@ -190,8 +190,10 @@ def _gen_src():
 
 def test_generate_caddyfile_passes_its_real_strip_and_authentik_only_when_installed():
     src = _gen_src()
+    # ATLAS W504 added X-Authentik-Jwt: ATLAS can read the administrator from it.
     assert "_AK_FWD_HEADERS = ('X-Authentik-Username', 'X-Authentik-Groups', 'X-Authentik-Email',\n" \
-           "                       'X-Authentik-Name', 'X-Authentik-Uid', 'X-Infratak-Proxy-Auth')" in src
+           "                       'X-Authentik-Name', 'X-Authentik-Uid', 'X-Authentik-Jwt',\n" \
+           "                       'X-Infratak-Proxy-Auth')" in src
     call = src[src.index('_emit_mediamtx_site('):]
     call = call[:call.index('\n        _emit_alias_redirect')]
     assert 'ak_up if _mtx_ak else None' in call
