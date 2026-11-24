@@ -41,7 +41,7 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 _WANT = {'MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER', '_CADDY_STRIP_AUTHENTIK_HEADERS',
-         '_emit_mediamtx_site'}
+         '_MEDIAMTX_AK_COPY_HEADERS', '_MEDIAMTX_IDENTITY_MARKER', '_emit_mediamtx_site'}
 
 
 def _load():
@@ -83,8 +83,13 @@ STRIP8 = '\n'.join(['        request_header -X-Authentik-*']
 NSTRIP = len(STRIP8.split('\n'))
 
 
+# ops #1153: with Authentik, every route to the editor then says that this proxy passes
+# Authentik's signed token (the overlay reads the person's name from it).
+MARKER = '        request_header X-Infratak-Identity signed'
+
+
 def _open_route(path, up):
-    return f'    route {path} {{\n{STRIP8}\n        reverse_proxy {up}\n    }}'
+    return f'    route {path} {{\n{STRIP8}\n{MARKER}\n        reverse_proxy {up}\n    }}'
 
 
 def _expected_ak(up, direct_hls=None):
@@ -97,12 +102,13 @@ def _expected_ak(up, direct_hls=None):
         _open_route('/shared-hls/*', up),
         '    route {',
         STRIP8,
+        MARKER,
         *([] if direct_hls else ['        request_header /hls-proxy/* -Authorization']),
         f'        #rescue https://{HOST}/',
         '        reverse_proxy /outpost.goauthentik.io/* 127.0.0.1:9090',
         '        forward_auth 127.0.0.1:9090 {',
         '            uri /outpost.goauthentik.io/auth/caddy',
-        '            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid',
+        '            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt',
         '            trusted_proxies private_ranges',
         '        }',
         f'        reverse_proxy {up}',
