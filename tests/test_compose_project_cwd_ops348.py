@@ -82,7 +82,7 @@ def test_project_dir_ignored_when_not_a_usable_compose_dir(tmp_path):
 
 def test_exec_runs_in_the_project_directory():
     body = _seg(BROKER, ast.FunctionDef, '_do_exec')
-    assert body.index('compose_project_dir(argv)') < body.index('subprocess.run(argv')
+    assert body.index('compose_project_dir(argv)') < body.index('_run_maybe_ufw_locked(argv')
     assert re.search(r"_pd = compose_project_dir\(argv\)\n\s+if _pd:\n\s+cwd = _pd", body)
 
 

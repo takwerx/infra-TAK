@@ -169,6 +169,20 @@ def _have(cmd):
     return shutil.which(cmd) is not None
 
 
+# Same lock the broker and fail2ban's infratak-ufw action hold for every ufw call
+# (broker/takwerx_broker.py UFW_LOCK_PATH). This script runs at boot as the console's
+# ExecStartPre — the same seconds fail2ban restores its bans with `ufw insert` — and two
+# unlocked ufw writers can drop rules from /etc/ufw/user.rules.
+_UFW_LOCK = '/run/infratak-ufw.lock'
+
+
+def _ufw(*args):
+    argv = ['ufw', *args]
+    if _have('flock'):
+        argv = ['flock', '-w', '90', _UFW_LOCK] + argv
+    return argv
+
+
 def rescope_firewall(old_ip, new_ip):
     """Repoint any source-scoped firewall rule pinned to old_ip → new_ip. Drives
     firewalld rich-rules or ufw `from <ip>` rules, matching the formats written by
@@ -207,8 +221,8 @@ def rescope_firewall(old_ip, new_ip):
         return
     if _have('ufw'):
         try:
-            out = subprocess.run(['ufw', 'status'],
-                                 capture_output=True, text=True, timeout=12).stdout or ''
+            out = subprocess.run(_ufw('status'),
+                                 capture_output=True, text=True, timeout=120).stdout or ''
         except Exception as e:
             log(f"ufw rule read failed: {str(e)[:120]}")
             return
@@ -232,12 +246,12 @@ def rescope_firewall(old_ip, new_ip):
             # argv, not a shell string (v10.1.48 W2): every field here is
             # regex-validated above, but that made the safety incidental —
             # a shell was never needed to run ufw.
-            subprocess.run(['ufw', '--force', 'delete', action, 'from', old_ip,
-                            'to', 'any', 'port', port, 'proto', proto],
-                           capture_output=True, text=True, timeout=12)
-            subprocess.run(['ufw', action, 'from', new_ip,
-                            'to', 'any', 'port', port, 'proto', proto],
-                           capture_output=True, text=True, timeout=12)
+            subprocess.run(_ufw('--force', 'delete', action, 'from', old_ip,
+                                'to', 'any', 'port', port, 'proto', proto),
+                           capture_output=True, text=True, timeout=120)
+            subprocess.run(_ufw(action, 'from', new_ip,
+                                'to', 'any', 'port', port, 'proto', proto),
+                           capture_output=True, text=True, timeout=120)
             changed += 1
             log(f"ufw: repinned {action} {port}/{proto} {old_ip} → {new_ip}")
         if not changed:

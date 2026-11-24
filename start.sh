@@ -1351,7 +1351,13 @@ else
         NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove ufw >/dev/null 2>&1 || true
     fi
     if command -v ufw >/dev/null 2>&1; then
-        ufw allow 5001/tcp >/dev/null 2>&1 || true
+        # Same lock as the broker and fail2ban's infratak-ufw action: two ufw writers at
+        # once can drop rules from /etc/ufw/user.rules (test6, 2026-11-21).
+        if command -v flock >/dev/null 2>&1; then
+            flock -w 90 /run/infratak-ufw.lock ufw allow 5001/tcp >/dev/null 2>&1 || true
+        else
+            ufw allow 5001/tcp >/dev/null 2>&1 || true
+        fi
     fi
 fi
 

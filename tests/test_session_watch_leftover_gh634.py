@@ -29,6 +29,7 @@ systemctl stubbed. `ss` answers from a file, so each test sets which sockets are
 import json
 import pathlib
 import subprocess
+import time
 
 import pytest
 
@@ -94,6 +95,7 @@ def box(tmp_path):
         return mails.read_text() if mails.exists() else ''
 
     run.log = lambda: (logs / 'session.log').read_text() if (logs / 'session.log').exists() else ''
+    run.state = state
     return run
 
 
@@ -190,3 +192,39 @@ def test_gh634_container_row_is_never_a_leftover(box):
         mail = box([ADMIN, LIVE, row], [IP + ':57833'])
         assert 'LEFTOVER' not in mail, local
         assert 'leftover=0' in _check_line(box.log())
+
+
+def _age(box, state_hours, last_alert_hours):
+    """Pretend the current state began state_hours ago and the last email went out last_alert_hours ago."""
+    now = int(time.time())
+    (box.state / 'session.state_since').write_text(str(now - int(state_hours * 3600)))
+    (box.state / 'session.last_alert').write_text(str(now - int(last_alert_hours * 3600)))
+
+
+def test_ops1148_leftover_coming_and_going_does_not_restart_the_24_hour_clock(box):
+    # test8, Nov 23-24: the leftover entry (tls:19) showed up as a leftover, then not (no matching
+    # socket proof, or not yet silent 5 min), then again, every 1 to 2 hours. The flag was part of
+    # the state, so each flip reset the clock and sent a new email at once: 11 mails in a row.
+    leftover = ([ADMIN, LIVE, LEAKED], [IP + ':57833'])
+    not_leftover = ([ADMIN, LIVE, dict(LEAKED, lastReportDiffMilliseconds=1000)], [IP + ':57833'])
+    assert '1 of them are LEFTOVERS' in box(*leftover)
+    _age(box, state_hours=5, last_alert_hours=2)
+    mail = box(*not_leftover)                      # hourly mail is due; it keeps counting from the first one
+    assert 'LEFTOVER' not in mail and 'Same state for: 5 h 0 min' in mail
+    _age(box, state_hours=5, last_alert_hours=0.5)
+    assert box(*leftover) == ''                    # was: a new email at once, "Same state for: 0 min"
+    _age(box, state_hours=26, last_alert_hours=2)
+    assert box(*not_leftover) == ''                # over a day: daily, and the flip does not undo that
+    _age(box, state_hours=26, last_alert_hours=25)
+    assert 'now repeats once a day' in box(*leftover)
+
+
+def test_ops1148_healthy_in_between_still_starts_over(box):
+    # The sticky flag lasts only while the problem lasts: a healthy check clears it.
+    leftover = ([ADMIN, LIVE, LEAKED], [IP + ':57833'])
+    assert '1 of them are LEFTOVERS' in box(*leftover)
+    _age(box, state_hours=5, last_alert_hours=2)
+    assert box([ADMIN, LIVE], [IP + ':57833']) == ''
+    assert not (box.state / 'session.state').exists()
+    mail = box(*leftover)
+    assert '1 of them are LEFTOVERS' in mail and 'Same state for: 0 min' in mail

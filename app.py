@@ -409,8 +409,16 @@ def _sudo_wrap(cmd):
         return [_sys.executable] + _BROKER_CLIENT_PYFLAGS + [_BROKER_CLIENT, 'exec', '--'] + cmd
     if os.getuid() != 0 and cmd and cmd[0] != 'sudo':
         return ['sudo', '-n'] + cmd
+    if cmd and cmd[0] == 'ufw' and shutil.which('flock'):
+        # Root console, no broker: take the box-wide ufw lock the broker takes
+        # (broker UFW_LOCK_PATH — two unlocked ufw writers drop rules).
+        return ['flock', '-w', '90', _UFW_LOCK_PATH] + cmd
     return cmd
 
+
+# The one lock every ufw call on the box holds — broker/takwerx_broker.py UFW_LOCK_PATH
+# carries the test6 incident; fail2ban takes it through the infratak-ufw action.
+_UFW_LOCK_PATH = '/run/infratak-ufw.lock'
 
 _BROKER_SHIM_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.shims')
 
@@ -1675,7 +1683,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.4.6-alpha"
+VERSION = "10.4.7-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1889,8 +1897,15 @@ NETBIRD_DASHBOARD_IMAGE = "netbirdio/dashboard:v2.96.0"
 AUTHENTIK_REDIS_IMAGE = 'docker.io/library/redis:8.10.3-alpine'
 # ops #819: 0.82.0 -> 0.82.1 (Nov 10): the account id is enforced on a proxy update (an account-scope
 # check). No config or store change. Rollback: re-pin the dev server image to 0.82.0.
-NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.82.1"  # UNDER TRIAL (ops #427, #819)
-NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.96.0"
+# ops #1088: 0.83.2 / v2.98.0 UNDER TRIAL on dev (T&E only, not promoted). 0.83.0 moves a peer's
+# connection state out of peers.peer_status_* into the new peer_connections + management_instances
+# tables (a migration copies peer_status_last_seen on first start; upstream names no way back), so
+# _netbird_peer_stats_from_db reads those tables when a live instance row exists. Dashboard v2.98.0
+# ships nginx 1.30.7 (v2.96.0 had 1.30.6, without the Nov 18 nginx fixes). Rollback: re-pin the dev
+# pair to 0.82.1 / v2.96.0; the pin-restore heal converges boxes back (0.82.1 on a 0.83-migrated
+# store is a T&E row, ops #1088).
+NETBIRD_SERVER_DEV_IMAGE = "netbirdio/netbird-server:0.83.2"  # UNDER TRIAL (ops #427, #819, #1088)
+NETBIRD_DASHBOARD_DEV_IMAGE = "netbirdio/dashboard:v2.98.0"
 
 
 def _get_netbird_target_images(settings=None):
@@ -13010,6 +13025,21 @@ def console_rollback_api():
                 return jsonify({'ok': False, 'error': (
                     'Rollback stopped: the MediaMTX web editor passwords could not be changed '
                     'for the older version. Nothing was changed.')}), 500
+        # ops #1151: an older release cannot keep ATLAS on Authentik's signed token (its
+        # Caddyfile does not pass the token and its Authentik reconfigure takes the signing
+        # key off). Put such a deployment back on the identity headers first, or it refuses
+        # every administrator after the rollback. A failure here does not stop the rollback.
+        atlas_reset = {}
+        try:
+            _atlas_rb = (mod_registry.MODULES.get('atlas') or {}).get('before_console_rollback')
+            if _atlas_rb:
+                atlas_reset = _atlas_rb(
+                    mod_registry.get_ctx(),
+                    lambda m: print(f'Rollback: ATLAS {m}', flush=True),
+                    _console_release_has_file(console_dir, prev_tag,
+                                              'modules/atlas_signed_identity.py')) or {}
+        except Exception as _arb:
+            print(f'Rollback: ATLAS sign-in step error (non-fatal): {str(_arb)[:160]}', flush=True)
         checkout_r = subprocess.run(
             git_cfg + ['checkout', '--force', prev_tag],
             cwd=console_dir, capture_output=True, text=True, timeout=30,
@@ -13028,6 +13058,9 @@ def console_rollback_api():
                         'format, so its accounts got new passwords. The admin password is on '
                         'the MediaMTX page. All of them are in '
                         '/opt/mediamtx-webeditor/initial_admin_password.txt on the editor box.')
+        if 'failed' in atlas_reset.values():
+            message += (' ATLAS could not be set back to the sign-in of that version. If the '
+                        'ATLAS console refuses administrators, press Update Now again.')
         return jsonify({
             'ok': True, 'tag': prev_tag,
             'message': message,
@@ -16840,8 +16873,8 @@ def netbird_uninstall_api():
             # Remove NetBird directory
             if os.path.exists(nb_dir):
                 _sh.rmtree(nb_dir)
-            # Remove UFW rule
-            _sp.run(['sudo', 'ufw', 'delete', 'allow', '3478/udp'], capture_output=True)
+            # Close the STUN port deploy opened (host firewall via _fw_remove, not bare ufw: ops #1176)
+            _fw_remove(3478, 'udp')
             # Update settings
             settings = load_settings()
             settings['netbird_enabled'] = False
@@ -23208,8 +23241,154 @@ def _f2b_banaction():
     Works on Rocky 9 via nft-backed iptables, with OR without firewalld active
     (firewalld is off on cloud boxes that rely on the security group). The
     infratak-guarddog notify action is appended on top by each jail. (Firewalld-
-    native banaction — firewallcmd-* — is part of the broader firewall-parity work.)"""
-    return 'iptables-allports' if _distro_family() == 'rhel' else 'ufw'
+    native banaction — firewallcmd-* — is part of the broader firewall-parity work.)
+
+    Debian → 'infratak-ufw' since v10.4.6: the stock ufw action with every ufw call
+    under the box-wide ufw lock (see _F2B_UFW_ACTION_CONF) — but only once the box has
+    been moved to it (_startup_f2b_ufw_lock_switch), or on a box with no jail of ours
+    yet. Until then 'ufw': a jail writer that changed the action and reloaded would
+    unban through the old, unlocked action outside the locked move. Never a name whose
+    file is not on disk — that stops the WHOLE fail2ban daemon."""
+    if _distro_family() == 'rhel':
+        return 'iptables-allports'
+    if os.path.exists(_F2B_UFW_ACTION_PATH):
+        return 'infratak-ufw'
+    try:
+        import glob as _glob
+        fresh = not _glob.glob('/etc/fail2ban/jail.d/infratak-*.conf')
+    except Exception:
+        fresh = False
+    if fresh and _f2b_ensure_ufw_action():
+        return 'infratak-ufw'
+    return 'ufw'
+
+
+_F2B_UFW_ACTION_PATH = '/etc/fail2ban/action.d/infratak-ufw.conf'
+# fail2ban's stock ufw action, defined in full here so it reads the same on fail2ban
+# 0.11 (Ubuntu 22.04) and 1.0 (24.04), whose stock ufw.conf differ. The only change
+# is `flock`: fail2ban runs its jails in parallel and restores every ban at boot, and
+# unlocked ufw writers drop rules from /etc/ufw/user.rules. On test6 (2026-11-21) the
+# recidive restore raced the console's boot `ufw delete` calls and 31 IPv4 rules —
+# 22/80/443/8089 among them — were lost; the box answered ping and nothing else. The
+# comment format matches the stock 1.0 action so the console's ban list reads the same.
+_F2B_UFW_ACTION_CONF = (
+    "# Managed by infra-TAK — rewritten on console start. fail2ban's stock ufw action\n"
+    "# with every ufw call holding /run/infratak-ufw.lock, the lock the console's\n"
+    "# privilege broker holds for its own ufw calls.\n"
+    "[Definition]\n"
+    "actionstart =\n"
+    "actionstop =\n"
+    "actioncheck =\n"
+    f"actionban = flock -w 90 {_UFW_LOCK_PATH} ufw insert <insertpos> <blocktype> from <ip> to <destination> comment \"<comment>\"\n"
+    f"actionunban = flock -w 90 {_UFW_LOCK_PATH} ufw delete <blocktype> from <ip> to <destination>\n"
+    "\n"
+    "[Init]\n"
+    "insertpos = 1\n"
+    "blocktype = reject\n"
+    "destination = any\n"
+    "comment = by Fail2Ban after <failures> attempts against <name>\n"
+    "# above flock's 90 s wait, so fail2ban does not kill a ban that is waiting its turn\n"
+    "timeout = 120\n"
+)
+
+
+def _f2b_ensure_ufw_action():
+    """Write the infratak-ufw fail2ban action if it is missing or different.
+    True when the file on disk is ours afterwards."""
+    try:
+        try:
+            with open(_F2B_UFW_ACTION_PATH) as f:
+                if f.read() == _F2B_UFW_ACTION_CONF:
+                    return True
+        except FileNotFoundError:
+            pass
+        except PermissionError:
+            pass
+        if not os.path.isdir('/etc/fail2ban/action.d') or not shutil.which('flock'):
+            return False
+        _write_priv(_F2B_UFW_ACTION_PATH, _F2B_UFW_ACTION_CONF)
+        return True
+    except Exception:
+        return False
+
+
+_F2B_STALE_UFW_RE = re.compile(r'(?m)^(\s*action\s*=\s*)ufw(?=\s|$)')
+
+
+def _f2b_stale_ufw_jails():
+    """Our jail.d/infratak-*.conf files still on the stock `action = ufw`, as
+    [(path, text)]. Only an `action = ufw` line counts; a guard-dog notify line under
+    it is kept when the line is rewritten."""
+    import glob as _glob
+    stale = []
+    for path in sorted(_glob.glob('/etc/fail2ban/jail.d/infratak-*.conf')):
+        try:
+            with open(path) as f:
+                txt = f.read()
+        except Exception:
+            continue
+        if _F2B_STALE_UFW_RE.search(txt):
+            stale.append((path, txt))
+    return stale
+
+
+# Same "To" values ufw prints for a plain port rule: 22, 22/tcp, 60000:61000/udp.
+_UFW_STATUS_ROW_RE = re.compile(
+    r'^(?P<to>\d+(?::\d+)?(?:/(?:tcp|udp))?)(?P<v6> \(v6\))?\s+'
+    r'(?P<action>ALLOW|DENY|REJECT|LIMIT)(?: IN)?\s+'
+    r'(?P<src>Anywhere(?: \(v6\))?)\s*(?:#.*)?$')
+
+
+def _ufw_ipv4_parity_heal(plog=None):
+    """Add back any IPv4 port rule whose IPv6 twin exists ("22/tcp (v6) ALLOW
+    Anywhere (v6)" with no "22/tcp ALLOW Anywhere"). `ufw allow 22/tcp` always writes
+    both families, so an IPv6-only port rule means the IPv4 copy was lost — the test6
+    failure (2026-11-21), where unlocked ufw writers dropped 31 IPv4 rules and the box
+    dropped every TCP port. fail2ban bans are IPv4 and rewrite only user.rules, which
+    is why IPv6 is the side that survives and the side this trusts.
+
+    One direction only: an IPv4-only rule is left alone, so this can never re-add a
+    rule the console removed. Only "Anywhere" port rules; source-scoped, interface,
+    app-profile and routed rules are not compared. Returns the rules it added."""
+    _log = plog or (lambda m: None)
+    if _fw_backend() != 'ufw':
+        return []
+    r = subprocess.run(_sudo_wrap(['ufw', 'status']), capture_output=True, text=True, timeout=120)
+    out = r.stdout or ''
+    if r.returncode != 0 or not out.lower().startswith('status: active'):
+        return []
+    v4, v6 = [], set()
+    for ln in out.splitlines():
+        m = _UFW_STATUS_ROW_RE.match(ln.strip())
+        if not m:
+            continue
+        key = (m.group('action').lower(), m.group('to'))
+        if m.group('v6'):
+            if m.group('src').endswith('(v6)'):
+                v6.add(key)
+        elif not m.group('src').endswith('(v6)'):
+            v4.append(key)
+    added = []
+    for action, to in sorted(v6 - set(v4)):
+        rr = subprocess.run(_sudo_wrap(['ufw', action, to]), capture_output=True, text=True, timeout=120)
+        if rr.returncode == 0:
+            added.append(f'{action} {to}')
+        else:
+            _log(f"ufw parity: could not add IPv4 {action} {to}: {(rr.stderr or rr.stdout or '').strip()[:120]}")
+    if added:
+        _log(f"ufw parity: {len(added)} IPv4 rule(s) were missing and are back: {', '.join(added)}")
+    return added
+
+
+def _startup_ufw_ipv4_parity():
+    """FIRST startup firewall step: repair IPv4 rules lost to an earlier ufw race
+    (_ufw_ipv4_parity_heal) before the console's own boot firewall calls run. The
+    fail2ban move to the locked action is later (_startup_f2b_ufw_lock_switch), after
+    the broker has converged onto this checkout's code."""
+    try:
+        _ufw_ipv4_parity_heal(lambda m: print(f"Startup migration: {m}", flush=True))
+    except Exception as e:
+        print(f"Startup migration: ufw parity error (non-fatal): {str(e)[:160]}", flush=True)
 
 
 # MediaMTX / TAK Video Restreamer listeners, from the mediamtx.yml we generate
@@ -36529,6 +36708,8 @@ def _authentik_sync_all_domain_refs(fqdn, settings, plog=None):
             _log(f"✓ Proxy providers updated ({len(providers)} total)")
         except Exception as e:
             _log(f"⚠ Proxy providers: {str(e)[:120]}")
+        # ops #1151: every provider was just saved, so each lost its signing key.
+        _atlas_signed_identity_converge(_log)
 
     # 6. Restart Authentik if env changed (env changes require full down/up, not just restart)
     if env_changed:
@@ -39559,6 +39740,20 @@ def _console_release_editor_ref(console_dir, tag):
         return ''
     m = re.search(r'''MEDIAMTX_EDITOR_REF\s*=\s*["']([^"']+)["']''', r.stdout or '')
     return m.group(1) if m else ''
+
+
+def _console_release_has_file(console_dir, tag, path):
+    """Does console release `tag` hold `path`? False when git cannot say (ops #1151)."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', str(tag or '')):
+        return False   # never let a stored value reach git as an option
+    try:
+        r = subprocess.run(
+            ['git', '-c', f'safe.directory={console_dir}', 'cat-file', '-e', f'{tag}:{path}'],
+            cwd=console_dir, capture_output=True, text=True, timeout=30,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    except Exception:
+        return False
+    return r.returncode == 0
 
 
 def _mediamtx_editor_run_users_script(settings, script):
@@ -43098,8 +43293,12 @@ def generate_caddyfile(settings=None):
     # the SSO path is unchanged (forward_auth adds the real header after the strip).
     # v10.1.1 S1: X-Infratak-Proxy-Auth is stripped from clients here too — only
     # Caddy itself may attach it (below, after forward_auth passes).
+    # ATLAS W504: X-Authentik-Jwt as well. ATLAS can read the administrator from
+    # it, so a client copy must never survive to the upstream. copy_headers also
+    # deletes it (Caddy 2.11), this keeps the strip list the whole contract.
     _AK_FWD_HEADERS = ('X-Authentik-Username', 'X-Authentik-Groups', 'X-Authentik-Email',
-                       'X-Authentik-Name', 'X-Authentik-Uid', 'X-Infratak-Proxy-Auth')
+                       'X-Authentik-Name', 'X-Authentik-Uid', 'X-Authentik-Jwt',
+                       'X-Infratak-Proxy-Auth')
     def _emit_ak_header_strip(indent):
         for _h in _AK_FWD_HEADERS:
             lines.append(f"{indent}request_header -{_h}")
@@ -43724,7 +43923,10 @@ def generate_caddyfile(settings=None):
             lines.append(f"        respond @atlas_device 404")
             lines.append(f"        forward_auth {ak_up} {{")
             lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-            lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+            # ATLAS W504: X-Authentik-Jwt too. ATLAS 2.10+ reads the administrator
+            # from that signed token once the module switches it over
+            # (`atlas_signed_identity`); the switch checks for this line first.
+            lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt")
             lines.append(f"            trusted_proxies private_ranges")
             lines.append(f"        }}")
             # SEC_AUDIT (ATLAS) S-1 — the same mechanism the console already uses
@@ -49720,7 +49922,7 @@ def run_takportal_deploy():
                             data=json_mod.dumps({'name': 'TAK Portal Proxy', 'authorization_flow': flow_pk,
                                 'invalidation_flow': inv_flow_pk,
                                 'external_host': _tp_host, 'mode': 'forward_single',
-                                'token_validity': 'hours=24', 'cookie_domain': _tp_cookie}).encode(),
+                                'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': _tp_cookie}).encode(),
                             headers=_ak_headers, method='POST')
                         resp = _urlreq.urlopen(req, timeout=10)
                         provider_pk = json_mod.loads(resp.read().decode())['pk']
@@ -64800,7 +65002,7 @@ def _ensure_authentik_nodered_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                 data=json.dumps({'name': 'Node-RED Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': _nr_host, 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                    'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': _cookie}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -64909,7 +65111,7 @@ def _ensure_authentik_webodm_app(fqdn, ak_token, plog=None, flow_pk=None, inv_fl
                 data=json.dumps({'name': 'WebODM Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': _wo_host, 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                    'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': _cookie}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -65148,7 +65350,7 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                 data=json.dumps({'name': 'TAK Video Restreamer Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': _tvr_host, 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                    'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': _cookie}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -65245,7 +65447,7 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
                 data=json.dumps({'name': 'Federation Hub Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': f'https://{_pub_hostport(fedhub_domain)}', 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
+                    'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': f'.{fqdn.split(":")[0]}'}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -65395,7 +65597,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
                         data=json.dumps({'name': name, 'authorization_flow': flow_pk,
                             'invalidation_flow': inv_flow_pk,
                             'external_host': host, 'mode': 'forward_single',
-                            'token_validity': 'hours=24', 'cookie_domain': cookie_domain}).encode(),
+                            'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': cookie_domain}).encode(),
                         method='POST', headers=_ak_headers, max_retries=3, timeout=30
                     ).read().decode())['pk']
                     provider_pks.append(pk)
@@ -66220,10 +66422,17 @@ def _netbird_peer_stats_from_db(nb_dir=None):
 
     Review #2 (PR #42) note: this SQL is fully static — no user/remote input is
     interpolated, so there is no injection surface (opened `mode=ro` besides). The residual
-    risk is schema-coupling to NetBird's internal `store.db` (`peers.peer_status_connected`);
-    tolerated because the image is PINNED (NETBIRD_SERVER_IMAGE) so the schema is fixed — RE-VERIFY
-    this table/column on any pin bump. Fails soft (try/except → None → callers fall back to the
-    mgmt API), so a broken read only blanks the peer-count stat, never the deploy."""
+    risk is schema-coupling to NetBird's internal `store.db`; tolerated because the image is
+    PINNED (NETBIRD_SERVER_IMAGE) so the schema is fixed — RE-VERIFY these tables/columns on any pin
+    bump. Fails soft (try/except → None → callers fall back to the mgmt API), so a broken read only
+    blanks the peer-count stat, never the deploy.
+
+    ops #1088: NetBird 0.83.0 stopped reading and writing `peers.peer_status_connected` (the column
+    stays, frozen). From 0.83 a peer counts as connected while its `peer_connections.instance_id`
+    names a `management_instances` row whose `last_seen` is under 5 minutes old (upstream
+    peer.go / connection.go, InstanceStaleAfter). A live instance row is therefore what says "the
+    0.83 server is running": with none, the old column is read (0.82 and older, and a box rolled
+    back to 0.82.1 on a 0.83-migrated store, where the new tables stay but are no longer written)."""
     import sqlite3
     nb_dir = nb_dir or NETBIRD_INSTALL_DIR
     db_path = os.path.join(nb_dir, 'data', 'store.db')
@@ -66231,9 +66440,26 @@ def _netbird_peer_stats_from_db(nb_dir=None):
         return None
     try:
         conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True, timeout=3)
-        row = conn.execute(
-            'SELECT COUNT(*), COALESCE(SUM(peer_status_connected), 0) FROM peers'
-        ).fetchone()
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('peer_connections', 'management_instances')")}
+        live_instance = False
+        if tables == {'peer_connections', 'management_instances'}:
+            live_instance = conn.execute(
+                "SELECT 1 FROM management_instances WHERE last_seen > datetime('now', '-300 seconds') LIMIT 1"
+            ).fetchone() is not None
+        if live_instance:
+            row = conn.execute(
+                'SELECT (SELECT COUNT(*) FROM peers), '
+                '(SELECT COUNT(*) FROM peers p '
+                ' JOIN peer_connections pc ON pc.peer_id = p.id '
+                ' JOIN management_instances mi ON mi.id = pc.instance_id '
+                " WHERE mi.last_seen > datetime('now', '-300 seconds'))"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                'SELECT COUNT(*), COALESCE(SUM(peer_status_connected), 0) FROM peers'
+            ).fetchone()
         conn.close()
         if not row:
             return None
@@ -66846,12 +67072,20 @@ def _run_netbird_deploy(settings):
 
         plog('')
         plog('━━━ Step 6/6: Firewall & Reverse Proxy ━━━')
-        _sp.run(['sudo', 'ufw', 'allow', '3478/udp'], capture_output=True)
+        # STUN/TURN 3478/udp must be reachable by NetBird peers. Go through _fw_allow
+        # (ufw on Debian, firewalld on RHEL, broker-wrapped on a non-root console): a bare
+        # `sudo ufw` is refused there and its result used to be ignored (ops #1176).
+        _stun_ok, _stun_msg = _fw_allow(3478, 'udp')
         settings['netbird_enabled'] = True
         save_settings(settings)
         generate_caddyfile(settings)
         _caddy_reload(timeout=90)
-        plog('✓ Caddy routes active — STUN 3478/udp allowed')
+        if _stun_ok:
+            plog('✓ Caddy routes active — STUN 3478/udp allowed')
+        else:
+            plog('✓ Caddy routes active')
+            plog(f'  ⚠ Could not open STUN 3478/udp in the host firewall: {str(_stun_msg).strip()[:160]}')
+            plog('  ⚠ NetBird peers may not connect until 3478/udp is open (Firewall page → allow 3478/udp)')
 
         fqdn = settings.get('fqdn', 'localhost')
         plog('')
@@ -66864,6 +67098,99 @@ def _run_netbird_deploy(settings):
     except Exception as e:
         plog(f'✗ Deployment failed: {str(e)}')
         _netbird_deploy_status.update({'running': False, 'error': True})
+
+
+# How long a sign-in through Authentik lasts for the apps behind it (ops #1159).
+# The outpost ends the session when the provider's ACCESS token ends, so the field
+# is `access_token_validity`. (The key `token_validity` that this code used to send
+# does not exist in Authentik's proxy provider API; Authentik ignored it and every
+# provider kept its default, `hours=1`.)
+_PROXY_SESSION_VALIDITY = 'hours=24'
+_AUTHENTIK_DEFAULT_ACCESS_TOKEN_VALIDITY = 'hours=1'
+
+# The proxy providers infra-TAK creates. Only these are repaired: any other proxy
+# provider on the box belongs to the operator.
+_INFRATAK_PROXY_PROVIDER_NAMES = frozenset({
+    'infra-TAK', 'TAK Portal Proxy', 'Node-RED Proxy', 'MediaMTX', 'Federation Hub Proxy',
+    'WebODM Proxy', 'TAK Video Restreamer Proxy', 'ATLAS MDM Proxy',
+})
+
+
+def _is_infratak_proxy_provider_name(name):
+    name = (name or '').strip()
+    return name in _INFRATAK_PROXY_PROVIDER_NAMES or name.startswith('ATLAS MDM Proxy (')
+
+
+def _proxy_session_validity_to_write(current):
+    """What a provider write should send for access_token_validity: the fleet value
+    when the provider still has Authentik's default (nobody chose it), else the value
+    it already has (an operator chose it in Authentik's admin page)."""
+    cur = (current or '').strip()
+    if not cur or cur == _AUTHENTIK_DEFAULT_ACCESS_TOKEN_VALIDITY:
+        return _PROXY_SESSION_VALIDITY
+    return cur
+
+
+def _ensure_proxy_providers_session_length(ak_url, ak_headers, plog=None):
+    """ops #1159: give the infra-TAK proxy providers that still have Authentik's
+    one-hour default the 24-hour sign-in infra-TAK always meant to give them.
+
+    Only providers named in _INFRATAK_PROXY_PROVIDER_NAMES, and only when the value is
+    exactly Authentik's default, so a length the operator set is never overwritten.
+    PATCH sends `mode` and `internal_host` with the field: Authentik refuses a PATCH
+    without them (HTTP 400, internal_host check, seen on 2026.8.5). Returns the number
+    of providers changed. Idempotent: the next run finds nothing to do."""
+    import urllib.request as _req
+    import urllib.error
+    _log = plog or (lambda m: None)
+    changed = 0
+    try:
+        r = _req.Request(f'{ak_url}/api/v3/providers/proxy/?page_size=200', headers=ak_headers)
+        providers = json.loads(_req.urlopen(r, timeout=15).read().decode()).get('results', []) or []
+    except Exception as e:
+        _log(f"  ⚠ proxy session length: could not list providers ({str(e)[:80]})")
+        return 0
+    for prov in providers:
+        name = (prov.get('name') or '').strip()
+        pk = prov.get('pk')
+        if not pk or not _is_infratak_proxy_provider_name(name):
+            continue
+        cur = (prov.get('access_token_validity') or '').strip()
+        if cur != _AUTHENTIK_DEFAULT_ACCESS_TOKEN_VALIDITY:
+            continue
+        body = {'mode': prov.get('mode') or 'forward_single',
+                'internal_host': prov.get('internal_host') or '',
+                'access_token_validity': _PROXY_SESSION_VALIDITY}
+        try:
+            _req.urlopen(_req.Request(f'{ak_url}/api/v3/providers/proxy/{pk}/',
+                                      data=json.dumps(body).encode(), headers=ak_headers,
+                                      method='PATCH'), timeout=15)
+            changed += 1
+            _log(f"  ✓ {name}: sign-in length {cur} → {_PROXY_SESSION_VALIDITY}")
+        except urllib.error.HTTPError as he:
+            _log(f"  ⚠ {name}: sign-in length PATCH failed HTTP {he.code} (will retry next start)")
+        except Exception as e:
+            _log(f"  ⚠ {name}: sign-in length PATCH failed ({str(e)[:80]}) (will retry next start)")
+    return changed
+
+
+def _ensure_authentik_proxy_session_length(plog):
+    """ops #1159: settings and token lookup for _ensure_proxy_providers_session_length.
+    Safe to call on every console start and after every update; never raises."""
+    try:
+        if not os.path.exists(os.path.expanduser('~/authentik/.env')):
+            return 0
+        _s = load_settings()
+        _tok = (_get_authentik_env_value(_s, 'AUTHENTIK_BOOTSTRAP_TOKEN') or
+                _get_authentik_env_value(_s, 'AUTHENTIK_TOKEN'))
+        _url = _get_authentik_api_url(_s)
+        if not _tok or not _url:
+            return 0
+        return _ensure_proxy_providers_session_length(
+            _url, {'Authorization': f'Bearer {_tok}', 'Content-Type': 'application/json'}, plog)
+    except Exception as e:
+        plog(f"  ⚠ proxy session length: skipped ({str(e)[:80]})")
+        return 0
 
 
 def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
@@ -66882,6 +67209,17 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
             pk = prov.get('pk')
             if not pk:
                 continue
+            # ops #1151: no write when the value is already right. Every save through
+            # this API makes Authentik reset the provider's OAuth2 settings, and that
+            # takes an ATLAS provider's token signing key off (signing_key = None in
+            # ProxyProvider.set_oauth_defaults, authentik/providers/proxy/models.py at
+            # version/2026.8.5). This runs after every console update.
+            # ✅ Seen on a box, Nov 23, 2026 (Authentik 2026.8.5): a save with `mode` in
+            # it takes the key off at once. This one-field PATCH is refused there with
+            # HTTP 400 for a forward-auth provider (internal_host check), so on that
+            # version it changes nothing; a version that accepts it takes the key off.
+            if (prov.get('cookie_domain') or '').strip() == cookie_domain:
+                continue
             try:
                 patch = _req.Request(f'{ak_url}/api/v3/providers/proxy/{pk}/',
                     data=json.dumps({'cookie_domain': cookie_domain}).encode(),
@@ -66892,6 +67230,24 @@ def _ensure_proxy_providers_cookie_domain(ak_url, ak_headers, fqdn, plog=None):
         _log("  ✓ Proxy providers cookie_domain set for shared session")
     except Exception as e:
         _log(f"  ⚠ Proxy cookie_domain: {str(e)[:80]}")
+    # ops #1151: a provider that did get a write has lost its signing key.
+    _atlas_signed_identity_converge(_log)
+
+
+def _atlas_signed_identity_converge(log=None):
+    """ops #1151: ask the ATLAS module to put a lost token signing key back.
+
+    Call it after anything that saves Authentik proxy providers through the proxy
+    provider API: that save takes the key off, and an ATLAS deployment that reads the
+    signed token then refuses every administrator. The module also checks every five
+    minutes. Never raises; nothing happens on a box with no ATLAS."""
+    _say = log or (lambda m: None)
+    try:
+        _conv = (mod_registry.MODULES.get('atlas') or {}).get('converge_signed_identity')
+        if _conv:
+            _conv(mod_registry.get_ctx(), lambda m: _say(f'  {m}'))
+    except Exception as _e:
+        _say(f'  ⚠ ATLAS signed sign-in check: {str(_e)[:120]}')
 
 
 def _reload_embedded_outpost(plog=None):
@@ -67184,7 +67540,7 @@ def _sync_authentik_takportal_provider_url(settings, plog=None):
             if flow_pk and inv_flow_pk:
                 try:
                     body = json.dumps({'name': 'TAK Portal Proxy', 'authorization_flow': flow_pk, 'invalidation_flow': inv_flow_pk,
-                        'external_host': desired_host, 'mode': 'forward_single', 'token_validity': 'hours=24', 'cookie_domain': desired_cookie})
+                        'external_host': desired_host, 'mode': 'forward_single', 'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': desired_cookie})
                     pr = _req.Request(f'{ak_url}/api/v3/providers/proxy/', data=body.encode(), headers=ak_headers, method='POST')
                     provider_pk = json.loads(_req.urlopen(pr, timeout=10).read().decode()).get('pk')
                 except urllib.error.HTTPError as e:
@@ -79439,7 +79795,13 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 # ops #1117: a `restart` saved by an older console for nothing but the
                 # outpost-recreate request (a fresh install, hours before its first update)
                 # was a young-TAK restart: treat it like `restart_if_young`.
-                _young_only = all(str(p_).startswith(_TAK_RECYCLE_YOUNG_REASON) for p_ in pending)
+                # Reasons that never ask for a restart themselves: that request, and the two the
+                # outage check adds below (an outpost / Guard Dog start after TAK's). A deferred
+                # call that kept them next to it must not make the saved flag a hard one (10.4.6 T&E).
+                _young_only = all(str(p_).startswith((
+                    _TAK_RECYCLE_YOUNG_REASON,
+                    'LDAP outpost restarted while TAK Server was running',
+                    'Guard Dog restarted Authentik while TAK Server was running')) for p_ in pending)
                 must_restart = (bool(st.get('restart')) and not _young_only) or (
                     bool(st.get('restart') or st.get('restart_if_young'))
                     and time.time() - tak_start < _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S)
@@ -80140,6 +80502,216 @@ def _ak_directory_watch_tick(plog):
     return did
 
 
+# A sign-in the LDAP outpost refused stays refused after the reason is gone (ops #1185, nuc
+# 2026-11-24, Authentik 2026.8.6). The outpost (bind_mode: cached) keeps every bind result per
+# name and password, refusals too (internal/outpost/ldap/bind/memory/memory.go). The entry lives as
+# long as the name's stored session; for a name with no good sign-in in the last hour that session
+# has no end date, so the entry never expires (ttlcache keeps an entry with a ttl <= 0 for ever).
+# Two admin actions then leave a user locked out of TAK 8446, 8089 and every LDAP client with the
+# CORRECT password, until the outpost restarts, while Authentik's own flow accepts that password:
+#   - an account is disabled, the user (or a TAK client with a saved password) tries, the account is
+#     enabled again;
+#   - a password is set to a value that was tried before.
+# A restart is no fix: it drops TAK's pooled LDAP connection (lessons: 8443 gives LDAP users no
+# groups until takserver-api restarts). The outpost builds a NEW cache only when the binder type
+# changes (NewSessionBinder keeps the old cache when the old binder is a SessionBinder), so the
+# console saves the LDAP provider with bind_mode direct and then cached again: no restart, no
+# dropped connection, a few seconds of direct (slower) binds. Proven on nuc: stuck 49 before, 0 after.
+# The watch reads every user's active flag and password_change_date from Authentik's database
+# every tick; a user that was inactive and is active now, or whose password changed, queues a flush.
+_AK_LDAP_CACHE_FLUSH_MIN_GAP_S = 60
+_AK_LDAP_CACHE_APPLY_WAIT_S = 30
+_AK_LDAP_CACHE_FLUSH_TRIES = 3
+_ak_ldap_cache_watch = {'snap': None, 'pending': set(), 'last_flush': 0.0, 'tries': 0}
+
+
+def _ak_user_credential_snapshot():
+    """{username: (is_active, password_change_date text)} for every Authentik user, from
+    Authentik's database (one query). None when it can't be read (no Authentik here,
+    container down)."""
+    sql = ("SELECT coalesce(json_object_agg(username, json_build_array(is_active, password_change_date::text)), "
+           "'{}') FROM authentik_core_user;")
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'authentik-postgresql-1', 'psql', '-U', 'authentik',
+                                       '-d', 'authentik', '-tA', '-c', sql]),
+                           capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads((r.stdout or '').strip() or '{}')
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {str(u): (bool(v[0]), str(v[1])) for u, v in data.items() if isinstance(v, list) and len(v) == 2}
+
+
+def _ak_ldap_cache_changed_users(old, new):
+    """Names the outpost may hold a stale refusal for: a user that was inactive and is active
+    now, or an active user whose password changed. New users are left out (nobody tried a
+    password for a name that did not exist), and so are users that were removed."""
+    out = set()
+    for u, (active, pw_date) in new.items():
+        prev = old.get(u)
+        if prev is None or not active:
+            continue
+        if not prev[0] or prev[1] != pw_date:
+            out.add(u)
+    return out
+
+
+def _ak_ldap_binders_built(since_epoch):
+    """How many times the LDAP outpost logged 'initialized direct binder' since since_epoch.
+    It logs that when it builds a direct binder AND when it builds a new bind cache (a cache
+    is built on top of a new direct binder); it logs nothing when it keeps the old cache.
+    None when the log can't be read."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'logs', '--since', str(int(since_epoch)), 'authentik-ldap-1']),
+                           capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return sum(1 for ln in ((r.stdout or '') + (r.stderr or '')).splitlines() if '"initialized direct binder"' in ln)
+
+
+def _ak_ldap_set_bind_mode(base, headers, pks, mode):
+    """Save the LDAP providers with this bind_mode. True when every save worked."""
+    ok = True
+    for pk in pks:
+        try:
+            with _ak_api_call(f'{base}/api/v3/providers/ldap/{pk}/', method='PATCH', headers=headers,
+                              data=json.dumps({'bind_mode': mode}).encode(), max_retries=2):
+                pass
+        except Exception:
+            ok = False
+    return ok
+
+
+def _ak_ldap_flush_state(**kv):
+    """Keep what a flush needs to undo itself, so a console restart in the middle of one
+    still ends with bind_mode cached. A None value removes the key."""
+    try:
+        s = load_settings()
+        cur = dict(s.get('ak_ldap_cache_flush') or {})
+        for k, v in kv.items():
+            if v is None:
+                cur.pop(k, None)
+            else:
+                cur[k] = v
+        s['ak_ldap_cache_flush'] = cur
+        save_settings(s)
+    except Exception:
+        pass
+
+
+def _ak_flush_ldap_bind_cache(plog):
+    """Make the LDAP outpost forget every bind result it holds, without restarting it:
+    bind_mode direct, wait until the outpost applied it, bind_mode cached, wait until it built a
+    new cache. Returns True when the outpost confirmed both steps."""
+    settings = load_settings()
+    token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+             or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '')
+    if not token:
+        return False
+    base = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    try:
+        with _ak_api_call(f'{base}/-/health/ready/', max_retries=1, timeout=5) as r:
+            if r.status != 200:
+                return False
+        with _ak_api_call(f'{base}/api/v3/providers/ldap/?page_size=100', headers=headers, max_retries=1) as r:
+            providers = json.loads(r.read().decode()).get('results', [])
+    except Exception as e:
+        plog(f"  LDAP sign-in cache flush: couldn't read the LDAP provider: {str(e)[:120]}")
+        return False
+    pks = [p['pk'] for p in providers if p.get('pk') and p.get('bind_mode') == 'cached']
+    if not pks:
+        return False          # direct mode keeps no cache; nothing to flush
+    _ak_ldap_flush_state(restore=pks, started=time.time())
+    t0 = time.time() - 1
+    built = False
+    try:
+        if not _ak_ldap_set_bind_mode(base, headers, pks, 'direct'):
+            plog("  LDAP sign-in cache flush: couldn't save the LDAP provider; putting it back")
+            return False
+        deadline = time.time() + _AK_LDAP_CACHE_APPLY_WAIT_S
+        while True:
+            n = _ak_ldap_binders_built(t0)
+            if n is not None and n >= len(pks):
+                break
+            if time.time() >= deadline:
+                plog(f"  LDAP sign-in cache flush: the outpost didn't apply bind_mode direct within "
+                     f"{_AK_LDAP_CACHE_APPLY_WAIT_S} s; putting it back")
+                return False
+            time.sleep(1)
+    finally:
+        back = _ak_ldap_set_bind_mode(base, headers, pks, 'cached')
+        if back:
+            _ak_ldap_flush_state(restore=None, started=None)
+        else:
+            plog("  LDAP sign-in cache flush: couldn't put bind_mode back to cached; will retry")
+    deadline = time.time() + _AK_LDAP_CACHE_APPLY_WAIT_S
+    while True:
+        n = _ak_ldap_binders_built(t0)
+        if n is not None and n >= 2 * len(pks):
+            built = True
+            break
+        if time.time() >= deadline:
+            break
+        time.sleep(1)
+    if not built:
+        plog(f"  LDAP sign-in cache flush: the outpost didn't confirm a new cache within "
+             f"{_AK_LDAP_CACHE_APPLY_WAIT_S} s")
+    return built
+
+
+def _ak_ldap_cache_watch_tick(plog):
+    """One pass: put back bind_mode cached if an earlier flush was cut off, then flush the
+    outpost's bind cache when an admin enabled a user again or set a password."""
+    st = _ak_ldap_cache_watch
+    if _console_update_in_progress():
+        return False
+    left = (load_settings().get('ak_ldap_cache_flush') or {}).get('restore')
+    if left:
+        settings = load_settings()
+        token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                 or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or '')
+        if token and _ak_ldap_set_bind_mode(_get_authentik_api_url(settings),
+                                            {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'},
+                                            list(left), 'cached'):
+            _ak_ldap_flush_state(restore=None, started=None)
+            plog("  LDAP sign-in cache flush: bind_mode put back to cached after an unfinished flush")
+    snap = _ak_user_credential_snapshot()
+    if snap is not None:
+        old, st['snap'] = st['snap'], snap
+        if old is not None:
+            st['pending'] |= _ak_ldap_cache_changed_users(old, snap)
+    if not st['pending'] or snap is None:
+        return False
+    if time.time() - st['last_flush'] < _AK_LDAP_CACHE_FLUSH_MIN_GAP_S:
+        return False
+    if _authentik_busy_reason():
+        return False
+    users, st['pending'] = sorted(st['pending']), set()
+    st['last_flush'] = time.time()
+    if _ak_flush_ldap_bind_cache(plog):
+        st['tries'] = 0
+        plog(f"  LDAP sign-in cache flushed (user enabled or password set: {_ak_log_names(users)}); "
+             f"an earlier refused sign-in with the right password works now")
+        return True
+    st['tries'] += 1
+    if st['tries'] >= _AK_LDAP_CACHE_FLUSH_TRIES:
+        st['tries'] = 0
+        plog(f"  LDAP sign-in cache flush gave up after {_AK_LDAP_CACHE_FLUSH_TRIES} tries "
+             f"({_ak_log_names(users)}); restarting the LDAP outpost clears a stuck sign-in")
+        return False
+    st['pending'] |= set(users)           # try again after the gap
+    return False
+
+
 def _ak_directory_watch_loop():
     log = lambda m: print(f"[ak-directory-watch] {m}", flush=True)
     while True:
@@ -80147,6 +80719,10 @@ def _ak_directory_watch_loop():
             _ak_directory_watch_tick(log)
         except Exception as e:
             log(f"error (non-fatal): {str(e)[:200]}")
+        try:
+            _ak_ldap_cache_watch_tick(log)
+        except Exception as e:
+            log(f"LDAP sign-in cache watch error (non-fatal): {str(e)[:200]}")
         time.sleep(_AK_DIR_WATCH_TICK_S)
 
 
@@ -80864,7 +81440,7 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                     'invalidation_flow': inv_flow_pk,
                     'external_host': desired_host,
                     'mode': 'forward_single',
-                    'token_validity': 'hours=24',
+                    'access_token_validity': _PROXY_SESSION_VALIDITY,
                     'cookie_domain': desired_cookie,
                 }
                 try:
@@ -80930,7 +81506,8 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
                         'invalidation_flow': inv_flow_pk,
                         'external_host': desired_host,
                         'mode': 'forward_single',
-                        'token_validity': 'hours=24',
+                        'access_token_validity': _proxy_session_validity_to_write(
+                            existing.get('access_token_validity')),
                         'cookie_domain': desired_cookie,
                         # Preserve operator-meaningful fields from the existing
                         # record (Authentik only validates internal_host when
@@ -81276,7 +81853,8 @@ def _ensure_authentik_proxy_external_hosts_canonical(plog, max_attempts=1, retry
                     'invalidation_flow': _full.get('invalidation_flow'),
                     'external_host': _want_clean,
                     'mode': _full.get('mode') or 'forward_single',
-                    'token_validity': _full.get('token_validity') or 'hours=24',
+                    'access_token_validity': _proxy_session_validity_to_write(
+                        _full.get('access_token_validity')),
                     'cookie_domain': _cookie_domain,
                     'internal_host': _full.get('internal_host') or '',
                     'internal_host_ssl_validation': _full.get(
@@ -85905,7 +86483,7 @@ entries:
                                 'invalidation_flow': inv_flow_pk or flow_pk,
                                 'external_host': f"https://{_pub_hostport(_get_service_domain(settings, 'takportal'))}",
                                 'mode': 'forward_single',
-                                'token_validity': 'hours=24',
+                                'access_token_validity': _PROXY_SESSION_VALIDITY,
                                 'cookie_domain': f'.{base_domain}'
                             }
                             req = urllib.request.Request(f'{ak_url}/api/v3/providers/proxy/',
@@ -113548,6 +114126,7 @@ def _start_guarddog_background_at_boot():
 
 
 _start_guarddog_background_at_boot()
+_startup_ufw_ipv4_parity()   # v10.4.6: FIRST firewall step — repair IPv4 rules lost to a ufw race
 _fw_remove_blanket_internal_ports()   # before the 8080 source-scope below
 _auto_harden_guarddog_8080()   # v0.9.12 A6: source-scope UFW for port 8080
 
@@ -118645,6 +119224,8 @@ def _startup_app_access_policy_converge(log=None):
                 _atlas_conv(mod_registry.get_ctx(), ak_url, ak_headers, _l)
         except Exception as _ace:
             _l(f'ATLAS access swap error (non-fatal): {str(_ace)[:160]}')
+        # ops #1151: at every console start too, so a restart repairs it at once.
+        _atlas_signed_identity_converge(_l)
     except Exception as _e:
         try:
             _l(f'error (non-fatal): {str(_e)[:200]}')
@@ -122180,6 +122761,11 @@ def _startup_migrations():
         except Exception as ak_ph_err:
             print(f"Startup migration: proxy external_hosts canonical check error (non-fatal): {ak_ph_err}")
 
+        # ops #1159: the sign-in length infra-TAK always asked for (24 hours) never
+        # reached Authentik, so existing providers sit on its one-hour default.
+        _ensure_authentik_proxy_session_length(
+            lambda m: print(f"Startup migration: {m}", flush=True))
+
         # v0.9.31: Fleet-uniform self-heal for the FULL Authentik forward_auth chain
         # (proxy provider + application + embedded-outpost membership) for every
         # deployed service. Supersedes the per-service band-aid era — closes the
@@ -123120,6 +123706,9 @@ def _post_update_auto_deploy():
                                         )
                                     except Exception as _chain_e:
                                         print(f"Post-update: proxy chain heal skipped: {_chain_e}")
+                                    # ops #1159: sign-in length (see startup migration)
+                                    _ensure_authentik_proxy_session_length(
+                                        lambda m: print(f"Post-update: {m}", flush=True))
                         except Exception as _akph_e:
                             print(f"Post-update: proxy external_hosts canonicalization skipped: {_akph_e}")
                         # v0.9.12: self-heal LDAP service account password drift.
@@ -124879,6 +125468,74 @@ def _startup_broker_converge():
 
 
 _startup_broker_converge()
+
+
+def _startup_f2b_ufw_lock_switch():
+    """Move fail2ban's jails from the stock `ufw` action to the locked `infratak-ufw`
+    action, once per box, then repair IPv4 again (now and 3 minutes later).
+
+    Runs AFTER _startup_broker_converge(), so the broker already holds the ufw lock for
+    its own ufw calls, and BEFORE _startup_migrations(), whose jail writers would
+    otherwise change the action with a plain reload. The stop is the only unsafe part:
+    it unbans every IP through the OLD, unlocked action. So the console stops fail2ban
+    while holding the ufw lock (one exact argv the broker allows), and no other ufw
+    writer can run until every one of those unbans is done. If that stop is refused or
+    fails, nothing is changed and the next start tries again."""
+    _log = lambda m: print(f"Startup migration: {m}", flush=True)
+    try:
+        if _distro_family() == 'rhel' or _fw_backend() != 'ufw':
+            return
+        if not os.path.isdir('/etc/fail2ban/action.d'):
+            return
+        stale = _f2b_stale_ufw_jails()
+        if stale:
+            act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                                 capture_output=True, text=True, timeout=15).stdout.strip()
+            if act == 'active':
+                r = subprocess.run(
+                    # Literal path on purpose: broker/scan_enforce_coverage.py (and the broker's
+                    # one exact allowed argv, FLOCK_F2B_STOP_ARGV) read the argv shape, and a
+                    # variable shows up as <var> and is reported as a denied call site.
+                    # tests/test_ufw_lock_and_parity.py keeps it equal to _UFW_LOCK_PATH.
+                    _sudo_wrap(['flock', '-w', '90', '/run/infratak-ufw.lock', 'systemctl', 'stop', 'fail2ban']),
+                    capture_output=True, text=True, timeout=300)
+                if r.returncode != 0:
+                    _log(f"fail2ban: could not stop it under the ufw lock (rc {r.returncode}: "
+                         f"{(r.stderr or r.stdout or '').strip()[:120]}) — jails stay on the stock "
+                         f"ufw action; the next console start tries again")
+                    return
+            if not _f2b_ensure_ufw_action():
+                _log("fail2ban: could not write the infratak-ufw action — jails stay on ufw")
+                if act == 'active':
+                    subprocess.run(_sudo_wrap(['systemctl', 'start', 'fail2ban']),
+                                   capture_output=True, text=True, timeout=120)
+                return
+            for path, txt in stale:
+                _write_priv(path, _F2B_STALE_UFW_RE.sub(r'\g<1>infratak-ufw', txt))
+            names = ', '.join(os.path.basename(p) for p, _ in stale)
+            if act == 'active':
+                r2 = subprocess.run(_sudo_wrap(['systemctl', 'start', 'fail2ban']),
+                                    capture_output=True, text=True, timeout=120)
+                how = 'restarted' if r2.returncode == 0 else f'start FAILED (rc {r2.returncode})'
+            else:
+                how = f'not running ({act or "unknown"}), left stopped'
+            _log(f"fail2ban: jails moved to the locked infratak-ufw action ({names}); fail2ban {how}")
+        else:
+            _f2b_ensure_ufw_action()          # keep the file current (a later release may change it)
+        _ufw_ipv4_parity_heal(_log)
+
+        def _later():
+            time.sleep(180)
+            try:
+                _ufw_ipv4_parity_heal(_log)
+            except Exception as e:
+                _log(f"ufw parity (delayed) error (non-fatal): {str(e)[:160]}")
+        threading.Thread(target=_later, daemon=True, name='ufw-parity-later').start()
+    except Exception as e:
+        _log(f"fail2ban infratak-ufw move error (non-fatal): {str(e)[:160]}")
+
+
+_startup_f2b_ufw_lock_switch()
 
 
 # v10.1.18 (SELinux enforce-the-domain): verify the box's

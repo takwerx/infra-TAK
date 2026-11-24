@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.4.5-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.5-alpha)**
+**Current release: [v10.4.6-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.6-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 

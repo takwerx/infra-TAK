@@ -82,6 +82,18 @@ MAX_TIMEOUT = 7200                            # seconds; ceiling for caller-requ
                                               # 20-60+ min; clamping requests to 600s killed every
                                               # non-root CloudTAK rebuild at exactly 10 min
                                               # (test12, 2026-07-17 — exit 125 mid-build).
+# One lock for EVERY ufw call on the box. ufw rewrites /etc/ufw/user.rules (and
+# user6.rules) with no lock of its own, so two ufw processes at once can each read the
+# file, change it, and write it back over the other. On test6 (2026-11-21 04:34 UTC)
+# fail2ban restored its recidive bans at boot (`ufw insert`) in the same seconds the
+# console ran `ufw --force delete allow 8080/tcp` and `5001/tcp`: 31 IPv4 rules were
+# lost, 22/80/443/8089 among them, and the box dropped every TCP port until it was
+# repaired from the provider's VNC console. The other writers take the SAME lock:
+# fail2ban through the `infratak-ufw` action (`flock`), selfheal_ip.py and the root
+# console through `flock` too. /run is root-only and cleared at boot.
+UFW_LOCK_PATH = '/run/infratak-ufw.lock'
+UFW_LOCK_WAIT = 90                            # seconds; a ufw write takes ~1 s
+FLOCK_F2B_STOP_ARGV = ['flock', '-w', '90', UFW_LOCK_PATH, 'systemctl', 'stop', 'fail2ban']
 SELF_PATH = os.path.realpath(__file__)
 # v10.1.13: sha of the source THIS daemon process was started from, captured at
 # import time (the on-disk file may be newer — a console update replaces the repo
@@ -95,6 +107,10 @@ try:
 except Exception:
     RUNNING_SRC_SHA = ''
 BROKER_UNIT = '/etc/systemd/system/takwerx-broker.service'
+# ops #645 W2.5: the boot unit that makes the console's folders nosuid,nodev. Written
+# by the broker only; deny-listed for the console like the broker unit.
+NOSUID_UNIT_NAME = 'infratak-nosuid.service'
+NOSUID_UNIT = '/etc/systemd/system/' + NOSUID_UNIT_NAME
 
 # ops #645 W1: the broker runs from a ROOT-OWNED copy of code that root fetched
 # from GitHub and checked (_root_install), not from the console user's repo. Until
@@ -565,6 +581,7 @@ PATH_DENY_EXACT = {
     '/etc/sudoers',
     '/etc/shadow', '/etc/gshadow', '/etc/passwd', '/etc/group',
     BROKER_UNIT,                         # console may NOT rewrite the broker unit
+    NOSUID_UNIT,                         # ...nor the nosuid boot unit (ops #645 W2.5)
     SELF_PATH,                           # ...nor the broker code
     SOCKET_PATH,
 }
@@ -579,6 +596,7 @@ PATH_DENY_PREFIX = (
     # systemd DROP-IN under its .d/ dir would override ExecStart/Environment
     # just the same (incl. the ENFORCE flag) — deny the whole drop-in dir.
     BROKER_UNIT + '.d/',
+    NOSUID_UNIT + '.d/',                 # ops #645 W2.5: same for the nosuid unit
     # ops #645 W0: write-then-root-runs paths under allowlisted prefixes that the
     # console never writes through the broker (static scan + test6/test12 audit
     # logs): apt hook config (DPkg::Pre-Invoke runs on the next apt), certbot
@@ -1524,7 +1542,7 @@ def _mode_lets_go_write(mode):
     return False
 
 
-def _check_docker(argv):
+def _check_docker(argv, cwd=None):
     """docker is inherently root-equivalent (run -v /:/host, --privileged, the
     docker.sock). We can't make it least-privilege in one pass — that's flagged
     in PLAN-v10.0.5 as core follow-on work. This first cut blocks the most
@@ -1570,6 +1588,10 @@ def _check_docker(argv):
         _check_docker_compose(argv)
     elif sub in ('save', 'build', 'buildx'):
         _check_docker_build_save(argv)
+    if sub in ('run', 'create', 'start', 'restart', 'compose'):
+        _check_docker_start_volumes(argv)       # ops #645 W2.5
+    if sub in ('build', 'buildx', 'load'):
+        _check_docker_build_reads(argv, cwd)    # ops #645 W2.5
 
 
 # ---------------------------------------------------------------------------
@@ -1827,6 +1849,281 @@ def _check_docker_volume(argv):
         raise Denied('docker volume create: one name only')
 
 
+# ---------------------------------------------------------------------------
+# ops #645 W2.5: a volume with a host path is checked again every time root starts
+# a container that uses it. `docker volume create` checks the device once
+# (_check_atlas_pg_volume), but Docker binds it at each container start, and the
+# console owns the folders above it: it could swap `pgdata` for a link to /etc
+# after the check, and the next start would mount /etc into a root container.
+# ---------------------------------------------------------------------------
+
+def _docker_get(path):
+    """GET a Docker Engine API path -> parsed JSON, None for 404 (no such object), or
+    None when there is no Docker socket (the rulebook dry runs and tests, where the
+    command could not run anyway). Any other answer raises Denied (fail closed)."""
+    if not os.path.exists(DOCKER_SOCK):
+        return None
+    try:
+        st, buf = _docker_api('GET', path, timeout=15)
+    except OSError as e:
+        raise Denied(f'cannot check docker volumes before a start: {e}')
+    if st == 404:
+        return None
+    if st != 200:
+        raise Denied(f'cannot check docker volumes before a start: HTTP {st}')
+    try:
+        return json.loads(buf.decode() or 'null')
+    except ValueError:
+        raise Denied('cannot check docker volumes before a start: bad answer')
+
+
+def _docker_ref_ok(ref):
+    """A container or volume name/id we put in an API path (no '/', '?', '%')."""
+    return bool(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,254}', ref or ''))
+
+
+def _volume_live_ok(vol):
+    """`vol` = a Docker volume object (GET /volumes/NAME). Raise Denied unless it is
+    a plain volume (no driver options) or the ATLAS Postgres bind volume whose
+    device STILL resolves to itself: no link anywhere below the ATLAS module dir."""
+    name = vol.get('Name') or '?'
+    opts = vol.get('Options') or {}
+    if not opts:
+        return
+    if (vol.get('Driver') != 'local' or set(opts) != {'type', 'o', 'device'}
+            or opts.get('type') != 'none' or opts.get('o') != 'bind'):
+        raise Denied(f'volume {name} has driver options root will not mount: {opts}')
+    device = opts.get('device') or ''
+    try:
+        _check_atlas_pg_volume(['--driver', 'local', '-o', 'type=none',
+                                '-o', 'device=' + device, '-o', 'o=bind', name])
+    except Denied as e:
+        raise Denied(f'volume {name} no longer passes the ATLAS check: {e}')
+    root = next((r for r in _ATLAS_VOLUME_ROOTS if device.startswith(r)), None)
+    if root is None or os.path.islink(root.rstrip('/')):
+        raise Denied(f'volume {name}: ATLAS folder is missing or a link')
+    want = os.path.realpath(root.rstrip('/')) + '/' + device[len(root):]
+    if os.path.realpath(device) != want:
+        raise Denied(f'volume {name}: {device} now resolves to {os.path.realpath(device)} '
+                     '(a link was planted after the volume was made)')
+
+
+def _check_volume_names(names):
+    for n in names:
+        if not _docker_ref_ok(n):
+            raise Denied(f'docker volume name not allowed: {n!r}')
+        vol = _docker_get('/volumes/' + n)
+        if vol is not None:
+            _volume_live_ok(vol)
+
+
+def _check_all_host_volumes():
+    """Every volume with driver options (compose can name any volume of the box)."""
+    data = _docker_get('/volumes')
+    for vol in (data or {}).get('Volumes') or []:
+        _volume_live_ok(vol)
+
+
+def _run_volume_names(args):
+    """Named-volume sources in `docker run|create` / `compose run` flags."""
+    names = []
+    for k, v in _docker_walk_flags(args, _DOCKER_RUN_VALUE_FLAGS, _DOCKER_RUN_BOOL_FLAGS,
+                                   'docker run'):
+        if k in ('-v', '--volume') and v and ':' in v:
+            src = v.split(':', 1)[0]
+            if src and not src.startswith('/'):
+                names.append(src)
+        elif k == '--mount' and v:
+            kv = dict(p.partition('=')[::2] for p in v.split(','))
+            src = kv.get('source') or kv.get('src') or ''
+            if kv.get('type', 'volume') == 'volume' and src:
+                names.append(src)
+    return names
+
+
+# `docker start|restart` flags that take a value (the value is not a container name)
+_DOCKER_START_VALUE_FLAGS = frozenset(('-t', '--time', '-s', '--signal', '--detach-keys',
+                                       '--checkpoint', '--checkpoint-dir'))
+_COMPOSE_START_SUBS = frozenset(('up', 'start', 'restart', 'run', 'create'))
+
+
+def _check_docker_start_volumes(argv):
+    """Before root starts a container: the volumes it will mount pass _volume_live_ok.
+    argv is already normalised (`docker container start` -> `docker start`)."""
+    sub = argv[1]
+    if sub in ('run', 'create'):
+        _check_volume_names(_run_volume_names(argv[2:]))
+    elif sub in ('start', 'restart'):
+        args, skip = argv[2:], False
+        for c in args:
+            if skip:
+                skip = False
+                continue
+            if c.startswith('-'):
+                skip = c in _DOCKER_START_VALUE_FLAGS     # `--time=5` carries its own value
+                continue
+            if not _docker_ref_ok(c):
+                raise Denied(f'docker {sub}: container name not allowed: {c!r}')
+            info = _docker_get('/containers/' + c + '/json')
+            names = [m.get('Name') for m in (info or {}).get('Mounts') or []
+                     if m.get('Type') == 'volume' and m.get('Name')]
+            _check_volume_names(names)
+    elif sub == 'compose':
+        csub, _ = _docker_compose_split(argv)
+        if csub in _COMPOSE_START_SUBS:
+            _check_all_host_volumes()
+
+
+# ---------------------------------------------------------------------------
+# ops #645 W2.5: `docker build` and `docker load` read host files as root (the
+# build context, -f, load -i). `docker build -t x /root` put root's files into an
+# image the console can read. Every such path must resolve (links followed) inside
+# a tree the console works in: its home (module dirs, the TAK bundle, the ETL
+# source cache), its own repo (the ETL shim), or a root-era module dir.
+# ---------------------------------------------------------------------------
+_BUILD_VALUE_FLAGS = frozenset((
+    '-t', '--tag', '-f', '--file', '--label', '--build-arg', '--network', '--target',
+    '--platform', '--cache-from', '--cache-to', '-o', '--output', '--progress',
+    '--add-host', '-m', '--memory', '--memory-swap', '--shm-size', '--ulimit',
+    '--cpu-shares', '-c', '--cpuset-cpus', '--cpuset-mems', '--cpu-period', '--cpu-quota',
+    '--isolation', '--builder', '--attest', '--sbom', '--provenance', '--annotation',
+    '--allow', '--call', '--no-cache-filter',
+))
+_BUILD_BOOL_FLAGS = frozenset(('--no-cache', '--pull', '--rm', '--force-rm', '-q', '--quiet',
+                               '--squash', '--compress', '--load', '--push', '--check'))
+# Read or write a host file as root, and no console call site uses them.
+_BUILD_DENY_FLAGS = {
+    '--secret': 'makes root read a host file into the build',
+    '--ssh': 'hands the build a host key or agent socket',
+    '--build-context': 'adds another host folder to the build',
+    '--iidfile': 'makes root write a host file',
+    '--metadata-file': 'makes root write a host file',
+    '--cgroup-parent': 'moves the build out of Docker\'s own cgroup',
+    '--security-opt': 'changes the build sandbox',
+}
+
+
+def _build_read_roots():
+    roots = [h for h in _HOME_ROOTS] + [d.rstrip('/') for d in ROOT_MODULE_DIRS]
+    if CONSOLE_REPO_DIR and CONSOLE_REPO_DIR != '/nonexistent':
+        roots.append(CONSOLE_REPO_DIR)
+    return roots
+
+
+def _effective_cwd(cwd):
+    """The folder _do_exec really runs in: the request's cwd only when it is an
+    existing folder, else the broker's own (/). The check must use the same one, or
+    `cwd=<missing folder in home>` + `docker build .` passed and then read `/`."""
+    if cwd and isinstance(cwd, str) and os.path.isdir(cwd):
+        return cwd
+    return '/'
+
+
+def _build_is_remote(path):
+    return path == '-' or bool(re.match(r'^(https?|git|ssh)://|^git@|^github\.com/', path))
+
+
+def _check_build_read_path(path, cwd, what):
+    """`path` (relative to the effective cwd) must resolve inside a build root."""
+    if _build_is_remote(path):
+        return                         # stdin, or a remote context: no host file
+    if '\x00' in path:
+        raise Denied(f'{what}: NUL in path')
+    full = path if path.startswith('/') else os.path.join(_effective_cwd(cwd), path)
+    for root in _build_read_roots():
+        if _within_realpath(full, root):
+            return
+    raise Denied(f'{what} reads a host path outside the console\'s folders: {path}')
+
+
+def _docker_build_read_slots(argv):
+    """argv normalised (`docker image build` -> `docker build`). Yields
+    (index in argv, prefix, path, what) for every host path root will read: the build
+    context(s), -f, and load -i. `prefix` is what goes before the path in that argv
+    word ('' for a separate word, '--file=' / '-f' for an attached value).
+    Raises Denied for the build flags that read or write other host files."""
+    sub = argv[1]
+    if sub == 'load':
+        i = 2
+        while i < len(argv):
+            tok = argv[i]
+            k, v = _flag_split(tok)
+            if k in ('-i', '--input'):
+                if v is None:
+                    yield i + 1, '', (argv[i + 1] if i + 1 < len(argv) else ''), 'docker load -i'
+                    i += 2
+                    continue
+                yield i, k + '=', v, 'docker load -i'
+            elif tok.startswith('-i') and len(tok) > 2 and not tok.startswith('--'):
+                yield i, '-i', tok[2:], 'docker load -i'
+            elif k == '--platform' and v is None:
+                i += 1
+            i += 1
+        return
+    start = 2
+    if sub == 'buildx':
+        if len(argv) < 3 or argv[2] not in ('build', 'b'):
+            return                     # buildx ls / inspect / use: no host files
+        start = 3
+    i = start
+    while i < len(argv):
+        tok = argv[i]
+        if tok == '--':
+            for j in range(i + 1, len(argv)):
+                yield j, '', argv[j], f'docker {sub} context'
+            return
+        if tok.startswith('-') and tok != '-':
+            k, v = _flag_split(tok)
+            pre = k + '='
+            if not tok.startswith('--') and len(tok) > 2 and tok[:2] in ('-f', '-t', '-o', '-m', '-c'):
+                k, v, pre = tok[:2], tok[2:], tok[:2]
+            if k in _BUILD_DENY_FLAGS:
+                raise Denied(f'docker {sub} {k} denied: {_BUILD_DENY_FLAGS[k]}')
+            if k in _BUILD_VALUE_FLAGS and v is None:
+                if k in ('-f', '--file') and i + 1 < len(argv) and argv[i + 1] != '-':
+                    yield i + 1, '', argv[i + 1], f'docker {sub} -f'
+                i += 2
+                continue
+            if k in ('-f', '--file') and v not in (None, '-'):
+                yield i, pre, v, f'docker {sub} -f'
+            i += 1
+            continue
+        yield i, '', tok, f'docker {sub} context'
+        i += 1
+
+
+def _check_docker_build_reads(argv, cwd):
+    for _i, _pre, path, what in _docker_build_read_slots(argv):
+        _check_build_read_path(path or '', cwd, what)
+
+
+def _docker_build_realpaths(argv, cwd):
+    """ops #645 W2.5: like _docker_bind_realpaths, for `docker build|buildx build|load`:
+    the context, -f and -i become the absolute resolved path the check passed, from
+    the same working folder _do_exec runs in. Anything unusual: argv unchanged (the
+    check already ran)."""
+    if not argv or os.path.basename(argv[0]) != 'docker' or len(argv) < 3:
+        return argv
+    a = list(argv)
+    if a[1] == 'image' and len(a) > 2 and a[2] in ('build', 'load'):
+        a = [a[0], a[2]] + a[3:]
+        off = 1
+    else:
+        off = 0
+    if a[1] not in ('build', 'buildx', 'load'):
+        return argv
+    out = list(argv)
+    try:
+        for i, pre, path, _what in _docker_build_read_slots(a):
+            if not path or _build_is_remote(path):
+                continue
+            full = path if path.startswith('/') else os.path.join(_effective_cwd(cwd), path)
+            out[i + off] = pre + os.path.realpath(full)
+    except Denied:
+        return argv
+    return out
+
+
 def _check_docker_build_save(argv):
     """`docker save -o PATH` and `docker build -o PATH` write a host file as root;
     `buildx --allow security.insecure` runs privileged build steps. Path-check the
@@ -1921,10 +2218,17 @@ def _docker_cp_host_direct(path, readonly):
     if path == '-':
         return True
     try:
-        _path_allowed(path, readonly=readonly)
-        return True
+        p = _path_allowed(path, readonly=readonly)
     except Denied:
         return False
+    # ops #645 W2.5: root never writes a unit, a validated config file or a root-run
+    # script from a container (`docker cp c:/x /etc/systemd/system/evil.service`,
+    # `docker cp c:/x /opt/tak-guarddog/<script>`). The unit checker and the Guard
+    # Dog lock only see `write` and the coreutils, so the copy goes through the
+    # console user instead, who cannot write those root-owned places.
+    if not readonly and _root_runs(p):
+        return False
+    return True
 
 
 def _check_docker_cp(argv):
@@ -2081,18 +2385,79 @@ def _check_docker_mount(spec, mount_flag=False, compose=False):
         if _within_realpath(src, TAK_BUNDLE_DIR):
             return
         raise Denied(f'docker bind mount escapes bundle dir via symlink: {src}')
-    bad = ('/', '/etc', '/root', '/home', '/boot', '/usr', '/bin', '/sbin',
-           '/lib', '/lib64', '/var/run', '/run', '/proc', '/sys', '/dev')
-    # Deny an exact match OR any CHILD of a sensitive root. The prefix loop MUST
-    # cover the same set as `bad`: a prior version only looped a narrow subset
-    # (/etc,/root,/home,/boot,/proc,/sys), so a SUBDIR of /usr,/bin,/sbin,/lib,
-    # /var/run,/run,/dev — e.g. `-v /usr/local/bin:/x:rw` — was neither an exact
-    # match nor caught by the prefix loop, and slipped the deny (a root-running
-    # container could then drop a root-owned binary onto the host PATH). '/' is
-    # excluded from the prefix loop (every abs path starts with it); the root
-    # mount is caught by the exact-match branch.
-    if real in bad or any(real.startswith(b + '/') for b in bad if b != '/'):
-        raise Denied(f'docker bind mount of sensitive host path denied: {src}')
+    # ops #645 W2.5: an ALLOW list. The old deny list (/, /etc, /root, /home, /usr,
+    # …) missed /var, /opt, /srv and /mnt: `-v /var:/v` reached root's crontab, the
+    # dpkg maintainer scripts and the broker's own state, `-v /opt:/o` the Guard Dog
+    # scripts. Besides the TAK bundle above (and the compose run carve-out), a bind
+    # source must now be one of:
+    #   - a single regular file directly in /tmp (the CloudTAK Marketplace step
+    #     binds its /tmp/ctak-*.yml and .cjs files; /tmp is sticky and world-
+    #     writable, so the kernel's protected_symlinks stops root from following a
+    #     link the console puts there later).
+    # Nothing else: module dirs were refused before (/home and /root were on the old
+    # deny list), and no `docker run` call site binds them or a system path (the
+    # read-only binds CloudTAK uses come from its compose file, W3). Harvest: test6
+    # and test12 audit logs Nov 9-19 2026 (docker run/create/compose run), and the
+    # docker run call sites in app.py.
+    parts = real.split('/')
+    if len(parts) == 3 and parts[1] == 'tmp' and parts[2]:
+        try:
+            st = os.lstat(real)
+        except OSError:
+            st = None
+        if st is not None and stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+            return
+        raise Denied(f'docker bind mount from /tmp must be an existing plain file: {src}')
+    raise Denied(f'docker bind mount of a host path outside the TAK bundle and /tmp '
+                 f'files denied: {src}')
+
+
+def _docker_bind_realpaths(argv):
+    """ops #645 W2.5 (Security review 2): the broker checked the RESOLVED bind source,
+    so Docker gets that path, not the console's spelling of it. A folder the console
+    swaps for a link after the check is then not followed at the top level. Only
+    `docker run|create` (also `docker container run|create`) absolute -v/--mount
+    bind sources change; everything else is returned as it came."""
+    if not argv or os.path.basename(argv[0]) != 'docker' or len(argv) < 3:
+        return argv
+    head = 2
+    if argv[1] == 'container' and len(argv) > 3:
+        head = 3
+    if argv[head - 1] not in ('run', 'create'):
+        return argv
+    out = list(argv)
+    i = head
+    while i < len(out):
+        tok = out[i]
+        if tok == '--' or not tok.startswith('-'):
+            break
+        k, v = _flag_split(tok)
+        if k in ('-v', '--volume', '--mount'):
+            j, val = (i, v) if v is not None else (i + 1, out[i + 1] if i + 1 < len(out) else '')
+            new = _bind_spec_realpath(val, k == '--mount')
+            if new != val:
+                out[j] = (k + '=' + new) if v is not None else new
+            i = j + 1
+            continue
+        if k in _DOCKER_RUN_VALUE_FLAGS and v is None:
+            i += 2
+            continue
+        i += 1
+    return out
+
+
+def _bind_spec_realpath(spec, mount_flag):
+    if mount_flag or spec.startswith('type='):
+        parts = spec.split(',')
+        for n, p in enumerate(parts):
+            k, sep, v = p.partition('=')
+            if k.strip() in ('source', 'src') and v.startswith('/'):
+                parts[n] = k + sep + os.path.realpath(v)
+        return ','.join(parts)
+    if ':' not in spec or not spec.startswith('/'):
+        return spec
+    src, rest = spec.split(':', 1)
+    return os.path.realpath(src) + ':' + rest
 
 
 def check_exec(argv, cwd=None):
@@ -2116,6 +2481,15 @@ def check_exec(argv, cwd=None):
     if base == 'bash':
         _check_bash(argv)
         return argv
+    # `flock` runs any command it is given, so it is not on the allow-list. ONE exact
+    # argv: stop fail2ban while holding the ufw lock. The console sends it once per box,
+    # when it moves fail2ban's jails from the stock unlocked `ufw` action to the locked
+    # `infratak-ufw` action: that stop unbans every IP through the OLD action, and holding
+    # the lock keeps every other ufw writer out while it does.
+    if base == 'flock':
+        if argv != FLOCK_F2B_STOP_ARGV:
+            raise Denied('flock: only the fail2ban stop under the ufw lock is allowed')
+        return argv
     if base in EXEC_DENY:
         raise Denied(f'binary is denied: {base}')
     if base not in EXEC_ALLOW:
@@ -2125,7 +2499,7 @@ def check_exec(argv, cwd=None):
     elif base == 'systemd-run':
         _check_systemd_run(argv)
     elif base == 'docker':
-        _check_docker(argv)
+        _check_docker(argv, cwd)
     elif base in ('apt', 'apt-get', 'dnf', 'yum'):
         _check_pkgmgr(argv)
     elif base == 'semanage':
@@ -3701,13 +4075,33 @@ def _check_systemctl(argv):
     """Allow only safe systemctl verbs. `link`/`edit`/`set-property`/
     `set-environment`/`switch-root` can run arbitrary root code or point a unit
     at console-controlled content, so they are denied."""
-    for a in argv[1:]:
+    for n, a in enumerate(argv[1:], start=1):
         if a.startswith('-'):
             continue               # global flag (--now, --no-block, -p, ...)
         if a in SYSTEMCTL_VERBS:
+            # ops #645 W2.5: the nosuid boot unit stays on (a mask or disable plus a
+            # reboot would bring the setuid route back before the broker re-applies it)
+            if a in _SYSTEMCTL_NOSUID_DENY and any(
+                    _names_nosuid_unit(u) for u in argv[n + 1:] if not u.startswith('-')):
+                raise Denied(f'systemctl {a} {NOSUID_UNIT_NAME} denied: it keeps setuid '
+                             'files out of the console\'s folders')
             return                 # first non-flag token is the verb
         raise Denied(f'systemctl verb not allowed: {a}')
     return                         # no verb (e.g. `systemctl --version`) — fine
+
+
+_SYSTEMCTL_NOSUID_DENY = frozenset(('stop', 'disable', 'mask', 'kill'))
+
+
+def _names_nosuid_unit(arg):
+    """True when a systemctl unit argument means the nosuid unit: its name with or
+    without `.service`, a path to it, or a glob that matches it."""
+    import fnmatch
+    u = os.path.basename(arg)
+    if u == NOSUID_UNIT_NAME or u + '.service' == NOSUID_UNIT_NAME:
+        return True
+    return any(c in u for c in '*?[') and (fnmatch.fnmatchcase(NOSUID_UNIT_NAME, u)
+                                          or fnmatch.fnmatchcase(NOSUID_UNIT_NAME[:-8], u))
 
 
 def _mode_setid_bits(mode):
@@ -3907,6 +4301,38 @@ def _recv_all(conn):
 BROKER_TRUSTED_PATH = '/usr/sbin:/usr/bin:/sbin:/bin'
 
 
+def _run_maybe_ufw_locked(argv, **kw):
+    """subprocess.run(argv, **kw), holding UFW_LOCK_PATH when argv is ufw (see the
+    constant for why). Waits up to UFW_LOCK_WAIT s for the lock; if it is still held
+    the command is NOT run, and the caller gets exit 75 (EX_TEMPFAIL). Running anyway
+    is the race this lock exists to stop, and a failed ufw call is visible where a
+    clobbered rules file is not."""
+    if os.path.basename(str(argv[0])) != 'ufw':
+        return subprocess.run(argv, **kw)
+    import fcntl
+    fd = os.open(UFW_LOCK_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        # fail2ban's `flock` creates the file 644 if it gets there first, and any user
+        # who can open a file can flock it — keep it root-only.
+        try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        deadline = time.monotonic() + UFW_LOCK_WAIT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    msg = f'ufw lock {UFW_LOCK_PATH} still held after {UFW_LOCK_WAIT}s; not run\n'
+                    return subprocess.CompletedProcess(argv, 75, b'', msg.encode())
+                time.sleep(0.1)
+        return subprocess.run(argv, **kw)
+    finally:
+        os.close(fd)                              # closing the fd releases the lock
+
+
 def _do_exec(req):
     # NB: the allow/deny decision is made in _dispatch (so permissive mode can
     # execute-and-log). Do NOT re-validate the ALLOWLIST here or permissive mode
@@ -3944,6 +4370,8 @@ def _do_exec(req):
     _pd = compose_project_dir(argv)
     if _pd:
         cwd = _pd
+    argv = _docker_bind_realpaths(argv)          # ops #645 W2.5: Docker gets the checked path
+    argv = _docker_build_realpaths(argv, cwd)
     # HARDENING (env injection): NEVER honor a caller-supplied `env`. check_exec
     # validates argv only; a merged-in LD_PRELOAD/LD_LIBRARY_PATH/BASH_ENV/ENV/PATH
     # turns ANY allowed binary into arbitrary root code (the same vector the
@@ -3983,8 +4411,8 @@ def _do_exec(req):
         # root-checked copy (TAK release key, or Caddy's published SHA-512).
         argv, pkg_stage = _pkg_stage_verified(argv, cwd, timeout)
         try:
-            proc = subprocess.run(argv, input=input_bytes, capture_output=True,
-                                  timeout=timeout, cwd=cwd, env=env)
+            proc = _run_maybe_ufw_locked(argv, input=input_bytes, capture_output=True,
+                                         timeout=timeout, cwd=cwd, env=env)
         finally:
             if pkg_stage:
                 shutil.rmtree(pkg_stage, ignore_errors=True)
@@ -5081,6 +5509,9 @@ def _do_disk_reclaim(req):
         _restore_docker()
         return {'ok': False, 'error': f'fstab update failed: {e}', 'log': log}
 
+    # ops #645 W2.5: the nosuid bind of the console home sits on /home and would make
+    # the umount below fail. Lift it; the dispatcher puts it back after the fold.
+    _nosuid_release_under('/home', log)
     # Plain umount only. If it fails the box is put back exactly as it was — see
     # _home_holders() for why lazy-detach must never lead into the lvremove below.
     um = subprocess.run(['umount', '/home'], capture_output=True, text=True, timeout=120)
@@ -7208,7 +7639,10 @@ def _dispatch(req, peer):
         if op == 'pg_restore':
             return _do_pg_restore(req)
         if op == 'disk_reclaim':
-            return _do_disk_reclaim(req)
+            try:
+                return _do_disk_reclaim(req)
+            finally:
+                _nosuid_apply_logged('after disk_reclaim')   # ops #645 W2.5: re-apply
         if op == 'takportal_sudoers':
             return _do_takportal_sudoers(req)
         if op == 'tak58_upgrade_db':
@@ -7495,8 +7929,8 @@ def _mtx_run(argv, timeout, as_user):
         env.setdefault('DEBIAN_FRONTEND', 'noninteractive')
         env.setdefault('NEEDRESTART_MODE', 'l')
         env.setdefault('DPKG_FORCE', 'confdef,confold')
-    proc = subprocess.run([resolved] + list(argv[1:]), capture_output=True,
-                          timeout=timeout, cwd='/', env=env, **kw)
+    proc = _run_maybe_ufw_locked([resolved] + list(argv[1:]), capture_output=True,
+                                 timeout=timeout, cwd='/', env=env, **kw)
     return {
         'ok': True,
         'returncode': proc.returncode,
@@ -8517,6 +8951,173 @@ def _drain(max_secs=RECYCLE_DRAIN_MAX_SECS, clock=time.monotonic, sleep=time.sle
     return True
 
 
+# ---------------------------------------------------------------------------
+# ops #645 W2.5: no setuid and no device files in folders the console can write.
+# A root container with a rw bind of a console folder (authentik-worker-1 binds
+# <home>/authentik/{data,certs,…} on test6 and test12) could drop a setuid-root copy
+# of sh there (`docker exec -u 0 … chmod 4755`), and `/` has no nosuid, so the
+# console then ran it as root. A root-owned boot unit, written by the broker (the
+# console cannot write it: PATH_DENY_EXACT, nor stop/disable/mask it: _check_systemctl),
+# remounts those folders nosuid,nodev before Docker and the console start. A folder
+# that is not its own mount point is first bound onto itself (mount --rbind D D).
+# ---------------------------------------------------------------------------
+NOSUID_FLAGS = ('nosuid', 'nodev')
+_NOSUID_SYSTEM_DIRS = ('/tmp', '/var/tmp', '/dev/shm')
+NOSUID_UNIT_TEXT = (
+    '# Written by takwerx-broker (ops #645 W2.5). Do not edit: the broker rewrites it.\n'
+    '[Unit]\n'
+    'Description=infra-TAK: no setuid or device files in folders the console can write\n'
+    'DefaultDependencies=no\n'
+    'After=local-fs.target\n'
+    'Before=docker.service containerd.service takwerx-console.service '
+    'takwerx-broker.service sysinit.target\n'
+    f'ConditionPathExists={ROOT_CODE_CURRENT}/broker/takwerx_broker.py\n'
+    '\n'
+    '[Service]\n'
+    'Type=oneshot\n'
+    'RemainAfterExit=yes\n'
+    f'ExecStart={SYSTEM_PYTHON} -I {ROOT_CODE_CURRENT}/broker/takwerx_broker.py nosuid\n'
+    '\n'
+    '[Install]\n'
+    'WantedBy=sysinit.target\n'
+)
+
+
+def _nosuid_targets():
+    """Folders the console user can write that a root process might exec from or a
+    root container may bind: its home(s), its own repo, and the shared temp dirs.
+    Only existing folders that are not links; a folder inside another one on the
+    list is covered by that one (rbind keeps the flags of the top mount)."""
+    cands = [h for h in _HOME_ROOTS]
+    if CONSOLE_REPO_DIR and CONSOLE_REPO_DIR != '/nonexistent':
+        cands.append(CONSOLE_REPO_DIR)
+    cands += list(_NOSUID_SYSTEM_DIRS)
+    out = []
+    for d in dict.fromkeys(os.path.normpath(c) for c in cands if c and c.startswith('/')):
+        if d == '/' or os.path.islink(d) or not os.path.isdir(d):
+            continue
+        out.append(d)
+    out.sort(key=len)
+    keep = []
+    for d in out:
+        if not any(d == k or d.startswith(k + '/') for k in keep):
+            keep.append(d)
+    return keep
+
+
+def _mountinfo(text=None):
+    """{mount point: set(per-mount options)} from /proc/self/mountinfo (the last
+    entry for a point wins: it is the one on top)."""
+    if text is None:
+        try:
+            with open('/proc/self/mountinfo') as f:
+                text = f.read()
+        except OSError:
+            return {}
+    out = {}
+    for line in text.splitlines():
+        f = line.split(' ')
+        if len(f) < 6:
+            continue
+        mp = re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), f[4])
+        out[mp] = set(f[5].split(','))
+    return out
+
+
+def _nosuid_plan(targets, mounts):
+    """Commands that make each target nosuid,nodev, given the current mounts."""
+    cmds = []
+    for d in targets:
+        opts = mounts.get(d)
+        if opts is not None and all(x in opts for x in NOSUID_FLAGS):
+            continue
+        if opts is None:
+            cmds.append(['mount', '--rbind', d, d])
+        cmds.append(['mount', '-o', 'remount,bind,' + ','.join(NOSUID_FLAGS), d])
+    return cmds
+
+
+def _apply_nosuid_mounts(run=None):
+    """Root only. Returns (ok, [log lines])."""
+    run = run or subprocess.run
+    mount = shutil.which('mount', path=BROKER_TRUSTED_PATH) or '/bin/mount'
+    log, ok = [], True
+    for cmd in _nosuid_plan(_nosuid_targets(), _mountinfo()):
+        r = run([mount] + cmd[1:], capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            ok = False
+            log.append('%s failed: %s' % (' '.join(cmd), (r.stderr or '').strip()[:200]))
+        else:
+            log.append(' '.join(cmd))
+    return ok, log
+
+
+def _nosuid_release_under(top, log=None, run=None):
+    """Lift the nosuid binds below `top` (deepest first) so `umount top` can work."""
+    run = run or subprocess.run
+    umount = shutil.which('umount', path=BROKER_TRUSTED_PATH) or '/bin/umount'
+    for d in sorted(_nosuid_targets(), key=len, reverse=True):
+        if d.startswith(top.rstrip('/') + '/') and d in _mountinfo():
+            r = run([umount, '-R', d], capture_output=True, text=True, timeout=60)
+            if log is not None:
+                log.append('nosuid bind of %s lifted for the fold (rc=%s)' % (d, r.returncode))
+
+
+def _nosuid_apply_logged(why):
+    try:
+        ok, lines = _apply_nosuid_mounts()
+        if lines and AUDIT is not None:
+            AUDIT.info(json.dumps({'op': 'nosuid', 'verdict': 'INFO' if ok else 'ERROR',
+                                   'summary': '%s: %s' % (why, '; '.join(lines))}))
+    except Exception as e:  # noqa: BLE001 — never let this stop the broker
+        if AUDIT is not None:
+            AUDIT.info(json.dumps({'op': 'nosuid', 'verdict': 'ERROR',
+                                   'summary': '%s: %s' % (why, e)}))
+
+
+def _converge_nosuid_unit(run=None):
+    """At broker start (root layout only: the unit runs the root copy): write the
+    unit if it differs, enable it, and apply the mounts now (the unit does it at
+    every boot, before Docker and the console). Returns True when the unit changed."""
+    if not RUNNING_FROM_ROOT:
+        return None
+    try:
+        pwd.getpwnam(BROKER_USER)
+    except KeyError:
+        return None                          # no console user: nothing to protect
+    run = run or subprocess.run
+    changed = False
+    try:
+        with open(NOSUID_UNIT) as f:
+            cur = f.read()
+    except OSError:
+        cur = None
+    if cur != NOSUID_UNIT_TEXT:
+        tmp = NOSUID_UNIT + '.takwerx-tmp'
+        with open(tmp, 'w') as f:
+            f.write(NOSUID_UNIT_TEXT)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, NOSUID_UNIT)
+        changed = True
+    systemctl = shutil.which('systemctl', path=BROKER_TRUSTED_PATH) or '/bin/systemctl'
+    if changed:
+        run([systemctl, 'daemon-reload'], capture_output=True, timeout=60)
+    run([systemctl, 'unmask', NOSUID_UNIT_NAME], capture_output=True, timeout=60)
+    run([systemctl, 'enable', NOSUID_UNIT_NAME], capture_output=True, timeout=60)
+    _nosuid_apply_logged('broker start')
+    return changed
+
+
+def _converge_nosuid_logged():
+    try:
+        if _converge_nosuid_unit():
+            AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
+                                   'summary': 'nosuid boot unit written and enabled (ops #645)'}))
+    except Exception as e:  # noqa: BLE001 — never let this stop the broker
+        AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'ERROR',
+                               'summary': 'nosuid unit converge failed: %s' % e}))
+
+
 def serve():
     global AUDIT, ENFORCE, ENFORCE_INFO, _MTX_SRV
     if os.geteuid() != 0:
@@ -8574,6 +9175,10 @@ def serve():
     except Exception as e:  # noqa: BLE001 — never let a unit tidy-up stop the broker
         AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'ERROR',
                                'summary': 'own unit converge failed: %s' % e}))
+    # ops #645 W2.5: in a thread. systemctl daemon-reload/enable took 12 s on a loaded
+    # test6 (load 10), and the main loop must answer the console's boot ping first.
+    threading.Thread(target=_converge_nosuid_logged, daemon=True,
+                     name='nosuid-converge').start()
     # ops #645 W1: a broker still started from the console repo moves itself to
     # the root-owned layout (after the socket is up; a fetch can take a while).
     if not RUNNING_FROM_ROOT:
@@ -8904,6 +9509,15 @@ def main(argv):
             return 1
     if cmd == 'selftest':
         return cli_selftest()
+    if cmd == 'nosuid':
+        # ops #645 W2.5: run by infratak-nosuid.service at boot (root)
+        if os.geteuid() != 0:
+            sys.stderr.write('nosuid must run as root\n')
+            return 2
+        ok, lines = _apply_nosuid_mounts()
+        for ln in lines:
+            print(ln)
+        return 0 if ok else 1
     if cmd == 'update' and len(argv) == 2:
         # ops #645 W1: ask the broker to install a verified commit (console converge)
         try:

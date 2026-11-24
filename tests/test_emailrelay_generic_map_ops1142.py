@@ -72,8 +72,8 @@ class _Run:
             out = self.hostname_f + '\n'
         elif list(cmd) == ['hostname']:
             out = self.hostname_f.split('.')[0] + '\n'
-        elif list(cmd)[:2] == ['postconf', '-hx']:
-            out = self.postconf.get(cmd[2], '') + '\n'
+        elif list(cmd)[:3] == ['postconf', '-h', '-x']:
+            out = self.postconf.get(cmd[3], '') + '\n'
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr='')
 
 
