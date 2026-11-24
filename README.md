@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.4.5-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.5-alpha)**
+**Current release: [v10.4.6-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.6-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -458,6 +458,56 @@ overrides, so treat that list as authoritative over this table.
 ---
 
 ## Changelog
+
+### v10.4.6-alpha — 2026-11-24 — CloudTAK 14, sign-ins that last 24 hours, safer ATLAS and Authentik sign-in, Email Relay fixes
+
+**Headline: CloudTAK 14 is now tested and offered, Authentik sign-ins last the 24 hours they were meant to, ATLAS 2.10 and newer identify their administrators from Authentik's signed token, and Email Relay delivers root mail again. Update from the Console page, Update Now.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.6-alpha))
+
+**Security.**
+- Authentik moves to 2026.8.6. New installs get it. On an existing server, press **Update** on the Authentik page (Update Now does not move it).
+- Redis moves to 8.10.3 for WebODM and for new Authentik installs. An existing Authentik keeps its current Redis.
+- ATLAS 2.10 or newer: administrators are identified from Authentik's signed token, not from plain headers. ATLAS on the main channel stays on headers as before. If Authentik restarts and drops the key, the console puts it back within about a minute.
+- The stream site reads the signed-in person from Authentik's signed token as well.
+- MediaMTX on a remote host: stream site video goes the same way as on a single server, and a console start keeps the stream site file current.
+- Node-RED data feed ports open to the Docker networks when the host firewall is on, so Node-RED can reach TAK Server again.
+
+**Sign-in.**
+- Sign-ins through Authentik last 24 hours. Before, they ended after 1 hour. Update Now moves existing providers to 24 hours, and a length you set yourself stays.
+- A user who is switched off and on again, or gets a password that was tried before, can sign in to TAK within about 15 to 35 seconds. No LDAP outpost restart is needed.
+- The webadmin password is never overwritten. A console banner and a Guard Dog reminder ask you to set a recovery email, and the Authentik page has an admin email card.
+- Admin accounts get the Guard Dog alert address, not a made-up one, so access-request emails no longer bounce.
+
+**CloudTAK.**
+- CloudTAK updates to 14.x. We tested the update with Print and Search Containment installed: both stay installed and load after the update.
+- A server with the old MinIO folder stops at the newest 13.x before 14.
+- When CloudTAK is already newer than the tested version, the Update button says "Nothing to do" in place of an error.
+- The CloudTAK page links to the official CloudTAK documentation.
+
+**Email Relay.**
+- Mail the server sends to root reaches a person.
+- The sender map covers every name Postfix can stamp on a message.
+- New option: send system notifications to the box.
+- Email Relay works with the broker in its strict mode.
+
+**Updates.**
+- A "What's new" link sits next to each app's update notice.
+- A stalled download in an update step is retried once. A "not enough free disk" message names the backup lists you can clear.
+- A fresh Ubuntu install keeps the changes of Step 8 (CloudTAK setup works with no Update Now).
+- Print is not started when its image was never built.
+
+**Guard Dog.**
+- After a boot, Guard Dog waits for Authentik to be ready before it checks LDAP groups, and waits 10 minutes before it emails that LDAP cannot resolve groups.
+- The "no channel" email lists up to 5 devices that have no channel, so you can see which device is behind each row (device ID, client, minutes silent).
+
+**Fixes.**
+- NetBird setup works on a non-root console (the STUN port opens through the firewall helpers).
+- Federation Hub certificate steps work with limited sudo rules.
+- Authentik deploy says plainly when the TAK Portal name has no DNS A record.
+
+**Known issues.**
+- An ATLAS administrator session that started while Authentik had dropped the key can show an error until the person signs out and in again.
+
+**Upgrading:** use **Update Now** on the Console page.
 
 ### v10.4.5-alpha — 2026-11-23 — Emergency security update: Linux kernel CVE-2026-98432 warning; TAK Portal and CloudTAK stay on tested versions
 

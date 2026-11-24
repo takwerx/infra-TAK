@@ -34,3 +34,10 @@ Each entry says where the fact comes from. `✅ verified <date> on <box>` means 
 - infra-TAK's blueprint sets `search_mode: cached` and `bind_mode: cached` (fleet constant).
 - ✅ verified 2026-10-30 on test12 (Authentik 2026.8.5): a user created in Authentik can bind straight away, but the outpost's search returns no entry or no groups for it, with the log line `User with pk is not in local cache`. In two clean runs the user and groups showed up on their own after about 2 minutes and about 4 minutes 20 seconds. No restart was needed.
 - A restart of `authentik-ldap-1` forces the refresh but drops LDAP for 10-30 seconds, so infra-TAK does not do it for this.
+
+## CloudTAK: documentation site
+
+**Source (official):** https://docs.cloudtak.io/ ("Get started with CloudTAK | CloudTAK Documentation"). The same site holds the integrations (ETL) pages at https://docs.cloudtak.io/integrations/, which the CloudTAK page already links.
+
+- infra-TAK links the docs home page from the header of the CloudTAK page (`templates/cloudtak.html`, `id="ct-docs-link"`), opening in a new tab.
+- ✅ verified 2026-11-20 from the Studio: both URLs return HTTP 200 with the titles above. Not checked: whether every page of the site stays at the same path in later CloudTAK releases.

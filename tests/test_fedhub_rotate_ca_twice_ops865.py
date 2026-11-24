@@ -160,7 +160,7 @@ class Hub:
         r = subprocess.run(['bash', '-c', cmd], env=env, capture_output=True, text=True, timeout=60)
         return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
 
-    def rotate(self):
+    def rotate(self, remote=False):
         src = _func('run_fedhub_remote_rotate_ca').replace(
             "fh_dir = '/opt/tak/federation-hub'", f'fh_dir = {str(self.fh)!r}')
         assert str(self.fh) in src
@@ -168,17 +168,24 @@ class Hub:
             're': re, 'shlex': shlex, 'datetime': datetime,
             'fedhub_rotate_log': self.log, 'fedhub_rotate_status': self.status,
             'load_settings': lambda: self.settings, 'save_settings': lambda s: self.settings.update(s),
-            '_get_fedhub_deployment_config': lambda s: {'deployed': True, 'target_mode': 'local', 'remote': {}},
+            '_get_fedhub_deployment_config': lambda s: (
+                {'deployed': True, 'target_mode': 'remote', 'remote': {'host': 'hub.example'}} if remote
+                else {'deployed': True, 'target_mode': 'local', 'remote': {}}),
             '_module_run': self._module_run,
             '_get_fedhub_cert_password': lambda s: 'atakatak',
             '_fedhub_cert_dn': lambda s: {'country': 'US', 'state': 'ST', 'city': 'CT', 'org': 'O', 'ou': 'OU'},
             '_fedhub_ca_lockdown': lambda *a, **k: None,
         }
-        for name in ('_fedhub_next_numbered_ca_name', '_fedhub_rotate_stash_cmd', '_fedhub_rotate_unstash_cmd'):
+        for node in TREE.body:  # gh #666: the sudo-refusal pattern the function uses
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == '_FEDHUB_SUDO_REFUSED_RE' for t in node.targets):
+                exec(ast.get_source_segment(APP, node), ns)
+        for name in ('_fedhub_next_numbered_ca_name', '_fedhub_rotate_stash_cmd', '_fedhub_rotate_unstash_cmd',
+                     '_fedhub_sudo_refused', '_fedhub_sudo_refusal_lines'):
             try:
                 exec(_func(name), ns)
             except AssertionError:
-                pass  # the base code has no stash helpers
+                pass  # the base code has no such helpers
         exec(src, ns)
         self.status.update({'running': True, 'complete': False, 'error': False})
         ns['run_fedhub_remote_rotate_ca']()
