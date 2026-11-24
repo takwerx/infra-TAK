@@ -221,8 +221,8 @@ def rescope_firewall(old_ip, new_ip):
         return
     if _have('ufw'):
         try:
-            out = subprocess.run(['ufw', 'status'],
-                                 capture_output=True, text=True, timeout=12).stdout or ''
+            out = subprocess.run(_ufw('status'),
+                                 capture_output=True, text=True, timeout=120).stdout or ''
         except Exception as e:
             log(f"ufw rule read failed: {str(e)[:120]}")
             return
