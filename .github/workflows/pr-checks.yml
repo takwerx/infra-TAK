@@ -16,9 +16,13 @@ on:
     branches: [dev, main]
 
 concurrency:
-  # PRs by number; push runs by branch, so a push to dev never cancels a PR run (or main's run).
-  group: pr-checks-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # ops #1189: a newer push to a PR cancels that PR's older run (nobody needs the old result), but a run
+  # on dev or main is never cancelled: a red dev that shows "cancelled" is invisible (ops #1174).
+  # Push runs get one group per commit, not one per branch. With cancel-in-progress off, GitHub still
+  # cancels a run that is waiting in the group when a newer one arrives, so three quick merges to dev
+  # would lose the middle run. One group per commit means no run ever waits behind another.
+  group: ${{ github.event_name == 'pull_request' && format('pr-checks-{0}', github.event.pull_request.number) || format('pr-checks-push-{0}', github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
