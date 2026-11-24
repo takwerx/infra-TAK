@@ -90,7 +90,10 @@ def test_flock_allows_only_the_locked_fail2ban_stop():
 
 def test_the_console_sends_exactly_the_argv_the_broker_allows():
     src = _func('_startup_f2b_ufw_lock_switch')
-    assert "['flock', '-w', '90', _UFW_LOCK_PATH, 'systemctl', 'stop', 'fail2ban']" in src
+    # The path is a literal at the call site on purpose: broker/scan_enforce_coverage.py reads
+    # the argv shape, and a variable shows up as <var> and is reported as a denied call site
+    # (tests/test_broker_escapes_ops645.py). So the literal must equal the broker's exact argv.
+    assert str(B.FLOCK_F2B_STOP_ARGV) in src
     assert _const('_UFW_LOCK_PATH').endswith(repr(B.UFW_LOCK_PATH))
 
 
