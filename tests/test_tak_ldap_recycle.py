@@ -95,7 +95,8 @@ class Box:
                  settings=None, coreconfig=True, update_in_progress=False, restart_rc=0, tak_running=True,
                  subs=None, ldap_users=None, tak_ldap_ok=True, dead_pool=0, online=True, api_ok=True,
                  history=None, https='ok', https_after_restart='ok', https_flaky=0, api_busy=0,
-                 gd_restart=None, ghosts=(), ghosts_leave=False, outpost='user', api_back_after=None):
+                 gd_restart=None, ghosts=(), ghosts_leave=False, outpost='user', api_back_after=None,
+                 api_restart='unavailable'):
         self.t = T0
         # What the local outpost's log shows of TAK's lookups during HTTPS logins (ops #158):
         # 'user' = each login is looked up; 'others' = TAK looks the console's admin cert up on
@@ -141,6 +142,9 @@ class Box:
         # answer). `https_flaky` = that many logins give no groups first (dead pooled connections
         # in the API's own LDAP pool, each dropped after its failure; ops #158).
         self.https, self.https_after_restart, self.https_flaky = https, https_after_restart, https_flaky
+        # ops #1039: what `systemctl restart takserver-api` does: 'fixes' (HTTPS gives groups again),
+        # 'no_fix' (still none), 'unavailable' (no such unit: the old behaviour of every older test)
+        self.api_restart = api_restart
         self.leaf_certs, self.user_api, self.workdirs, self.missions = [], [], [], set()
         self.alerts = []               # GH #549: Guard Dog alerts (at, args, kwargs)
 
@@ -309,6 +313,14 @@ class Box:
                 self.ports_up_at = self.t + 120
                 self.https = self.https_after_restart
             return subprocess.CompletedProcess(cmd, self.restart_rc, stdout='', stderr='boom' if self.restart_rc else '')
+        if cmd == ['systemctl', 'restart', 'takserver-api']:
+            self.t += 20
+            if self.api_restart == 'unavailable':
+                return subprocess.CompletedProcess(cmd, 5, stdout='', stderr='Unit takserver-api.service not found.\n')
+            self.ports_up_at = self.t + 60
+            if self.api_restart == 'fixes':
+                self.https = 'ok'
+            return ok()
         if cmd[0] == 'ldapsearch':
             flt = [a for a in cmd if a.startswith('(')][0]
             if flt.startswith('(|'):       # the per-user memberOf lookup
@@ -338,7 +350,10 @@ class Box:
         self.t += s
 
     def restarts(self):
-        return [c for c in self.calls if c[1:2] == ['restart']]
+        return [c for c in self.calls if c[1:2] == ['restart'] and c[2:3] != ['takserver-api']]
+
+    def api_restarts(self):
+        return [c for c in self.calls if c == ['systemctl', 'restart', 'takserver-api']]
 
     def drops(self):
         return [urllib.parse.unquote(u.rsplit('/', 1)[1]) for m, u, _ in self.api if m == 'DELETE']
@@ -394,12 +409,12 @@ class Box:
                   '_TAK_API_CHECK_WAIT_S', '_TAK_API_CHECK_RETRY_S', '_TAK_API_CHECK_RETRY_MAX_S',
                   '_TAK_MARTI_READ_WAIT_S', '_TAK_MARTI_READ_RETRY_MAX_S', '_TAK_API_CHECK_STUCK_S'):
             ns[c] = _const(c)
-        for c in ('_TAK_HTTPS_BROKEN_RESTART_S', '_TAK_BOOT_HTTPS_CHECK_AFTER_S'):   # GH #549
+        for c in ('_TAK_HTTPS_BROKEN_RESTART_S', '_TAK_BOOT_HTTPS_CHECK_AFTER_S', '_TAK_API_ONLY_RESTART_WAIT_S'):   # GH #549, ops #1039
             if re.search(r'^%s = \d+' % c, APP, re.M):
                 ns[c] = _const(c)
         ns['_tak_https_broken_alert'] = lambda *a, **k: box.alerts.append((box.t, a, k))
         ns['_tak_ldap_recycle_lock'] = threading.Lock()
-        for name in ('_epoch_from_rfc3339', '_docker_started_epoch', '_tak_started_epoch', '_tak_wait_ready',
+        for name in ('_epoch_from_rfc3339', '_docker_started_epoch', '_tak_started_epoch', '_tak_wait_ready', '_tak_api_only_restart',
                      '_tak_ldap_recycle_request', '_tak_recycle_after_ldap_outage',
                      '_authentik_ldap_sa_group_probe', '_authentik_ldap_sa_groups_settle',
                      '_ldap_filter_escape', '_ldap_users_tak_groups', '_ldap_users_tak_group_counts',
@@ -408,6 +423,8 @@ class Box:
                      '_tak_log_removed_subscriptions', '_tak_heal_ldap_sessions',
                      '_tak_api_user_check_once', '_tak_api_user_check',
                      '_ldap_outpost_tak_searches', '_tak_api_check_stuck'):
+            if name == '_tak_api_only_restart' and 'def _tak_api_only_restart(' not in APP:
+                continue   # ops #1039: absent on the base code, so the new tests fail on their own asserts
             exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
         return ns
 
@@ -940,6 +957,60 @@ def test_gh549_restart_that_does_not_fix_https_is_alerted_and_not_repeated():
         box.t += 600
         box.recycle(trigger='periodic LDAP outage check', final=False)
     assert len(box.restarts()) == 1 and len(box.alerts) == 1
+
+
+def test_ops1039_https_stuck_with_grouped_clients_restarts_only_takserver_api_and_drops_nobody():
+    # test12 Nov 25 (ops #1039): after LDAP was unusable for TAK's API, its 8443 side gave no groups
+    # for 6+ min with the core back and the outpost restarted; only `systemctl restart takserver-api`
+    # cleared it (248 s). 8089 clients keep their groups, so a restart of the API process alone costs
+    # no client: it is done at the first finding, not after 15 min, and TAK itself is never restarted.
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others',
+                      api_restart='fixes')
+    assert box.recycle() is False
+    assert box.api_restarts() == [['systemctl', 'restart', 'takserver-api']]
+    assert box.restarts() == [] and box.drops() == []                    # TAK not restarted, no client dropped
+    assert box.t - T0 < _const('_TAK_HTTPS_BROKEN_RESTART_S')            # long before the 15-minute wait
+    assert any('Restarting only TAK' in l and 'no client is dropped' in l for l in box.log)
+    assert any(l.startswith('  \u2713 TAK LDAP recycle: TAK') and 'after restarting only its API process' in l for l in box.log)
+    st = box.settings['tak_ldap_recycle']
+    assert st['last_outcome'] == 'HTTPS healed by an API-only restart'
+    assert 'pending' not in st and 'https_broken_since' not in st
+    assert abs(st['healed_ldap_start'] - (T0 - HOUR)) < 1                # marked healed
+    assert box.alerts == []
+    n = len(box.calls)
+    box.t += 600
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert len(box.api_restarts()) == 1 and box.restarts() == []        # healed: later ticks touch nothing
+
+
+def test_ops1039_api_only_restart_that_does_not_help_is_tried_once_then_the_old_15_minute_path_runs():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others',
+                      api_restart='no_fix')
+    assert box.recycle() is False
+    assert len(box.api_restarts()) == 1 and box.restarts() == []
+    assert any('restarting only TAK' in l and 'did not give users their groups' in l for l in box.log)
+    st = box.settings['tak_ldap_recycle']
+    assert st['pending'] and st['https_broken_since'] >= T0              # still pending, still re-checked
+    n = _ticks_until_restart(box)
+    assert n is not None and n <= 2, box.log
+    assert len(box.api_restarts()) == 1                                  # never repeated within the episode
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']]     # the old fallback still ends it
+
+
+def test_ops1039_no_takserver_api_unit_falls_back_to_the_old_wait():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others',
+                      api_restart='unavailable')
+    assert box.recycle() is False
+    assert len(box.api_restarts()) == 1 and box.restarts() == []
+    assert any('could not be restarted' in l for l in box.log)
+    assert box.settings['tak_ldap_recycle']['https_broken_since'] >= T0
+
+
+def test_ops1039_docker_tak_never_gets_an_api_only_restart():
+    box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others',
+                      container=True, api_restart='fixes')
+    box.recycle()
+    assert box.api_restarts() == []
 
 
 def test_gh549_tak_that_booted_with_authentik_and_has_no_https_groups_is_found():

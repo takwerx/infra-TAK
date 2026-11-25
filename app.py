@@ -79287,6 +79287,14 @@ _TAK_RECYCLE_API_TIMEOUT_S = 300        # Guard Dog's api wait (_MAX_API)
 # heal keeps re-checking on every monitor tick, and restarts TAK once it has been broken this
 # long: broken Data Sync for everyone is worse than one reconnect.
 _TAK_HTTPS_BROKEN_RESTART_S = 900
+# ops #1039: TAK's API process keeps a bad pooled LDAP connection after LDAP was unusable for it
+# (test12 Nov 25: outpost restarted into a stopped core; TAK's 8443 side gave no groups from the
+# first second and was still empty 6 min after the core answered, a restarted outpost did not
+# clear it, `systemctl restart takserver-api` did, and the API answered again 248 s after it).
+# Restarting only the API process drops no 8089 client, so unlike a TAK restart it needs no
+# 15-minute wait: it is done once per episode, as soon as the HTTPS check has waited its own
+# `_TAK_API_CHECK_WAIT_S` and still finds no groups. The API needs this long to answer again.
+_TAK_API_ONLY_RESTART_WAIT_S = 480
 # GH #549: at box boot TAK and the outpost start together, so the outpost-start test above
 # never fires, and a TAK that came up while Authentik answered 502 was never checked. Once
 # per TAK start, this long after it, the HTTPS side is checked once (one login, quiet if OK).
@@ -80113,6 +80121,28 @@ def _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S, earl
         delay = min(delay * 2, _TAK_API_CHECK_RETRY_MAX_S)
 
 
+def _tak_api_only_restart(plog, tag, ldap_pass):
+    """ops #1039: restart ONLY TAK's API process (native install: `systemctl restart takserver-api`),
+    wait for it to answer on 8443, then run the HTTPS check again. 8089 clients stay connected.
+    Returns (verdict, summary) of that check: 'ok' = TAK's API gives users their groups again;
+    anything else = it did not help, or could not be tried (no such unit, the restart failed)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver-api']),
+                           capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        plog(f"  {tag}: restart of takserver-api still running after 240s - checking the API anyway")
+        r = None
+    if r is not None and r.returncode != 0:
+        return 'unknown', f"takserver-api could not be restarted: {((r.stderr or '') + (r.stdout or '')).strip()[-200:]}"
+    t0 = time.time()
+    while not _tcp_accepts(8443):
+        if time.time() - t0 >= _TAK_API_ONLY_RESTART_WAIT_S:
+            return 'unknown', f"the API (8443) was not up {int(time.time() - t0)}s after restarting takserver-api"
+        time.sleep(5)
+    plog(f"  {tag}: TAK's API answers on 8443 ({int(time.time() - t0)}s after the API-only restart)")
+    return _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S)
+
+
 def _tak_ldap_recycle_request(reason, need_groups=True, restart=False, restart_if_young=False):
     """Ask for one TAK client heal (TAK restart only as the fallback) once LDAP is healthy
     again; `restart` = TAK must restart regardless (CoreConfig's LDAP credential changed).
@@ -80398,6 +80428,31 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 # checks again; once broken this long, TAK is restarted after all.
                 since = float(st.get('https_broken_since') or 0) or time.time()
                 broken_for = time.time() - since
+                # ops #1039: the HTTPS check above already waited its full time. Restart only TAK's
+                # API process once per episode (8089 clients stay connected) before the long wait.
+                if (not _tak_is_container() and not must_restart
+                        and float((load_settings().get('tak_ldap_recycle') or {}).get('https_api_restart_epoch') or 0) < since):
+                    try:
+                        _s = load_settings()
+                        _c = dict(_s.get('tak_ldap_recycle') or {})
+                        _c['https_api_restart_epoch'] = time.time()
+                        _s['tak_ldap_recycle'] = _c
+                        save_settings(_s)
+                    except Exception:
+                        pass
+                    plog(f"  {tag}: TAK's HTTPS/API side still gives users no groups ({api_summary}) while {who}. "
+                         f"Restarting only TAK's API process (takserver-api); no client is dropped...")
+                    try:
+                        api_v2, api_s2 = _tak_api_only_restart(plog, tag, ldap_pass)
+                    except Exception as e:
+                        api_v2, api_s2 = 'unknown', f"API-only restart error: {str(e)[:120]}"
+                    if api_v2 == 'ok':
+                        plog(f"  ✓ {tag}: TAK's HTTPS/API side gives users their groups again after restarting only "
+                             f"its API process; {api_s2}. No client was dropped")
+                        _finish('HTTPS healed by an API-only restart', healed_ldap_start=ldap_start,
+                                healed_gd_restart=gd_restart)
+                        return False
+                    plog(f"  {tag}: restarting only TAK's API process did not give users their groups: {api_s2}")
                 if broken_for < _TAK_HTTPS_BROKEN_RESTART_S:
                     plog(f"  ✗ {tag}: {summary}, BUT TAK's HTTPS/API side still gives users no groups: {api_summary}. "
                          f"TAK Server NOT restarted yet: {who}, and a restart would drop them all. ATAK Data "
