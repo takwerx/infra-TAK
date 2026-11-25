@@ -30238,6 +30238,8 @@ KNOWN_SECURITY_RELEASES = (
     # drops a distrusted root the container still trusted in 2026.8.4.
     {'component': 'authentik', 'fixed_in': '2026.8.5',
      'reason': 'a certificate bundle that still trusted a distrusted root (eMudhra)'},
+    # ops #1253: CloudTAK plugins from TAK Portal's Marketplace use component `plugin:<id>`
+    # (the Marketplace id). Add a plugin's security release here only once it is public.
 )
 
 
@@ -32139,6 +32141,96 @@ def _module_update_items(unknown):
     return items
 
 
+# ops #1253: CloudTAK plugins installed through TAK Portal's CloudTAK Marketplace. The console's
+# own plugin catalog holds only the Simulator, and a Marketplace install deletes the plugin's
+# .git folder (marketplace-helper), so no git compare can see them. TAK Portal itself checks
+# every installed plugin against its catalog branch every 5 minutes and keeps the answer in
+# sha-cache.json (byId[<plugin id>] = {updateAvailable, installedVersion, remoteVersion,
+# installedSha, remoteSha}); plugins.json is its copy of the catalog (the plugin names).
+# Read the same way as the jobs file above: `docker exec <portal> cat`.
+_TAKPORTAL_MARKETPLACE_DATA = '/usr/src/app/data/cloudtak-marketplace'
+_MARKETPLACE_CACHE_MAX_AGE_S = 24 * 3600   # an older answer means the portal stopped checking
+_MARKETPLACE_HOW = ('TAK Portal → CloudTAK Marketplace → press Update on this plugin, then '
+                    'Deploy (CloudTAK rebuilds once).')
+
+
+def _takportal_marketplace_read(name):
+    """One JSON file from TAK Portal's Marketplace data folder, parsed. Raises when the
+    container or the file cannot be read, or holds no JSON object."""
+    r = subprocess.run(_sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat',
+                                   f'{_TAKPORTAL_MARKETPLACE_DATA}/{name}']),
+                       capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        raise RuntimeError(f'{name}: ' + ((r.stderr or '').strip()[:160] or f'exit {r.returncode}'))
+    doc = json.loads(r.stdout or 'null')
+    if not isinstance(doc, dict):
+        raise ValueError(f'{name}: not a JSON object')
+    return doc
+
+
+def _marketplace_plugin_items(unknown, now=None):
+    """ops #1253: pending updates for CloudTAK plugins installed from TAK Portal's Marketplace,
+    as _collect_pending_updates items (key `marketplace:<plugin id>`). One item per plugin whose
+    update TAK Portal reports; identity is the new VERSION (one mail per release, not per
+    commit), or the short commit when the plugin carries no version. A release listed in
+    KNOWN_SECURITY_RELEASES under component `plugin:<id>` is a security item.
+
+    Nothing is claimed when TAK Portal cannot be read or its answer is more than a day old:
+    the source goes into `unknown`, so the dedup state of every marketplace:* key is carried
+    (never re-mailed on a guess). A box with no TAK Portal, or no Marketplace data, adds no
+    items."""
+    import calendar
+    now = time.time() if now is None else now
+    if not detect_modules().get('takportal', {}).get('installed'):
+        return []
+    try:
+        cache = _takportal_marketplace_read('sha-cache.json')
+        by_id = cache.get('byId')
+        if not isinstance(by_id, dict):
+            raise ValueError('sha-cache.json: no byId')
+        try:
+            age = now - calendar.timegm(time.strptime(str(cache.get('updatedAt') or '')[:19],
+                                                      '%Y-%m-%dT%H:%M:%S'))
+        except ValueError:
+            age = None
+        if age is None or age > _MARKETPLACE_CACHE_MAX_AGE_S:
+            raise ValueError('sha-cache.json: too old or no timestamp')
+    except Exception as e:
+        unknown.add('marketplace')
+        print(f"[update-notify] Marketplace plugin check failed: {e}", flush=True)
+        return []
+    names = {}
+    try:
+        catalog = _takportal_marketplace_read('plugins.json').get('plugins')
+        names = {str(p.get('id')): str(p.get('name') or '') for p in catalog or [] if isinstance(p, dict)}
+    except Exception as e:
+        print(f"[update-notify] Marketplace plugin names unreadable (ids shown): {e}", flush=True)
+    items = []
+    for pid, rec in sorted(by_id.items()):
+        if not (isinstance(rec, dict) and rec.get('updateAvailable')):
+            continue
+        if not re.match(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$', str(pid)):
+            continue
+        # the file is data: a version or commit that is not plain text never reaches the mail
+        ver = lambda v: v if re.match(r'^v?[0-9][0-9A-Za-z.+_-]{0,31}$', v) else ''
+        sha = lambda v: v[:7] if re.match(r'^[0-9a-f]{7,64}$', v) else ''
+        inst_v, tgt_v = ver(str(rec.get('installedVersion') or '').lstrip('v')), \
+            ver(str(rec.get('remoteVersion') or '').lstrip('v'))
+        inst_s, tgt_s = sha(str(rec.get('installedSha') or '')), sha(str(rec.get('remoteSha') or ''))
+        if not tgt_v and not tgt_s:
+            continue
+        name = re.sub(r'[^\w .,()+&/-]+', ' ', names.get(pid) or pid).strip()[:60] or pid
+        item = {'key': f'marketplace:{pid}', 'label': f'CloudTAK plugin “{name}”',
+                'installed': (f'v{inst_v}' if inst_v else inst_s) or '(unknown)',
+                'target': f'v{tgt_v}' if tgt_v else tgt_s,
+                'identity': tgt_v or tgt_s, 'how': _MARKETPLACE_HOW}
+        known = ['Fixes ' + k for k in _known_security_fixed_by(f'plugin:{pid}', inst_v, tgt_v)]
+        if known:
+            item['security'] = known
+        items.append(_apply_security_identity(item))
+    return items
+
+
 def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
     """All currently-pending updates as [{key,label,installed,target,identity}], plus
     (ops #168) `security`/`how` on the ones that are security fixes. Read-only; each
@@ -32244,6 +32336,12 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
                                 'identity': ident})
     except Exception as e:
         print(f"[update-notify] plugin check failed: {e}", flush=True)
+    try:
+        # ops #1253: plugins installed from TAK Portal's CloudTAK Marketplace
+        pending.extend(_marketplace_plugin_items(unknown))
+    except Exception as e:
+        unknown.add('marketplace')
+        print(f"[update-notify] Marketplace plugin check failed: {e}", flush=True)
     try:
         # W3/W9: ETL catalog — updates for installed ETLs and new catalog ETLs. Only while the
         # ETL Runner is on: a box that never turned ETL on is not told about ETLs.
