@@ -2176,7 +2176,7 @@ async function applyUpdate(){
         if(d.success){
             status.style.color='var(--green)';
             status.textContent='OK Updated! Restarting console...';
-            if(d.restart_message){status.innerHTML=status.textContent+'<br><small style="opacity:0.9;display:block;margin-top:6px">'+d.restart_message+'</small>';}
+            if(d.restart_message){status.innerHTML=status.textContent+'<br><small style="opacity:0.9;display:block;margin-top:6px">'+escapeHtml(d.restart_message)+'</small>';}
             setTimeout(function(){window.location.reload()},12000);
         }else if(d.in_progress){
             // v0.9.24 Item 1: server-side single-flight lock detected an
@@ -2190,7 +2190,7 @@ async function applyUpdate(){
             setTimeout(function(){window.location.reload()},30000);
         }else{
             status.style.color='var(--red)';status.textContent='Error: '+d.error;
-            if(d.workaround){status.innerHTML=status.textContent+'<br><small style="opacity:0.9">'+d.workaround+'</small>';}
+            if(d.workaround){status.innerHTML=status.textContent+'<br><small style="opacity:0.9">'+escapeHtml(d.workaround)+'</small>';}
             btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1';
         }
     }catch(e){status.style.color='var(--red)';status.textContent='Error: '+e.message;btn.disabled=false;btn.textContent='Update Now';btn.style.opacity='1'}
@@ -2330,11 +2330,11 @@ async function doConsoleRollback(){
     try{
         var r=await fetch('/api/console/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'});var d=await r.json();
         if(d.ok){
-            if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--green)">✓ '+d.message+'</div>';
+            if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--green)">✓ '+escapeHtml(d.message)+'</div>';
             setTimeout(function(){window.location.reload()},10000);
         }else{
-            if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--red)">✗ Error: '+(d.error||'failed')+'</div>';
+            if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--red)">✗ Error: '+escapeHtml(d.error||'failed')+'</div>';
         }
-    }catch(e){if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--red)">Network error: '+e.message+'</div>';}
+    }catch(e){if(bar)bar.innerHTML='<div style="font-size:12px;color:var(--red)">Network error: '+escapeHtml(e.message)+'</div>';}
 }
 </script>{% endblock %}
