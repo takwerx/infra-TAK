@@ -304,12 +304,47 @@ def test_a_later_release_of_a_plugin_mails_again():
 
 
 # ── the table and the reader keep their contract ───────────────────────────────────────────
-def test_the_security_table_takes_plugin_components_and_ships_no_unreleased_entry():
+def test_the_security_table_takes_plugin_components():
     n = _exec({'re': re}, '_semver_tuple', consts=('KNOWN_SECURITY_RELEASES',))
-    # no plugin entry until its release is public (a public repo must not announce a fix before it ships)
-    assert [x for x in n['KNOWN_SECURITY_RELEASES'] if x['component'].startswith('plugin:')] == []
     for x in n['KNOWN_SECURITY_RELEASES']:
         assert set(x) == {'component', 'fixed_in', 'reason'}
+
+
+def _real_dispatcher_items(installed, remote):
+    """The sweep with the REAL table (no fixture entry), a portal that reports Dispatcher."""
+    cache = {'updatedAt': FRESH, 'byId': {'dispatcher': {
+        'remoteSha': 'bc44445bfadda0f47535e927f347c2f619aeccf3',
+        'installedSha': 'b059d26aac613ded6bddaf080676b326d1f2fff2',
+        'updateAvailable': True, 'remoteVersion': remote, 'installedVersion': installed}}}
+    cat = {'version': 1, 'plugins': [{'id': 'dispatcher', 'name': 'Dispatcher',
+           'repo': 'https://github.com/takwerx/cloudtak-dispatcher-plugin.git', 'ref': 'main'}]}
+    n = _ns({'sha-cache.json': cache, 'plugins.json': cat})
+    n['KNOWN_SECURITY_RELEASES'] = _exec({'re': re}, '_semver_tuple',
+                                         consts=('KNOWN_SECURITY_RELEASES',))['KNOWN_SECURITY_RELEASES']
+    return n['_marketplace_plugin_items'](set(), now=NOW)
+
+
+@pytest.mark.parametrize('installed', ['1.8.0', '1.7.0', '1.0.0'])
+def test_dispatcher_below_1_8_1_gets_the_security_update_mail(installed):
+    """ops #1253 proof: red without the table entry (a plain update item), green with it."""
+    (d,) = _real_dispatcher_items(installed, '1.8.1')
+    assert d['key'] == 'marketplace:dispatcher' and d['label'] == 'CloudTAK plugin “Dispatcher”'
+    assert (d['installed'], d['target']) == (f'v{installed}', 'v1.8.1')
+    assert d['security'] == ['Fixes a missing access check on connections in TAK-CAD mode '
+                             '(fixed in v1.8.1)']
+    assert d['identity'] == '1.8.1+security'
+
+
+def test_dispatcher_security_mail_reads_plainly_and_names_where_to_press():
+    (d,) = _real_dispatcher_items('1.8.0', '1.8.1')
+    assert 'Marketplace' in d['how'] and 'Deploy' in d['how']
+    assert 'GHSA' not in str(d) and 'CVE' not in str(d)    # nothing beyond what the public notes say
+
+
+def test_dispatcher_a_later_plain_release_is_not_a_security_item():
+    # a box on 1.8.1 that is offered 1.8.2 later: the 1.8.1 fix is already in, so a plain update
+    assert _real_dispatcher_items('1.8.1', '1.8.2')[0].get('security') is None
+    assert _real_dispatcher_items('1.8.1', '1.8.2')[0]['identity'] == '1.8.2'
 
 
 def test_the_reader_uses_one_docker_exec_cat_of_the_portal_data_folder():
