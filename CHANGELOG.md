@@ -4,21 +4,21 @@ All notable changes to infra-TAK, newest first. Each entry opens with a plain-la
 
 Back to the [README](README.md).
 
-## v10.4.7-alpha — 2026-11-25 — Safer sign-in on every site, fixes for users in many groups, Rocky console restarts, firewall and ATLAS recovery after a reboot
+## v10.4.7-alpha — 2026-11-25 — Safer sign-in on every site, fixes for users in many groups, Rocky console restarts, firewall recovery after a reboot, ATLAS recovery after a Docker restart
 
-**Headline: every site behind Authentik now checks which application Authentik answered for, and a forged forwarding header no longer gets anyone in. Users in many Authentik groups can sign in again. The Rocky console restarts again. Firewall rules and ATLAS come back by themselves after a reboot. Update from the Console page, Update Now.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.7-alpha))
+**Headline: every site behind Authentik now checks which application Authentik answered for, and a forged forwarding header no longer gets anyone in. Users in many Authentik groups can sign in again. The Rocky console restarts again. Firewall rules come back by themselves after a reboot, and ATLAS comes back when Docker restarts. Update from the Console page, Update Now.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.7-alpha))
 
 **Security.**
-- Sign-in checks: one piece of code writes the Authentik check for every site, each site now confirms Authentik answered for the right application, and a forged `X-Forwarded-Host` header is no longer trusted. A new module site gets the same check when its deploy ends, with no console restart.
-- Console helper (broker): tighter checks on the Docker commands it runs, and the console folders are mounted so programs cannot start from them with extra rights.
+- Sign-in checks: every site confirms Authentik answered for its own application, and a forged forwarding header is no longer trusted. A new module site gets the check when its deploy ends, with no console restart.
+- Console helper: tighter checks on the Docker commands it runs, and console folders cannot start programs.
 
 **Sign-in.**
 - Users who belong to many Authentik groups no longer get "HTTP 431" on the console and on TAK Portal.
 - Federation Hub behind Authentik no longer gets the same error: it receives no Authentik headers.
 
 **Rocky and Red Hat.**
-- The console restarts again on Rocky 9 after the update (a new SELinux module, 2.2).
-- A fresh Rocky install gets the confined SELinux console module from the start.
+- The console restarts again on Rocky 9 after the update.
+- A fresh Rocky install on 10.4.7 gets the confined SELinux console module (2.2) from the start. A box first installed on 10.4.6 or older keeps its older module, and its console still restarts.
 
 **Updates.**
 - NetBird moves to 0.83.2 and its dashboard to v2.98.0. On an existing NetBird server, press **Update** on the NetBird page.
@@ -36,7 +36,7 @@ Back to the [README](README.md).
 - README now has a table of contents, and the release notes live in this file.
 
 **Known issues.**
-- After an Authentik application is renamed, its site answers "403" until the console restarts once.
+- After the slug (the web name) of an Authentik application is changed, its site does not open until the console restarts once.
 
 **Upgrading:** use **Update Now** on the Console page.
 
