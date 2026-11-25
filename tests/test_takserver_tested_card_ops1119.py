@@ -167,19 +167,27 @@ def _render(tak):
 
 def test_card_text_behind():
     html = _render({'tested': '5.8-RELEASE105', 'tested_state': 'behind'})
-    assert 'Latest we tested: 5.8-RELEASE105' in html and 'yours is older' in html
-    assert 'display:none' not in html
+    assert 'Newer Version Available' in html and 'display:none' not in html
+    assert 'Current Release' not in html
+    assert 'title="Latest we tested: 5.8-RELEASE105"' in html      # the version is only a tooltip; the line is AJ's words
 
 
-def test_card_text_current_and_newer():
-    assert 'you run it' in _render({'tested': '5.8-RELEASE104', 'tested_state': 'current'})
-    assert 'yours is newer' in _render({'tested': '5.8-RELEASE104', 'tested_state': 'newer'})
+def test_card_text_current():
+    html = _render({'tested': '5.8-RELEASE104', 'tested_state': 'current'})
+    assert 'Current Release' in html and 'Newer Version Available' not in html and 'display:none' not in html
+
+
+def test_card_is_hidden_when_the_box_is_ahead_of_what_we_tested():
+    # no claim either way: nothing newer is known, and we have not tested what it runs
+    html = _render({'tested': '5.8-RELEASE104', 'tested_state': 'newer'})
+    assert 'display:none' in html and 'Current Release' not in html and 'Newer Version Available' not in html
 
 
 def test_no_file_means_a_hidden_empty_line():
-    for tak in (None, {}, {'version': '5.8-RELEASE104'}):
+    for tak in (None, {}, {'version': '5.8-RELEASE104'}, {'tested': '5.8-RELEASE104', 'tested_state': 'unknown'}):
         html = _render(tak)
         assert 'display:none' in html and 'Latest we tested' not in html
+        assert 'Current Release' not in html and 'Newer Version Available' not in html
 
 
 def test_the_version_is_escaped_in_the_server_rendered_line():
@@ -193,6 +201,12 @@ def test_the_script_sets_text_never_html_and_runs_on_every_poll():
     poll = CONSOLE[CONSOLE.index('function refreshModuleVersions()'):]
     assert 'applyTakTested(data.takserver)' in poll[:400]
     assert 'try{if(data&&data.takserver)applyTakTested(data.takserver);}catch(e){}' in poll[:400]  # never stops the badges
+
+
+def test_the_script_uses_the_two_card_phrases():
+    js = CONSOLE[CONSOLE.index('function applyTakTested(d)'):CONSOLE.index('function refreshModuleVersions()')]
+    assert "'Newer Version Available'" in js and "'Current Release'" in js
+    assert 'yours is' not in js and 'you run it' not in js and "'Latest we tested: '+d.tested" in js  # tooltip only
 
 
 def test_the_card_line_sits_only_on_the_takserver_card():
