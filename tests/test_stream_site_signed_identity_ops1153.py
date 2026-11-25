@@ -442,9 +442,12 @@ def _app_ns():
     if _APP_NS:              # app.py is parsed once for the file, not once per test
         return _APP_NS
     names = ('_emit_mediamtx_site', '_caddy_vhost_block', '_mediamtx_vhost_is_safe',
-             '_mediamtx_vhost_needs_regen')
+             '_mediamtx_vhost_needs_regen', '_caddy_forward_auth_lines')
     consts = ('MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER', '_CADDY_STRIP_AUTHENTIK_HEADERS',
-              '_MEDIAMTX_AK_COPY_HEADERS', '_MEDIAMTX_IDENTITY_MARKER', 'CADDYFILE_USER_BLOCKS_MARKER')
+              '_MEDIAMTX_AK_COPY_HEADERS', '_MEDIAMTX_IDENTITY_MARKER', 'CADDYFILE_USER_BLOCKS_MARKER',
+              # ops #1081, ops #1108: the one writer of every forward_auth block
+              '_CADDY_FORWARD_AUTH_URI', '_CADDY_FORWARD_AUTH_PIN', '_CADDY_APP_HEADER',
+              '_CADDY_APP_LOCK_MATCHER', '_CADDY_APP_LOCK_TEXT', '_CADDY_APP_SLUG_RE')
     ns = {'_pub_url': lambda h, s=None: f'https://{h}' if h else '', 're': re}
     for node in ast.parse(APP).body:
         if isinstance(node, ast.FunctionDef) and node.name in names:

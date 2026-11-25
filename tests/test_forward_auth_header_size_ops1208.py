@@ -66,9 +66,10 @@ def _groups_header(n):
 
 def test_console_vhost_copies_only_the_username_header():
     src = _func_src('generate_caddyfile')
-    block = src[src.index('forward_auth @needs_sso'):]
+    # ops #1081: the block comes from the one writer; the console hands it its header list.
+    block = src[src.index('_caddy_forward_auth_lines(ak_up, "        ", _CONSOLE_AK_COPY_HEADERS,'):]
     block = block[:block.index('reverse_proxy 127.0.0.1:5001')]
-    assert 'copy_headers {_CONSOLE_AK_COPY_HEADERS}' in block
+    assert "matcher='@needs_sso'" in block
     assert _const('_CONSOLE_AK_COPY_HEADERS') == 'X-Authentik-Username'
     for name in ('Groups', 'Email', 'Name', 'Uid', 'Jwt'):
         assert f'X-Authentik-{name}' not in block, f'the console vhost must not copy X-Authentik-{name}'

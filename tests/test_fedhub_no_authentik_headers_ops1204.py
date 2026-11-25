@@ -29,6 +29,7 @@ is the shipped text.
 """
 import ast
 import pathlib
+import re
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
@@ -53,8 +54,12 @@ def _fedhub_vhost_source():
 
 
 def _gate():
-    ns = {}
-    exec(compile(_segment('_fedhub_forward_auth_lines'), 'app.py', 'exec'), ns)
+    # ops #1081: the hub gate comes from the one writer of every forward_auth block.
+    ns = {'re': re}
+    for name in ('_CADDY_FORWARD_AUTH_URI', '_CADDY_FORWARD_AUTH_PIN', '_CADDY_APP_HEADER',
+                 '_CADDY_APP_LOCK_MATCHER', '_CADDY_APP_LOCK_TEXT', '_CADDY_APP_SLUG_RE',
+                 '_caddy_forward_auth_lines', '_fedhub_forward_auth_lines'):
+        exec(compile(_segment(name), 'app.py', 'exec'), ns)
     return ns['_fedhub_forward_auth_lines']('127.0.0.1:9090', '    ')
 
 
@@ -62,7 +67,12 @@ def test_the_hub_gate_asks_authentik_and_copies_nothing():
     gate = '\n'.join(_gate())
     assert 'forward_auth 127.0.0.1:9090 {' in gate
     assert 'uri /outpost.goauthentik.io/auth/caddy' in gate
-    assert 'trusted_proxies private_ranges' in gate
+    # ops #1081: no trust line; Caddy sets the two forwarded headers itself.
+    assert 'trusted_proxies' not in gate
+    assert 'header_up X-Forwarded-Host {http.request.hostport}' in gate
+    assert 'header_up X-Forwarded-Proto {http.request.scheme}' in gate
+    # ops #1108: no application compare in the hub's `handle` block (Caddy sorts its lines).
+    assert '@ak_other_app' not in gate
     assert 'copy_headers' not in gate          # the whole bug: the group list went to the hub in X-Authentik-Groups
 
 

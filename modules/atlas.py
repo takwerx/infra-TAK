@@ -5486,6 +5486,10 @@ def _run_update(ctx, inst=None):
                 # ⚠️ Before anything below reads or writes `.env` (W243): a
                 # deployment built before W240 has a root-owned one.
                 _repair_env_ownership(os.path.join(dirpath, '.env'), ctx, plog)
+                # ops #1221: here too, so a deployment whose release already
+                # carries the newest code still gets containers that come back
+                # after Docker restarts. Recreated below with the `api` restart.
+                _policy_changed = ensure_restart_policy(dirpath, plog)
                 # ⚠️ Reconciled here too, or a deployment already on the newest
                 # release (installed before this module could set renewal up,
                 # or by an update that failed to) could never get it: this
@@ -5509,7 +5513,7 @@ def _run_update(ctx, inst=None):
                 # release would never move to the signed token.
                 restart_api = _reconcile_signed_identity(
                     ctx, inst, plog, regenerate=True) or restart_api
-                if _renewal['env_changed'] or restart_api:
+                if _renewal['env_changed'] or restart_api or _policy_changed:
                     _compose(ctx, 'up -d api', timeout=300, inst=inst)
                 if _cas['recreated']:
                     # The running `api` still mounts the folder Docker made.
@@ -5566,6 +5570,9 @@ def _run_update(ctx, inst=None):
         # ⚠️ Before the rebuild, or the new image starts without the setting and
         # spends a release accepting identity headers from anywhere.
         _set_trusted_proxies(dirpath, plog, _me['compose_project'])
+        # ops #1221: before the rebuild, so the containers it recreates carry
+        # the restart policy. An older release (1.51.0 has none) has none of its own.
+        ensure_restart_policy(dirpath, plog)
         # ⚠️ On every update, not only at deploy: this is how a deployment
         # made before renewal existed gets its account, and how the token is
         # rotated. Before the rebuild, so compose reads the new `.env`.
@@ -6465,8 +6472,20 @@ _COMPOSE_OVERRIDE = """# Written by the infra-TAK ATLAS module.
 # api` brings the database and the migration step with it and stops there.
 services:
   api:
+    # ⚠️ **Named here, not left to the release (ops #1221).** ATLAS 1.51.0's own
+    # compose file gave `api` and `db` no restart policy at all, which means
+    # `no`. Docker came back after an OS update and every other container with
+    # it, but these two stayed `Exited (0)` until somebody pressed Start, and
+    # no device could check in meanwhile. Later releases set it themselves;
+    # saying it again here means a deployment that has not updated yet, or a
+    # release that loses the line, is still brought back. `init` is one-shot
+    # and keeps `restart: "no"` -- restarting it would loop.
+    restart: unless-stopped
     ports:
       - "127.0.0.1:{app_port}:8000"
+
+  db:
+    restart: unless-stopped
 
   # ⚠️ **No `user:` here, and that was tried.** Running the containers as
   # the console's own uid would have removed the host-side chown entirely,
@@ -6482,6 +6501,73 @@ services:
   init:
     command: ["python", "-m", "app.cli", "init-pki"]
 """
+
+#: The services whose containers must come back by themselves when Docker does.
+RESTART_SERVICES = ('api', 'db')
+_OVERRIDE_PORT_RE = re.compile(r'"127\.0\.0\.1:(\d+):8000"')
+
+
+def _service_block(body, name):
+    """The lines of one service in a compose file, comments left out.
+
+    A service starts at a two-space key and runs to the next two-space key.
+    """
+    lines, found = [], False
+    for line in body.split(chr(10)):
+        if re.match(r'^  [A-Za-z0-9_.-]+:\s*$', line):
+            found = line.strip() == name + ':'
+            continue
+        if found and not line.lstrip().startswith('#'):
+            lines.append(line)
+    return chr(10).join(lines)
+
+
+def override_restart_policy_missing(body):
+    """The services in a compose override that have no `restart: unless-stopped`."""
+    return [name for name in RESTART_SERVICES
+            if not re.search(r'^\s+restart:\s*["\']?unless-stopped["\']?\s*$',
+                             _service_block(body, name), re.MULTILINE)]
+
+
+def ensure_restart_policy(dirpath, plog):
+    """Give an existing deployment the restart policy a new one is written with (ops #1221).
+
+    Returns True when it rewrote the override, so the caller recreates the
+    containers (`up -d api`) and they pick the policy up. False when there was
+    nothing to do or nothing safe to do.
+
+    ⚠️ **Only the override file is touched, and only when a policy is missing.**
+    The port is read back out of the file being replaced: it was allocated per
+    deployment at deploy time and is not recorded anywhere else. A file this
+    cannot read the port from is left alone and said so, because guessing a
+    port would point Caddy's upstream at nothing. A box with no override file
+    was never deployed by this module, so one is not created.
+
+    ⚠️ **Why not `docker update --restart` on the live containers.** It would
+    heal them until the next `up -d`, which recreates them from the compose
+    files; the file is what has to change.
+    """
+    path = os.path.join(dirpath, 'docker-compose.override.yml')
+    try:
+        with open(path, encoding='utf-8') as handle:
+            body = handle.read()
+    except OSError:
+        return False
+    missing = override_restart_policy_missing(body)
+    if not missing:
+        return False
+    found = _OVERRIDE_PORT_RE.search(body)
+    if not found:
+        plog('⚠ ' + ' and '.join(missing) + ' have no restart policy, but the port in '
+             'docker-compose.override.yml could not be read, so it was left alone')
+        return False
+    try:
+        _write_own(path, _COMPOSE_OVERRIDE.format(app_port=found.group(1)))
+    except OSError as exc:
+        plog('⚠ Could not give ' + ' and '.join(missing) + ' a restart policy: ' + str(exc)[:120])
+        return False
+    plog('✓ ' + ' and '.join(missing) + ' now restart by themselves when Docker does')
+    return True
 
 
 # --------------------------------------------------------------------------- #

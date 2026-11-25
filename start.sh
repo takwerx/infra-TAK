@@ -1198,14 +1198,35 @@ _install_selinux_module() {
     command -v checkmodule >/dev/null 2>&1 || dnf install -y checkpolicy >/dev/null 2>&1 || true
     command -v checkmodule >/dev/null 2>&1 && command -v semodule_package >/dev/null 2>&1 || return 1
     local tmp; tmp=$(mktemp -d); local rc=1
-    if checkmodule -M -m -o "$tmp/$name.mod" "$te" >/dev/null 2>&1 \
-       && semodule_package -o "$tmp/$name.pp" -m "$tmp/$name.mod" >/dev/null 2>&1 \
-       && semodule -i "$tmp/$name.pp" >/dev/null 2>&1; then
+    # ops #1230: keep each tool's own output so a failure says why (it used to go
+    # to /dev/null, which is how a fresh Rocky install lost the confined module
+    # with no message at all).
+    local out="$tmp/$name.out"
+    if checkmodule -M -m -o "$tmp/$name.mod" "$te" >"$out" 2>&1 \
+       && semodule_package -o "$tmp/$name.pp" -m "$tmp/$name.mod" >>"$out" 2>&1 \
+       && semodule -i "$tmp/$name.pp" >>"$out" 2>&1; then
         rc=0
         [ -n "$te_ver" ] && echo "$te_ver" > "$stamp" 2>/dev/null
+    else
+        echo -e "${YELLOW}    $name: $(tail -n 3 "$out" 2>/dev/null | tr '\n' ' ' | cut -c1-300)${NC}"
     fi
     rm -rf "$tmp"
     return $rc
+}
+
+# ops #1230: takwerx_console_confined.te names types from container-selinux
+# (container_runtime_exec_t, for the docker client the console runs). On Rocky/RHEL
+# that package comes with Docker, and Docker is installed LATER in this script
+# (ensure_docker_nonroot). With the package missing, `semodule -i` fails with
+# "Failed to resolve typeattributeset statement" and the console used to fall back
+# to unconfined_service_t with no message, on every fresh Rocky install. Install
+# the package first: docker-ce requires it anyway, so the box ends up with the same
+# packages. Returns 0 when it is present afterwards.
+_ensure_container_selinux() {
+    [ "$PKG_MGR" = "dnf" ] || return 0
+    rpm -q container-selinux >/dev/null 2>&1 && return 0
+    dnf -y install container-selinux >/dev/null 2>&1
+    rpm -q container-selinux >/dev/null 2>&1
 }
 
 install_selinux_console_policy() {
@@ -1230,10 +1251,15 @@ install_selinux_console_policy() {
     #    fresh provisions. Sets CONFINED_POLICY_OK so create_service emits the
     #    takwerx_console_t context. SSH kill switch if enforcing ever wedges:
     #    `semanage permissive -a takwerx_console_t`.
-    if [ "$BORN_NONROOT" = "1" ] \
-       && _install_selinux_module takwerx_console_confined "$INSTALL_DIR/selinux/takwerx_console_confined.te"; then
-        CONFINED_POLICY_OK=1
-        echo "  ✓ SELinux confined console domain installed (takwerx_console_t, permissive until v1.2)"
+    if [ "$BORN_NONROOT" = "1" ]; then
+        _ensure_container_selinux \
+            || echo -e "${YELLOW}  ⚠ container-selinux is not installed; the confined console module may not link${NC}"
+        if _install_selinux_module takwerx_console_confined "$INSTALL_DIR/selinux/takwerx_console_confined.te"; then
+            CONFINED_POLICY_OK=1
+            echo "  ✓ SELinux confined console domain installed (takwerx_console_t, permissive until v1.2)"
+        else
+            echo -e "${YELLOW}  ⚠ SELinux confined console domain was not installed; the console runs in unconfined_service_t${NC}"
+        fi
     fi
 }
 

@@ -4397,7 +4397,16 @@ def _do_exec(req):
         # installed) died at "end of file on stdin at conffile prompt" and was left iU.
         # Keep the file on disk — the same choice the OS upgrade makes (L4). Fixed value,
         # set here because the -o Dpkg::Options form is denied by _check_pkgmgr.
-        env.setdefault('DPKG_FORCE', 'confdef,confold')
+        _dpkg_force = 'confdef,confold'
+        # ops #1218: DPKG_FORCE REPLACES dpkg's built-in defaults, and `downgrade` is one of
+        # them. With it gone, `apt-get install --allow-downgrades ./older.deb` plans the
+        # downgrade, then dpkg prints "will not downgrade ... skipping" (term.log only) and
+        # apt exits 0 with the newer package still installed (measured on a fresh Ubuntu
+        # 22.04 box, TAK Server R105 -> R104: adding `downgrade` made it install). Put it back
+        # only when the caller passed apt's own --allow-downgrades, which is the opt-in.
+        if '--allow-downgrades' in argv[1:]:
+            _dpkg_force += ',downgrade'
+        env.setdefault('DPKG_FORCE', _dpkg_force)
     if _docker_cp_needs_stage(argv):
         # ops #645 W0 (hardening, both modes): a docker cp whose host path is not on
         # the allowlist never lets root open that path; the console user does the
@@ -9037,8 +9046,64 @@ def _nosuid_plan(targets, mounts):
     return cmds
 
 
+# ops #1229: with the policy capability nnp_nosuid_transition=1 (Rocky/RHEL 9), systemd
+# can start a confined service from a nosuid mount only if the policy has
+# `allow init_t <domain>:process2 nosuid_transition`. takwerx_console_confined has it
+# from 2.2. Applying the mounts under 2.1 or older made the console unable to restart
+# (203/EXEC, Permission denied, nuc Tue Nov 24, 2026). So the mounts wait for 2.2.
+NOSUID_SELINUX_CAP = '/sys/fs/selinux/policy_capabilities/nnp_nosuid_transition'
+CONSOLE_UNIT_FILE = '/etc/systemd/system/takwerx-console.service'
+CONFINED_DOMAIN_CONTEXT = 'SELinuxContext=system_u:system_r:takwerx_console_t'
+CONFINED_MODULE_STAMP = '/etc/selinux/.takwerx-takwerx_console_confined.ver'
+CONFINED_NOSUID_MIN = (2, 2)
+_SELINUX_CONVERGED = threading.Event()   # set when the module refresh pass has ended
+
+
+def _ver_tuple(text):
+    m = re.match(r'^\s*(\d+(?:\.\d+)*)', text or '')
+    return tuple(int(x) for x in m.group(1).split('.')) if m else ()
+
+
+def _nosuid_selinux_block(cap=None, unit=None, stamp=None):
+    """None when the nosuid mounts are safe to apply, else the reason they are not:
+    the kernel checks nosuid transitions and the console unit runs in the confined
+    domain but its module is older than the one that allows the transition."""
+    try:
+        with open(cap or NOSUID_SELINUX_CAP) as f:
+            if f.read().strip() != '1':
+                return None
+    except OSError:
+        return None          # no SELinux, or a kernel that does not check: nothing in the way
+    try:
+        with open(unit or CONSOLE_UNIT_FILE) as f:
+            if CONFINED_DOMAIN_CONTEXT not in f.read():
+                return None  # the console is not in the confined domain
+    except OSError:
+        return None
+    try:
+        with open(stamp or CONFINED_MODULE_STAMP) as f:
+            have = f.read().strip()
+    except OSError:
+        have = ''
+    if _ver_tuple(have) >= CONFINED_NOSUID_MIN:
+        return None
+    return ('takwerx_console_confined is %s, needs %s or newer (nosuid_transition) '
+            'before the console folders go nosuid'
+            % (have or 'not stamped', '.'.join(str(x) for x in CONFINED_NOSUID_MIN)))
+
+
+def _selinux_policy_converge_signalled():
+    try:
+        _selinux_policy_converge()
+    finally:
+        _SELINUX_CONVERGED.set()
+
+
 def _apply_nosuid_mounts(run=None):
     """Root only. Returns (ok, [log lines])."""
+    block = _nosuid_selinux_block()
+    if block:
+        return True, ['nosuid mounts skipped: ' + block]
     run = run or subprocess.run
     mount = shutil.which('mount', path=BROKER_TRUSTED_PATH) or '/bin/mount'
     log, ok = [], True
@@ -9109,6 +9174,10 @@ def _converge_nosuid_unit(run=None):
 
 
 def _converge_nosuid_logged():
+    # ops #1229: the SELinux module refresh goes first (it adds the rule the console
+    # needs to start from a nosuid folder). If it fails or runs long, the gate in
+    # _apply_nosuid_mounts keeps the folders as they are.
+    _SELINUX_CONVERGED.wait(timeout=1800)
     try:
         if _converge_nosuid_unit():
             AUDIT.info(json.dumps({'op': 'startup', 'verdict': 'INFO',
@@ -9165,7 +9234,7 @@ def serve():
                                'summary': f'listening on {MEDIAMTX_SOCKET_PATH} (mediamtx list)'}))
     # SELinux module refresh runs AFTER the socket is up (a policy rebuild can
     # take tens of seconds; the console's boot ping must not wait on it).
-    threading.Thread(target=_selinux_policy_converge, daemon=True,
+    threading.Thread(target=_selinux_policy_converge_signalled, daemon=True,
                      name='selinux-policy-converge').start()
     try:
         if _converge_own_unit():
