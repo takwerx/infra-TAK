@@ -627,8 +627,8 @@ async function loadCAInfo(){
             var caCn=(d.old_ca_names||{})[alias]||'';
             var caLabel=(caCn&&caCn.toLowerCase()!==alias.toLowerCase())?alias+' ('+caCn+')':alias;
             rh+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">';
-            rh+='<span style="color:var(--yellow)">'+caLabel.replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];})+'</span>';
-            rh+='<button type="button" onclick="revokeOldCA(\''+alias.replace(/'/g,"\\'")+'\')" style="padding:6px 14px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Revoke</button>';
+            rh+='<span style="color:var(--yellow)">'+escapeHtml(caLabel)+'</span>';
+            rh+='<button type="button" onclick="revokeOldCA('+jsArg(alias)+')" style="padding:6px 14px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Revoke</button>';
             rh+='</div>';
           }
           listEl.innerHTML=rh;
@@ -1183,6 +1183,9 @@ async function togglePkgLock(){
 }
 /* ops #827: escapes & < > " ' so the result is safe in text and in a quoted attribute */
 function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+// ops #897: a value as an argument of an inline handler (onclick="f(...)"). JSON makes the
+// JavaScript string, escapeHtml makes it safe in the attribute. Never build the quotes by hand.
+function jsArg(v){return escapeHtml(JSON.stringify(v==null?'':String(v)));}
 function renderPkgLock(){
     var btn=document.getElementById('pkg-lock-btn');
     var label=document.getElementById('pkg-lock-status-label');
@@ -2685,24 +2688,24 @@ function loadPlugins(){
       var classKey=p.classname||'';
       var jarKey=p.jar||'';
       var configBtn=classKey
-        ?'<button type="button" onclick="takPluginToggleConfig(\''+classKey+'\')" style="padding:4px 10px;background:transparent;color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Edit config</button>'
+        ?'<button type="button" onclick="takPluginToggleConfig('+jsArg(classKey)+')" style="padding:4px 10px;background:transparent;color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Edit config</button>'
         :'';
       var removeBtn=jarKey
-        ?'<button type="button" onclick="takPluginRemove(\''+jarKey+'\')" style="padding:4px 10px;background:transparent;color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Remove</button>'
+        ?'<button type="button" onclick="takPluginRemove('+jsArg(jarKey)+')" style="padding:4px 10px;background:transparent;color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Remove</button>'
         :'';
       var configSection=classKey
-        ?'<div id="tak-plugin-cfg-'+classKey+'" style="display:none;margin-top:10px;padding:12px;background:rgba(6,182,212,0.04);border:1px solid var(--border);border-radius:8px">'
-          +'<div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-family:\'JetBrains Mono\',monospace">'+classKey+'.yaml</div>'
-          +'<textarea id="tak-plugin-cfg-txt-'+classKey+'" style="width:100%;min-height:140px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:11px;padding:10px;box-sizing:border-box;resize:vertical" spellcheck="false"></textarea>'
+        ?'<div id="tak-plugin-cfg-'+escapeHtml(classKey)+'" style="display:none;margin-top:10px;padding:12px;background:rgba(6,182,212,0.04);border:1px solid var(--border);border-radius:8px">'
+          +'<div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-family:\'JetBrains Mono\',monospace">'+escapeHtml(classKey)+'.yaml</div>'
+          +'<textarea id="tak-plugin-cfg-txt-'+escapeHtml(classKey)+'" style="width:100%;min-height:140px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:11px;padding:10px;box-sizing:border-box;resize:vertical" spellcheck="false"></textarea>'
           +'<div style="display:flex;align-items:center;gap:10px;margin-top:8px">'
-          +'<button type="button" onclick="takPluginSaveConfig(\''+classKey+'\')" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Save</button>'
-          +'<span id="tak-plugin-cfg-msg-'+classKey+'" style="font-size:11px;color:var(--text-dim)"></span>'
+          +'<button type="button" onclick="takPluginSaveConfig('+jsArg(classKey)+')" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Save</button>'
+          +'<span id="tak-plugin-cfg-msg-'+escapeHtml(classKey)+'" style="font-size:11px;color:var(--text-dim)"></span>'
           +'</div>'
           +'</div>'
         :'';
       return '<div style="padding:10px 14px;background:rgba(6,182,212,0.03);border:1px solid var(--border);border-radius:8px;margin-bottom:8px">'
         +'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">'
-        +'<div><span style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-primary)">'+name+'</span> '+configLabel+'</div>'
+        +'<div><span style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-primary)">'+escapeHtml(name)+'</span> '+configLabel+'</div>'
         +'<div style="display:flex;gap:6px">'+configBtn+' '+removeBtn+'</div>'
         +'</div>'
         +configSection
