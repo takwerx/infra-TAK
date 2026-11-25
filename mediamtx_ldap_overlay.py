@@ -28,10 +28,13 @@ Patches the vanilla MediaMTX config editor Flask app to:
 import base64
 import hashlib
 import hmac
+import io
 import os
 import re
 import json
 import math
+import socket
+import ssl
 import threading
 import time
 import urllib.parse
@@ -440,8 +443,115 @@ def _ak_delete(path):
     urllib.request.urlopen(r, timeout=15)
 
 
+# ── TLS on the editor's own port (ops #1149) ─────────────────────────────────────────────
+# On a remote MediaMTX host, Caddy on the console reaches this editor over the network. The
+# stream certificate is on such a host already (RTSPS and HLS use it), so the editor takes
+# TLS with it on its one port and still takes plain http there. Caddy of a console that does
+# not know about this (an older release, a rollback) keeps working, and the console changes
+# its Caddy to https only after it saw this port answer TLS. The first byte of a connection
+# tells the two apart: 0x16 is a TLS handshake record, and no HTTP request starts with it.
+EDITOR_TLS_CERT = os.environ.get('INFRATAK_EDITOR_TLS_CERT', '/etc/mediamtx/certs/stream.crt')
+EDITOR_TLS_KEY = os.environ.get('INFRATAK_EDITOR_TLS_KEY', '/etc/mediamtx/certs/stream.key')
+EDITOR_TLS_HANDSHAKE_SECONDS = 20
+_editor_tls_lock = threading.Lock()
+_editor_tls_state = {'stamp': None, 'ctx': None}
+
+
+def _editor_tls_context():
+    """The TLS context for the two files above, or None when there is no usable pair. The
+    files are read again when one of them changes (a renewed certificate needs no restart)."""
+    try:
+        stamp = tuple((st.st_mtime_ns, st.st_size, st.st_ino)
+                      for st in (os.stat(EDITOR_TLS_CERT), os.stat(EDITOR_TLS_KEY)))
+    except OSError:
+        return None
+    with _editor_tls_lock:
+        if _editor_tls_state['stamp'] != stamp:
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                ctx.load_cert_chain(EDITOR_TLS_CERT, EDITOR_TLS_KEY)
+            except Exception:
+                ctx = None
+            _editor_tls_state.update(stamp=stamp, ctx=ctx)
+        return _editor_tls_state['ctx']
+
+
+def _editor_tls_handler(base):
+    """A request handler like `base` (werkzeug's) that takes TLS or plain http on one port.
+    All of it runs in the connection's own thread: a slow peer holds up nobody else."""
+
+    class TlsOrPlainHandler(base):
+        _tls_sock = None
+        _dropped = False
+
+        def setup(self):
+            sock = self.request
+            if isinstance(sock, ssl.SSLSocket):   # a server that does TLS itself: nothing to tell apart
+                super().setup()
+                return
+            try:
+                if sock.recv(1, socket.MSG_PEEK) == b'\x16':
+                    ctx = _editor_tls_context()
+                    if ctx is None:
+                        self._dropped = True      # TLS asked for and no certificate: no answer
+                    else:
+                        sock.settimeout(EDITOR_TLS_HANDSHAKE_SECONDS)
+                        self._tls_sock = ctx.wrap_socket(sock, server_side=True)
+                        self._tls_sock.settimeout(None)
+                        self.request = self._tls_sock
+            except Exception:
+                self._dropped = True
+            if self._dropped:
+                # wrap_socket has taken the socket away on a failed handshake: nothing to read
+                self.connection = self.request
+                self.rfile, self.wfile = io.BytesIO(), io.BytesIO()
+                return
+            try:
+                super().setup()
+            except Exception:
+                if self._tls_sock is not None:
+                    self._tls_sock.close()
+                raise
+
+        def handle(self):
+            if not self._dropped:
+                super().handle()
+
+        def finish(self):
+            try:
+                super().finish()
+            finally:
+                if self._tls_sock is not None:
+                    try:
+                        self._tls_sock.close()
+                    except OSError:
+                        pass
+
+    return TlsOrPlainHandler
+
+
+def _editor_tls_install(app):
+    """Make app.run() serve TLS and plain http on its port. Never raises: an editor that
+    cannot do this starts as before, on plain http."""
+    try:
+        from werkzeug.serving import WSGIRequestHandler
+        handler = _editor_tls_handler(WSGIRequestHandler)
+        run = app.run
+
+        def run_tls_or_plain(*args, **kwargs):
+            if not kwargs.get('ssl_context'):     # an editor that does TLS itself keeps its own way
+                kwargs.setdefault('request_handler', handler)
+            return run(*args, **kwargs)
+
+        app.run = run_tls_or_plain
+    except Exception:
+        pass
+
+
 def apply_ldap_overlay(app):
     """Patch the Flask app for Authentik/LDAP mode."""
+    _editor_tls_install(app)
 
     VIEWER_ALLOWED = ('/viewer', '/api/viewer/streams', '/api/share-links', '/api/share-links/generate', '/api/theme/logo')
     VIEWER_PREFIXES = ('/watch/', '/hls-proxy/', '/shared/', '/shared-hls/')
