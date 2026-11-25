@@ -275,6 +275,7 @@ class Console:
         self.caddyfile_after = None      # what the file holds after Caddy was asked
         self.reload_ok = True
         self.reloads = []
+        self.includes = {}               # operator include files: path -> text (None: not readable)
         ns = {
             'os': os, 're': re, 'tempfile': tempfile, 'time': time, 'threading': threading,
             'subprocess': subprocess, 'CONFIG_DIR': str(self.cfg_dir),
@@ -291,6 +292,7 @@ class Console:
             '_broker_available': lambda: self.broker,
             '_broker_request': self._broker,
             '_read_priv': self._read_caddyfile,
+            '_caddy_operator_include_files': lambda: sorted(self.includes),
             'load_settings': lambda: self.settings,
             '_startup_converge_mediamtx_remote_hls_road': self._road,
             'print': lambda *a, **k: self.log.append(' '.join(str(x) for x in a)),
@@ -311,6 +313,10 @@ class Console:
         return {'ok': True} if self.reload_ok else {'ok': False, 'error': 'adapt failed'}
 
     def _read_caddyfile(self, path):
+        if path in self.includes:
+            if self.includes[path] is None:
+                raise OSError('broker read denied')
+            return self.includes[path]
         assert path == '/etc/caddy/Caddyfile'
         return self.caddyfile
 
@@ -574,6 +580,21 @@ def test_non_root_console_opens_the_port_again_when_the_file_has_the_direct_road
     c.caddyfile = CADDYFILE_DIRECT
     c.port()
     assert host.allows(8888) == [CONSOLE] and host.bind() == '0.0.0.0:8888' and c.closed_mark() is None
+
+
+def test_non_root_console_reads_the_operator_include_files_too(tmp_path, host):
+    inc = '/etc/caddy/sites/stream.example.org/own.caddy'
+    c = _non_root(tmp_path, host, CADDYFILE_VIA_EDITOR, includes={inc: f'reverse_proxy /own/* {HOST}:8888\n'})
+    assert c.port() == 'open' and host.sent == [] and host.allows(8888) == [CONSOLE]
+    c.includes = {inc: None}                # a file the console cannot read: it cannot know
+    assert c.port() == 'kept' and host.sent == [] and host.allows(8888) == [CONSOLE]
+
+
+def test_non_root_console_is_not_fooled_by_a_comment_or_a_longer_address(tmp_path, host):
+    text = CADDYFILE_VIA_EDITOR + (f'# reverse_proxy {HOST}:8888\n'
+                                   f'other.example.org {{\n    reverse_proxy 1{HOST}:8888 {HOST}:88880\n}}\n')
+    c = _non_root(tmp_path, host, text)
+    assert c.port() == 'closed' and host.allows(8888) == []
 
 
 def test_a_console_that_can_ask_the_admin_api_never_reloads_caddy(console, host):

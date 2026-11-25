@@ -50960,23 +50960,33 @@ def _mediamtx_remote_caddy_reads_hls(host):
     the Caddyfile on disk answers, but only after Caddy took that exact file: the broker's
     caddy_reload runs `caddy reload` without --force, which loads the file when it differs
     from the running config and does nothing when they match
-    (https://caddyserver.com/docs/command-line#caddy-reload). A file Caddy refuses, a file
-    that changed meanwhile, or no broker: None."""
+    (https://caddyserver.com/docs/command-line#caddy-reload). The operator's include files
+    are read with it (Caddy imports them). A file Caddy refuses, a file that changed
+    meanwhile, a file the console cannot read, or no broker: None."""
     needle = f'{host}:{_MEDIAMTX_REMOTE_HLS_PORT}'
     uses = _caddy_running_config_has(needle)
     if uses is not None:
         return uses
+
+    def _on_disk():
+        parts = [_read_priv(CADDYFILE_PATH) or '']
+        if not parts[0].strip():
+            return None
+        parts += [_read_priv(path) or '' for path in _caddy_operator_include_files()]
+        return '\n'.join(parts)
+
     try:
         if not (_caddy_private() and _broker_should_route() and _broker_available()):
             return None
-        text = _read_priv(CADDYFILE_PATH) or ''
-        if not text.strip():
+        text = _on_disk()
+        if text is None:
             return None
         if not _broker_request({'op': 'caddy_reload'}, timeout=75).get('ok'):
             return None
-        if (_read_priv(CADDYFILE_PATH) or '') != text:
+        if _on_disk() != text:
             return None         # written again while Caddy was asked: the next look decides
-        return needle in text
+        live = '\n'.join(ln for ln in text.splitlines() if not ln.lstrip().startswith('#'))
+        return re.search(r'(?<![\w.-])' + re.escape(needle) + r'(?!\d)', live) is not None
     except Exception:
         return None
 
