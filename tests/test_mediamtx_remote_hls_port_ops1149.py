@@ -57,6 +57,7 @@ NAMES = (
     '_MEDIAMTX_REMOTE_HLS_PORT', '_MEDIAMTX_REMOTE_HLS_CLOSED_FILE', '_mediamtx_remote_hls_closed',
     '_MEDIAMTX_REMOTE_HLS_BIND_SH', '_mediamtx_remote_hls_bind', '_mediamtx_remote_hls_port',
     '_MEDIAMTX_REMOTE_HLS_PORT_LOCK', '_mediamtx_remote_hls_port_locked',
+    '_mediamtx_remote_caddy_reads_hls',
     '_startup_converge_mediamtx_remote_hls_port', '_console_release_app_has',
     '_mediamtx_remote_hls_port_before_rollback',
     # what it builds on
@@ -267,6 +268,13 @@ class Console:
         self.settings = {'fqdn': 'example.org', 'server_ip': CONSOLE, 'mediamtx_deployment': self.cfg}
         self.road_calls = []
         self.firewall_on = True
+        # a non-root console on the private layout: no admin socket for it, a broker instead
+        self.private_nonroot = False
+        self.broker = True
+        self.caddyfile = ''
+        self.caddyfile_after = None      # what the file holds after Caddy was asked
+        self.reload_ok = True
+        self.reloads = []
         ns = {
             'os': os, 're': re, 'tempfile': tempfile, 'time': time, 'threading': threading,
             'subprocess': subprocess, 'CONFIG_DIR': str(self.cfg_dir),
@@ -277,6 +285,12 @@ class Console:
             '_module_fw': lambda cfg, verb, port, proto='tcp', log_fn=None: (True, ''),
             '_fedhub_caddy_source_ip': lambda s: CONSOLE,
             '_caddy_running_config_has': self._caddy_has,
+            'CADDYFILE_PATH': '/etc/caddy/Caddyfile',
+            '_caddy_private': lambda: self.private_nonroot,
+            '_broker_should_route': lambda: self.private_nonroot,
+            '_broker_available': lambda: self.broker,
+            '_broker_request': self._broker,
+            '_read_priv': self._read_caddyfile,
             'load_settings': lambda: self.settings,
             '_startup_converge_mediamtx_remote_hls_road': self._road,
             'print': lambda *a, **k: self.log.append(' '.join(str(x) for x in a)),
@@ -289,6 +303,16 @@ class Console:
     def _caddy_has(self, needle):
         assert needle == f'{HOST}:8888'
         return self.caddy_dials
+
+    def _broker(self, req, timeout=600):
+        self.reloads.append(dict(req))
+        if self.caddyfile_after is not None:
+            self.caddyfile = self.caddyfile_after
+        return {'ok': True} if self.reload_ok else {'ok': False, 'error': 'adapt failed'}
+
+    def _read_caddyfile(self, path):
+        assert path == '/etc/caddy/Caddyfile'
+        return self.caddyfile
 
     def _road(self, after=None):
         self.road_calls.append(after)
@@ -489,6 +513,81 @@ def test_bind_sends_only_the_two_fixed_addresses(console, host):
     assert [re.search(r'W="([^"]*)"', sh).group(1) for sh in sent] == [
         '127.0.0.1:8888', '0.0.0.0:8888', '127.0.0.1:8888']
     assert not any('reboot' in sh or '__' in sh for sh in sent)
+
+
+# ── a non-root console: Caddy's admin socket is for root and caddy only (ops #814) ─────────
+# Found on the box: the console (user takwerx) could not ask the admin API, so the port never
+# closed. There the Caddyfile on disk answers, after the broker made Caddy take that file.
+
+CADDYFILE_VIA_EDITOR = f'stream.example.org {{\n    reverse_proxy {HOST}:5080\n}}\n'
+CADDYFILE_DIRECT = (f'stream.example.org {{\n    handle_path /hls-proxy/* {{\n        reverse_proxy {HOST}:8888\n    }}\n'
+                    f'    reverse_proxy {HOST}:5080\n}}\n')
+
+
+def _non_root(tmp_path, host, caddyfile, **kw):
+    c = Console(tmp_path, host, caddy_dials=None)       # the admin API cannot be asked
+    c.private_nonroot = True
+    c.caddyfile = caddyfile
+    for k, v in kw.items():
+        setattr(c, k, v)
+    return c
+
+
+def test_non_root_console_start_closes_the_port_after_caddy_took_the_file_on_disk(tmp_path, host):
+    c = _non_root(tmp_path, host, CADDYFILE_VIA_EDITOR)
+    assert c.start() == 'closed'
+    assert c.reloads and all(r == {'op': 'caddy_reload'} for r in c.reloads)
+    assert host.allows(8888) == [], 'the console is still allowed on the HLS port'
+    assert host.allows(5080) == [CONSOLE] and host.bind() == '127.0.0.1:8888'
+    assert c.closed_mark() == HOST
+
+
+def test_non_root_console_changes_nothing_when_caddy_refuses_the_file(tmp_path, host):
+    c = _non_root(tmp_path, host, CADDYFILE_VIA_EDITOR, reload_ok=False)
+    assert c.port() == 'kept'
+    assert host.sent == [] and host.allows(8888) == [CONSOLE] and c.closed_mark() is None
+    assert any('could not ask the running Caddy' in ln for ln in c.log)
+
+
+def test_non_root_console_keeps_the_port_open_while_the_file_has_the_direct_road(tmp_path, host):
+    c = _non_root(tmp_path, host, CADDYFILE_DIRECT)
+    assert c.port() == 'open'
+    assert host.sent == [] and host.allows(8888) == [CONSOLE] and c.closed_mark() is None
+
+
+def test_non_root_console_does_not_decide_on_a_file_written_again_meanwhile(tmp_path, host):
+    c = _non_root(tmp_path, host, CADDYFILE_VIA_EDITOR, caddyfile_after=CADDYFILE_DIRECT)
+    assert c.port() == 'kept'
+    assert host.sent == [] and host.allows(8888) == [CONSOLE]
+
+
+def test_non_root_console_with_no_broker_or_no_file_changes_nothing(tmp_path, host):
+    c = _non_root(tmp_path, host, CADDYFILE_VIA_EDITOR, broker=False)
+    assert c.port() == 'kept' and c.reloads == [] and host.sent == []
+    c.broker, c.caddyfile = True, ''
+    assert c.port() == 'kept' and c.reloads == [] and host.sent == []
+
+
+def test_non_root_console_opens_the_port_again_when_the_file_has_the_direct_road(tmp_path, host):
+    c = _non_root(tmp_path, host, CADDYFILE_VIA_EDITOR)
+    assert c.port() == 'closed' and host.allows(8888) == []
+    c.caddyfile = CADDYFILE_DIRECT
+    c.port()
+    assert host.allows(8888) == [CONSOLE] and host.bind() == '0.0.0.0:8888' and c.closed_mark() is None
+
+
+def test_a_console_that_can_ask_the_admin_api_never_reloads_caddy(console, host):
+    console.private_nonroot = True
+    assert console.port() == 'closed' and console.reloads == []
+
+
+def test_a_console_that_cannot_ask_says_so(tmp_path, host):
+    c = Console(tmp_path, host, caddy_dials=None)
+    assert c.port() == 'kept'
+    assert any('could not ask the running Caddy' in ln for ln in c.log)
+    quiet = Console(tmp_path / 'q', host, marked=False, caddy_dials=None) if (tmp_path / 'q').mkdir() is None else None
+    assert quiet.port() == 'kept' and quiet.log == [], 'a host not on the road through the editor gets no line'
+
 
 
 # ── later console starts ───────────────────────────────────────────────────────────────────

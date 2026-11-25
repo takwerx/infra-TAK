@@ -50951,6 +50951,36 @@ def _mediamtx_remote_hls_bind(cfg, loopback):
     return m.group(1) if (ok and m) else 'fail'
 
 
+def _mediamtx_remote_caddy_reads_hls(host):
+    """ops #1149: does the RUNNING Caddy have an upstream on `<host>:8888`? True, False, or
+    None when that cannot be known.
+
+    The admin API answers for a root console. On the private layout (ops #814) the admin API
+    is a unix socket for root and `caddy` only, so a non-root console cannot open it. There
+    the Caddyfile on disk answers, but only after Caddy took that exact file: the broker's
+    caddy_reload runs `caddy reload` without --force, which loads the file when it differs
+    from the running config and does nothing when they match
+    (https://caddyserver.com/docs/command-line#caddy-reload). A file Caddy refuses, a file
+    that changed meanwhile, or no broker: None."""
+    needle = f'{host}:{_MEDIAMTX_REMOTE_HLS_PORT}'
+    uses = _caddy_running_config_has(needle)
+    if uses is not None:
+        return uses
+    try:
+        if not (_caddy_private() and _broker_should_route() and _broker_available()):
+            return None
+        text = _read_priv(CADDYFILE_PATH) or ''
+        if not text.strip():
+            return None
+        if not _broker_request({'op': 'caddy_reload'}, timeout=75).get('ok'):
+            return None
+        if (_read_priv(CADDYFILE_PATH) or '') != text:
+            return None         # written again while Caddy was asked: the next look decides
+        return needle in text
+    except Exception:
+        return None
+
+
 _MEDIAMTX_REMOTE_HLS_PORT_LOCK = threading.Lock()
 
 
@@ -50970,7 +51000,7 @@ def _mediamtx_remote_hls_port_locked(settings, cfg, log, force_open=False):
     open to the console's address and bound to every interface. Nothing we ship reads it then
     (CloudTAK's media server pulls RTSP on 8554, ops #797).
 
-    ORDER: the RUNNING Caddy is asked first (admin API). The port closes only when Caddy has
+    ORDER: the RUNNING Caddy is asked first (_mediamtx_remote_caddy_reads_hls). The port closes only when Caddy has
     no upstream `<host>:8888` and the console has marked the host as serving video through the
     editor: firewall rule first, then the bind. When Caddy does dial the port (no Authentik,
     or an editor that does not serve video yet), a port this console closed is opened again:
@@ -50988,8 +51018,11 @@ def _mediamtx_remote_hls_port_locked(settings, cfg, log, force_open=False):
     if force_open:
         want_open = True
     else:
-        uses = _caddy_running_config_has(f'{host}:{port}')
+        uses = _mediamtx_remote_caddy_reads_hls(host)
         if uses is None:
+            if closed or _mediamtx_remote_hls_via_editor(settings):
+                log(f"⚠ Port {port} on {host} stays as it is: the console could not ask the "
+                    "running Caddy which road it uses. The next console start tries again.")
             return 'kept'
         if not uses and not _mediamtx_remote_hls_via_editor(settings):
             return 'kept'       # no reader, but not on the road through the editor: as it was
@@ -117224,8 +117257,7 @@ def _startup_converge_mediamtx_remote_hls_port(after=None, wait_s=180):
             return 'none'
         if _mediamtx_remote_hls_via_editor(settings) and not _mediamtx_remote_hls_closed(cfg):
             end = time.time() + wait_s
-            while (time.time() < end and
-                   _caddy_running_config_has(f'{host}:{_MEDIAMTX_REMOTE_HLS_PORT}') is not False):
+            while time.time() < end and _mediamtx_remote_caddy_reads_hls(host) is not False:
                 time.sleep(10)
         return _mediamtx_remote_hls_port(settings, cfg, lambda ln: print(f"{tag} {ln}", flush=True))
     except Exception as e:
