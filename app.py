@@ -43426,6 +43426,7 @@ def _startup_caddy_selfheal():
 # ops #1103: security headers Caddy adds at the edge. `header ?Name value` sets the header only
 # when the upstream (or an operator's sites.d include) did not send one, so neither is overridden.
 CADDY_HSTS_LINE = '    header ?Strict-Transport-Security "max-age=31536000;"'
+CADDY_HSTS_STATIC_LINE = '    header Strict-Transport-Security "max-age=31536000;"'
 CADDY_NOSNIFF_LINE = '    header ?X-Content-Type-Options nosniff'
 _CADDY_SITE_PORT_RE = re.compile(r':\d+$')
 
@@ -43451,14 +43452,23 @@ def _inject_security_headers(lines):
         addrs = s[:-1].replace(',', ' ').split()
         if not addrs or any(_CADDY_SITE_PORT_RE.search(a) for a in addrs):
             continue
-        j, has_own = i + 1, False
+        j, has_own, static_only, has_proxy = i + 1, False, False, False
         while j < n and flat[j].rstrip() != '}':
             if 'Strict-Transport-Security' in flat[j]:
                 has_own = True
                 break
+            _w = flat[j].split()
+            if _w[:1] == ['file_server']:
+                static_only = True
+            elif _w[:1] in (['reverse_proxy'], ['forward_auth']):
+                has_proxy = True
             j += 1
         if not has_own:
-            out.append(CADDY_HSTS_LINE)
+            # A site that only serves files (the Cesium 3D tiles site) has no upstream that could
+            # send its own HSTS, and the `?` form is skipped when file_server answers 404 (a
+            # handler error), so ZAP's look at the site root found no HSTS. The plain form is
+            # also sent on the 404 and cannot double up here.
+            out.append(CADDY_HSTS_STATIC_LINE if (static_only and not has_proxy) else CADDY_HSTS_LINE)
     return out
 
 

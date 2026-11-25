@@ -56,8 +56,8 @@ def _load(names, ns=None):
 
 
 def _inject():
-    return _load(['CADDY_HSTS_LINE', 'CADDY_NOSNIFF_LINE', '_CADDY_SITE_PORT_RE',
-                  '_inject_security_headers'])
+    return _load(['CADDY_HSTS_LINE', 'CADDY_HSTS_STATIC_LINE', 'CADDY_NOSNIFF_LINE',
+                  '_CADDY_SITE_PORT_RE', '_inject_security_headers'])
 
 
 HSTS = '    header ?Strict-Transport-Security "max-age=31536000;"'
@@ -173,7 +173,7 @@ def _converge(caddyfile, regen_to=None, registry=True):
           '_read_priv': lambda p: state['file'], 'load_settings': lambda: {'fqdn': 'x.example'},
           'generate_caddyfile': gen, '_caddy_reload_if_changed': reload_if_changed,
           '_CADDY_REGISTRY_READY': ev, 'print': lambda *a, **k: printed.append(' '.join(map(str, a)))}
-    _load(['CADDY_HSTS_LINE', '_startup_caddy_security_headers_converge'], ns)
+    _load(['CADDY_HSTS_LINE', 'CADDY_HSTS_STATIC_LINE', '_startup_caddy_security_headers_converge'], ns)
     ns['_startup_caddy_security_headers_converge']()
     return calls, printed
 
@@ -206,3 +206,21 @@ def test_converge_defers_to_the_registry_regen():
 def test_converge_is_wired_into_startup_migrations():
     src = APP[APP.index('def _startup_migrations'):]
     assert '_startup_caddy_security_headers_converge()' in src
+
+
+def test_a_file_server_only_site_gets_the_plain_form_so_a_404_carries_it_too():
+    """Box run fi-20261125-190902: the Cesium tiles site (file_server, no upstream) sent no HSTS
+    on a 404 with the `?` form (Caddy skips the deferred default when file_server errors), while
+    the plain ACAO line next to it was there. ZAP reads the site root, a 404, so it still said
+    no HSTS. A file_server-only site has no upstream HSTS to double up with, so it gets the plain
+    form; every proxied site keeps the `?` form."""
+    lines = ['tiles.example.com {', '    root * /srv/tiles', '    file_server',
+             '    header Access-Control-Allow-Origin *', '}', '',
+             'mixed.example.com {', '    file_server', '    reverse_proxy 127.0.0.1:8080', '}', '']
+    ns = _inject()
+    out = ns['_inject_security_headers'](lines)
+    sites = _sites(out)
+    plain = '    header Strict-Transport-Security "max-age=31536000;"'
+    assert sites['tiles.example.com {'][0] == plain
+    assert sites['mixed.example.com {'][0] == HSTS
+    assert ns['_inject_security_headers'](out) == out
