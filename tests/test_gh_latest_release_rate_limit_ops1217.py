@@ -34,6 +34,7 @@ import threading
 import time
 import types
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import pytest
@@ -128,7 +129,7 @@ def test_api_refused_still_names_the_newest_tag(gh, tmp_path):
     n = _helper(tmp_path)
     assert n['_gh_latest_release_tag']('takwerx/infra-TAK') == 'v10.4.2-alpha'
     # the redirect is asked first: the API's hourly budget is not spent at all
-    assert not any('api.github.com' in c for c in gh.calls)
+    assert 'api.github.com' not in {urllib.parse.urlparse(c).hostname for c in gh.calls}
 
 
 def test_tag_with_a_slash_is_kept_whole(gh, tmp_path):
