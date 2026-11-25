@@ -47,7 +47,7 @@ IP_ADDR = """1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever p
 8: br-8cca2a52cb78    inet 172.25.0.1/16 brd 172.25.255.255 scope global br-8cca2a52cb78\\       valid_lft forever
 """
 
-# coturn/coturn:4.18.0 and 4.19.1 docker/coturn/rootfs/usr/local/bin/docker-entrypoint.sh (same expansion loop; ops #816 checked 4.19.1 on test6), last line printf instead of exec
+# coturn/coturn:4.18.0, 4.19.1 and 4.19.2 docker/coturn/rootfs/usr/local/bin/docker-entrypoint.sh (same expansion loop; ops #816 checked 4.19.1 on test6; ops #962 found the 4.19.1 and 4.19.2 scripts byte-identical), last line printf instead of exec
 ENTRYPOINT = r'''#!/bin/bash
 if [ "${1:0:1}" == '-' ]; then
   set -- turnserver "$@"

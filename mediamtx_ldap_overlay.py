@@ -25,11 +25,22 @@ Patches the vanilla MediaMTX config editor Flask app to:
   5. Future: filter streams in /viewer by path-to-group mapping (vid_public vs vid_private determines which streams each user sees)
 """
 
+import base64
+import hashlib
+import hmac
+import io
 import os
 import re
 import json
+import math
+import socket
+import ssl
+import threading
+import time
+import urllib.parse
 import urllib.request
 import urllib.error
+from html import escape as _html_escape
 from flask import session, request, redirect, jsonify, Response
 
 AK_URL = os.environ.get('AUTHENTIK_API_URL', 'http://127.0.0.1:9090')
@@ -64,6 +75,304 @@ ADMIN_GROUPS = frozenset({'authentik Admins'})
 VIEWER_GROUPS = frozenset({'vid_private', 'vid_public'})
 
 VISIBILITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stream_visibility.json')
+
+# Which groups a signed-in person is in (ops #1082).
+#
+# Roles here come from group NAMES, so the names must be exact. The X-Authentik-Groups
+# header cannot give that: the outpost joins the names with "|" into one value, and an
+# Authentik group name is free text that may hold "|" itself, so splitting the header
+# does not give back the list that went in. The list is read from Authentik's user API
+# instead (a JSON list, one entry per group), with the token this editor already uses
+# for the Stream Access page. It is also the live answer: a person taken out of a group
+# loses the role within GROUPS_RECHECK_SECONDS, not at their next sign-in.
+#
+# No answer from Authentik (restarting, token unusable) never gives a role: the last
+# answer is kept for GROUPS_UNCONFIRMED_MAX_SECONDS, after that the person has no groups
+# (a viewer of public streams) until Authentik answers again.
+#
+# Header format: https://docs.goauthentik.io/add-secure-apps/providers/proxy/
+# ("X-authentik-groups ... separated by a pipe"). The header and the API's groups_obj
+# are the same list, the person's own groups: blueprints/system/providers-oauth2.yaml
+# (profile scope, request.user.groups) and authentik/core/api/users.py (instance.groups),
+# read at version/2026.8.5.
+GROUPS_RECHECK_SECONDS = 60            # ask Authentik again at most this often per user
+GROUPS_UNKNOWN_RETRY_SECONDS = 20      # after no answer, wait this long before the next try
+GROUPS_UNCONFIRMED_MAX_SECONDS = 900   # how long the last answer stands with no new one
+GROUPS_LOOKUP_TIMEOUT_SECONDS = 4      # one API call
+GROUPS_LOOKUP_WAIT_SECONDS = 9         # a request never waits longer than this (two calls)
+
+_groups_lock = threading.Lock()
+_groups_cache = {}      # username -> (tuple of names, or None for no answer; time checked)
+_groups_last = {}       # username -> (tuple of names, time of the last real answer)
+_groups_inflight = {}   # username -> Thread
+_groups_warned = {}     # username -> time of the last "no answer" log line
+
+
+def _authentik_groups_lookup(username):
+    """The exact names of the groups `username` is in, asked from Authentik now.
+    A tuple (empty for an unknown or deactivated account), or None for no usable answer.
+    Never raises."""
+    try:
+        if not AK_TOKEN:
+            return None
+
+        def _get(path):
+            r = urllib.request.Request(f'{AK_URL}/api/v3/{path}', headers=_ak_headers())
+            return json.loads(urllib.request.urlopen(
+                r, timeout=GROUPS_LOOKUP_TIMEOUT_SECONDS).read().decode())
+
+        # `username=` is an exact match; the row is still compared, because Authentik
+        # ignores a filter it does not know and would then return every user.
+        data = _get('core/users/?username=%s&include_groups=true'
+                    % urllib.parse.quote(username, safe=''))
+        results = data.get('results') if isinstance(data, dict) else None
+        if not isinstance(results, list):
+            return None
+        user = next((u for u in results
+                     if isinstance(u, dict) and u.get('username') == username), None)
+        if user is None or user.get('is_active') is not True:
+            return ()
+        groups = user.get('groups_obj')
+        if not isinstance(groups, list):
+            full = _get('core/users/%d/' % int(user['pk']))
+            groups = full.get('groups_obj') if isinstance(full, dict) else None
+            if not isinstance(groups, list):
+                return None
+        return tuple(g['name'] for g in groups
+                     if isinstance(g, dict) and isinstance(g.get('name'), str) and g['name'])
+    except Exception:
+        return None
+
+
+def _authentik_groups(username):
+    """Cached _authentik_groups_lookup(): the exact group names as a list, or None when
+    Authentik gave no answer and the last one is older than
+    GROUPS_UNCONFIRMED_MAX_SECONDS. One lookup per user at a time."""
+    if not username:
+        return None
+    started = time.time()
+
+    def _run():
+        names = _authentik_groups_lookup(username)
+        with _groups_lock:
+            if len(_groups_cache) > 2048:
+                _groups_cache.clear()
+                _groups_last.clear()
+                _groups_warned.clear()
+            _groups_cache[username] = (names, time.time())
+            if names is not None:
+                _groups_last[username] = (names, time.time())
+            _groups_inflight.pop(username, None)
+
+    def _answer(hit):
+        if hit[0] is not None:
+            return list(hit[0])
+        last = _groups_last.get(username)
+        if last and 0 <= time.time() - last[1] <= GROUPS_UNCONFIRMED_MAX_SECONDS:
+            return list(last[0])
+        return None
+
+    with _groups_lock:
+        hit = _groups_cache.get(username)
+        if hit:
+            ttl = GROUPS_UNKNOWN_RETRY_SECONDS if hit[0] is None else GROUPS_RECHECK_SECONDS
+            if 0 <= started - hit[1] < ttl:
+                return _answer(hit)
+        t = _groups_inflight.get(username)
+        if t is None:
+            t = threading.Thread(target=_run, daemon=True, name='authentik-groups-lookup')
+            _groups_inflight[username] = t
+            t.start()
+    t.join(GROUPS_LOOKUP_WAIT_SECONDS)
+    with _groups_lock:
+        hit = _groups_cache.get(username)
+        if hit and hit[1] >= started:
+            return _answer(hit)
+        return _answer((None, started))
+
+
+# Who the signed-in person is (ops #1153).
+#
+# Authentik's outpost sends the name twice: as plain text (X-Authentik-Username) and inside
+# the token Authentik signed for this sign-in (X-Authentik-Jwt). Only the token proves the
+# name, so when the proxy in front passes it, the name is read from the token and from
+# nothing else. Caddy says that it passes the token with IDENTITY_MARKER_HEADER, written
+# in the same vhost block as the copy of X-Authentik-Jwt (app.py, _emit_mediamtx_site), so
+# the two always arrive together. Without that line (a Caddyfile from before this change)
+# the plain name header is used as before.
+#
+# The token is checked with this site's own key: Authentik signs a proxy provider's tokens
+# with HS256 and the provider's client secret (authentik/providers/oauth2/models.py,
+# OAuth2Provider.jwt_key; authentik/providers/proxy/models.py, set_oauth_defaults, read at
+# version/2026.8.6). The outpost passes that token as X-authentik-jwt
+# (internal/outpost/proxyv2/application/mode_common.go). The secret is read from
+# Authentik's API with the token this editor already holds, for the provider of the
+# application STREAM_APP_SLUG and no other, so a token made for another application is
+# refused. Standard library only: the editor's venv gets no new package.
+# https://docs.goauthentik.io/add-secure-apps/providers/proxy/header_authentication/
+IDENTITY_MARKER_HEADER = 'X-Infratak-Identity'
+IDENTITY_MARKER_SIGNED = 'signed'
+STREAM_APP_SLUG = 'stream'
+TOKEN_KEY_RECHECK_SECONDS = 300        # read the key from Authentik again at most this often
+TOKEN_KEY_RETRY_SECONDS = 20           # after no answer, or a token the key does not fit
+TOKEN_KEY_TIMEOUT_SECONDS = 4          # one API call
+TOKEN_CLOCK_LEEWAY_SECONDS = 60
+TOKEN_MAX_BYTES = 16384
+# The stream vhost's paths outside the login (app.py, MEDIAMTX_OPEN_PATHS; a test keeps the two
+# equal). Only there does a request come without a token from a Caddyfile that passes it.
+OPEN_PATH_PREFIXES = ('/watch/', '/shared/', '/shared-hls/')
+_IDENTITY_SESSION_KEYS = ('username', 'logged_in', 'role', 'ldap_groups', 'ldap_mode',
+                          'identity_source')
+
+_token_key_lock = threading.Lock()
+_token_key = {'key': None, 'checked': 0.0, 'tried': 0.0}   # key: (client_id, secret bytes)
+_token_warned = {}      # reason -> time of the last log line
+
+
+def _stream_token_key_lookup():
+    """(client_id, secret as bytes) of this site's Authentik provider, asked from Authentik
+    now, or None for no usable answer. Never raises."""
+    try:
+        if not AK_TOKEN:
+            return None
+
+        def _get(path):
+            r = urllib.request.Request(f'{AK_URL}/api/v3/{path}', headers=_ak_headers())
+            return json.loads(urllib.request.urlopen(
+                r, timeout=TOKEN_KEY_TIMEOUT_SECONDS).read().decode())
+
+        app = _get('core/applications/%s/' % urllib.parse.quote(STREAM_APP_SLUG, safe=''))
+        if not isinstance(app, dict) or app.get('slug') != STREAM_APP_SLUG:
+            return None
+        pk = app.get('provider')
+        if not isinstance(pk, int) or isinstance(pk, bool):
+            return None
+        prov = _get('providers/oauth2/%d/' % pk)
+        if not isinstance(prov, dict) or prov.get('pk') != pk:
+            return None
+        if prov.get('signing_key'):
+            return None     # not HS256 then; this check knows HS256 only
+        client_id, secret = prov.get('client_id'), prov.get('client_secret')
+        if not (isinstance(client_id, str) and client_id
+                and isinstance(secret, str) and len(secret) >= 16):
+            return None
+        return client_id, secret.encode('utf-8')
+    except Exception:
+        return None
+
+
+def _stream_token_key(refresh=False):
+    """Cached _stream_token_key_lookup(). The last good key stays in use while Authentik
+    gives no answer. `refresh` asks again now (at most once per TOKEN_KEY_RETRY_SECONDS),
+    for a token the cached key does not fit: the secret may have been changed."""
+    now = time.time()
+    with _token_key_lock:
+        key = _token_key['key']
+        age = now - _token_key['checked']
+        since_try = now - _token_key['tried']
+        if key is not None and not refresh and 0 <= age < TOKEN_KEY_RECHECK_SECONDS:
+            return key
+        if 0 <= since_try < TOKEN_KEY_RETRY_SECONDS:
+            return key
+        _token_key['tried'] = now
+        if key is None:
+            # No key yet: the other requests wait here for this one answer.
+            fresh = _stream_token_key_lookup()
+            if fresh is not None:
+                _token_key['key'] = fresh
+                _token_key['checked'] = now
+            return fresh
+    # A key is in use: ask again without holding the others up (video segments come
+    # through here too). They keep the key they have until this answer is in.
+    fresh = _stream_token_key_lookup()
+    with _token_key_lock:
+        if fresh is not None:
+            _token_key['key'] = fresh
+            _token_key['checked'] = time.time()
+        return _token_key['key']
+
+
+def _b64url_bytes(text):
+    """The bytes of one base64url part of a token (no padding in a token). Raises on
+    anything that is not base64url."""
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', text):
+        raise ValueError('not base64url')
+    return base64.urlsafe_b64decode(text + '=' * (-len(text) % 4))
+
+
+def _token_fits(token_parts, key):
+    """True when the signature of the token is the HS256 of its first two parts with
+    `key` and its audience is this site's provider. Returns (fits, claims)."""
+    client_id, secret = key
+    signed = (token_parts[0] + '.' + token_parts[1]).encode('ascii')
+    want = hmac.new(secret, signed, hashlib.sha256).digest()
+    if not hmac.compare_digest(want, _b64url_bytes(token_parts[2])):
+        return False, None
+    claims = json.loads(_b64url_bytes(token_parts[1]).decode('utf-8'))
+    if not isinstance(claims, dict):
+        return False, None
+    aud = claims.get('aud')
+    if not (aud == client_id or (isinstance(aud, list) and client_id in aud)):
+        return False, None
+    return True, claims
+
+
+def _signed_username(token):
+    """The username inside Authentik's signed token, or (None, reason) when the token does
+    not prove one. Returns (username, None) for a good token. Never raises."""
+    try:
+        if not token:
+            return None, 'no-token'
+        if len(token) > TOKEN_MAX_BYTES:
+            return None, 'too-long'
+        parts = token.split('.')
+        if len(parts) != 3:
+            return None, 'not-a-token'
+        head = json.loads(_b64url_bytes(parts[0]).decode('utf-8'))
+        # One algorithm, named here: a token never picks how it is checked.
+        if not isinstance(head, dict) or head.get('alg') != 'HS256':
+            return None, 'algorithm'
+        key = _stream_token_key()
+        if key is None:
+            return None, 'no-key'
+        fits, claims = _token_fits(parts, key)
+        if not fits:
+            newer = _stream_token_key(refresh=True)
+            if newer is None or newer == key:
+                return None, 'signature'
+            fits, claims = _token_fits(parts, newer)
+            if not fits:
+                return None, 'signature'
+        now = time.time()
+        exp = claims.get('exp')
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)) or not math.isfinite(exp):
+            return None, 'expired'
+        if exp + TOKEN_CLOCK_LEEWAY_SECONDS < now:
+            return None, 'expired'
+        nbf = claims.get('nbf')
+        if (isinstance(nbf, (int, float)) and not isinstance(nbf, bool)
+                and nbf - TOKEN_CLOCK_LEEWAY_SECONDS > now):
+            return None, 'expired'
+        name = claims.get('preferred_username')
+        if not isinstance(name, str) or not name:
+            return None, 'no-name'
+        return name, None
+    except Exception:
+        return None, 'not-a-token'
+
+
+_TOKEN_REASONS = {
+    'no-token': 'the proxy sent no signed token for this sign-in',
+    'not-a-token': 'the signed token could not be read',
+    'too-long': 'the signed token is longer than %d bytes' % TOKEN_MAX_BYTES,
+    'algorithm': 'the signed token is not HS256',
+    'no-key': ('Authentik did not give the key to check it (API %s, application "%s"). '
+               'Check AUTHENTIK_TOKEN in the editor env file and that Authentik is up'
+               % (AK_URL, STREAM_APP_SLUG)),
+    'signature': 'the signature or the audience of the token is not this site\'s',
+    'expired': 'the token is past its end time',
+    'no-name': 'the token names no user',
+}
 
 # v10.2.4 (GH #82): MediaMTX stream paths may be nested — OBS and DJI publish to
 # rtmp://host/live/<name>. One path segment: MediaMTX's path-name characters (plus ':').
@@ -134,19 +443,134 @@ def _ak_delete(path):
     urllib.request.urlopen(r, timeout=15)
 
 
+# ── TLS on the editor's own port (ops #1149) ─────────────────────────────────────────────
+# On a remote MediaMTX host, Caddy on the console reaches this editor over the network. The
+# stream certificate is on such a host already (RTSPS and HLS use it), so the editor takes
+# TLS with it on its one port and still takes plain http there. Caddy of a console that does
+# not know about this (an older release, a rollback) keeps working, and the console changes
+# its Caddy to https only after it saw this port answer TLS. The first byte of a connection
+# tells the two apart: 0x16 is a TLS handshake record, and no HTTP request starts with it.
+EDITOR_TLS_CERT = os.environ.get('INFRATAK_EDITOR_TLS_CERT', '/etc/mediamtx/certs/stream.crt')
+EDITOR_TLS_KEY = os.environ.get('INFRATAK_EDITOR_TLS_KEY', '/etc/mediamtx/certs/stream.key')
+EDITOR_TLS_HANDSHAKE_SECONDS = 20
+_editor_tls_lock = threading.Lock()
+_editor_tls_state = {'stamp': None, 'ctx': None}
+
+
+def _editor_tls_context():
+    """The TLS context for the two files above, or None when there is no usable pair. The
+    files are read again when one of them changes (a renewed certificate needs no restart)."""
+    try:
+        stamp = tuple((st.st_mtime_ns, st.st_size, st.st_ino)
+                      for st in (os.stat(EDITOR_TLS_CERT), os.stat(EDITOR_TLS_KEY)))
+    except OSError:
+        return None
+    with _editor_tls_lock:
+        if _editor_tls_state['stamp'] != stamp:
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                ctx.load_cert_chain(EDITOR_TLS_CERT, EDITOR_TLS_KEY)
+            except Exception:
+                ctx = None
+            _editor_tls_state.update(stamp=stamp, ctx=ctx)
+        return _editor_tls_state['ctx']
+
+
+def _editor_tls_handler(base):
+    """A request handler like `base` (werkzeug's) that takes TLS or plain http on one port.
+    All of it runs in the connection's own thread: a slow peer holds up nobody else."""
+
+    class TlsOrPlainHandler(base):
+        _tls_sock = None
+        _dropped = False
+
+        def setup(self):
+            sock = self.request
+            if isinstance(sock, ssl.SSLSocket):   # a server that does TLS itself: nothing to tell apart
+                super().setup()
+                return
+            try:
+                if sock.recv(1, socket.MSG_PEEK) == b'\x16':
+                    ctx = _editor_tls_context()
+                    if ctx is None:
+                        self._dropped = True      # TLS asked for and no certificate: no answer
+                    else:
+                        sock.settimeout(EDITOR_TLS_HANDSHAKE_SECONDS)
+                        self._tls_sock = ctx.wrap_socket(sock, server_side=True)
+                        self._tls_sock.settimeout(None)
+                        self.request = self._tls_sock
+            except Exception:
+                self._dropped = True
+            if self._dropped:
+                # wrap_socket has taken the socket away on a failed handshake: nothing to read
+                self.connection = self.request
+                self.rfile, self.wfile = io.BytesIO(), io.BytesIO()
+                return
+            try:
+                super().setup()
+            except Exception:
+                if self._tls_sock is not None:
+                    self._tls_sock.close()
+                raise
+
+        def handle(self):
+            if not self._dropped:
+                super().handle()
+
+        def finish(self):
+            try:
+                super().finish()
+            finally:
+                if self._tls_sock is not None:
+                    try:
+                        self._tls_sock.close()
+                    except OSError:
+                        pass
+
+    return TlsOrPlainHandler
+
+
+def _editor_tls_install(app):
+    """Make app.run() serve TLS and plain http on its port. Never raises: an editor that
+    cannot do this starts as before, on plain http."""
+    try:
+        from werkzeug.serving import WSGIRequestHandler
+        handler = _editor_tls_handler(WSGIRequestHandler)
+        run = app.run
+
+        def run_tls_or_plain(*args, **kwargs):
+            if not kwargs.get('ssl_context'):     # an editor that does TLS itself keeps its own way
+                kwargs.setdefault('request_handler', handler)
+            return run(*args, **kwargs)
+
+        app.run = run_tls_or_plain
+    except Exception:
+        pass
+
+
 def apply_ldap_overlay(app):
     """Patch the Flask app for Authentik/LDAP mode."""
+    _editor_tls_install(app)
 
     VIEWER_ALLOWED = ('/viewer', '/api/viewer/streams', '/api/share-links', '/api/share-links/generate', '/api/theme/logo')
     VIEWER_PREFIXES = ('/watch/', '/hls-proxy/', '/shared/', '/shared-hls/')
 
     _untrusted_seen = set()
 
+    def _forget_identity():
+        """Drop a sign-in that came from Authentik. A sign-in through the editor's own
+        login page (no ldap_mode) is not this code's to end."""
+        if session.get('ldap_mode'):
+            for key in _IDENTITY_SESSION_KEYS:
+                session.pop(key, None)
+
     @app.before_request
     def _authentik_auto_auth():
         ak_user = request.headers.get('X-Authentik-Username', '')
-        ak_groups_raw = request.headers.get('X-Authentik-Groups', '')
-        if not ak_user:
+        ak_token = request.headers.get('X-Authentik-Jwt', '')
+        marker = request.headers.get(IDENTITY_MARKER_HEADER, '')
+        if not (ak_user or ak_token or marker):
             return
         # Peer pin (v10.1.48). Believe identity headers only from a peer that is
         # supposed to be able to set them. Anyone else is treated as if they sent
@@ -162,13 +586,50 @@ def apply_ldap_overlay(app):
                       'INFRATAK_TRUSTED_PROXIES in mediamtx-webeditor.service.'
                       % (peer or '<unknown>', ','.join(sorted(TRUSTED_PROXIES))), flush=True)
             return
-        groups = [g.strip() for g in ak_groups_raw.split('|') if g.strip()]
+        # ops #1153: the proxy passes Authentik's signed token (see IDENTITY_MARKER_HEADER).
+        # The name is then the one in the token; the plain name header proves nothing and
+        # is not read. A sign-in kept from before the token was checked is not kept.
+        signed_mode = marker == IDENTITY_MARKER_SIGNED
+        if signed_mode:
+            if session.get('identity_source') != IDENTITY_MARKER_SIGNED:
+                _forget_identity()
+            # Outside the login (share link, watch page) Caddy sends no identity: the
+            # sign-in from the request before stands. Every other path came through
+            # forward_auth, so a request there with no good token is nobody's sign-in,
+            # whatever the session held before.
+            if not (ak_user or ak_token) and request.path.startswith(OPEN_PATH_PREFIXES):
+                return
+            ak_user, why = _signed_username(ak_token)
+            if ak_user is None:
+                _forget_identity()
+                now = time.time()
+                if now - _token_warned.get(why, 0) > 300:
+                    _token_warned[why] = now
+                    print('[infratak-overlay] a sign-in through Authentik was not accepted: '
+                          '%s. This person is not signed in to the stream site.'
+                          % _TOKEN_REASONS.get(why, why), flush=True)
+                return
+        elif not ak_user:
+            return
+        # ops #1082: the groups come from Authentik's own list, never from the groups
+        # header (see _authentik_groups). No answer means no groups and no admin role.
+        groups = _authentik_groups(ak_user)
+        if groups is None:
+            groups = []
+            now = time.time()
+            if now - _groups_warned.get(ak_user, 0) > 300:
+                _groups_warned[ak_user] = now
+                print('[infratak-overlay] Authentik did not say which groups %r is in '
+                      '(API %s). Until it does, this person is a viewer of public streams '
+                      'only. Check AUTHENTIK_TOKEN in the editor env file and that '
+                      'Authentik is up.' % (ak_user, AK_URL), flush=True)
         role = 'admin' if any(g in ADMIN_GROUPS for g in groups) else 'viewer'
         session['username'] = ak_user
         session['logged_in'] = True
         session['role'] = role
         session['ldap_groups'] = groups
         session['ldap_mode'] = True
+        session['identity_source'] = IDENTITY_MARKER_SIGNED if signed_mode else 'header'
         # Redirect away from standalone auth pages
         if request.path in ('/login', '/register', '/forgot-password', '/reset-password'):
             return redirect('/')
@@ -220,8 +681,11 @@ def apply_ldap_overlay(app):
                         m = _re.search(r'/([a-z0-9.-]+\.[a-z]{2,})/\1\.crt', cert)
                         if m:
                             domain = m.group(1)
-            if domain:
-                return {'domain': domain, 'protocol': 'https' if hls_enc else 'http'}
+            # ops #1110: the protocol is MediaMTX's own hlsEncryption, with or without a
+            # domain in the certificate path. A remote host keeps its certificate at
+            # /etc/mediamtx/certs/stream.crt (no domain in the path), and plain http to a
+            # TLS listener is answered 400: no video through /hls-proxy/ there.
+            return {'domain': domain, 'protocol': 'https' if hls_enc else 'http'}
         except Exception:
             pass
         return {'domain': None, 'protocol': 'http'}
@@ -324,6 +788,13 @@ def apply_ldap_overlay(app):
                     return Response(WATCH_PRIVATE_HTML, content_type='text/html', status=403)
             else:
                 return Response(WATCH_PRIVATE_HTML, content_type='text/html', status=403)
+        # ops #900: the player must start INSIDE the playlist. The box's MediaMTX keeps
+        # hlsSegmentCount: 3 (app.py), and MediaMTX drops the oldest listed segment about
+        # one segment after it listed it. hls.js with liveSyncDurationCount >= 3 starts at
+        # that oldest segment, so a viewer on a slow link got 404 on it, no video, and
+        # Stream Offline. liveSyncDurationCount 2 starts one segment in; a network error
+        # that is not fatal restarts the load, as CloudTAK's player does. The same two
+        # values are in the Watch popup (watchStream) below.
         hls_url = f'/hls-proxy/{stream_name}/index.m3u8'
         title = f'{stream_name} - Live'
         html = f'''<!DOCTYPE html>
@@ -340,10 +811,10 @@ z-index:100;justify-content:center;align-items:center;flex-direction:column;text
 <script>
 var video=document.getElementById("v"),err=document.getElementById("err"),url="{hls_url}";
 function start(){{
-if(Hls.isSupported()){{var hls=new Hls({{enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:4,liveMaxLatencyDurationCount:7}});
+if(Hls.isSupported()){{var hls=new Hls({{enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:2,liveMaxLatencyDurationCount:7}});
 hls.loadSource(url);hls.attachMedia(video);
 hls.on(Hls.Events.MANIFEST_PARSED,function(){{err.style.display="none";video.play().catch(function(){{}});}});
-hls.on(Hls.Events.ERROR,function(ev,data){{if(data.fatal){{err.style.display="flex";setTimeout(function(){{hls.destroy();start();}},5000);}}}});
+hls.on(Hls.Events.ERROR,function(ev,data){{if(!data.fatal&&data.type===Hls.ErrorTypes.NETWORK_ERROR){{hls.startLoad();}}if(data.fatal){{err.style.display="flex";setTimeout(function(){{hls.destroy();start();}},5000);}}}});
 }}else if(video.canPlayType("application/vnd.apple.mpegurl")){{video.src=url;video.addEventListener("loadedmetadata",function(){{video.play().catch(function(){{}});}});}}
 }}
 start();
@@ -362,6 +833,9 @@ start();
         'headerTitle': 'MediaMTX Configuration Editor',
         'subtitle': 'Brought to you by TAKWERX',
     }
+
+    # A CSS colour as the theme editor saves it (#hex), or a colour name / rgb() / hsl() form.
+    _THEME_COLOUR_RE = re.compile(r'^(#[0-9A-Fa-f]{3,8}|[A-Za-z]{3,30}|(?:rgb|hsl)a?\([0-9.,%/ a-z-]{1,60}\))$')
 
     def _load_theme():
         try:
@@ -383,18 +857,30 @@ start();
             return redirect('/')
         theme = _load_theme()
         logo = _logo_exists()
+        # ops #897: every value is written into the page as text. The title and subtitle are
+        # the admin's, the username is the Authentik one (X-Authentik-Username), and the editor's
+        # own pages already show the title and subtitle as text (Jinja autoescape). A colour
+        # that is not a plain CSS colour falls back to the default, because it lands in <style>.
+        # The username goes in last so that no text in it is read as a placeholder.
+        def _text(v):
+            return _html_escape(str(v if v is not None else ''), quote=True)
+
+        def _colour(key):
+            v = str(theme.get(key) or '').strip()
+            return v if _THEME_COLOUR_RE.match(v) else _THEME_DEFAULTS[key]
+
         html = ACTIVE_STREAMS_VIEWER_HTML
-        html = html.replace('{{HEADER_COLOR}}', theme.get('headerColor', '#1e3a8a'))
-        html = html.replace('{{HEADER_COLOR_END}}', theme.get('headerColorEnd', '#1e293b'))
-        html = html.replace('{{ACCENT_COLOR}}', theme.get('accentColor', '#3b82f6'))
-        html = html.replace('{{HEADER_TITLE}}', theme.get('headerTitle', 'MediaMTX Configuration Editor'))
+        html = html.replace('{{HEADER_COLOR}}', _colour('headerColor'))
+        html = html.replace('{{HEADER_COLOR_END}}', _colour('headerColorEnd'))
+        html = html.replace('{{ACCENT_COLOR}}', _colour('accentColor'))
+        html = html.replace('{{LOGO_DISPLAY}}', 'block' if logo else 'none')
         sub = theme.get('subtitle', 'Brought to you by TAKWERX')
         if sub:
-            html = html.replace('{{SUBTITLE}}', sub)
+            html = html.replace('{{SUBTITLE}}', _text(sub))
         else:
             html = html.replace('<div class="subtitle">{{SUBTITLE}}</div>', '')
-        html = html.replace('{{LOGO_DISPLAY}}', 'block' if logo else 'none')
-        html = html.replace('{{USERNAME}}', session.get('username', ''))
+        html = html.replace('{{HEADER_TITLE}}', _text(theme.get('headerTitle', 'MediaMTX Configuration Editor')))
+        html = html.replace('{{USERNAME}}', _text(session.get('username', '')))
         return Response(html, content_type='text/html')
 
     # v10.2.6: /api/viewer/hlscred is gone. It handed the hlsviewer credential — read on
@@ -767,7 +1253,11 @@ td{padding:12px;border-top:1px solid #333}
   </div>
 </div>
 <script>
-function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+/* ops #897: escapes & < > " ' so the result is safe in text and in a quoted attribute */
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+/* ops #897: a value for an inline handler, e.g. onclick="watchStream(' + jsArg(name) + ')". JSON makes
+   it a JavaScript string, escapeHtml() then makes that string safe inside the quoted attribute. */
+function jsArg(v){return escapeHtml(JSON.stringify(v==null?'':String(v)));}
 
 function streamPath(name){return name.split('/').map(encodeURIComponent).join('/');}
 
@@ -793,10 +1283,10 @@ function watchStream(name){
     +'var url="'+hlsUrl+'";'
     +'function start(){'
     +'if(Hls.isSupported()){'
-    +'var hls=new Hls({enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:4,liveMaxLatencyDurationCount:7});'
+    +'var hls=new Hls({enableWorker:true,lowLatencyMode:false,maxBufferLength:30,maxMaxBufferLength:60,liveSyncDurationCount:2,liveMaxLatencyDurationCount:7});'
     +'hls.loadSource(url);hls.attachMedia(video);'
     +'hls.on(Hls.Events.MANIFEST_PARSED,function(){err.style.display="none";video.play().catch(function(){})});'
-    +'hls.on(Hls.Events.ERROR,function(ev,data){if(data.fatal){err.style.display="flex";setTimeout(function(){hls.destroy();start()},5000)}});'
+    +'hls.on(Hls.Events.ERROR,function(ev,data){if(!data.fatal&&data.type===Hls.ErrorTypes.NETWORK_ERROR){hls.startLoad()}if(data.fatal){err.style.display="flex";setTimeout(function(){hls.destroy();start()},5000)}});'
     +'}else if(video.canPlayType("application/vnd.apple.mpegurl")){'
     +'video.src=url;video.addEventListener("loadedmetadata",function(){video.play().catch(function(){})});'
     +'}}'
@@ -858,8 +1348,8 @@ function shareStream(name,vis,btn){
       html+='</td>';
       html+='<td style="text-align:center;color:#888">—</td>';
       html+='<td style="text-align:center;white-space:nowrap">';
-      html+='<button class="btn btn-watch" onclick="watchStream(\''+escapeHtml(name).replace(/'/g,"\\'")+'\')"><span style="font-size:16px">&#x25B6;&#xFE0F;</span> Watch</button>';
-      html+='<button class="btn btn-share" onclick="shareStream(\''+escapeHtml(name).replace(/'/g,"\\'")+'\',\''+vis+'\',this)">&#x1F517; Share</button>';
+      html+='<button class="btn btn-watch" onclick="watchStream('+jsArg(name)+')"><span style="font-size:16px">&#x25B6;&#xFE0F;</span> Watch</button>';
+      html+='<button class="btn btn-share" onclick="shareStream('+jsArg(name)+','+jsArg(vis)+',this)">&#x1F517; Share</button>';
       html+='</td></tr>';
     }
     html+='</tbody></table>';
@@ -1115,24 +1605,24 @@ function renderTable() {
     h += '<td>' + esc(u.name || '\u2014') + '</td>';
     h += '<td style="color:var(--text-dim)">' + esc(u.email || '\u2014') + '</td>';
     const isAdmin = u.role === 'admin';
-    h += '<td><span class="role-badge ' + (isAdmin ? 'role-admin' : 'role-viewer') + '"' + (adminGroupPk ? ' onclick="toggleRole(this,\'' + u.pk + '\',' + isAdmin + ')"' : '') + '>' + (isAdmin ? 'Admin' : 'Viewer') + '</span></td>';
+    h += '<td><span class="role-badge ' + (isAdmin ? 'role-admin' : 'role-viewer') + '"' + (adminGroupPk ? ' onclick="toggleRole(this,' + jsArg(u.pk) + ',' + (isAdmin ? 'true' : 'false') + ')"' : '') + '>' + (isAdmin ? 'Admin' : 'Viewer') + '</span></td>';
     h += '<td><span class="' + (u.is_active ? 'status-enabled' : 'status-disabled') + '">' + (u.is_active ? 'Enabled' : 'Disabled') + '</span></td>';
     h += '<td><div class="groups-cell">';
     for (const g of availableGroups) {
       const on = u.groups.includes(g);
-      h += '<span class="gbadge ' + (on ? 'on' : 'off') + ' ' + g + '" onclick="toggleGroup(this,\'' + u.pk + '\',\'' + g + '\',' + on + ')">';
-      h += '<span class="material-symbols-outlined">' + (on ? 'check_circle' : 'add_circle_outline') + '</span>' + g.replace('vid_','');
+      h += '<span class="gbadge ' + (on ? 'on' : 'off') + ' ' + esc(g) + '" onclick="toggleGroup(this,' + jsArg(u.pk) + ',' + jsArg(g) + ',' + (on ? 'true' : 'false') + ')">';
+      h += '<span class="material-symbols-outlined">' + (on ? 'check_circle' : 'add_circle_outline') + '</span>' + esc(g.replace('vid_',''));
       h += '</span>';
     }
     h += '</div></td>';
     h += '<td><div class="actions">';
-    h += '<button class="btn btn-edit" onclick="openEdit(\'' + u.pk + '\')">Edit</button>';
+    h += '<button class="btn btn-edit" onclick="openEdit(' + jsArg(u.pk) + ')">Edit</button>';
     if (u.is_active) {
-      h += '<button class="btn btn-disable" onclick="toggleActive(\'' + u.pk + '\',false)">Disable</button>';
+      h += '<button class="btn btn-disable" onclick="toggleActive(' + jsArg(u.pk) + ',false)">Disable</button>';
     } else {
-      h += '<button class="btn btn-enable" onclick="toggleActive(\'' + u.pk + '\',true)">Enable</button>';
+      h += '<button class="btn btn-enable" onclick="toggleActive(' + jsArg(u.pk) + ',true)">Enable</button>';
     }
-    h += '<button class="btn btn-delete" onclick="openDelete(\'' + u.pk + '\')">Delete</button>';
+    h += '<button class="btn btn-delete" onclick="openDelete(' + jsArg(u.pk) + ')">Delete</button>';
     h += '</div></td></tr>';
   }
   h += '</tbody></table>';
@@ -1252,7 +1742,10 @@ function toast(msg,type) {
   t.textContent = msg; t.className = 'toast ' + type + ' show';
   setTimeout(()=>t.classList.remove('show'), 3000);
 }
-function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+/* ops #897: escapes & < > " ' so the result is safe in text and in a quoted attribute */
+function esc(s) { return String(s==null?'':s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+/* ops #897: a value for an inline handler: a JavaScript string, made safe for the quoted attribute */
+function jsArg(v) { return esc(JSON.stringify(v==null?'':String(v))); }
 
 loadUsers();
 </script>

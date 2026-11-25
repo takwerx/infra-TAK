@@ -80,6 +80,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% block body_attrs %}{% endblock %}
 {% block content %}<div class="main">
 {% from '_relay_health_banner.html' import relay_health_banner %}{{ relay_health_banner() }}
+{% from '_webadmin_email_banner.html' import webadmin_email_banner %}{{ webadmin_email_banner() }}
 {% if not settings.get('fqdn') %}
 <div style="background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(239,68,68,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:20px 24px;margin-bottom:24px;font-family:'JetBrains Mono',monospace">
 <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
@@ -119,6 +120,23 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <button onclick="dismissPgRemote()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss</button>
 </div>
 </div></div>
+<div id="java-restart-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px"><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; A Java update is installed, but TAK Server is still running the old Java</div>
+<div id="java-restart-body" style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6">The update only takes effect when TAK Server restarts. Clients reconnect on their own, but pick a quiet moment if you are mid-operation.</div>
+<div id="java-restart-msg" style="font-size:11px;margin-top:6px"></div></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button id="java-restart-btn" onclick="javaRestartTak()" style="padding:6px 14px;background:linear-gradient(135deg,#dc2626,#b91c1c);color:#fff;border:none;border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;cursor:pointer">Restart TAK Server</button>
+<button onclick="dismissJavaRestart()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">I'll restart later</button>
+</div></div></div>
+<div id="java-image-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
+<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
+<div style="flex:1;min-width:260px"><div style="font-size:13px;font-weight:600;color:var(--yellow)">&#9888; A newer Java is available for TAK Server</div>
+<div id="java-image-body" style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6"></div>
+<div id="java-image-how" style="font-size:11px;color:var(--text-dim);margin-top:5px;line-height:1.6"></div></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap">
+<button onclick="dismissJavaImage()" style="padding:5px 12px;background:none;border:1px solid rgba(234,179,8,0.3);color:var(--text-dim);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:11px;cursor:pointer">Dismiss for a day</button>
+</div></div></div>
 <div id="kernel-patch-banner" style="display:none;background:linear-gradient(135deg,rgba(234,179,8,0.1),rgba(234,179,8,0.05));border:1px solid rgba(234,179,8,0.3);border-radius:12px;padding:14px 20px;margin-bottom:16px;font-family:'JetBrains Mono',monospace">
 <div id="kpatch-idle">
 <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px">
@@ -469,10 +487,12 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird', 'connectivity', 'clientfeed') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 {% if key != 'tak_video_restreamer' %}<div class="module-desc">{{ mod.description }}</div>{% endif %}
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available or v.node_security %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if key == 'authentik' %}{% if v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'cloudtak' %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('latest') %} <span style="color:var(--green);font-size:10px" title="Tracking upstream CloudTAK — running the latest release">latest ✓</span>{% endif %}{% elif key == 'takportal' %}{% if v.get('channel') == 'beta' %} <span style="color:var(--yellow);font-size:10px" title="Beta Mode is ON in TAK Portal — this is a main-branch build, not a published release. Turn off Enable Beta Features inside TAK Portal to track releases.">· beta</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}{% elif v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available or v.node_security %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if key == 'authentik' %}{% if v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'cloudtak' %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('latest') %} <span style="color:var(--green);font-size:10px" title="Tracking upstream CloudTAK — running the latest release">latest ✓</span>{% endif %}{% elif key == 'takportal' %}{% if v.get('channel') == 'beta' %} <span style="color:var(--yellow);font-size:10px" title="Beta Mode is ON in TAK Portal — this is a main-branch build, not a published release. Turn off Enable Beta Features inside TAK Portal to track releases.">· beta</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}{% elif v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}{% if v.update_available and v.get('release_notes_url') %} <span class="whats-new-link" role="link" tabindex="0" data-url="{{ v.release_notes_url }}" style="color:var(--cyan);font-size:10px;text-decoration:underline;cursor:pointer" title="Open the release notes on GitHub">What's new</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+{% if key == 'takserver' and mod.installed %}{% set _tt = module_versions.get('takserver') or {} %}{% set _st = _tt.get('tested_state') if _tt.get('tested') else '' %}<div id="takserver-card-tested" data-state="{{ _tt.get('tested_state', '') }}"{% if _st in ('behind', 'current') %} title="Latest we tested: {{ _tt.get('tested') }}"{% endif %} style="font-family:'JetBrains Mono',monospace;font-size:10px;color:{% if _st == 'behind' %}var(--yellow,#eab308){% elif _st == 'current' %}var(--green){% else %}var(--text-dim){% endif %};margin-top:4px{% if _st not in ('behind', 'current') %};display:none{% endif %}">{% if _st == 'behind' %}Newer Version Available{% elif _st == 'current' %}Current Release{% endif %}</div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+{% if key == 'fedhub' and mod.installed %}{% set _ft = module_versions.get('fedhub') or {} %}{% set _fst = _ft.get('tested_state') if _ft.get('tested') else '' %}<div id="fedhub-card-tested" data-state="{{ _ft.get('tested_state', '') }}"{% if _fst in ('behind', 'current') %} title="Latest release we tested: {{ _ft.get('tested') }}"{% endif %} style="font-family:'JetBrains Mono',monospace;font-size:10px;color:{% if _fst == 'behind' %}var(--yellow,#eab308){% elif _fst == 'current' %}var(--green){% else %}var(--text-dim){% endif %};margin-top:4px{% if _fst not in ('behind', 'current') %};display:none{% endif %}">{% if _fst == 'behind' %}Newer Version Available{% elif _fst == 'current' %}Current Release{% endif %}</div>{% endif %}
 {% if key == 'caddy' and mod.installed %}<div id="caddy-card-cert-days" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 </a>
 {% endfor %}
@@ -514,7 +534,8 @@ async function toggleUU(cb){
         else{cb.checked=!cb.checked;if(lb){lb.textContent=(action==='disable'?'Disable failed: ':'Enable failed: ')+(d.error||'unknown');lb.style.color='var(--red)';}}
     }catch(e){if(sp)sp.style.display='none';cb.checked=!cb.checked;if(lb){lb.textContent='Error';lb.style.color='var(--red)';}}
 }
-function escapeHtml(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+/* ops #827: escapes & < > " ' so the result is safe in text and in a quoted attribute */
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function formatRamGb(memPct,totalRamGb){if(totalRamGb==null)return '';var gb=(Number(memPct||0)/100)*totalRamGb;return gb.toFixed(2)+' GB';}
 function cpuColor(pct){var n=Number(pct||0);if(n>=80)return 'var(--red)';if(n>=50)return '#eab308';return 'var(--green)';}
 function normCpu(rawPct,vcpus){return vcpus>1?rawPct/vcpus:rawPct;}
@@ -599,7 +620,7 @@ async function fetchRetry(url,opts,tries){
    Power-Off treatment: password re-confirm plus the operator types the exact LV,
    which is what the API's confirm_lv echo is for. */
 var _diskLayout=null,_diskBusy=false;
-function _diskEsc(s){var d=document.createElement('div');d.textContent=(s==null?'':String(s));return d.innerHTML;}
+function _diskEsc(s){return escapeHtml(s);}
 function _diskEl(id){return document.getElementById(id);}
 function diskLayoutRefresh(){
     if(_diskBusy)return;
@@ -768,21 +789,49 @@ function updateGuardDogOverallHealth(){
 }
 setInterval(refreshModuleCards,8000);
 setTimeout(refreshModuleCards,3000);
+// infra-TAK #627: "What's new" sits inside the module card, which is itself a link, so it is a
+// span (an <a> cannot hold an <a>). Open the release page in a new tab; only github.com URLs.
+function openWhatsNew(e){
+    var t=e.target&&e.target.closest?e.target.closest('.whats-new-link'):null;
+    if(!t)return;
+    if(e.type==='keydown'&&e.key!=='Enter'&&e.key!==' ')return;
+    e.preventDefault();e.stopPropagation();
+    var u=t.getAttribute('data-url')||'';
+    if(u.indexOf('https://github.com/')===0)window.open(u,'_blank','noopener,noreferrer');
+}
+document.addEventListener('click',openWhatsNew);
+document.addEventListener('keydown',openWhatsNew);
+function applyTakTested(d,id,what){
+    // ops #1119: "Current Release / Newer Version Available" on the TAK Server and Federation Hub cards. Text only, never HTML: the version came from a signed file.
+    var el=document.getElementById(id||'takserver-card-tested');
+    if(!el)return;
+    // AJ (ops #1119): two words only. Behind = "Newer Version Available", on it = "Current Release". Ahead of what we tested: no line.
+    var note=d&&d.tested?{behind:['Newer Version Available','var(--yellow,#eab308)'],current:['Current Release','var(--green)']}[d.tested_state]:null;
+    if(!note){el.style.display='none';el.textContent='';el.removeAttribute('data-state');el.removeAttribute('title');return;}
+    el.textContent=note[0];
+    el.style.color=note[1];
+    el.title=(what||'Latest we tested')+': '+d.tested;
+    el.setAttribute('data-state',d.tested_state||'');
+    el.style.display='';
+}
 function refreshModuleVersions(){
     fetch('/api/modules/version').then(function(r){return r.json()}).then(function(data){
+        try{if(data&&data.takserver)applyTakTested(data.takserver);}catch(e){}  // the extra line must never stop the version badges below
+        try{if(data&&data.fedhub)applyTakTested(data.fedhub,'fedhub-card-tested','Latest release we tested');}catch(e){}
         for(var key in data){
             var el=document.getElementById('module-version-'+key);
             if(!el)continue;
             var d=data[key];
             var s='';
-            if(d.version)s=(key==='mediamtx'?'':'v')+d.version;
+            // ops #827: every version string is text from a container or a remote host. Escape it.
+            if(d.version)s=(key==='mediamtx'?'':'v')+escapeHtml(d.version);
             if(key==='authentik'&&d.channel==='dev'){
-                if(d.vetted_release)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted_release+'">· main: v'+d.vetted_release+'</span>';
+                if(d.vetted_release)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+escapeHtml(d.vetted_release)+'">· main: v'+escapeHtml(d.vetted_release)+'</span>';
                 if(d.update_available){
                     s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
                 }
             }else if(key==='netbird'&&d.channel==='dev'){
-                if(d.vetted)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+d.vetted+'">· main: v'+d.vetted+'</span>';
+                if(d.vetted)s+=' <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v'+escapeHtml(d.vetted)+'">· main: v'+escapeHtml(d.vetted)+'</span>';
                 if(d.update_available){
                     s+=' <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>';
                 }
@@ -798,11 +847,12 @@ function refreshModuleVersions(){
             }else if(d.update_available){
                 s+=(s?' ':'')+'<span style="color:var(--cyan);font-size:10px" title="Update available">update</span>';
             }else if(key==='authentik'&&d.ahead_of_vetted&&d.vetted_release){
-                s+=' <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v'+d.vetted_release+') — not yet validated on main channel">! unvetted</span>';
+                s+=' <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v'+escapeHtml(d.vetted_release)+') — not yet validated on main channel">! unvetted</span>';
             }else if(key==='authentik'&&d.vetted_release){
                 s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
             }
-            if(d.node_security)s+=(s?' ':'')+'<span style="color:var(--red);font-size:10px;font-weight:600" title="'+d.node_security.replace(/"/g,'&quot;')+'">🔒 Node.js out of date — press Update</span>';
+            if(d.update_available&&typeof d.release_notes_url==='string'&&d.release_notes_url.indexOf('https://github.com/')===0)s+=(s?' ':'')+'<span class="whats-new-link" role="link" tabindex="0" data-url="'+escapeHtml(d.release_notes_url)+'" style="color:var(--cyan);font-size:10px;text-decoration:underline;cursor:pointer" title="Open the release notes on GitHub">What\'s new</span>';
+            if(d.node_security)s+=(s?' ':'')+'<span style="color:var(--red);font-size:10px;font-weight:600" title="'+escapeHtml(d.node_security)+'">🔒 Node.js out of date — press Update</span>';
             el.innerHTML=s;if(s)el.style.display='';
         }
     }).catch(function(){});
@@ -1120,6 +1170,75 @@ function renderOsUpdates(d){
     var be=document.getElementById('osupd-details-body');
     if(be)be.innerHTML=body;
 }
+// ops #963: the new Java is on disk but TAK Server still runs the old one (it only changes on a
+// restart). Shown from /api/os-updates `java_restart`; "later" is quiet for 24 h per Java install.
+function _javaRestartDismissed(sig){
+    try{var d=JSON.parse(localStorage.getItem('java-restart-dismissed')||'null');
+        return !!(d&&d.sig===sig&&d.ts>0&&(Date.now()-d.ts)<24*60*60*1000);}catch(e){return false;}
+}
+function _javaRestartRender(ud){
+    var b=document.getElementById('java-restart-banner');if(!b)return;
+    var j=ud&&ud.java_restart;
+    if(!(j&&j.stale&&j.stale.length)||_javaRestartDismissed(j.sig)){b.style.display='none';return;}
+    b.setAttribute('data-java-sig',j.sig||'');
+    b.style.display='block';
+}
+function dismissJavaRestart(){
+    var b=document.getElementById('java-restart-banner');if(!b)return;
+    var sig=b.getAttribute('data-java-sig')||'';
+    if(sig){try{localStorage.setItem('java-restart-dismissed',JSON.stringify({sig:sig,ts:Date.now()}));}catch(e){}}
+    b.style.display='none';
+}
+async function javaRestartTak(){
+    if(!confirm('Restart TAK Server now?\n\nIt is unavailable for about a minute. Clients reconnect on their own.'))return;
+    var btn=document.getElementById('java-restart-btn'),msg=document.getElementById('java-restart-msg');
+    if(btn)btn.disabled=true;
+    if(msg){msg.style.color='var(--cyan)';msg.textContent='Restarting TAK Server\u2026';}
+    try{
+        var r=await fetch('/api/takserver/control',{method:'POST',credentials:'same-origin',
+            headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'restart',target:'core'})});
+        var d=await r.json();
+        if(!r.ok||d.error)throw new Error(d.error||('HTTP '+r.status));
+        if(msg){msg.style.color='var(--green)';msg.textContent='TAK Server restarted. Checking the Java it runs\u2026';}
+        setTimeout(async function(){
+            try{
+                var ur=await fetch('/api/os-updates',{credentials:'same-origin',cache:'no-store'});
+                var ud=await ur.json();
+                var j=ud&&ud.java_restart;
+                if(j&&j.stale&&j.stale.length){
+                    if(msg){msg.style.color='var(--yellow)';msg.textContent='TAK Server is still starting. Check again in a minute.';}
+                    if(btn)btn.disabled=false;
+                }else{_javaRestartRender(ud);}
+            }catch(e){if(btn)btn.disabled=false;}
+        },15000);
+    }catch(e){
+        if(msg){msg.style.color='var(--red)';msg.textContent='Restart failed: '+e.message;}
+        if(btn)btn.disabled=false;
+    }
+}
+// ops #968: Docker TAK Server only. Its Java lives inside the image, so no restart or system update
+// changes it; the notice says which Java it runs and which one a rebuild would bring. Shown from
+// /api/os-updates `java_image`; "dismiss" is quiet for 24 h per gap. Text is set with textContent.
+function _javaImageDismissed(sig){
+    try{var d=JSON.parse(localStorage.getItem('java-image-dismissed')||'null');
+        return !!(d&&d.sig===sig&&d.ts>0&&(Date.now()-d.ts)<24*60*60*1000);}catch(e){return false;}
+}
+function _javaImageRender(ud){
+    var b=document.getElementById('java-image-banner');if(!b)return;
+    var j=ud&&ud.java_image;
+    if(!(j&&j.stale)||_javaImageDismissed(j.sig)){b.style.display='none';return;}
+    var body=document.getElementById('java-image-body'),how=document.getElementById('java-image-how');
+    if(body)body.textContent='TAK Server runs Java '+j.running+'. Java '+j.newest+' is available. TAK Server in Docker keeps its own Java inside its image, so system updates do not change it.';
+    if(how)how.textContent=j.how||'';
+    b.setAttribute('data-java-image-sig',j.sig||'');
+    b.style.display='block';
+}
+function dismissJavaImage(){
+    var b=document.getElementById('java-image-banner');if(!b)return;
+    var sig=b.getAttribute('data-java-image-sig')||'';
+    if(sig){try{localStorage.setItem('java-image-dismissed',JSON.stringify({sig:sig,ts:Date.now()}));}catch(e){}}
+    b.style.display='none';
+}
 async function checkKernelPatch(){
     var banner=document.getElementById('kernel-patch-banner');if(!banner)return;
     // First: check if a background patch job is in flight (started in a prior
@@ -1180,6 +1299,8 @@ async function checkKernelPatch(){
     try{
         var ur=await fetch('/api/os-updates',{credentials:'same-origin',cache:'no-store'});
         var ud=await ur.json();
+        try{_javaRestartRender(ud);}catch(e){}
+        try{_javaImageRender(ud);}catch(e){}
         if(ud&&ud.error){
             // "Could not check" is NOT "nothing pending" — say so rather than
             // rendering an empty, reassuring screen.

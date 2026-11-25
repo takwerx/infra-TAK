@@ -35,7 +35,7 @@ import urllib.request
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 _FUNCS = {'_get_cloudtak_latest_release_tag', '_cloudtak_latest_tag_from_git',
-          '_get_cloudtak_target_release_tag'}
+          '_get_cloudtak_target_release_tag', '_cloudtak_newest_allowed_tag'}
 
 
 def _ns(**extra):
@@ -44,7 +44,7 @@ def _ns(**extra):
     assert {n.name for n in body} == _FUNCS
     import json, os, time
     ns = {'re': re, 'subprocess': subprocess, 'json': json, 'os': os,
-          'CLOUDTAK_VETTED_RELEASE': '13.54.3',
+          'CLOUDTAK_VETTED_RELEASE': '13.54.3', 'CLOUDTAK_MAX_MAJOR': 13,
           '_cloudtak_release_cache': {'tag': None, 'ts': 0}}
     ns.update(extra)
     exec(compile(ast.Module(body=body, type_ignores=[]), 'app.py', 'exec'), ns)
@@ -115,7 +115,7 @@ def test_run_cloudtak_update_asks_without_fallback_and_refuses_downgrade():
     src = src[:src.index('\ndef ', 10)]
     assert 'allow_fallback=False' in src
     assert 'if not release_tag:' in src
-    assert 'not downgrading' in src
+    assert 'is newer than the version we test' in src   # ops #1134 wording
     # the stop happens before anything touches the tree
-    assert src.index('not downgrading') < src.index('Step 2/3')
+    assert src.index('is newer than the version we test') < src.index('Step 2/3')
     assert src.index('if not release_tag:') < src.index('Step 2/3')

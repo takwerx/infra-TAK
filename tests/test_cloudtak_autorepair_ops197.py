@@ -70,6 +70,14 @@ def _assign(name):
         and any(isinstance(t, ast.Name) and t.id == name for t in n.targets)))
 
 
+def _present(*names):
+    """ops #1018: names the shipped app.py has (so the proof test can also run on the base commit,
+    which lacks the new ones, and fail there for the right reason)."""
+    src = {n.name for n in TREE.body if isinstance(n, ast.FunctionDef)}
+    src |= {t.id for n in TREE.body if isinstance(n, ast.Assign) for t in n.targets if isinstance(t, ast.Name)}
+    return [n for n in names if n in src]
+
+
 def _iso(ts):
     return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(ts)) + '.123456789Z'
 
@@ -94,6 +102,10 @@ class Box:
         self.up_rc = 0
         self.heal_ok = True
         self.upload_heal_ok = True
+        self.etl_heal_ok = True
+        self.etl = 'UPSTREAM'   # ops #969: True (fix there), False (gone) or 'UPSTREAM' (CloudTAK has it, not drift)
+        self.etl_mtime = 1       # when the route file was edited (epoch)
+        self.etl_started = None  # when the api container started (epoch); None = the fake does not say
         self.busy = None
         self.settings = {'guarddog_alert_email': 'ops@example.com'}
         self.takportal_recreate()
@@ -122,12 +134,17 @@ class Box:
                 out = json.dumps(env)
             elif '.State.Status' in fmt:
                 out = f'running {_iso(self.api_started)}\n'
+            elif '.State.StartedAt' in fmt and self.etl_started:
+                out = f'{_iso(self.etl_started)}\n'
         elif argv[:3] == ['docker', 'inspect', 'cloudtak-media-1']:
             out = self.media_image + '\n'
         elif argv[:2] == ['docker', 'ps'] and 'label=com.docker.compose.project=cloudtak' in argv:
             out = ''.join(f'{n}|{f}\n' for n, f in self.labels.items())
         elif argv[:2] == ['docker', 'ps'] and 'name=cloudtak-media' in argv:
             out = 'cloudtak-media-1\n'
+        elif argv[:4] == ['docker', 'exec', '-i', 'cloudtak-api-1'] and 'connection-layer' in (kw.get('input') or ''):
+            # ops #969: the ETL layer check script
+            out = {True: f'OK {int(self.etl_mtime)}', False: 'MISSING'}.get(self.etl, 'UPSTREAM') + '\n'
         elif argv[:4] == ['docker', 'exec', '-i', 'cloudtak-api-1']:
             # ops #502: self.upload is True (rule there), False (rule gone) or 'NOCONF' (stock file)
             out = {True: 'OK', False: 'MISSING'}.get(self.upload, 'NOCONF') + '\n'
@@ -143,6 +160,8 @@ class Box:
                 self.labels = {n: files for n in self.labels}
                 self.media_image, self.api_ca, self.hls = PINNED_MEDIA, True, False
                 self.upload = False
+                if self.etl is True:
+                    self.etl = False     # ops #969: a recreate brings back CloudTAK's own routes
                 self.api_started = time.time()
         return types.SimpleNamespace(stdout=out, stderr='', returncode=rc)
 
@@ -158,8 +177,19 @@ class Box:
             self.upload = True
         return self.upload_heal_ok
 
+    def etl_heal(self, plog=None, remote_cfg=None, wait=False):
+        self.calls.append((['ETL'], None))
+        if self.etl_heal_ok:
+            self.etl = True
+            self.etl_started = time.time() + 5     # the api was restarted after the edit
+            self.upload = True     # the real heal restarts the api, then re-applies the upload limit
+        return self.etl_heal_ok
+
     def uploads(self):
         return [c for c, _ in self.calls if c == ['UPLOAD']]
+
+    def etls(self):
+        return [c for c, _ in self.calls if c == ['ETL']]
 
     def ns(self):
         fake_threading = types.SimpleNamespace(
@@ -184,6 +214,7 @@ class Box:
             '_docker_compose_pull': lambda *a, **k: self.calls.append((['PULL'], k.get('services'))) or True,
             '_cloudtak_media_hls_heal': self.heal,
             '_cloudtak_upload_limit_heal': self.upload_heal,   # ops #470, #502
+            '_cloudtak_etl_layer_heal': self.etl_heal,         # ops #969
             '_write_priv': lambda path, content, mode='w', perm=None: self.guard_log.append((path, content, mode)),
             '_guarddog_server_identifier': lambda s: 'test-box (10.0.0.1)',
             '_guarddog_send_alert_email_via_relay': lambda to, subj, body: self.mails.append((to, subj, body)) or True,
@@ -195,9 +226,11 @@ class Box:
             [_assign(n) for n in (
                 '_CT_ENV_LINE_RE', 'CLOUDTAK_CUSTOM_COMPOSE', '_CLOUDTAK_CUSTOM_COMPOSE_SEED',
                 '_CLOUDTAK_TAKPORTAL_CSP_COMPOSE', '_CT_MEDIA_CHECK_SH', '_CT_NGINX_UPLOAD_CHECK_SH',
+                '_CT_ETL_LAYER_SH',   # ops #969
                 '_CLOUDTAK_RECREATE_PENDING', 'CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR',
                 'CLOUDTAK_AUTOREPAIR_SETTLE_S', 'CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S',
                 'CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S', '_CLOUDTAK_COMPOSE_UP_RE',   # ops #889
+                'CLOUDTAK_JOBEND_POLL_S', *_present('CLOUDTAK_AUTOREPAIR_PASSES', 'CLOUDTAK_AUTOREPAIR_RECHECK_S'),   # ops #1018
                 '_CLOUDTAK_AUTOREPAIR_RECORD', '_CLOUDTAK_COMPOSE_BUSY_RE',
                 '_CLOUDTAK_PORTAL_JOB_RE',   # ops #850: TAK Portal's helper counts as a stack change
                 'cloudtak_autorepair_status', '_cloudtak_autorepair_lock')]
@@ -205,15 +238,17 @@ class Box:
                 '_open_secret_w',   # ops #632: _cloudtak_env_set writes the .env through it
                 '_cloudtak_env_read', '_cloudtak_env_set', '_cloudtak_compose_file_value',
                 '_cloudtak_ensure_custom_compose', '_ct_media_converged',
-                '_ct_recreate_pending', '_ct_recreate_arm', '_ct_recreate_clear',
+                '_ct_recreate_pending', '_ct_recreate_arm', '_ct_recreate_clear', '_ct_etl_stale',   # ops #969
                 '_ct_docker_out', '_ct_wait_compose_idle', '_cloudtak_override_services', '_cloudtak_containers_without_override',
                 '_cloudtak_write_override_file', '_cloudtak_recreate_and_heal',
                 '_cloudtak_drift', '_cloudtak_drift_summary', '_cloudtak_stack_busy_procs',
                 '_cloudtak_autorepair_wait_reason',
                 '_cloudtak_autorepair_record', '_cloudtak_autorepair_record_save',
-                '_cloudtak_autorepair_request', '_cloudtak_autorepair_run',
+                '_cloudtak_autorepair_request', *_present('_cloudtak_autorepair_await_quiet'), '_cloudtak_autorepair_run',
                 '_cloudtak_autorepair_notify')])
         exec(compile(src, 'app.py', 'exec'), ns)
+        ns['CLOUDTAK_AUTOREPAIR_RECHECK_S'] = 0     # ops #1018: no real waiting in a test (ignored on a commit without it)
+        ns['CLOUDTAK_JOBEND_POLL_S'] = 0
         return ns
 
     def request(self):

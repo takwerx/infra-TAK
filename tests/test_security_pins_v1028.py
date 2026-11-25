@@ -88,6 +88,14 @@ def test_coturn_pin_has_the_4_19_security_fixes():
     assert re.fullmatch(r'\d+\.\d+\.\d+', pin)
 
 
+def test_coturn_pin_has_the_4_19_2_security_fixes():
+    # ops #962: upstream 4.19.2 (Nov 18, 2026) security fixes in the UDP and DTLS listeners.
+    # The pin must never slide back below 4.19.2.
+    pin = re.search(r"^COTURN_IMAGE = 'coturn/coturn:([^']+)'", APP, re.M).group(1)
+    assert _v(pin) >= (4, 19, 2)
+    assert re.fullmatch(r'\d+\.\d+\.\d+', pin)
+
+
 def test_coturn_flags_avoid_the_ones_418_removed():
     # ops #201: the override is built in one place for install and the startup converge
     body = APP[APP.index('def _coturn_override_content('):]
@@ -119,8 +127,9 @@ def test_netbird_vetted_pair_is_0_82_1_and_dev_pair_is_not_behind():
         return re.search(rf'^{name} = "[^:"]+:v?([^"]+)"', APP, re.M).group(1)
     assert pin('NETBIRD_SERVER_IMAGE') == '0.82.1'
     assert pin('NETBIRD_DASHBOARD_IMAGE') == '2.96.0'
-    assert pin('NETBIRD_SERVER_DEV_IMAGE') == '0.82.1'
-    assert pin('NETBIRD_DASHBOARD_DEV_IMAGE') == '2.96.0'
+    # ops #1088: the dev pair moved on to 0.83.2 / v2.98.0 (see test_netbird_peer_stats_083_ops1088.py)
+    assert pin('NETBIRD_SERVER_DEV_IMAGE') == '0.83.2'
+    assert pin('NETBIRD_DASHBOARD_DEV_IMAGE') == '2.98.0'
     assert _v(pin('NETBIRD_SERVER_DEV_IMAGE')) >= _v(pin('NETBIRD_SERVER_IMAGE'))
     assert _v(pin('NETBIRD_DASHBOARD_DEV_IMAGE')) >= _v(pin('NETBIRD_DASHBOARD_IMAGE'))
 

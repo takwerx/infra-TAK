@@ -16,11 +16,14 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """An ETL on hold stays uninstallable (operator, v10.4.0 T&E, 2026-11-15).
 
-etl-arcgis: a security report sent to the COE on 2026-11-09 (ticket #979) is still open and
-7.33.0 only bumped dependencies. Held until fixed. A later sync or scan must not re-offer it.
+etl-arcgis: a security report sent to the COE on 2026-11-09 (ticket #979) held it. The COE fixed
+the problem in v7.34.0, the diff was reviewed and the ETL ran on a box (ops #899, 2026-11-17),
+so the hold is lifted and the catalog offers v7.35.1 or newer. It must never go back to a
+version before 7.35.1. The tests ask for "at least the fixed release", not an exact pin, so a
+later signed catalog bump does not break them.
 
 etl-cotrip-signs and etl-cotrip-weather (ops #833, 2026-11-16): their Dockerfile security report
-went to the COE the same day and is still open, so they are held the same way."""
+went to the COE the same day and is still open, so they stay held."""
 
 import importlib.util
 import json
@@ -37,8 +40,10 @@ from modules import etlrunner as etl  # noqa: E402
 
 HOLDS = json.loads((REPO / 'modules' / 'etlrunner' / 'holds.json').read_text())['holds']
 HOLDS_FILE = REPO / 'modules' / 'etlrunner' / 'holds.json'
-# Every ETL held for the COE security report of 2026-11-09. Each must stay in holds.json.
-COE_HELD = ['etl-arcgis', 'etl-cotrip-signs', 'etl-cotrip-weather']
+# Every ETL still held for the COE security report of 2026-11-09. Each must stay in holds.json.
+COE_HELD = ['etl-cotrip-signs', 'etl-cotrip-weather']
+# etl-arcgis was held too until the COE fixed it upstream (v7.34.0 and later; ops #899).
+ARCGIS_FIXED_VERSION = (7, 35, 1)                                   # the release reviewed and run on a box (ops #899)
 
 
 def _load(name):
@@ -48,11 +53,24 @@ def _load(name):
     return m
 
 
-def test_arcgis_is_held_and_the_bundled_catalog_refuses_it():
-    assert 'etl-arcgis' in HOLDS
+def _semver(v):
+    return tuple(int(x) for x in v.split('.'))
+
+
+def test_arcgis_is_not_held_and_the_catalog_offers_the_fixed_release():
+    assert 'etl-arcgis' not in HOLDS
     e = next(x for x in etl.bundled_catalog()['entries'] if x['prefix'] == 'etl-arcgis')
-    assert e['reviewed'] is None and e['note'] == HOLDS['etl-arcgis']
-    assert etl.installable(e) == (False, 'Waiting for security review')
+    assert e['reviewed'] and 'note' not in e
+    assert etl.installable(e) == (True, '')
+    assert _semver(e['version']) >= ARCGIS_FIXED_VERSION
+    # the sha belongs to the ref it names: the entry's own files are served from that sha
+    assert e['ref'] == 'v' + e['version']
+    assert len(e['sha']) == 40 and e['sha'] in e['logo'] and e['sha'] in e['readme']
+
+
+def test_arcgis_pin_is_never_older_than_the_security_fix():
+    e = next(x for x in etl.bundled_catalog()['entries'] if x['prefix'] == 'etl-arcgis')
+    assert _semver(e['version']) >= (7, 34, 0)      # the COE security fix
 
 
 def test_every_held_entry_in_the_bundle_is_unreviewed():
@@ -63,10 +81,10 @@ def test_every_held_entry_in_the_bundle_is_unreviewed():
 
 def test_sync_keeps_a_held_entry_unreviewed(tmp_path):
     sync = _load('etl_catalog_sync')
-    ents = [{'prefix': 'etl-arcgis', 'reviewed': '2026-11-09 /module-scan'},
+    ents = [{'prefix': 'etl-cotrip-signs', 'reviewed': '2026-11-09 /module-scan'},
             {'prefix': 'etl-geojson', 'reviewed': '2026-11-09 /module-scan'}]
     sync.apply_holds(ents)
-    assert ents[0]['reviewed'] is None and ents[0]['note'] == HOLDS['etl-arcgis']
+    assert ents[0]['reviewed'] is None and ents[0]['note'] == HOLDS['etl-cotrip-signs']
     assert ents[1]['reviewed'] == '2026-11-09 /module-scan' and 'note' not in ents[1]
 
 
@@ -94,7 +112,7 @@ def test_review_tool_does_not_mark_a_held_entry_reviewed_on_a_pass(tmp_path, mon
 def test_every_coe_held_etl_is_in_holds_json_with_the_standard_reason():
     for prefix in COE_HELD:
         assert prefix in HOLDS, f'{prefix} must stay on hold'
-        assert HOLDS[prefix] == HOLDS['etl-arcgis']
+        assert HOLDS[prefix] == HOLDS['etl-cotrip-signs']
         assert 'security report sent to the COE on 2026-11-09 is still open' in HOLDS[prefix]
 
 
@@ -106,24 +124,25 @@ def test_cotrip_signs_and_weather_are_in_the_bundle_and_not_installable(prefix):
     assert etl.installable(e) == (False, 'Waiting for security review')
 
 
-def test_the_other_cotrip_etls_are_not_held():
-    for prefix in ('etl-cotrip-incidents', 'etl-cotrip-plows', 'etl-cotrip-cameras'):
+def test_the_other_cotrip_etls_and_arcgis_are_not_held():
+    for prefix in ('etl-arcgis', 'etl-cotrip-incidents', 'etl-cotrip-plows', 'etl-cotrip-cameras'):
         assert prefix not in HOLDS
 
 
 def test_sync_keeps_the_cotrip_etls_unreviewed_using_the_real_holds_file():
     sync = _load('etl_catalog_sync')
     reviewed = '2026-11-09 /module-scan'
-    ents = [{'prefix': p, 'reviewed': reviewed} for p in COE_HELD + ['etl-cotrip-incidents']]
+    ents = [{'prefix': p, 'reviewed': reviewed} for p in COE_HELD + ['etl-arcgis', 'etl-cotrip-incidents']]
     sync.apply_holds(ents, path=str(HOLDS_FILE))
-    for e in ents[:-1]:
+    for e in ents[:len(COE_HELD)]:
         assert e['reviewed'] is None and e['note'] == HOLDS[e['prefix']]
-    assert ents[-1]['reviewed'] == reviewed and 'note' not in ents[-1]
+    for e in ents[len(COE_HELD):]:
+        assert e['reviewed'] == reviewed and 'note' not in e
 
 
 def test_review_tool_does_not_mark_the_cotrip_etls_reviewed_on_a_pass(tmp_path, monkeypatch):
     rev = _load('etl_catalog_review')
-    prefixes = COE_HELD + ['etl-cotrip-incidents']
+    prefixes = COE_HELD + ['etl-arcgis', 'etl-cotrip-incidents']
     shutil.copy(HOLDS_FILE, tmp_path / 'holds.json')           # the real list, not a stand-in
     cat = tmp_path / 'catalog.json'
     cat.write_text(json.dumps({'schema': 1, 'serial': 1, 'entries': [
@@ -137,4 +156,27 @@ def test_review_tool_does_not_mark_the_cotrip_etls_reviewed_on_a_pass(tmp_path, 
     out = {e['prefix']: e for e in json.loads(cat.read_text())['entries']}
     for p in COE_HELD:
         assert out[p]['reviewed'] is None and out[p]['note'] == HOLDS[p]
-    assert out['etl-cotrip-incidents']['reviewed'] == '2026-11-16 /module-scan'
+    for p in ('etl-arcgis', 'etl-cotrip-incidents'):
+        assert out[p]['reviewed'] == '2026-11-16 /module-scan' and 'note' not in out[p]
+
+
+# ── ops #899: an operator who has the old etl-arcgis installed hears about the new one ────────
+
+def test_guard_dog_tells_an_operator_with_the_old_arcgis_to_update():
+    catalog = etl.load_catalog()
+    items, _known = etl.notify_items(catalog, {'etl-arcgis': ['7.33.0']}, {'etl-arcgis'})
+    mine = [i for i in items if i['key'] == 'etl:etl-arcgis']
+    assert len(mine) == 1
+    entry = next(x for x in catalog if x['prefix'] == 'etl-arcgis')
+    assert _semver(entry['version']) >= ARCGIS_FIXED_VERSION
+    assert mine[0]['installed'] == 'v7.33.0' and mine[0]['target'] == 'v' + entry['version']
+    assert _semver(mine[0]['target'].lstrip('v')) >= ARCGIS_FIXED_VERSION
+    assert mine[0]['identity'] == entry['sha']
+    assert 'Update' in mine[0]['how']
+
+
+def test_guard_dog_stays_quiet_about_the_held_cotrip_etls():
+    catalog = etl.load_catalog()
+    installed = {p: ['0.0.1'] for p in COE_HELD}
+    items, _known = etl.notify_items(catalog, installed, set(COE_HELD))
+    assert not [i for i in items if i['key'] in {f'etl:{p}' for p in COE_HELD}]

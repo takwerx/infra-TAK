@@ -51,6 +51,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 # ⚠️ Module level. `ensure_authentik_app` sleeps between attempts while it
 # waits for Authentik's authorization flow; in app.py that name came from a
 # module-level import, and moving the function here left it unbound. It only
@@ -62,9 +63,12 @@ from . import register_module, job_log, job_state, get_ctx
 # ⚠️ The sizing modes live in the instance model, not here. Two copies of
 # 'fixed'/'dynamic' would drift, and the one that drifted would be the one
 # deciding whether an image reserves its blocks.
+from . import atlas_access
 from . import atlas_backup
 from . import atlas_instances
 from . import atlas_renewal
+from . import atlas_roster
+from . import atlas_signed_identity
 from . import atlas_tak_cas
 from .atlas_instances import MODE_DYNAMIC, MODE_FIXED
 
@@ -1195,6 +1199,13 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
         # `settings` is passed by the page's route; a caller that does not
         # pass it is not asking about the group, and gets None.
         'admin_group_problem': agency_group_problem(settings, inst),
+        # ops #1151: a deployment behind Authentik that does not read the signed
+        # token yet says so on its row. Asked only by the page's route (it
+        # passes `settings`), and only of a built deployment: two file reads.
+        'admin_signin_problem': (
+            atlas_signed_identity.card_note(instance_paths(ctx, inst)['dir'],
+                                            env_keys_compose_passes)
+            if built and settings is not None else None),
     }
 
 
@@ -1207,7 +1218,8 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
 #: rely on; `test_atlas_route_contract.py` holds both halves to it.
 INSTANCE_FIELDS = ('slug', 'name', 'mode', 'size_gb', 'port', 'built',
                    'running', 'stranded', 'version', 'running_version',
-                   'agency_name', 'renewal_enabled', 'admin_group_problem', 'latest',
+                   'agency_name', 'renewal_enabled', 'admin_group_problem',
+                   'admin_signin_problem', 'latest',
                    'update_available', 'paths')
 
 
@@ -1933,6 +1945,19 @@ def remove_agency_admin_group(ctx, inst, plog=None):
             body = _urlreq.urlopen(req, timeout=10).read().decode()
             return json.loads(body or '{}')
 
+        # ⚠️ The access policy goes first, with the deployment. A later
+        # deployment on the same slug then starts from the administrators
+        # alone, not from whatever groups this one's policy held (ops #979).
+        try:
+            if atlas_access.remove(atlas_access.Api(ak_url, headers),
+                                   names['authentik_slug']) and plog:
+                plog('Authentik access policy "%s" removed'
+                     % atlas_access.policy_name(names['authentik_slug']))
+        except Exception as exc:
+            if plog:
+                plog('⚠ Authentik access policy could not be removed: %s'
+                     % str(exc)[:80])
+
         found = api('core/groups/?name=%s' % _q(group_name))
         for group in found.get('results', []):
             # ⚠️ Exact match. Authentik's `?name=` is a filter, not an
@@ -1988,11 +2013,16 @@ def agency_admin_group_outcome(ctx, inst, ak_url, ak_headers, plog=None):
     tile said nothing. An agency deployment could then run with no admin
     group, and the only symptom was its administrators being turned away.
 
-    ⚠️ **Bound beside "Allow authentik Admins", never instead of it.** Measured
-    on the box: the ATLAS applications run with `policy_engine_mode: any`, so
-    bindings are alternatives — the global administrators keep their access and
-    the agency's gain theirs. Replacing the policy binding would lock the global
-    administrator out of every agency console at once.
+    ⚠️ **One access policy, not a binding per group (ops #979).** Authentik
+    treats separate bindings as alternatives only under `policy_engine_mode:
+    any`. The Hardened posture sets `all` on every login application (its MFA
+    step), and there a second group binding is a second requirement: an agency
+    administrator who was not also an Authentik administrator got "Permission
+    denied". `atlas_access.ensure` makes one expression policy (global admins OR
+    this agency's group), binds it, and only then removes the separate "Allow
+    authentik Admins" binding and any direct group binding it replaces. It means
+    the same under `any` and `all`, and the global administrators keep their
+    access.
 
     ⚠️ **Empty on purpose.** Nobody is put in the group here; that is the
     operator's decision and the only part of this that should be manual.
@@ -2053,37 +2083,14 @@ def agency_admin_group_outcome(ctx, inst, ak_url, ak_headers, plog=None):
             return failed('Could not create the agency admin group', exc)
 
     # --- and its way in ----------------------------------------------------- #
-    try:
-        app = api('core/applications/%s/' % names['authentik_slug'])
-        target = app['pk']
-        bindings = api('policies/bindings/?target=%s&page_size=100' % target)
-        ours = [b for b in bindings.get('results', [])
-                if str(b.get('group')) == str(group_pk)]
-        # ⚠️ A binding that is there but disabled or negated admits nobody — the
-        # exact silent state this check exists to surface — so it is not
-        # "present". And it is NOT re-enabled here: somebody switched it off in
-        # Authentik, and that is their decision to undo (v10.2.8, PR #89 review).
-        if ours and not any(b.get('enabled', True) and not b.get('negate')
-                            for b in ours):
-            detail = ('"%s" is bound to this deployment, but the binding is '
-                      'disabled or negated in Authentik — its members are '
-                      'turned away until it is re-enabled there' % group_name)
-            log('  ⚠ ' + detail)
-            return outcome('failed', detail)
-        if ours:
-            log('  ✓ "%s" already admitted to this deployment' % group_name)
-            return outcome('created' if created else 'present')
-        api('policies/bindings/', {
-            'target': target, 'group': group_pk,
-            # ⚠️ After the admins policy, which sits at 0. Order does not decide
-            # the outcome under `any`, but it keeps the list readable in
-            # Authentik's own UI.
-            'order': 10, 'negate': False, 'enabled': True, 'timeout': 30,
-        }, method='POST')
-        log('  ✓ "%s" admitted to this deployment only' % group_name)
-        return outcome('created')
-    except Exception as exc:
-        return failed('Could not admit the agency admin group', exc)
+    result = atlas_access.ensure(atlas_access.Api(ak_url, ak_headers),
+                                 names['authentik_slug'], add=[group_name],
+                                 plog=log)
+    if result['status'] == 'failed':
+        return outcome('failed', 'Could not admit the agency admin group: %s'
+                       % result['detail'])
+    return outcome('created' if created or result['status'] == 'created'
+                   else 'present')
 
 
 def agency_group_key(inst=None):
@@ -3679,6 +3686,32 @@ def deploy(ctx, job, params):
         tag, expected = _resolve_install_target(ctx, plog)
         signed = not _is_pin_fallback(tag, expected)
 
+        # ⚠️ **Not backwards (ops #982).** Update refuses to move a built
+        # deployment to an older release; Deploy on the same deployment did
+        # not, and took ATLAS down (2.3.0 rebuilt on 2.2.2, database already
+        # migrated). Asked before git touches the checkout, so a refusal leaves
+        # the box as it was. The pin fallback is checked too: it is the older
+        # release most likely to be offered.
+        _built = _installed_version(ctx, _inst)
+        refusal = _downgrade_lines(_built, tag.lstrip('vV'), _channel_of(ctx))
+        if refusal:
+            for line in refusal:
+                plog(line)
+            if _is_pin_fallback(tag, expected):
+                # ⚠️ The cause is GitHub, not the channel. "Switch the channel
+                # back" would send an operator the wrong way, and GitHub's
+                # unauthenticated limit (60 an hour per address) is easy to hit.
+                raise RuntimeError(
+                    'ATLAS could not read the release list from GitHub (it '
+                    'may be rate-limited), and the only release left was the '
+                    'old built-in ' + tag + ', which is older than the ' +
+                    (_built or '?') + ' this deployment runs. Nothing was '
+                    'changed. Try again in a few minutes.')
+            raise RuntimeError(
+                refusal[1].strip() + ' Nothing was changed. Switch the ATLAS '
+                'channel back to the one this deployment came from, then press '
+                'Update.')
+
         if os.path.isdir(os.path.join(dirpath, '.git')):
             plog(f'  Already cloned at {dirpath} — fetching {tag}')
             ctx['_module_git'](dirpath, 'checkout', '--', '.', timeout=60)
@@ -4031,10 +4064,19 @@ def deploy(ctx, job, params):
             # the group, and said nothing when it did. Idempotent: on the
             # ordinary path this only confirms what was just made.
             _reconcile_agency_group(ctx, _inst, plog)
+            # ATLAS W495: after the agency group, which its role is scoped to.
+            _reconcile_roster(ctx, _inst, plog)
+            # ⚠️ Last of the Authentik steps, after the access policy is bound
+            # (ops #985): on a Hardened box a new application must carry the
+            # require-MFA binding like every other login app.
+            _reassert_mfa(ctx, plog)
             # Re-emit now that the application exists: the console vhost only
             # grows its forward_auth block once Authentik is in the picture.
             ctx['generate_caddyfile'](ctx['load_settings']())
             ctx['_caddy_reload'](plog)
+            # ATLAS W504: after the vhost is re-emitted, which it checks.
+            if _reconcile_signed_identity(ctx, _inst, plog):
+                _compose(ctx, 'up -d api', timeout=300, inst=_inst)
             plog('  ✓ Sign in with an Authentik administrator account.')
         else:
             # ⚠️ Degrading here does NOT mean an open console. ATLAS has two auth
@@ -4387,6 +4429,17 @@ def _restrict_to_admins(ak_url, ak_headers, plog=None, app_slug='atlas'):
         # to nothing at all while the log said it was restricted.
         app_pk = _get('core/applications/%s/' % app_slug)['pk']
 
+        bindings = _get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
+        # ⚠️ An ATLAS access policy (global admins OR this deployment's group,
+        # `atlas_access`) is the restriction too, and it must stand alone: a
+        # second "Allow authentik Admins" binding beside it is one more
+        # requirement under `policy_engine_mode: all` and turns the agency's
+        # administrators away (ops #979). Checked first, so this never re-adds
+        # the binding the agency reconcile just replaced.
+        if any(atlas_access.is_access_binding(b) for b in bindings):
+            log("  ✓ Console restricted to Authentik administrators and this "
+                "deployment's admin group (access policy already bound)")
+            return True
         policy_pk = None
         for p in _get('policies/all/?page_size=200').get('results', []):
             if p.get('name') == policy_name:
@@ -4398,7 +4451,6 @@ def _restrict_to_admins(ak_url, ak_headers, plog=None, app_slug='atlas'):
                 f"application by hand.")
             return False
 
-        bindings = _get(f'policies/bindings/?target={app_pk}&page_size=100')['results']
         if any(str(b.get('policy')) == str(policy_pk) or
                (b.get('policy_obj', {}) or {}).get('name') == policy_name
                for b in bindings):
@@ -4492,7 +4544,7 @@ def ensure_authentik_app(ctx, fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
                 data=json.dumps({'name': _names['provider'], 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk,
                     'external_host': _atlas_host, 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
+                    'access_token_validity': 'hours=24', 'cookie_domain': _cookie}).encode(),
                 headers=_ak_headers, method='POST')
             resp = _urlreq.urlopen(req, timeout=10)
             provider_pk = json.loads(resp.read().decode())['pk']
@@ -4707,6 +4759,30 @@ def _parse_version(text):
         return tuple(int(p) for p in parts)
     except ValueError:
         return None
+
+
+def _downgrade_lines(current, target, channel):
+    """The refusal Update and Deploy both give, or None when `target` is not older.
+
+    ⚠️ **One check, two buttons (ops #982).** Update refused a downgrade and
+    Deploy did not: pressing Deploy on a built 2.3.0 deployment with the channel
+    on `main` (offering 2.2.2) checked out 2.2.2 and rebuilt it against a
+    database 2.3.0 had migrated, and the api stopped answering. ATLAS 2.x is
+    forward-only, so every path that can move a checkout backwards asks here.
+    An unreadable version on either side is no evidence of a downgrade (a
+    first deploy has no VERSION yet), so it is not refused.
+    """
+    here, there = _parse_version(current), _parse_version(target)
+    if not (here and there and there < here):
+        return None
+    return [
+        '✗ This deployment is on ' + (current or '?') + ', which is '
+        'newer than what the ' + channel + ' channel offers (' + target + ').',
+        '  Refusing to downgrade: ' + target + ' would run against a '
+        'database ' + (current or 'a newer release') + ' has migrated.',
+        '  Switch back to the channel it came from, or publish a '
+        'forward fix.',
+    ]
 
 
 def _channel_of(ctx=None, settings=None):
@@ -4938,6 +5014,74 @@ def _reconcile_agency_group(ctx, inst, plog):
     return _record_agency_group_state(ctx, inst, outcome, plog=plog)
 
 
+def _reconcile_roster(ctx, inst, plog):
+    """The standard-admin group and the read-only roster account (ATLAS W495).
+
+    ⚠️ **After `_reconcile_agency_group`**, because the roster role is scoped
+    to the agency admin group and must never be scoped to one that is missing.
+    Restarts `api` when `.env` changed, so ATLAS starts with the current token.
+    Never raises; see `atlas_roster`.
+
+    ⚠️ **`admit` runs even when the set-up or the restart failed** (Security
+    read, ops #978). It is also the step that takes the group *out*: a
+    `_compose` timeout that skipped it would leave a group admitted on an ATLAS
+    that may no longer know its name. A failure before it counts as "not
+    restarted", and unknown versions keep the group out.
+    """
+    restarted = True
+    dirpath = None
+    try:
+        dirpath = instance_paths(ctx, inst)['dir']
+        if atlas_roster.ensure(ctx, inst, dirpath, write_env_value, plog)['env_changed']:
+            r = _compose(ctx, 'up -d api', timeout=300, inst=inst)
+            restarted = getattr(r, 'returncode', 1) == 0
+    except Exception as exc:
+        restarted = False
+        plog('  ⚠ Could not reconcile the standard admins: %s' % str(exc)[:80])
+    try:
+        if dirpath is None:
+            dirpath = instance_paths(ctx, inst)['dir']
+        # ⚠️ **After the restart** (Security read, ops #978), so ATLAS knows
+        # the group's name before its first member is let in, and on **both**
+        # versions: the file says what was checked out, the container what
+        # serves. A failed rebuild or Deploy run again on an older tag makes
+        # them differ, and then the group stays out.
+        installed = running = container_group = None
+        try:
+            installed = _installed_version(ctx, inst)
+            # Waited for only when the checkout could admit the group at all.
+            if atlas_roster.admits_role(installed):
+                running = _settled_running_version(ctx, inst)
+                # ⚠️ The name as the running container has it, not as `.env`
+                # has it: a restart that failed on an earlier update is not
+                # in `restarted` (Security read, ops #978).
+                container_group = _compose_exec(
+                    ctx, ['printenv', atlas_roster.ENV_GROUP], inst=inst)
+            else:
+                running = _running_version(ctx, inst)
+        except Exception as exc:
+            plog('  ⚠ ATLAS version not read: %s' % str(exc)[:80])
+        atlas_roster.admit(ctx, inst, dirpath, installed, running, plog,
+                           restarted=restarted, container_group=container_group)
+    except Exception as exc:
+        plog('  ⚠ Could not check the standard admins\' access: %s' % str(exc)[:80])
+
+
+def _settled_running_version(ctx, inst, tries=24, delay=5):
+    """`_running_version`, waiting up to two minutes for `api` to answer.
+
+    ⚠️ Right after a rebuild or a restart the container is still starting, and
+    None then would keep the standard group out until the next update.
+    """
+    for attempt in range(tries):
+        version = _running_version(ctx, inst)
+        if version:
+            return version
+        if attempt + 1 < tries:
+            time.sleep(delay)
+    return None
+
+
 def _reconcile_access(ctx, inst, plog):
     """Every Authentik check an update owes a deployment, in one place.
 
@@ -4954,9 +5098,37 @@ def _reconcile_access(ctx, inst, plog):
     # ⚠️ Idempotent, and the only route by which a deployment made before
     # W221 gets its group and its binding at all.
     _reconcile_agency_group(ctx, inst, plog)
+    # ⚠️ Idempotent, and after the agency group (its role is scoped to it).
+    _reconcile_roster(ctx, inst, plog)
     # ⚠️ Idempotent, and the only route by which a provider created with the
     # wrong hostname is ever corrected — see the function.
     _reconcile_provider_host(ctx, inst, plog)
+
+
+def _reassert_mfa(ctx, plog):
+    """On a Hardened box, put the require-MFA binding on every login app.
+
+    ⚠️ **Reported from a real box (ops #985):** a new agency deployment on a
+    Hardened box came up with policy mode `any` and only its own access
+    binding, so the agency's administrators signed in without the MFA step
+    every other app asks for. Hardening binds MFA to the apps that exist when
+    it runs; an app made afterwards is covered only by the console's boot-time
+    sweep, and a module deploy does not restart the console. Remote Assist and
+    NetBird call the same sweep at the end of their deploy; ATLAS did not.
+
+    The sweep is the console's own (`_w1_reassert_app_mfa`), so the policy,
+    the engine mode and the record that Hardening reverts from stay in one
+    place. It does nothing when Hardening is not applied. Never raises: a
+    deploy or an update must not fail over it.
+    """
+    sweep = (ctx or {}).get('_w1_reassert_app_mfa')
+    if not sweep:
+        return False
+    try:
+        return bool(sweep(plog))
+    except Exception as exc:
+        plog('  ⚠ Could not check the MFA requirement: %s' % str(exc)[:80])
+        return False
 
 
 def _reconcile_provider_host(ctx, inst, plog):
@@ -5040,6 +5212,158 @@ def _reconcile_provider_host(ctx, inst, plog):
         plog('  ⚠ Could not check the Authentik provider hostname: %s'
              % str(exc)[:80])
         return 'failed'
+
+
+def _reconcile_signed_identity(ctx, inst, plog, regenerate=False):
+    """Switch ATLAS to Authentik's signed token, or keep it on headers (ATLAS W504).
+
+    Returns True when `.env` changed, so the caller recreates `api`. Never
+    raises. See `atlas_signed_identity` for the order and why each check
+    comes before the switch.
+
+    ⚠️ **After the vhost is generated**, because the switch is allowed only
+    once the Caddyfile on disk copies the token into this deployment's vhost.
+    `regenerate` does that first, for the one path that does not already
+    (an update with nothing to install).
+    """
+    try:
+        if regenerate:
+            ctx['generate_caddyfile'](ctx['load_settings']())
+            ctx['_caddy_reload'](plog)
+        me = deployment_identity(ctx, inst, ctx['load_settings']())
+        result = atlas_signed_identity.ensure(
+            ctx, inst, me['dir'], write_env_value, plog, host=me['host'],
+            compose_passes=env_keys_compose_passes)
+        return bool(result.get('env_changed'))
+    except Exception as exc:
+        plog('  ⚠ Could not check administrator sign-in: %s' % str(exc)[:120])
+        return False
+
+
+#: ops #1186: how often the console looks for a lost signing key.
+#: ✅ Seen on a box (Rocky 9, Authentik 2026.8.5): a restart of Authentik's
+#: worker takes the key off 15 seconds later, and ATLAS refused administrators
+#: until the five-minute check (276 s, 291 s, 4 min 35 s). The check is three
+#: small reads of the local Authentik per deployment on `jwt`, and nothing
+#: when no deployment is on `jwt`, so one minute costs almost nothing.
+SIGNING_KEY_CHECK_INTERVAL_S = 60
+
+_converge_lock = threading.Lock()
+
+
+def converge_signed_identity(ctx, log):
+    """ops #1151: put a lost signing key back on every deployment that reads the
+    signed token. {deployment name: 'healed' | 'headers' | 'failed'}; a
+    deployment that needs nothing is not in the answer. Never raises.
+
+    📖 Authentik takes the signing key off a proxy provider on every save
+    through its proxy provider API (`atlas_signed_identity.key_lost` has the
+    source lines). The console does such a save after each of its own updates
+    (`_ensure_proxy_providers_cookie_domain`, a domain change), and an operator
+    does one with Save in Authentik's admin page. ATLAS on `jwt` then answers
+    401 to every administrator, and it has no other sign-in.
+
+    Called through the module spec by the console (boot converge, and after it
+    writes the proxy providers) and every five minutes by this module's own
+    loop, so a save nobody told us about is repaired within that time.
+    (ops #1186: the loop is now `_start_signing_key_loop`, every 60 seconds.)
+
+    ⚠️ **Only a deployment already on `jwt`, and only when the key is gone.**
+    The move from headers to the signed token stays with Deploy and Update,
+    which regenerate the vhost first. Here the usual answer is two Authentik
+    reads and no write.
+
+    ⚠️ **One run at a time (ops #1186).** The 60-second loop, the console's
+    own calls and a slow repair can meet; two runs would restart `api` twice
+    and write `.env` at the same time. The second waits for the first, then
+    reads the key again, so it sees what the first one did.
+    """
+    with _converge_lock:
+        return _converge_signed_identity_locked(ctx, log)
+
+
+def _converge_signed_identity_locked(ctx, log):
+    out = {}
+    try:
+        instances = load_instances(ctx)
+        if not instances:
+            return out
+        wanted = [inst for inst in instances
+                  if atlas_signed_identity.env_source(
+                      instance_paths(ctx, inst)['dir']) == 'jwt']
+        if not wanted:
+            return out
+        projects = compose_projects_present(ctx)
+    except Exception as exc:
+        log('ATLAS signed sign-in: could not read the deployments: %s' % str(exc)[:80])
+        return out
+    for inst in wanted:
+        name = atlas_instances.derive(inst)['name']
+
+        def say(msg, n=name):
+            log('ATLAS %s: %s' % (n, msg.strip()))
+        try:
+            if not instance_is_built(ctx, inst, projects):
+                continue
+            if not atlas_signed_identity.key_lost(ctx, inst):
+                continue
+            say('the signing key is no longer on the Authentik provider, putting it back')
+            if _reconcile_signed_identity(ctx, inst, say):
+                _compose(ctx, 'up -d api', timeout=300, inst=inst)
+            dirpath = instance_paths(ctx, inst)['dir']
+            if atlas_signed_identity.env_source(dirpath) != 'jwt':
+                out[name] = 'headers'
+            elif atlas_signed_identity.key_lost(ctx, inst):
+                out[name] = 'failed'
+            else:
+                out[name] = 'healed'
+        except Exception as exc:
+            say('⚠ signed sign-in not checked: %s' % str(exc)[:80])
+            out[name] = 'failed'
+    return out
+
+
+def before_console_rollback(ctx, log, target_reads_signed_token):
+    """ops #1151: called by the console's Rollback, before it checks out the
+    older release. {deployment name: 'headers' | 'failed'}. Never raises.
+
+    ⚠️ **A release without `atlas_signed_identity` cannot keep `jwt` working.**
+    Its Caddyfile does not pass `X-Authentik-Jwt`, and its Authentik
+    reconfigure takes the signing key off the provider with nothing to put it
+    back. A deployment left on `jwt` would refuse every administrator until
+    someone edited `.env` by hand. So each one goes back to the identity
+    headers first, which is what that release expects. The next ATLAS Update
+    on a release that has the module switches it again.
+
+    Nothing is done when the older release has the module.
+    """
+    out = {}
+    if target_reads_signed_token:
+        return out
+    try:
+        instances = load_instances(ctx)
+        projects = compose_projects_present(ctx) if instances else set()
+    except Exception as exc:
+        log('signed sign-in: could not read the deployments: %s' % str(exc)[:80])
+        return out
+    for inst in instances:
+        name = atlas_instances.derive(inst)['name']
+        try:
+            dirpath = instance_paths(ctx, inst)['dir']
+            if atlas_signed_identity.env_source(dirpath) != 'jwt':
+                continue
+            if not instance_is_built(ctx, inst, projects):
+                continue
+            write_env_value(os.path.join(dirpath, '.env'),
+                            atlas_signed_identity.ENV_SOURCE, 'headers')
+            _compose(ctx, 'up -d api', timeout=300, inst=inst)
+            log('%s: administrator sign-in set back to the identity headers for '
+                'the older release' % name)
+            out[name] = 'headers'
+        except Exception as exc:
+            log('%s: ⚠ administrator sign-in not set back: %s' % (name, str(exc)[:80]))
+            out[name] = 'failed'
+    return out
 
 
 def _run_update_recorded(ctx, inst=None):
@@ -5139,7 +5463,8 @@ def _run_update(ctx, inst=None):
              ' → ' + channel + ' offers ' + target)
 
         here, there = _parse_version(current), _parse_version(target)
-        if here and there and there < here:
+        refusal = _downgrade_lines(current, target, channel)
+        if refusal:
             # ⚠️ **Behind, not equal — and this is a refusal, not a no-op.**
             # It happens when a box switches from `dev` to `main`, or when a
             # release is withdrawn by moving `main` back. Running older code
@@ -5147,13 +5472,8 @@ def _run_update(ctx, inst=None):
             # loss, so the way back is a forward fix on the channel, never this
             # button. Said plainly, because a button that looks like it did
             # nothing is a button an operator presses again.
-            plog('✗ This deployment is on ' + (current or '?') + ', which is '
-                 'newer than what the ' + channel + ' channel offers (' +
-                 target + ').')
-            plog('  Refusing to downgrade: ' + target + ' would run against a '
-                 'database ' + (current or 'a newer release') + ' has migrated.')
-            plog('  Switch back to the channel it came from, or publish a '
-                 'forward fix.')
+            for line in refusal:
+                plog(line)
             _reconcile_access(ctx, inst, plog)
             slot.update({'running': False, 'complete': True, 'error': False})
             return
@@ -5166,6 +5486,10 @@ def _run_update(ctx, inst=None):
                 # ⚠️ Before anything below reads or writes `.env` (W243): a
                 # deployment built before W240 has a root-owned one.
                 _repair_env_ownership(os.path.join(dirpath, '.env'), ctx, plog)
+                # ops #1221: here too, so a deployment whose release already
+                # carries the newest code still gets containers that come back
+                # after Docker restarts. Recreated below with the `api` restart.
+                _policy_changed = ensure_restart_policy(dirpath, plog)
                 # ⚠️ Reconciled here too, or a deployment already on the newest
                 # release (installed before this module could set renewal up,
                 # or by an update that failed to) could never get it: this
@@ -5185,7 +5509,11 @@ def _run_update(ctx, inst=None):
                 except Exception as exc:
                     restart_api = False
                     plog('⚠ Could not check the admin gate: ' + str(exc)[:120])
-                if _renewal['env_changed'] or restart_api:
+                # ATLAS W504: here too, or a deployment already on the newest
+                # release would never move to the signed token.
+                restart_api = _reconcile_signed_identity(
+                    ctx, inst, plog, regenerate=True) or restart_api
+                if _renewal['env_changed'] or restart_api or _policy_changed:
                     _compose(ctx, 'up -d api', timeout=300, inst=inst)
                 if _cas['recreated']:
                     # The running `api` still mounts the folder Docker made.
@@ -5242,6 +5570,9 @@ def _run_update(ctx, inst=None):
         # ⚠️ Before the rebuild, or the new image starts without the setting and
         # spends a release accepting identity headers from anywhere.
         _set_trusted_proxies(dirpath, plog, _me['compose_project'])
+        # ops #1221: before the rebuild, so the containers it recreates carry
+        # the restart policy. An older release (1.51.0 has none) has none of its own.
+        ensure_restart_policy(dirpath, plog)
         # ⚠️ On every update, not only at deploy: this is how a deployment
         # made before renewal existed gets its account, and how the token is
         # rotated. Before the rebuild, so compose reads the new `.env`.
@@ -5292,6 +5623,8 @@ def _run_update(ctx, inst=None):
             changed = _arm_admin_gates(ctx, dirpath, plog, inst=inst,
                                        global_group=_global_admin_group(ctx))
             changed = _push_email_relay(ctx, dirpath, plog) or changed
+            # ATLAS W504: after the vhost above, which it checks.
+            changed = _reconcile_signed_identity(ctx, inst, plog) or changed
             if changed:
                 _compose(ctx, 'up -d api', timeout=300, inst=inst)
             _seed_relay_choice(ctx, plog, inst=inst)
@@ -5541,6 +5874,59 @@ def refresh_databases(ctx, log):
     return out
 
 
+def converge_access(ctx, ak_url, ak_headers, log):
+    """ops #919: the one access policy for every deployment, after a console update.
+
+    The console's boot converge calls this, through the module spec, right after
+    `_ensure_app_access_policies`. {deployment name: ensure status, or 'skipped'
+    when its application is not in Authentik}. Never raises.
+
+    ⚠️ **Update Now has to be enough** (10.4.3 T&E, ops #984). A box on 10.4.2
+    has "Allow authentik Admins" (and, for an agency, its group bound directly)
+    on each ATLAS application. Under the Hardened posture's `all` that is the
+    agency-admin lockout of ops #979. Both the boot converge and `_restrict_to_admins`
+    read that binding as "already restricted", so before this only a press of
+    Update on the ATLAS page swapped it for the access policy.
+
+    ⚠️ **Nothing new is let in.** The agency's own group (the one 10.4.2 already
+    bound) is added; the standard group is not: only an ATLAS Update admits it,
+    after it has checked the running container (`_reconcile_roster`). A policy
+    changed by hand is reported and left; a failure leaves the old bindings
+    (`atlas_access.ensure`). The group itself is never created here.
+    """
+    import urllib.error
+    out = {}
+    try:
+        instances = load_instances(ctx)
+    except Exception as exc:
+        log('ATLAS access: could not read the deployments: %s' % str(exc)[:80])
+        return out
+    api = atlas_access.Api(ak_url, ak_headers)
+    for inst in instances:
+        names = atlas_instances.derive(inst)
+        name = names['name']
+        app_slug = atlas_instances.authentik_names(inst)['app_slug']
+
+        def say(msg, n=name):
+            log('ATLAS %s: %s' % (n, msg.strip()))
+        try:
+            try:
+                api.call('core/applications/%s/' % app_slug)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise
+                # Not registered (yet): Deploy makes the policy with the app.
+                out[name] = 'skipped'
+                continue
+            add = [names['admin_group']] if names['slug'] else []
+            out[name] = atlas_access.ensure(api, app_slug, add=add,
+                                            plog=say)['status']
+        except Exception as exc:
+            say('⚠ access policy not checked: %s' % str(exc)[:80])
+            out[name] = 'failed'
+    return out
+
+
 def revocation_tick(ctx, log):
     """ATLAS W461: copy TAK Server's revoked certificates to every built
     deployment's renewal container. The container refuses renewal on a copy
@@ -5582,6 +5968,34 @@ def _start_revocation_loop(ctx):
             time.sleep(atlas_renewal.REVOCATION_INTERVAL_S)
 
     threading.Thread(target=loop, daemon=True, name='atlas-revocations').start()
+
+
+_signing_key_loop_started = False
+
+
+def _start_signing_key_loop(ctx):
+    """ops #1186: look for a lost signing key every minute, not every five.
+
+    Once per console process. A failed tick is logged and the next one runs.
+    A box with no deployment on `jwt` reads its settings and stops there.
+    """
+    global _signing_key_loop_started
+    if _signing_key_loop_started:
+        return
+    _signing_key_loop_started = True
+
+    def loop():
+        # Later than the revocation loop's 30 seconds: the console's own
+        # converge at start has the first word.
+        time.sleep(45)
+        while True:
+            try:
+                converge_signed_identity(ctx, lambda m: print('[' + KEY + '] ' + m, flush=True))
+            except Exception as exc:
+                print('[' + KEY + '] signed sign-in: tick failed: ' + str(exc)[:160], flush=True)
+            time.sleep(SIGNING_KEY_CHECK_INTERVAL_S)
+
+    threading.Thread(target=loop, daemon=True, name='atlas-signing-key').start()
 
 
 def _run_update_all(ctx):
@@ -5800,6 +6214,17 @@ def remove_instance(ctx, inst, plog=None):
     renewal_note = atlas_renewal.remove(ctx, inst)
     if renewal_note:
         note(f'{label}: {renewal_note}')
+
+    # ⚠️ And the standard-admin group and its roster account (ATLAS W495), or
+    # a reused slug inherits the old deployment's standard admins.
+    roster_note = atlas_roster.remove(ctx, inst)
+    if roster_note:
+        note(f'{label}: {roster_note}')
+    # ATLAS W504: the provider's own signing key, or a reused slug's provider
+    # would find the old one by name and sign with it.
+    key_note = atlas_signed_identity.remove(ctx, inst)
+    if key_note:
+        note(f'{label}: {key_note}')
 
     # ⚠️ Only the keys this deployment owns. `atlas_` is a prefix of
     # `atlas_corona_`, so a `startswith` sweep while removing the *plain*
@@ -6047,8 +6472,20 @@ _COMPOSE_OVERRIDE = """# Written by the infra-TAK ATLAS module.
 # api` brings the database and the migration step with it and stops there.
 services:
   api:
+    # ⚠️ **Named here, not left to the release (ops #1221).** ATLAS 1.51.0's own
+    # compose file gave `api` and `db` no restart policy at all, which means
+    # `no`. Docker came back after an OS update and every other container with
+    # it, but these two stayed `Exited (0)` until somebody pressed Start, and
+    # no device could check in meanwhile. Later releases set it themselves;
+    # saying it again here means a deployment that has not updated yet, or a
+    # release that loses the line, is still brought back. `init` is one-shot
+    # and keeps `restart: "no"` -- restarting it would loop.
+    restart: unless-stopped
     ports:
       - "127.0.0.1:{app_port}:8000"
+
+  db:
+    restart: unless-stopped
 
   # ⚠️ **No `user:` here, and that was tried.** Running the containers as
   # the console's own uid would have removed the host-side chown entirely,
@@ -6065,6 +6502,73 @@ services:
     command: ["python", "-m", "app.cli", "init-pki"]
 """
 
+#: The services whose containers must come back by themselves when Docker does.
+RESTART_SERVICES = ('api', 'db')
+_OVERRIDE_PORT_RE = re.compile(r'"127\.0\.0\.1:(\d+):8000"')
+
+
+def _service_block(body, name):
+    """The lines of one service in a compose file, comments left out.
+
+    A service starts at a two-space key and runs to the next two-space key.
+    """
+    lines, found = [], False
+    for line in body.split(chr(10)):
+        if re.match(r'^  [A-Za-z0-9_.-]+:\s*$', line):
+            found = line.strip() == name + ':'
+            continue
+        if found and not line.lstrip().startswith('#'):
+            lines.append(line)
+    return chr(10).join(lines)
+
+
+def override_restart_policy_missing(body):
+    """The services in a compose override that have no `restart: unless-stopped`."""
+    return [name for name in RESTART_SERVICES
+            if not re.search(r'^\s+restart:\s*["\']?unless-stopped["\']?\s*$',
+                             _service_block(body, name), re.MULTILINE)]
+
+
+def ensure_restart_policy(dirpath, plog):
+    """Give an existing deployment the restart policy a new one is written with (ops #1221).
+
+    Returns True when it rewrote the override, so the caller recreates the
+    containers (`up -d api`) and they pick the policy up. False when there was
+    nothing to do or nothing safe to do.
+
+    ⚠️ **Only the override file is touched, and only when a policy is missing.**
+    The port is read back out of the file being replaced: it was allocated per
+    deployment at deploy time and is not recorded anywhere else. A file this
+    cannot read the port from is left alone and said so, because guessing a
+    port would point Caddy's upstream at nothing. A box with no override file
+    was never deployed by this module, so one is not created.
+
+    ⚠️ **Why not `docker update --restart` on the live containers.** It would
+    heal them until the next `up -d`, which recreates them from the compose
+    files; the file is what has to change.
+    """
+    path = os.path.join(dirpath, 'docker-compose.override.yml')
+    try:
+        with open(path, encoding='utf-8') as handle:
+            body = handle.read()
+    except OSError:
+        return False
+    missing = override_restart_policy_missing(body)
+    if not missing:
+        return False
+    found = _OVERRIDE_PORT_RE.search(body)
+    if not found:
+        plog('⚠ ' + ' and '.join(missing) + ' have no restart policy, but the port in '
+             'docker-compose.override.yml could not be read, so it was left alone')
+        return False
+    try:
+        _write_own(path, _COMPOSE_OVERRIDE.format(app_port=found.group(1)))
+    except OSError as exc:
+        plog('⚠ Could not give ' + ' and '.join(missing) + ' a restart policy: ' + str(exc)[:120])
+        return False
+    plog('✓ ' + ' and '.join(missing) + ' now restart by themselves when Docker does')
+    return True
+
 
 # --------------------------------------------------------------------------- #
 # Registration
@@ -6076,6 +6580,8 @@ def register(ctx):
 
     # ATLAS W461: renewal refuses a revoked-certificate list an hour old.
     _start_revocation_loop(ctx)
+    # ops #1186: and the signing key, every minute.
+    _start_signing_key_loop(ctx)
 
     def _requested_instance(default_first=False):
         """The deployment a request is about, from `?slug=` or a JSON body.
@@ -6745,6 +7251,14 @@ def register(ctx):
         'tak_ca_changed': tak_ca_changed,
         # ops #755: called by the console after its own update (PostgreSQL security minors).
         'refresh_databases': refresh_databases,
+        # ops #919: called by the console's boot converge (so after its own
+        # update), to swap every ATLAS application to its one access policy.
+        'converge_access': converge_access,
+        # ops #1151: called by the console after it saves the Authentik proxy
+        # providers (that save takes the signing key off), and at boot.
+        'converge_signed_identity': converge_signed_identity,
+        # ops #1151: called by the console's Rollback before the checkout.
+        'before_console_rollback': before_console_rollback,
         'uninstall': uninstall,
         'control_map': {
             'start':   lambda c: _compose_argv(c, 'up', '-d', 'api'),

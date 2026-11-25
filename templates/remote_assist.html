@@ -151,6 +151,8 @@
 <script src="/log-tools.js?v={{ version }}"></script>
 <script>initLogToolbar('deploy-log');initLogToolbar('deploy-log-dyn');initLogToolbar('container-logs');</script>
 <script>
+/* ops #827: escapes & < > " ' so a version string is shown as text */
+function raEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 var logInterval=null;
 function pickLogEl(){var lc=document.getElementById('log-card');return (lc&&lc.style.display!=='none'?document.getElementById('deploy-log-dyn'):null)||document.getElementById('deploy-log')||document.getElementById('deploy-log-dyn');}
 function startDeploy(){var btn=document.getElementById('deploy-btn');if(btn)btn.disabled=true;document.getElementById('log-card').style.display='block';var logEl=document.getElementById('deploy-log-dyn');if(logEl)logEl.textContent='Starting...';
@@ -192,7 +194,7 @@ function refreshRaVersion(manual){
     var st='';
     if(d.update_available)st=' <span id="ra-latest-status" style="color:var(--cyan);font-size:11px">update ready</span>';
     else if(d.is_current)st=' <span id="ra-latest-status" style="color:var(--text-dim);font-size:11px">current</span>';
-    if(d.latest)latestEl.innerHTML='v'+d.latest+st;
+    if(d.latest)latestEl.innerHTML='v'+raEsc(d.latest)+st;
     else latestEl.innerHTML='<span style="color:var(--text-dim)">unavailable</span>';
     if(btn){
       if(d.update_available){btn.classList.add('btn-update-active');btn.title='Update available: v'+(d.latest||'');}
@@ -200,8 +202,8 @@ function refreshRaVersion(manual){
     }
     if(d.version){
       var inst=document.getElementById('ra-installed-version');if(inst){
-        var runNote=(d.running&&d.running!==d.version)?' <span style="color:var(--yellow)">(running v'+d.running+')</span>':'';
-        inst.innerHTML='v'+d.version+runNote;
+        var runNote=(d.running&&d.running!==d.version)?' <span style="color:var(--yellow)">(running v'+raEsc(d.running)+')</span>':'';
+        inst.innerHTML='v'+raEsc(d.version)+runNote;
       }
     }
     restoreCheckBtn();

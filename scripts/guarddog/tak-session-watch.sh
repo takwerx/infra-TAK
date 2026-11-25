@@ -121,6 +121,11 @@ PEER_IPS=$(ss -tn state established "( sport = :$PORT )" 2>/dev/null \
   | grep -Ev "$LOCAL_PEER_RE" || true)
 EXTERNAL=$(printf '%s\n' "$PEER_IPS" | grep -c . || true)
 EXTERNAL=${EXTERNAL:-0}
+# GH #634: the same peers WITH their source port. A subscription whose ip:port is not in this
+# list has no open socket any more (a leftover TAK kept after the client's connection closed).
+PEER_ADDRS=$(ss -tn state established "( sport = :$PORT )" 2>/dev/null \
+  | tail -n +2 | awk '{print $4}' \
+  | grep -Ev "$LOCAL_PEER_RE" || true)
 
 # ── 2. Subscriptions the api JVM knows about ──
 _admin_cert() {
@@ -213,8 +218,8 @@ fi
 # takVersion), and `read` splits the line on whitespace. So text fields are cut to one
 # plain word and numbers are printed as int, and the shell checks both again after the
 # read and fails closed. Client text must never reach $(( )) or a test.
-read -r SUBS GROUPLESS SERVICE UNKNOWN TOPUID TOPUIDN TOPCLIENT TOPVER TOPIP TOPIPSOCK TOPIPUIDS KEYS <<EOF
-$(printf '%s' "$SUBS_JSON" | PEER_IPS="$PEER_IPS" python3 -c '
+read -r SUBS GROUPLESS SERVICE UNKNOWN TOPUID TOPUIDN TOPCLIENT TOPVER TOPIP TOPIPSOCK TOPIPUIDS GLNAMED GLLEFT LEFTOVERS GLDEVS KEYS <<EOF
+$(printf '%s' "$SUBS_JSON" | PEER_IPS="$PEER_IPS" PEER_ADDRS="$PEER_ADDRS" python3 -c '
 import json, os, re, sys, collections
 _UNSAFE = re.compile(r"[^A-Za-z0-9._:-]")
 def safe(x, n):           # one shell word, never anything bash can expand
@@ -223,15 +228,39 @@ def out(*a): print(" ".join(str(x) for x in a))
 try:
     rows = json.load(sys.stdin).get("data") or []
 except Exception:
-    out("ERR",0,0,0,"-",0,"-","-","-",0,0,"-"); sys.exit(0)
+    out("ERR",0,0,0,"-",0,"-","-","-",0,0,0,0,"-","-","-"); sys.exit(0)
 if not isinstance(rows, list):
-    out("ERR",0,0,0,"-",0,"-","-","-",0,0,"-"); sys.exit(0)
+    out("ERR",0,0,0,"-",0,"-","-","-",0,0,0,0,"-","-","-"); sys.exit(0)
 
 groupless = service = unknown = 0
 keys = set()
 uid_subs = collections.Counter()        # non-empty clientUid -> subscriptions
 ip_uids  = collections.defaultdict(set) # peer ip -> distinct non-empty uids
 uid_meta = {}                           # uid -> (takClient, takVersion)
+
+# GH #634: leftover subscriptions. TAK can keep a subscription after its client connection closed
+# (field 2026-11-22: tls:412, no groups, user name set, silent 89 min, its source port absent from
+# ss; the same device had a live subscription with 4 groups). The console automatic drop only
+# touches connections TAK gave NO user name, so this one never clears by itself.
+LEFT_SILENT_MS = 300000                 # silent 5+ min: a connection newer than the ss read can never be
+def _norm_host(h):
+    h = str(h).strip().strip("[]").lower()
+    return h[7:] if h.startswith("::ffff:") else h
+peer_addrs = set()
+for a in (os.environ.get("PEER_ADDRS") or "").split():
+    host, _, port = a.rpartition(":")
+    if host and port.isdigit():
+        peer_addrs.add(_norm_host(host) + ":" + port)
+LOCAL_PEER = re.compile(r"^(127\.|::1$|172\.(1[6-9]|2[0-9]|3[01])\.)")
+def row_addr(r):
+    ip, port = _norm_host(r.get("ipAddress") or ""), str(r.get("port") or "").strip()
+    return ip + ":" + port if ip and port.isdigit() else ""
+def row_is_local(r):    # our own containers and loopback: ss on the host does not show them as peers
+    return bool(LOCAL_PEER.match(_norm_host(r.get("ipAddress") or "")))
+sock_proven = False    # ss and the API agree on at least one channel-holding client: the match works here
+gl_named = 0           # channel-less device rows TAK knows by user name or DN
+left = []              # ...of which the socket is gone and the row is silent: leftovers
+gl_devs = []           # every channel-less device row: (entry, device id, client, version, silent ms)
 
 for r in rows:
     if not isinstance(r, dict):
@@ -267,8 +296,30 @@ for r in rows:
                 service += 1      # server-side service with no channel: expected, not a fault
             else:
                 groupless += 1    # anything with device identity: the thing worth alerting on
+                # ops #1052: name the device behind the row so the operator can find it. Device id,
+                # client name and version, and silence only: never callsign, user name or DN.
+                try:
+                    _sil = int(r.get("lastReportDiffMilliseconds"))
+                except (TypeError, ValueError):
+                    _sil = -1
+                gl_devs.append((str(r.get("subscriptionUid") or ""), _uid,
+                                str(r.get("takClient") or "").strip(), str(r.get("takVersion") or "").strip(), _sil))
+                if str(r.get("username") or "").strip() or str(r.get("dn") or "").strip():
+                    gl_named += 1
+                    sid = str(r.get("subscriptionUid") or "")
+                    try:
+                        silent = int(r.get("lastReportDiffMilliseconds"))
+                    except (TypeError, ValueError):
+                        silent = -1     # no number: never call it silent
+                    a = row_addr(r)
+                    if (sid.startswith(("tls:", "ssl:")) and a and not row_is_local(r)
+                            and a not in peer_addrs and silent >= LEFT_SILENT_MS):
+                        left.append(sid)
     else:
         unknown += 1              # not the pinned shape at all
+    if isinstance(g, list) and any(isinstance(x, dict) and x.get("name") and "__ANON__" not in str(x.get("name")) for x in g):
+        if str(r.get("subscriptionUid") or "").startswith(("tls:", "ssl:")) and row_addr(r) in peer_addrs:
+            sock_proven = True
 
     uid = str(r.get("clientUid") or "").strip()
     if uid:                       # empty uid is never device identity
@@ -296,9 +347,24 @@ if sock:
     top_ip, top_sock = sock.most_common(1)[0]
     top_ipuids = len(ip_uids.get(top_ip, ()))
 
+# Only believe "no socket" when the same match finds a socket for a client that holds channels
+# (a Docker TAK behind a NAT or proxy shows other addresses in ss, and then nothing matches).
+if not sock_proven:
+    left = []
+left.sort(key=lambda x: (len(x), x))
+# ops #1052: one text entry per channel-less device row, longest-silent first, at most 5:
+# entry+device+client+version+minutes silent+L (a leftover) or -. "+" never occurs inside a field
+# (safe() maps it to "-"), so the shell can split on it. Text fields come from the client.
+gl_devs.sort(key=lambda d: -d[4])
+def dev_entry(d):
+    mins = str(d[4] // 60000) if d[4] >= 0 else "?"
+    return "+".join([safe(d[0], 24), safe(d[1], 48), safe(d[2].replace(" ", "_"), 24),
+                     safe(d[3].split()[0] if d[3].split() else "", 24), mins, "L" if d[0] in left else "-"])
+gl_dev_txt = ",".join(dev_entry(d) for d in gl_devs[:5]) or "-"
 out(int(len(rows)), int(groupless), int(service), int(unknown),
     safe(top_uid, 64), int(top_n), safe(tc, 24), safe(tv, 24),
     safe(top_ip.strip("[]"), 64), int(top_sock), int(top_ipuids),
+    int(gl_named), int(len(left)), ",".join(safe(x, 24) for x in left[:5]) or "-", gl_dev_txt,
     ",".join(safe(k, 64) for k in sorted(keys, key=str)) or "-")
 ' 2>/dev/null)
 EOF
@@ -310,16 +376,20 @@ fi
 # ops #628: never trust the split. Every count must be digits only before it reaches
 # $(( )) or a test; anything else fails closed. Text fields go into the log and the
 # email only, and must be one plain word. Only the field NAME is logged, never the value.
-for _v in SUBS GROUPLESS SERVICE UNKNOWN TOPUIDN TOPIPSOCK TOPIPUIDS; do
+for _v in SUBS GROUPLESS SERVICE UNKNOWN TOPUIDN TOPIPSOCK TOPIPUIDS GLNAMED GLLEFT; do
   case "${!_v}" in
     ''|*[!0-9]*) _log "SKIP | subscriptions helper gave a non-number for $_v — not evaluating"; exit 0 ;;
   esac
 done
-for _v in TOPUID TOPCLIENT TOPVER TOPIP KEYS; do
+for _v in TOPUID TOPCLIENT TOPVER TOPIP LEFTOVERS KEYS; do
   case "${!_v}" in
     ''|*[!A-Za-z0-9._:,-]*) printf -v "$_v" '%s' '-' ;;
   esac
 done
+# ops #1052: the device list also holds "+" between its fields and "?" for an unknown silence.
+case "$GLDEVS" in
+  ''|*[!A-Za-z0-9._:,+?-]*) GLDEVS='-' ;;
+esac
 case "$EXTERNAL" in ''|*[!0-9]*) EXTERNAL=0 ;; esac
 
 # Record the schema once so a future release can stop guessing at the group key.
@@ -348,7 +418,7 @@ fi
 if [ "$API_BROKEN" -eq 1 ]; then
   _log "CHECK | subscriptions API BROKEN (HTTP $SUBS_CODE on every read) external_sockets=$EXTERNAL"
 else
-  _log "CHECK | external_sockets=$EXTERNAL subscriptions=$SUBS groupless=$GROUPLESS service=$SERVICE unknown_schema=$UNKNOWN invisible=$INVISIBLE top_uid=$TOPUID/$TOPUIDN top_ip=$TOPIP/$TOPIPSOCK sockets/$TOPIPUIDS uids storm_uid=$STORM_UID storm_ip=$STORM_IP"
+  _log "CHECK | external_sockets=$EXTERNAL subscriptions=$SUBS groupless=$GROUPLESS service=$SERVICE unknown_schema=$UNKNOWN invisible=$INVISIBLE top_uid=$TOPUID/$TOPUIDN top_ip=$TOPIP/$TOPIPSOCK sockets/$TOPIPUIDS uids storm_uid=$STORM_UID storm_ip=$STORM_IP groupless_named=$GLNAMED leftover=$GLLEFT"
 fi
 
 # ── 3. Verdict ──
@@ -364,8 +434,16 @@ fi
 # cooldown never backed off. A new state (or the box going healthy) starts over and alerts
 # promptly.
 NOW=$(date +%s)
-STATE_KEY="api_broken=$API_BROKEN invisible=$([ "$INVISIBLE" -gt 0 ] && echo 1 || echo 0) groupless=$([ "$GROUPLESS" -gt 0 ] && echo 1 || echo 0) storm_uid=$STORM_UID storm_ip=$STORM_IP"
+STATE_KEY="api_broken=$API_BROKEN invisible=$([ "$INVISIBLE" -gt 0 ] && echo 1 || echo 0) groupless=$([ "$GROUPLESS" -gt 0 ] && echo 1 || echo 0) leftover=$([ "$GLLEFT" -gt 0 ] && echo 1 || echo 0) storm_uid=$STORM_UID storm_ip=$STORM_IP"
 PREV_KEY=""; [ -f "$STATE_FILE" ] && PREV_KEY=$(cat "$STATE_FILE" 2>/dev/null)
+# ops #1148: the leftover flag comes and goes by itself (it needs a matching-socket proof and 5 min of
+# silence, and the same device's entry can drop out of both for a check or two). test8, Nov 23-24:
+# every flip restarted the 24 h clock and mailed at once, 11 mails in a row. Once a leftover has been
+# seen in this state, keep it in the key until the box is healthy again. Going from "not a leftover"
+# TO a leftover still restarts the clock, because the advice in the email changes.
+if [ "$STATE_KEY" != "$PREV_KEY" ] && [ "${STATE_KEY/leftover=0/leftover=1}" = "$PREV_KEY" ]; then
+  STATE_KEY="$PREV_KEY"
+fi
 if [ "$STATE_KEY" != "$PREV_KEY" ]; then
   echo "$STATE_KEY" > "$STATE_FILE"
   echo "$NOW" > "$STATE_SINCE_FILE"
@@ -462,18 +540,57 @@ if [ "$GROUPLESS" -gt 0 ]; then
    above: $SERVICE)
   Connected and authenticated, but holding no channel, so TAK routes them
   nothing."
+  # ops #1052: name the device behind each row, so the operator can find it. Entry, device ID,
+  # client and version, minutes silent. Never callsign, user name or certificate name.
+  if [ "$GLDEVS" != "-" ]; then
+    _DEVTXT=""
+    _OLDIFS=$IFS
+    IFS=,
+    for _e in $GLDEVS; do
+      IFS=+ read -r _d_sid _d_uid _d_cl _d_ver _d_min _d_left <<DEV
+$_e
+DEV
+      _DEVTXT="$_DEVTXT
+    TAK entry $_d_sid: device $_d_uid, $_d_cl $_d_ver, silent $_d_min min$([ "$_d_left" = "L" ] && echo ', leftover')"
+    done
+    IFS=$_OLDIFS
+    FINDINGS="$FINDINGS
+  Devices with no channel (longest silent first, up to 5):$_DEVTXT"
+  fi
+  # GH #634: a row whose socket is gone is not "connected". Say so, name the TAK entries, and do
+  # not promise a self-heal that the console does not do for a connection TAK knows by name.
+  if [ "$GLLEFT" -gt 0 ]; then
+    FINDINGS="$FINDINGS
+  $GLLEFT of them are LEFTOVERS: no open connection on TCP $PORT matches them and they have
+  been silent for over 5 minutes (TAK entries: $LEFTOVERS). TAK kept the entry after the
+  client's connection closed. Nobody is connected on these."
+  fi
   # GH #207: the LDAP-outage case comes first and names every trigger, not just a reboot.
   # Field: after a console update and a Guard Dog Authentik restart, accounts that DID have
   # channels were stuck on __ANON__; reconnecting the client (restarting Node-RED for its
   # feeds) cleared them, and another TAK Server restart wasn't needed.
+  if [ "$GLLEFT" -gt 0 ]; then
+    ACTIONS="$ACTIONS
+- For the LEFTOVER entries ($LEFTOVERS): TAK knows these by user name, so the console
+  does NOT drop them, and they do not clear by themselves. They stay until TAK Server
+  restarts. No client is on them, so deleting an entry in TAK Server client dashboard
+  disconnects nobody. If TAK refuses to delete it, it goes away at your next planned
+  TAK Server restart; a restart only for this is not needed.
+  Restarting or powering off the device does not remove the entry. If the same device
+  makes new entries again and again (TAK numbers them up), look at that device: signal,
+  power and client build. A device that reconnects every few minutes can leave more."
+  fi
+  if [ "$GLLEFT" -lt "$GROUPLESS" ]; then
   ACTIONS="$ACTIONS
-- For the __ANON__ subscriptions: there are two different causes and they need
+- For the other __ANON__ subscriptions: there are two different causes and they need
   different fixes.
     * Most often: they CONNECTED DURING AN LDAP OUTAGE (a reboot, a console
       update, or an Authentik restart by Guard Dog) and the account is fine.
       The console reconnects these by itself within about 10 minutes of LDAP
       being healthy again (and drops one TAK never looked up, with no user at
-      all, after it has stayed that way 10 minutes). If they are still there:
+      all, after it has stayed that way 10 minutes). A connection TAK knows by
+      user name is reconnected only after an LDAP outage the console saw; if
+      there was none, the console does nothing for it. If they are still there:
       reconnect the client
       (for Node-RED data feeds, restart Node-RED); restart TAK Server only if
       that does not clear them.
@@ -481,6 +598,7 @@ if [ "$GROUPLESS" -gt 0 ]; then
       ACCOUNT HAS NO CHANNEL ASSIGNED. Restarting will not fix it. Assign the
       user a channel (TAK Portal -> the user -> channels), then have them
       reconnect."
+  fi
 fi
 
 if [ "$STORM_UID" -eq 1 ]; then

@@ -122,6 +122,18 @@ select.input-field{cursor:pointer}
 </table>
 </div>
 
+<div class="section-title">System Notifications</div>
+<div id="notify-card" style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<p style="margin:0 0 12px 0;color:var(--text-muted)">The server sends its own mail too: sudo warnings, cron failures, update reports. Choose who reads it.</p>
+<div style="display:flex;gap:12px;align-items:end">
+<div style="flex:1"><label class="input-label" for="notify-to">Send system notifications to</label>
+<input type="text" id="notify-to" class="input-field" placeholder="{{ notify_default or 'you@example.com' }}" value="{{ notify_to }}" autocomplete="off"></div>
+<button onclick="saveNotifyTo()" id="notify-btn" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap">Save</button>
+</div>
+<p id="notify-hint" style="margin:8px 0 0 0;font-size:11px;color:var(--text-dim)">Separate several addresses with commas (up to 5). Leave it empty to use {% if notify_default_is_guarddog %}the Guard Dog alert address{% else %}the relay From address (set a Guard Dog alert address to change that){% endif %}{% if notify_default %}: {{ notify_default }}{% endif %}.</p>
+<div id="notify-result" style="margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;display:none"></div>
+</div>
+
 <div class="section-title">App SMTP Settings</div>
 <div class="info-box">
 Configure TAK Portal and MediaMTX to use the local relay:<br><br>
@@ -288,6 +300,18 @@ async function swapProvider(){
     var d=await r.json();
     if(d.success){location.reload()}
     else{alert('Error: '+d.error)}
+}
+
+async function saveNotifyTo(){
+    var v=document.getElementById('notify-to').value.trim();
+    var res=document.getElementById('notify-result');
+    res.style.display='block';res.style.color='var(--text-dim)';res.textContent='Saving...';
+    try{
+        var r=await fetch('/api/emailrelay/notify-to',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({notify_to:v})});
+        var d=await r.json();
+        if(d.success){res.style.color='var(--green)';res.textContent='✓ Saved. System mail goes to '+d.goes_to+'.'}
+        else{res.style.color='var(--red)';res.textContent='✗ '+(d.error||'Could not save')}
+    }catch(e){res.style.color='var(--red)';res.textContent='✗ '+e}
 }
 
 async function sendTest(){

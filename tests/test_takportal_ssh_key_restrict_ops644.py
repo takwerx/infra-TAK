@@ -132,6 +132,7 @@ def test_setup_ssh_writes_a_restricted_line_not_a_bare_key(monkeypatch, tmp_path
                _takportal_push_settings=lambda restart=False: None,
                _takportal_install_sudoers=lambda log_fn=None: (True, 'skipped'),
                _takportal_install_caddy_validate_shim=lambda log_fn=None: 'skipped',
+               _takportal_harden_logout_file=lambda log_fn=None: 'absent',
                _takportal_ssh_probe=lambda: ('nopasswd', ''), _tak_is_container=lambda: False)
     log = []
     assert ns['_takportal_setup_ssh'](log_fn=log.append) is True

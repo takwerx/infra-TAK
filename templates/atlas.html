@@ -1011,6 +1011,16 @@ function instanceRow(i){
     row.appendChild(warn);
   }
 
+  // ops #1151: a deployment that does not read Authentik's signed token yet
+  // says so here. It used to be one line in the update log.
+  if (i.admin_signin_problem){
+    const warn = document.createElement('span');
+    warn.className = 'chan-warn';
+    warn.style.cssText = 'margin:0 8px;display:inline';
+    warn.textContent = '⚠ ' + i.admin_signin_problem;
+    row.appendChild(warn);
+  }
+
   if (i.update_available){
     const badge = document.createElement('span');
     badge.className = 'badge-new';

@@ -8,6 +8,12 @@
 # already ignores. Pins in requirements.txt
 # are exact on purpose (fleet uniformity): Dependabot proposes the bump, a test
 # on the fleet decides whether it merges.
+#
+# requirements.txt (and .github/ci/requirements-test.txt) carry their own hashes and transitive pins
+# and are the ONLY copy: CI installs those same files, so a Dependabot bump of a pin needs no hand
+# relock (ops #1113). The job console-deps in pr-checks.yml installs requirements.txt on Python 3.9,
+# 3.10 and 3.12, so a bump that needs a newer Python than RHEL/Rocky 9 has goes red there. If a bump
+# needs a new transitive pin, run tools/relock-console-requirements.sh on the PR branch.
 version: 2
 updates:
   - package-ecosystem: "pip"
@@ -52,6 +58,16 @@ updates:
     ignore:
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      # The simulator base is python:3.12-slim, pinned by digest, and
+      # tests/test_node_pins_ops824.py pins the 3.12 line on purpose. Dependabot
+      # counts 3.12 to 3.15 as a minor bump, so ignore python minor and major
+      # bumps here and keep patch updates for the 3.12 line. The python line
+      # moves only by a deliberate change to that pin test and a box test
+      # (ops #885: PR 515 failed the pin test).
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

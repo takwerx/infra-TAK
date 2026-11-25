@@ -22,6 +22,7 @@ The helpers are cut out of app.py and run against stubs: the code under test is 
 """
 
 import ast
+import os
 import pathlib
 import subprocess
 from types import SimpleNamespace
@@ -56,14 +57,17 @@ def _load(held, results):
 
     ns = {
         'subprocess': subprocess,
+        'os': os,
         'time': SimpleNamespace(sleep=lambda s: setattr(clock, 'slept', clock.slept + s)),
         '_sudo_wrap': lambda c: c,
         '_run_priv_chain': chain,
+        '_apt_failure_is_transient': lambda out: False,   # ops #1124: the stall wording is tested in test_apt_stall_retry_ops1124
     }
     real_run = subprocess.run
     ns['subprocess'] = SimpleNamespace(run=lsof_run, CompletedProcess=subprocess.CompletedProcess)
     for name in ('_APT_LOCK_FILES', '_APT_LOCK_MSGS', '_apt_lock_held',
-                 '_apt_wait_for_lock', '_apt_run_waiting'):
+                 '_apt_wait_for_lock', '_apt_stalled', '_apt_broker_env', '_apt_chain_run', '_apt_retry_stalled',
+                 '_apt_run_waiting'):
         exec(_segment(name), ns)
     assert subprocess.run is real_run
     return ns, clock

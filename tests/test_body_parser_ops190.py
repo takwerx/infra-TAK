@@ -195,7 +195,8 @@ def test_takportal_builds_pin_after_the_checkout():
     _before(upd, '_takportal_update_git(portal_dir)', '_apply_npm_security_overrides(portal_dir')
     _before(upd, '_apply_npm_security_overrides(portal_dir', "['docker', 'compose', 'up', '-d', '--build']")
     dep = _segment('run_takportal_deploy')
-    _before(dep, "'checkout', '--force', _tp_tag", '_apply_npm_security_overrides(portal_dir, plog=plog)')
+    # ops #1042: the existing-checkout checkout lives in _takportal_checkout_existing now
+    _before(dep, '_takportal_checkout_existing(portal_dir, _tp_tag', '_apply_npm_security_overrides(portal_dir, plog=plog)')
     _before(dep, '_apply_npm_security_overrides(portal_dir, plog=plog)', "'--build', '--no-start'")
     ctl = _segment('takportal_control')
     start = ctl[ctl.index("if action == 'start':"):ctl.index("elif action == 'stop':")]

@@ -50,7 +50,7 @@ def _const(name):
     raise AssertionError(f'{name} was renamed or removed')
 
 
-def _setup_ssh(monkeypatch, tmp_path, container, probe='direct'):
+def _setup_ssh(monkeypatch, tmp_path, container, probe='direct', portal_docker=False):
     home = tmp_path / 'home'
     key_dir = home / 'TAK-Portal' / 'data' / 'ssh'
     key_dir.mkdir(parents=True)
@@ -74,8 +74,10 @@ def _setup_ssh(monkeypatch, tmp_path, container, probe='direct'):
         '_takportal_push_settings': lambda restart=False: None,
         '_takportal_install_sudoers': lambda log_fn=None: (True, 'skipped'),
         '_takportal_install_caddy_validate_shim': lambda log_fn=None: 'skipped',
+        '_takportal_harden_logout_file': lambda log_fn=None: 'absent',
         '_takportal_ssh_probe': _probe,
         '_tak_is_container': lambda: container,
+        '_takportal_portal_supports_docker': lambda: portal_docker,   # ops #987
     }
     exec(compile(_const('TAKPORTAL_CONTAINER_TAK_NOTE') + '\n\n' + _func('_takportal_setup_ssh'), 'app.py', 'exec'), ns)
     log = []
@@ -115,3 +117,14 @@ def test_status_card_and_repair_show_the_note():
     repair = _func('takportal_ssh_repair')
     assert 'TAKPORTAL_CONTAINER_TAK_NOTE' in repair and "'note'" in repair
     assert 'd.note' in TPL
+
+
+@pytest.mark.parametrize('probe,ok_expected', [('nopasswd', True), ('root', True), ('none', False), ('direct', False)])
+def test_container_tak_with_a_docker_capable_portal_is_verified_by_the_probe(monkeypatch, tmp_path, probe, ok_expected):
+    """ops #987: a portal that ships Docker TAK Server support is checked, not waved through."""
+    ok, log, calls = _setup_ssh(monkeypatch, tmp_path, container=True, probe=probe, portal_docker=True)
+    text = '\n'.join(log)
+    assert calls['probe'] == 1
+    assert ok is ok_expected
+    assert 'Privileged TAK Portal extras unavailable' not in text
+    assert ('Verified end-to-end' in text) is ok_expected

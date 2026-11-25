@@ -1,3 +1,27 @@
 {
-  "advisories": []
+  "advisories": [
+    {
+      "id": "CVE-2026-98432",
+      "what": "A flaw in the Linux kernel that lets someone on the internet attack this server through any open network port, with no login.",
+      "why": "It is rated critical and attacks are likely soon. The fix only works after the server restarts.",
+      "packages": {
+        "kernel": {
+          "ubuntu-22.04": "5.15.0-203",
+          "ubuntu-22.04/aws": "5.15.0-1120",
+          "ubuntu-22.04/azure": "5.15.0-1126",
+          "ubuntu-22.04/lowlatency": "5.15.0-198",
+          "ubuntu-22.04@6.8": "6.8.0-149",
+          "ubuntu-22.04/aws@6.8": "6.8.0-1069",
+          "ubuntu-22.04/azure@6.8": "6.8.0-1073",
+          "ubuntu-22.04/lowlatency@6.8": "6.8.0-149",
+          "ubuntu-24.04": "6.8.0-149",
+          "ubuntu-24.04/aws": "6.8.0-1069",
+          "ubuntu-24.04/azure": "6.8.0-1073",
+          "ubuntu-24.04/lowlatency": "6.8.0-149",
+          "rocky-9": "5.14.0-687.64.1",
+          "rocky-9@9.9": "5.14.0-741.20.1"
+        }
+      }
+    }
+  ]
 }
