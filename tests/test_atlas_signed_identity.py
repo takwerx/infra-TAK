@@ -336,8 +336,10 @@ def test_the_atlas_vhost_copies_and_strips_the_token():
     src = (ROOT / 'app.py').read_text(encoding='utf-8')
     start = src.index('# ATLAS MDM — administration console (443)')
     block = src[start:src.index('# ATLAS MDM — agent package', start)]
-    copy = [line for line in block.splitlines() if 'copy_headers' in line]
-    assert len(copy) == 1 and 'X-Authentik-Jwt' in copy[0]
+    # ops #1081: the block comes from the one writer; the ATLAS site hands it its header list.
+    copy = [line for line in block.splitlines() if '_caddy_forward_auth_lines(' in line]
+    assert len(copy) == 1 and '_ATLAS_AK_COPY_HEADERS' in copy[0]
+    assert "_ATLAS_AK_COPY_HEADERS = _CADDY_AK_COPY_HEADERS + ' X-Authentik-Jwt'\n" in src
     strip = src[src.index('_AK_FWD_HEADERS = ('):]
     strip = strip[:strip.index(')')]
     assert "'X-Authentik-Jwt'" in strip

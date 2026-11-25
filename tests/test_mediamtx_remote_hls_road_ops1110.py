@@ -71,6 +71,9 @@ NAMES = (
     'MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER', '_CADDY_STRIP_AUTHENTIK_HEADERS',
     '_emit_mediamtx_site', '_caddy_vhost_block', 'CADDYFILE_USER_BLOCKS_MARKER',
     '_MEDIAMTX_IDENTITY_MARKER', '_MEDIAMTX_AK_COPY_HEADERS',
+    # ops #1081, ops #1108: the one writer of every forward_auth block
+    '_caddy_forward_auth_lines', '_CADDY_FORWARD_AUTH_URI', '_CADDY_FORWARD_AUTH_PIN', '_CADDY_APP_HEADER',
+    '_CADDY_APP_LOCK_MATCHER', '_CADDY_APP_LOCK_TEXT', '_CADDY_APP_SLUG_RE',
 )
 
 
