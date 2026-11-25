@@ -633,8 +633,12 @@ def test_console_start_runs_the_pass_in_the_background_after_the_firewall_check(
     body = ast.get_source_segment(APP, fn)
     m = re.search(r'(\w+) = threading\.Thread\(target=_startup_converge_mediamtx_remote_firewall,', body)
     assert m, 'the firewall check thread has no name to wait for'
-    assert re.search(r'threading\.Thread\(target=_startup_converge_mediamtx_overlay_remote,\s*'
+    # ops #1110: the thread runs the video road pass, whose first step is this pass.
+    assert re.search(r'threading\.Thread\(target=_startup_converge_mediamtx_remote_hls_road,\s*'
                      r'args=\(%s,\),\s*daemon=True' % re.escape(m.group(1)), body)
+    road = next(ast.get_source_segment(APP, n) for n in TREE.body
+                if isinstance(n, ast.FunctionDef) and n.name == '_startup_converge_mediamtx_remote_hls_road')
+    assert 'res = _startup_converge_mediamtx_overlay_remote(after)' in road
 
 
 def test_pass_waits_for_the_firewall_check(tmp_path, host, authentik):

@@ -33,6 +33,10 @@ docs/*
 !docs/MANAGED-DB-UPGRADE-FOR-TAK-5.8.md
 !docs/MODULE-DEVELOPMENT.md
 !docs/PLATFORM_REFERENCE.md
+!docs/INSTALL.md
+!docs/RECOVERY.md
+!docs/PORTS.md
+!docs/CONSOLE-ACTIONS.md
 memory-bank/
 .cursor/
 .cursorrules
