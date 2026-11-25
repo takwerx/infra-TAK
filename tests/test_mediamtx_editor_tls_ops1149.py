@@ -274,6 +274,7 @@ def test_default_paths_are_where_the_console_copies_the_stream_certificate():
 
 import ast  # noqa: E402
 import os  # noqa: E402
+import re  # noqa: E402
 import tempfile  # noqa: E402
 import types  # noqa: E402
 
@@ -286,6 +287,9 @@ CONSOLE_NAMES = (
     '_mediamtx_remote_editor_tls_road', '_startup_converge_mediamtx_remote_editor_tls',
     'MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER', '_CADDY_STRIP_AUTHENTIK_HEADERS',
     '_emit_mediamtx_site', '_MEDIAMTX_IDENTITY_MARKER', '_MEDIAMTX_AK_COPY_HEADERS',
+    # ops #1081, ops #1108: the one writer of every forward_auth block
+    '_caddy_forward_auth_lines', '_CADDY_FORWARD_AUTH_URI', '_CADDY_FORWARD_AUTH_PIN', '_CADDY_APP_HEADER',
+    '_CADDY_APP_LOCK_MATCHER', '_CADDY_APP_LOCK_TEXT', '_CADDY_APP_SLUG_RE',
 )
 
 
@@ -320,7 +324,7 @@ class Console:
             return socket.create_connection(('127.0.0.1', port), timeout=timeout)
 
         ns = {
-            'os': os, 'tempfile': tempfile, 'CONFIG_DIR': str(self.cfg_dir),
+            'os': os, 're': re, 'tempfile': tempfile, 'CONFIG_DIR': str(self.cfg_dir),
             'socket': types.SimpleNamespace(create_connection=connect),
             'ssl': types.SimpleNamespace(
                 SSLError=ssl.SSLError, SSLCertVerificationError=ssl.SSLCertVerificationError,
