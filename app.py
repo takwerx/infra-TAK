@@ -81503,13 +81503,18 @@ def _tak_groupless_clients_check(plog):
     for s in sessions:
         if s['cn'] and s['cn'].lower() not in file_users:
             by_cn.setdefault(s['cn'].lower(), []).append(s)
-    # A user with a connection that HAS its groups is looked up fine; its empty ones are old ghosts or
-    # extra connections, not a stuck lookup. It also starts that client over for the next time.
+    # Judge the NEWEST connections of a user. An empty connection OLDER than one that has its groups is a ghost
+    # TAK still lists (ops #172, #223), not a stuck lookup. An empty one NEWER than the newest grouped one is the
+    # client's real connection (nuc Nov 25: the emulator's old socket was still listed with its groups while the new
+    # one sat on __ANON__). A user whose newest connection has its groups starts over for the next time.
+    empty = []
     for cn, ss in by_cn.items():
-        if any(x['groups'] for x in ss):
+        nums = [_subscription_num(x['uid']) for x in ss]
+        newest_ok = max((_subscription_num(x['uid']) for x in ss if x['groups']), default=-1)
+        if newest_ok == max(nums):
             st['dropped'].pop(cn, None)
-    empty = [s for ss in by_cn.values() if not any(x['groups'] for x in ss) for s in ss
-             if s['uid'] not in st['refused']]
+        empty += [x for x in ss if not x['groups'] and _subscription_num(x['uid']) > newest_ok
+                  and x['uid'] not in st['refused']]
     if not empty:
         _reset()
         return None

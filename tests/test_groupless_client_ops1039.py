@@ -216,6 +216,18 @@ def test_a_connection_that_gets_groups_before_the_second_check_starts_over():
     assert box.drops() == []
 
 
+def test_an_empty_connection_newer_than_one_listed_with_groups_is_the_real_one_and_is_healed():
+    """nuc Nov 25: the emulator's old socket was still listed with its groups, the new connection sat on __ANON__."""
+    box = stuck_named_box()
+    box.subs.append(sess(10, 'takdev-emu'))        # the old connection TAK still lists, with its groups
+    tick = checker(box)
+    assert tick() is None and tick() == 'dropped'
+    assert box.drops() == ['tls:16']               # the newer, empty one, not the old one
+    box.t += 20
+    assert tick() is None and tick() == 'restart'  # it came back empty again
+    assert len(box.messaging_restarts()) == 1
+
+
 def test_one_connection_with_groups_makes_the_users_empty_ghosts_harmless():
     box = stuck_named_box()
     box.subs.append(sess(17, 'takdev-emu'))        # the same user's newer connection has its groups
