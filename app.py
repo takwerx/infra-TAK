@@ -42700,6 +42700,40 @@ def _startup_caddy_request_encoding_converge():
           % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
 
 
+def _startup_caddy_security_headers_converge():
+    """ops #1103 — put HSTS (and nosniff on the Authentik sites) into the Caddyfile of a box
+    that already has sites, so the console update itself carries it. Same shape as
+    _startup_caddy_request_encoding_converge(): one read on a box that already has it."""
+    if not os.path.exists(CADDYFILE_PATH):
+        return
+    try:
+        generated = _read_priv(CADDYFILE_PATH).split(CADDYFILE_USER_BLOCKS_MARKER, 1)[0]
+    except Exception as e:
+        print('Startup migration: security headers converge skipped — cannot read %s (%s)'
+              % (CADDYFILE_PATH, str(e)[:120]), flush=True)
+        return
+    if CADDY_HSTS_LINE in generated:
+        return
+    s = load_settings()
+    if not (s.get('fqdn') or '').strip():
+        return
+    generate_caddyfile(s)
+    if not _CADDY_REGISTRY_READY.is_set():
+        print('Startup migration: security headers queued — written with the post-registry '
+              'Caddyfile regen (ops #1103)', flush=True)
+        return
+    try:
+        after = _read_priv(CADDYFILE_PATH)
+    except Exception:
+        return
+    if CADDY_HSTS_LINE not in after:
+        # Nothing to add (no HTTPS site yet) or the regenerated file was rolled back.
+        return
+    _ok, _detail = _caddy_reload_if_changed(timeout=60)
+    print('Startup migration: ✓ sites now send HSTS (and nosniff on Authentik) and Caddy %s (ops #1103)'
+          % ('reloaded' if _ok else 'reload FAILED: ' + _detail[:120]), flush=True)
+
+
 def _nodered_vhost_has_login(generated):
     """True when the Node-RED vhost in a generated Caddyfile has nothing in front of the
     editor to remove (no vhost at all counts as fine). ops #613."""
@@ -43390,6 +43424,55 @@ def _startup_caddy_selfheal():
     _rl_ok, _ = _caddy_reload_checked(timeout=60)
     print('Startup migration: \u2713 Caddyfile regenerated and Caddy %s (GH #59 self-heal)'
           % ('reloaded' if _rl_ok else 'reload FAILED'), flush=True)
+
+
+# ops #1103: security headers Caddy adds at the edge. `header ?Name value` sets the header only
+# when the upstream (or an operator's sites.d include) did not send one, so neither is overridden.
+CADDY_HSTS_LINE = '    header ?Strict-Transport-Security "max-age=31536000;"'
+CADDY_HSTS_STATIC_LINE = '    header Strict-Transport-Security "max-age=31536000;"'
+CADDY_NOSNIFF_LINE = '    header ?X-Content-Type-Options nosniff'
+_CADDY_SITE_PORT_RE = re.compile(r':\d+$')
+
+
+def _inject_security_headers(lines):
+    """Add HSTS to every HTTPS site of a rendered Caddyfile (ops #1103, Lynis/ZAP baseline).
+
+    HSTS belongs to the host name, not the port, so only plain `host {` sites get it:
+    `http://…` (ATLAS's agent package site: plain HTTP on purpose) and `host:port`
+    listeners (CloudTAK video 9997, ATLAS device 8449, Remote Assist device port) are
+    skipped. A site that already writes its own Strict-Transport-Security (ATLAS and Remote
+    Assist) is left byte-identical. Pure function on the line list, so it is testable without
+    a box."""
+    flat = '\n'.join(lines).split('\n')
+    out = []
+    n = len(flat)
+    for i, ln in enumerate(flat):
+        out.append(ln)
+        s = ln.rstrip()
+        if (not s.endswith('{') or s == '{' or s[0].isspace()
+                or s.startswith(('#', '(', 'http://'))):
+            continue
+        addrs = s[:-1].replace(',', ' ').split()
+        if not addrs or any(_CADDY_SITE_PORT_RE.search(a) for a in addrs):
+            continue
+        j, has_own, static_only, has_proxy = i + 1, False, False, False
+        while j < n and flat[j].rstrip() != '}':
+            if 'Strict-Transport-Security' in flat[j]:
+                has_own = True
+                break
+            _w = flat[j].split()
+            if _w[:1] == ['file_server']:
+                static_only = True
+            elif _w[:1] in (['reverse_proxy'], ['forward_auth']):
+                has_proxy = True
+            j += 1
+        if not has_own:
+            # A site that only serves files (the Cesium 3D tiles site) has no upstream that could
+            # send its own HSTS, and the `?` form is skipped when file_server answers 404 (a
+            # handler error), so ZAP's look at the site root found no HSTS. The plain form is
+            # also sent on the 404 and cannot double up here.
+            out.append(CADDY_HSTS_STATIC_LINE if (static_only and not has_proxy) else CADDY_HSTS_LINE)
+    return out
 
 
 def _inject_custom_cert_tls(lines, cert_path, key_path):
@@ -44148,6 +44231,7 @@ def generate_caddyfile(settings=None):
         ak_host = sd['authentik']
         lines.append(f"# Authentik")
         lines.append(f"{ak_host} {{")
+        lines.append(CADDY_NOSNIFF_LINE)   # ops #1103: upstream does not send it on every path
         lines.append(f"    reverse_proxy {ak_up}")
         lines.append(f"}}")
         lines.append("")
@@ -44156,6 +44240,7 @@ def generate_caddyfile(settings=None):
         if fqdn_base and ak_host == f'tak.{fqdn_base}':
             lines.append(f"# Authentik (alternate hostname — same backend)")
             lines.append(f"authentik.{fqdn_base} {{")
+            lines.append(CADDY_NOSNIFF_LINE)
             lines.append(f"    reverse_proxy {ak_up}")
             lines.append(f"}}")
             lines.append("")
@@ -44694,6 +44779,9 @@ def generate_caddyfile(settings=None):
         lines.append(f"    respond 404")
         lines.append(f"}}")
         lines.append("")
+
+    # ops #1103: HSTS on every HTTPS site (the ATLAS and Remote Assist blocks already send it).
+    lines = _inject_security_headers(lines)
 
     # v0.9.51 — Custom certificate (bring-your-own-cert) mode. When ssl_mode == 'custom'
     # the operator has uploaded a full-chain PEM + key on the Caddy page; Caddy must serve
@@ -124136,6 +124224,11 @@ def _startup_migrations():
             _startup_caddy_request_encoding_converge()
         except Exception as _rce_err:
             print(f"Startup migration: request Content-Encoding converge error (non-fatal): {_rce_err}",
+                  flush=True)
+        try:
+            _startup_caddy_security_headers_converge()
+        except Exception as _sh_err:
+            print(f"Startup migration: security headers converge error (non-fatal): {_sh_err}",
                   flush=True)
         try:
             _startup_caddy_nodered_login_converge()
