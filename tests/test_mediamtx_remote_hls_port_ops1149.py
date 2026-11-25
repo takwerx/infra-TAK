@@ -267,6 +267,7 @@ class Console:
                     'remote': {'host': HOST, 'ssh_user': 'ops', 'ssh_port': 22}}
         self.settings = {'fqdn': 'example.org', 'server_ip': CONSOLE, 'mediamtx_deployment': self.cfg}
         self.road_calls = []
+        self.tls_calls = []
         self.firewall_on = True
         # a non-root console on the private layout: no admin socket for it, a broker instead
         self.private_nonroot = False
@@ -295,6 +296,8 @@ class Console:
             '_caddy_operator_include_files': lambda: sorted(self.includes),
             'load_settings': lambda: self.settings,
             '_startup_converge_mediamtx_remote_hls_road': self._road,
+            # the TLS check of the editor hop runs in the same pass (its own test file)
+            '_startup_converge_mediamtx_remote_editor_tls': lambda s, c, log: self.tls_calls.append(list(host.sent)),
             'print': lambda *a, **k: self.log.append(' '.join(str(x) for x in a)),
         }
         exec(_src(*NAMES), ns)
@@ -397,6 +400,11 @@ def test_port_stays_as_it_is_for_a_host_not_on_the_road_through_the_editor(tmp_p
     c = Console(tmp_path, host, marked=False)
     assert c.port() == 'kept'
     assert host.sent == [] and host.allows(8888) == [CONSOLE]
+
+
+def test_the_editor_tls_check_runs_before_the_port_closes(console, host):
+    console.start()
+    assert console.tls_calls == [[]], 'the TLS check must run once, before the host is asked to close the port'
 
 
 def test_firewall_closes_before_the_bind_changes(console, host):
