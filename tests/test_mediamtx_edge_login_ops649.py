@@ -41,10 +41,12 @@ APP = (REPO / 'app.py').read_text(encoding='utf-8')
 TREE = ast.parse(APP)
 
 _NAMES = ('_emit_mediamtx_site', '_caddy_vhost_block', '_vhost_uses_sso',
-          '_mediamtx_vhost_is_safe', '_mediamtx_vhost_needs_regen')
+          '_mediamtx_vhost_is_safe', '_mediamtx_vhost_needs_regen', '_caddy_forward_auth_lines')
 _CONSTS = ('MEDIAMTX_OPEN_PATHS', '_MEDIAMTX_VHOST_MARKER', '_CADDY_STRIP_AUTHENTIK_HEADERS',
            '_MEDIAMTX_AK_COPY_HEADERS', '_MEDIAMTX_IDENTITY_MARKER',
-           'CADDYFILE_USER_BLOCKS_MARKER', '_MEDIAMTX_EDITOR_LOGIN_SCRIPT')
+           'CADDYFILE_USER_BLOCKS_MARKER', '_MEDIAMTX_EDITOR_LOGIN_SCRIPT',
+           '_CADDY_AK_COPY_HEADERS', '_CADDY_FORWARD_AUTH_URI', '_CADDY_FORWARD_AUTH_PIN',
+           '_CADDY_APP_HEADER', '_CADDY_APP_LOCK_MATCHER', '_CADDY_APP_LOCK_TEXT', '_CADDY_APP_SLUG_RE')
 AK_HEADERS = ('X-Authentik-Username', 'X-Authentik-Groups', 'X-Authentik-Email',
               'X-Authentik-Name', 'X-Authentik-Uid', 'X-Infratak-Proxy-Auth')
 HOST = 'stream.example.com'
