@@ -196,7 +196,7 @@ def test_the_version_is_escaped_in_the_server_rendered_line():
 
 
 def test_the_script_sets_text_never_html_and_runs_on_every_poll():
-    js = CONSOLE[CONSOLE.index('function applyTakTested(d)'):CONSOLE.index('function refreshModuleVersions()')]
+    js = CONSOLE[CONSOLE.index('function applyTakTested('):CONSOLE.index('function refreshModuleVersions()')]
     assert 'innerHTML' not in js and 'textContent' in js
     poll = CONSOLE[CONSOLE.index('function refreshModuleVersions()'):]
     assert 'applyTakTested(data.takserver)' in poll[:400]
@@ -204,9 +204,9 @@ def test_the_script_sets_text_never_html_and_runs_on_every_poll():
 
 
 def test_the_script_uses_the_two_card_phrases():
-    js = CONSOLE[CONSOLE.index('function applyTakTested(d)'):CONSOLE.index('function refreshModuleVersions()')]
+    js = CONSOLE[CONSOLE.index('function applyTakTested('):CONSOLE.index('function refreshModuleVersions()')]
     assert "'Newer Version Available'" in js and "'Current Release'" in js
-    assert 'yours is' not in js and 'you run it' not in js and "'Latest we tested: '+d.tested" in js  # tooltip only
+    assert 'yours is' not in js and 'you run it' not in js and "(what||'Latest we tested')+': '+d.tested" in js  # tooltip only
 
 
 def test_the_card_line_sits_only_on_the_takserver_card():

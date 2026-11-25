@@ -492,6 +492,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'takserver' and mod.installed %}{% set _tt = module_versions.get('takserver') or {} %}{% set _st = _tt.get('tested_state') if _tt.get('tested') else '' %}<div id="takserver-card-tested" data-state="{{ _tt.get('tested_state', '') }}"{% if _st in ('behind', 'current') %} title="Latest we tested: {{ _tt.get('tested') }}"{% endif %} style="font-family:'JetBrains Mono',monospace;font-size:10px;color:{% if _st == 'behind' %}var(--yellow,#eab308){% elif _st == 'current' %}var(--green){% else %}var(--text-dim){% endif %};margin-top:4px{% if _st not in ('behind', 'current') %};display:none{% endif %}">{% if _st == 'behind' %}Newer Version Available{% elif _st == 'current' %}Current Release{% endif %}</div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+{% if key == 'fedhub' and mod.installed %}{% set _ft = module_versions.get('fedhub') or {} %}{% set _fst = _ft.get('tested_state') if _ft.get('tested') else '' %}<div id="fedhub-card-tested" data-state="{{ _ft.get('tested_state', '') }}"{% if _fst in ('behind', 'current') %} title="Latest release we tested: {{ _ft.get('tested') }}"{% endif %} style="font-family:'JetBrains Mono',monospace;font-size:10px;color:{% if _fst == 'behind' %}var(--yellow,#eab308){% elif _fst == 'current' %}var(--green){% else %}var(--text-dim){% endif %};margin-top:4px{% if _fst not in ('behind', 'current') %};display:none{% endif %}">{% if _fst == 'behind' %}Newer Version Available{% elif _fst == 'current' %}Current Release{% endif %}</div>{% endif %}
 {% if key == 'caddy' and mod.installed %}<div id="caddy-card-cert-days" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 </a>
 {% endfor %}
@@ -800,22 +801,23 @@ function openWhatsNew(e){
 }
 document.addEventListener('click',openWhatsNew);
 document.addEventListener('keydown',openWhatsNew);
-function applyTakTested(d){
-    // ops #1119: "Latest we tested" on the TAK Server card. Text only, never HTML: the version came from a signed file.
-    var el=document.getElementById('takserver-card-tested');
+function applyTakTested(d,id,what){
+    // ops #1119: "Current Release / Newer Version Available" on the TAK Server and Federation Hub cards. Text only, never HTML: the version came from a signed file.
+    var el=document.getElementById(id||'takserver-card-tested');
     if(!el)return;
     // AJ (ops #1119): two words only. Behind = "Newer Version Available", on it = "Current Release". Ahead of what we tested: no line.
     var note=d&&d.tested?{behind:['Newer Version Available','var(--yellow,#eab308)'],current:['Current Release','var(--green)']}[d.tested_state]:null;
     if(!note){el.style.display='none';el.textContent='';el.removeAttribute('data-state');el.removeAttribute('title');return;}
     el.textContent=note[0];
     el.style.color=note[1];
-    el.title='Latest we tested: '+d.tested;
+    el.title=(what||'Latest we tested')+': '+d.tested;
     el.setAttribute('data-state',d.tested_state||'');
     el.style.display='';
 }
 function refreshModuleVersions(){
     fetch('/api/modules/version').then(function(r){return r.json()}).then(function(data){
         try{if(data&&data.takserver)applyTakTested(data.takserver);}catch(e){}  // the extra line must never stop the version badges below
+        try{if(data&&data.fedhub)applyTakTested(data.fedhub,'fedhub-card-tested','Latest release we tested');}catch(e){}
         for(var key in data){
             var el=document.getElementById('module-version-'+key);
             if(!el)continue;
