@@ -1647,9 +1647,12 @@ def apply_security_headers(response):
     # v0.9.29 (security audit LOW): dropped 'unsafe-eval' — codebase has no
     # eval()/new Function()/string-form setTimeout. Inline scripts still
     # require 'unsafe-inline' (template surgery deferred to nonces).
+    # ops #897: script-src lost `https:`. No console page loads a script from another
+    # host (tests/test_console_csp_script_src_ops897.py keeps it so), and with `https:`
+    # a script injected into a page could load a second script from anywhere.
     csp = (
         "default-src 'self' https: data: blob:; "
-        "script-src 'self' 'unsafe-inline' https:; "
+        "script-src 'self' 'unsafe-inline'; "
         "style-src 'self' 'unsafe-inline' https:; "
         "img-src 'self' data: https:; "
         "font-src 'self' data: https:; "
@@ -74295,6 +74298,44 @@ def _yaml_duplicate_keys(raw, yaml_mod):
     return found
 
 
+_DOCKER_SOCKET_PATHS = ('/var/run/docker.sock', '/run/docker.sock')
+
+
+def _authentik_volume_is_docker_socket(vol):
+    """True when one compose `volumes:` entry mounts the host Docker socket (ops #1103).
+
+    Handles the short form (`/var/run/docker.sock:/var/run/docker.sock[:ro]`) and the long
+    form (`{type: bind, source: /var/run/docker.sock, target: ...}`)."""
+    if isinstance(vol, dict):
+        return str(vol.get('source') or '').rstrip('/') in _DOCKER_SOCKET_PATHS
+    return str(vol).split(':', 1)[0].strip().rstrip('/') in _DOCKER_SOCKET_PATHS
+
+
+def _authentik_strip_docker_socket(services, plog=None):
+    """Remove the Docker socket mount from every service of Authentik's compose file.
+
+    ops #1103 (docker-bench 5.32): upstream's stock compose mounts /var/run/docker.sock in
+    the worker for outposts Authentik starts by itself. Nothing of ours uses it: the LDAP
+    outpost is our own compose service, forward_auth uses the embedded outpost, and the local
+    Docker service connection is deleted at start (_auto_remove_stale_docker_service_connections).
+    With the mount, a takeover of the worker is a takeover of the host. Returns True if
+    anything was removed."""
+    removed = False
+    for _name, _svc in (services or {}).items():
+        if not isinstance(_svc, dict) or not isinstance(_svc.get('volumes'), list):
+            continue
+        _keep = [v for v in _svc['volumes'] if not _authentik_volume_is_docker_socket(v)]
+        if len(_keep) != len(_svc['volumes']):
+            if _keep:
+                _svc['volumes'] = _keep
+            else:
+                _svc.pop('volumes')
+            removed = True
+            if plog:
+                plog(f"  ✓ Removed the Docker socket mount from {_name} (ops #1103)")
+    return removed
+
+
 def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
     """Legacy text-based compose patcher — kept as fallback if PyYAML cannot parse the file.
     Used by _ensure_authentik_compose_patches when yaml.safe_load raises YAMLError.
@@ -74428,6 +74469,15 @@ def _ensure_authentik_compose_patches_legacy(compose_path, plog=None):
                     changed = True
                     if plog:
                         plog("  ✓ Added redis: to top-level volumes section [legacy patcher]")
+
+        # ops #1103: the Docker socket mount goes in this path too (short-form list lines only).
+        _no_sock = [_l for _l in lines
+                    if not (_l.lstrip().startswith('-') and any(_p in _l for _p in _DOCKER_SOCKET_PATHS))]
+        if len(_no_sock) != len(lines):
+            lines = _no_sock
+            changed = True
+            if plog:
+                plog("  ✓ Removed the Docker socket mount [legacy patcher] (ops #1103)")
 
         if changed:
             with open(compose_path, 'w') as f:
@@ -74631,6 +74681,10 @@ def _ensure_authentik_compose_patches(compose_path, plog=None):
             changed = True
             if plog:
                 plog(f"  ✓ Bound {_svc_name} published ports to 127.0.0.1")
+
+    # ── Docker socket out of every service (ops #1103, docker-bench 5.32) ─────
+    if _authentik_strip_docker_socket(services, plog):
+        changed = True
 
     if not changed:
         return False
@@ -77259,7 +77313,7 @@ def _authentik_busy_reason():
     return ''
 
 
-def _recreate_authentik_server_worker(plog, reason):
+def _recreate_authentik_server_worker(plog, reason, services=('server', 'worker')):
     """v0.8.7: Force-recreate Authentik server + worker containers (NEVER ldap).
 
     Used to apply env-var changes (gunicorn only re-reads .env at process startup,
@@ -77281,7 +77335,8 @@ def _recreate_authentik_server_worker(plog, reason):
         return False
 
     started = time.time()
-    plog(f"  authentik recreate: starting (reason={reason}, target=server+worker, ldap=untouched)")
+    _targets = [x for x in services if x in ('server', 'worker')] or ['server', 'worker']
+    plog(f"  authentik recreate: starting (reason={reason}, target={'+'.join(_targets)}, ldap=untouched)")
 
     # v10.0.3: clear any orphaned migration advisory lock first so the recreated server
     # can acquire the migration lock instead of crash-looping 'waiting to acquire database
@@ -77301,7 +77356,7 @@ def _recreate_authentik_server_worker(plog, reason):
                      f"the compose lock; the caller should retry on its next tick")
                 return False
             r = subprocess.run(
-                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps', 'server', 'worker']),
+                _sudo_wrap(['docker', 'compose', 'up', '-d', '--force-recreate', '--no-deps'] + _targets),
                 cwd=os.path.expanduser('~/authentik'), capture_output=True, text=True, timeout=180
             )
             ok = (r.returncode == 0)
@@ -77313,7 +77368,7 @@ def _recreate_authentik_server_worker(plog, reason):
 
     duration = int(time.time() - started)
     if ok:
-        plog(f"  ✓ authentik recreate complete in {duration}s (server+worker recreated, ldap preserved)")
+        plog(f"  ✓ authentik recreate complete in {duration}s ({'+'.join(_targets)} recreated, ldap preserved)")
     else:
         plog(f"  ✗ authentik recreate failed (duration={duration}s): {err_text}")
 
@@ -85236,6 +85291,55 @@ def _authentik_audit_scrape_recent(usernames=('adm_ldapservice', 'webadmin'),
     except Exception as _e:
         _log(f"audit scrape exception (non-fatal): {str(_e)[:160]}")
         return 0
+
+
+def _authentik_docker_socket_converge(plog):
+    """Startup converge (ops #1103): no Authentik container mounts the Docker socket.
+
+    Strips the mount from ~/authentik/docker-compose.yml when it is there (only that, none
+    of the other compose patches), then recreates the worker when the RUNNING worker still
+    has the socket mounted: a compose edit alone changes nothing until the container is
+    recreated. Server, LDAP outpost and the database are not touched. Returns True when the
+    file or the running worker was changed. Idempotent: a clean box does nothing."""
+    compose_path = os.path.expanduser('~/authentik/docker-compose.yml')
+    if not os.path.exists(compose_path):
+        return False
+    try:
+        import yaml as _yaml
+    except ImportError:
+        return False
+    try:
+        with open(compose_path) as f:
+            data = _yaml.safe_load(f.read())
+    except Exception as e:
+        plog(f"  docker socket converge: cannot read the compose file ({str(e)[:120]}), skipping")
+        return False
+    if not isinstance(data, dict):
+        return False
+    acted = False
+    if _authentik_strip_docker_socket(data.get('services'), plog):
+        try:
+            with open(compose_path, 'w') as f:
+                _yaml.safe_dump(data, f, default_flow_style=False, sort_keys=False,
+                                allow_unicode=True, width=200)
+            acted = True
+        except Exception as e:
+            plog(f"  ⚠ docker socket converge: compose write failed: {e}")
+            return False
+    try:
+        r = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', '--format',
+                        '{{range .Mounts}}{{println .Source}}{{end}}', 'authentik-worker-1']),
+            capture_output=True, text=True, timeout=15)
+    except Exception:
+        return acted
+    if r.returncode != 0:
+        return acted   # no such container: a stopped or remote worker; the file is already right
+    if any(_l.strip().rstrip('/') in _DOCKER_SOCKET_PATHS for _l in (r.stdout or '').splitlines()):
+        plog("  the running Authentik worker still has the Docker socket mounted — recreating the worker")
+        if _recreate_authentik_server_worker(plog, reason='docker-socket-strip', services=('worker',)):
+            acted = True
+    return acted
 
 
 def _auto_remove_stale_docker_service_connections(label='Post-update'):
@@ -124438,6 +124542,15 @@ def _startup_migrations():
                 _auto_remove_stale_docker_service_connections(label='Startup migration')
         except Exception as ak_dock_err:
             print(f"Startup migration: docker.sock orphan cleanup error (non-fatal): {ak_dock_err}")
+
+        # ops #1103: the Authentik worker has no Docker socket mount. Fresh deploys and the
+        # compose patcher strip it; this converges a box that already has it (an old deploy,
+        # a hand edit, a stock compose that came back).
+        try:
+            if os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml')):
+                _authentik_docker_socket_converge(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as ak_sock_err:
+            print(f"Startup migration: docker socket strip error (non-fatal): {ak_sock_err}")
 
         # v0.9.21: Re-assert embedded outpost authentik_host to current public URL.
         # Catches FQDN changes after first install and boxes where the one-time
