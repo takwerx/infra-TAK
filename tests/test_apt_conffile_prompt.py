@@ -37,7 +37,8 @@ def test_pkg_install_keeps_existing_conffiles_on_root_boxes():
 def test_broker_keeps_existing_conffiles_for_apt_and_only_apt():
     i = BROKER.index("if os.path.basename(argv[0]) in ('apt', 'apt-get'):\n        env = dict(os.environ)")
     block = BROKER[i:BROKER.index('proc = subprocess.run(argv', i)]
-    assert "env.setdefault('DPKG_FORCE', 'confdef,confold')" in block
+    assert "_dpkg_force = 'confdef,confold'" in block
+    assert "env.setdefault('DPKG_FORCE', _dpkg_force)" in block
 
 
 def test_broker_still_denies_dpkg_options_on_the_command_line():

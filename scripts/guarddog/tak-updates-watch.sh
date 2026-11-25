@@ -39,9 +39,34 @@ unsubstituted() { case "$1" in *_PLACEHOLDER) return 0 ;; *) return 1 ;; esac; }
 # settings.json at send time, so a box deployed before an email was configured still
 # alerts once one is saved - no "click Update Guard Dog" step.
 
+# ops #1217: api.github.com allows 60 calls an hour per IP address, shared with the console.
+# When it answers 403 the old code got an empty answer and the "Update pending" mail was
+# skipped for that run. The github.com /releases/latest page is not limited that way: it
+# redirects to /releases/tag/<tag>, and the Location header names the newest release.
+# Prints the tag (no version/ or v prefix), or nothing. Only a tag on THIS repo's own release
+# pages counts (a renamed or moved repo prints nothing).
+latest_tag_redirect() {
+  local repo="$1" loc
+  loc=$(curl -sS -I --max-time "$CURL_TIMEOUT" -H "User-Agent: infra-TAK" \
+    "https://github.com/${repo}/releases/latest" 2>/dev/null | tr -d '\r' | \
+    awk 'tolower($1)=="location:" {print $2}' | tail -1)
+  case "$loc" in
+    "https://github.com/${repo}/releases/tag/"*) ;;
+    "/${repo}/releases/tag/"*) loc="https://github.com${loc}" ;;
+    *) return 0 ;;
+  esac
+  loc="${loc#https://github.com/${repo}/releases/tag/}"
+  # shape check: the tag goes into a mail and a state file, nothing else
+  printf '%s' "$loc" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._+/-]{0,79}$' || return 0
+  echo "$loc" | sed 's/^version\///' | sed 's/^v//'
+}
+
 # Fetch latest tag from GitHub (repo = org/repo). Strips version/ and v prefix.
+# The release page redirect first (no rate limit), the API second.
 latest_tag() {
-  local repo="$1"
+  local repo="$1" raw
+  raw=$(latest_tag_redirect "$repo")
+  if [ -n "$raw" ]; then echo "$raw"; return 0; fi
   raw=$(curl -sS -f --max-time "$CURL_TIMEOUT" \
     -H "Accept: application/vnd.github.v3+json" -H "User-Agent: infra-TAK" \
     "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null | \
@@ -49,12 +74,15 @@ latest_tag() {
   echo "$raw" | sed 's/^version\///' | sed 's/^v//'
 }
 
-# For infra-TAK we use tags API (no releases/latest)
+# For infra-TAK: the tags API, then the newest release page (the console's own source)
 latest_infratak() {
-  curl -sS -f --max-time "$CURL_TIMEOUT" \
+  local out
+  out=$(curl -sS -f --max-time "$CURL_TIMEOUT" \
     -H "Accept: application/vnd.github.v3+json" -H "User-Agent: infra-TAK" \
     "https://api.github.com/repos/takwerx/infra-TAK/tags?per_page=5" 2>/dev/null | \
-    grep -o '"name":[[:space:]]*"v[^"]*"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/'
+    grep -o '"name":[[:space:]]*"v[^"]*"' | head -1 | sed 's/.*"v\([^"]*\)".*/\1/')
+  if [ -z "$out" ]; then out=$(latest_tag_redirect "takwerx/infra-TAK"); fi
+  echo "$out"
 }
 
 # Return 0 if update available (cur < latest). If we don't know cur, don't report (avoid false "update" when already current).

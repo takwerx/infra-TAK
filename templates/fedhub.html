@@ -79,6 +79,21 @@
   <div class="status-banner not-installed"><div class="dot"></div>Not registered — upload the .deb, choose target (local or remote) below, then <strong>Deploy</strong> (or confirm manually)</div>
   {% endif %}
 
+  {# ops #1119: newest release that passed our TAK Server install and update tests (signed file). Federation Hub ships in the same tak.gov release, so the same number applies. tak.gov needs a login, so the page says it cannot see what tak.gov has. #}
+  {% if fh.installed and fedhub_tested and fedhub_tested.tested %}
+  <div id="fedhub-tested-row" data-state="{{ fedhub_tested.state }}" style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:12px 20px;margin:0 0 18px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.6;color:var(--text-secondary)">
+    <div><strong style="color:var(--text-primary)">Latest release we tested:</strong> {{ fedhub_tested.tested }}{% if fedhub_tested.tested_date %} <span style="color:var(--text-dim)">(tested {{ fedhub_tested.tested_date }}: TAK Server fresh install and update both passed)</span>{% endif %}</div>
+    {% if fedhub_tested.state == 'behind' %}
+    <div style="color:var(--yellow,#eab308)">This Federation Hub runs {{ fedhub_version }}, which is older. Download the takserver-fed-hub {{ fedhub_tested.tested }} package from tak.gov, then use Update Federation Hub below.</div>
+    {% elif fedhub_tested.state == 'current' %}
+    <div style="color:var(--green)">This Federation Hub runs the release we tested.</div>
+    {% elif fedhub_tested.state == 'newer' %}
+    <div style="color:var(--text-dim)">This Federation Hub runs {{ fedhub_version }}, which is newer than the release we tested. We have not tested it yet.</div>
+    {% endif %}
+    <div style="color:var(--text-dim)">tak.gov may have a newer release still. It needs a login, so this page cannot check it.</div>
+  </div>
+  {% endif %}
+
   {% if fh.installed %}
   <div id="fedhub-cert-expiry-banner" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);margin:-4px 0 18px;line-height:1.5;min-height:1.2em"></div>
   {% endif %}

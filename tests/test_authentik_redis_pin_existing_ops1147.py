@@ -36,7 +36,8 @@ yaml = pytest.importorskip('yaml')
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP = (REPO / 'app.py').read_text(encoding='utf-8')
 TREE = ast.parse(APP)
-_WANT = {'_yaml_duplicate_keys', '_ensure_authentik_compose_patches', '_authentik_loopback_port'}
+_WANT = {'_yaml_duplicate_keys', '_ensure_authentik_compose_patches', '_authentik_loopback_port',
+         '_authentik_volume_is_docker_socket', '_authentik_strip_docker_socket'}   # the last two: ops #1103, called by the patcher
 _HELPER = '_authentik_redis_image_target'   # added by the fix; optional here so the base branch fails on behaviour
 
 PIN = 'docker.io/library/redis:8.10.3-alpine'
@@ -62,6 +63,7 @@ def _load(legacy=None):
         '_authentik_pg_command_for_ram': lambda ram: (PG_CMD, 'test-tier'),
         '_local_ram_mb': lambda: 16000,
         'AUTHENTIK_REDIS_IMAGE': _const('AUTHENTIK_REDIS_IMAGE'),
+        '_DOCKER_SOCKET_PATHS': _const('_DOCKER_SOCKET_PATHS'),
         '_ensure_authentik_compose_patches_legacy': legacy or (lambda *a, **k: pytest.fail('legacy patcher reached')),
     }
     exec(compile('\n\n'.join(parts), 'app.py', 'exec'), ns)
@@ -232,7 +234,8 @@ def _legacy_ns():
         if isinstance(node, ast.FunctionDef) and node.name in {'_ensure_authentik_compose_patches_legacy', _HELPER}:
             parts.append(ast.get_source_segment(APP, node))
     ns = {'os': __import__('os'), 're': re, '_authentik_pg_command_for_ram': lambda ram: (PG_CMD, 'test-tier'),
-          '_local_ram_mb': lambda: 16000, 'AUTHENTIK_REDIS_IMAGE': _const('AUTHENTIK_REDIS_IMAGE')}
+          '_local_ram_mb': lambda: 16000, 'AUTHENTIK_REDIS_IMAGE': _const('AUTHENTIK_REDIS_IMAGE'),
+          '_DOCKER_SOCKET_PATHS': _const('_DOCKER_SOCKET_PATHS')}
     exec(compile('\n\n'.join(parts), 'app.py', 'exec'), ns)
     return ns
 

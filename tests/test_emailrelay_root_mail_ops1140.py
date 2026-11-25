@@ -56,7 +56,9 @@ def _fake_run(calls):
         out = ''
         if argv[:2] == ['hostname', '-f']:
             out = 'box1.internal\n'
-        elif argv[:3] == ['postconf', '-h', 'myhostname']:
+        elif argv[:4] == ['postconf', '-h', '-x', 'myorigin']:
+            out = '/etc/mailname\n'           # Debian default: the name comes from the file
+        elif argv[:4] == ['postconf', '-h', '-x', 'myhostname']:
             out = 'box1.internal\n'
         return types.SimpleNamespace(returncode=0, stdout=out, stderr='')
     return run
@@ -81,7 +83,11 @@ def _ctx(files, settings):
 def _stub(monkeypatch, calls):
     monkeypatch.setattr(subprocess, 'run', _fake_run(calls))
     monkeypatch.setattr(er, 'job_log', lambda *a, **k: None, raising=False)
-    monkeypatch.setattr(er, '_read_mailname', lambda: 'tak.example.test', raising=False)
+    # ops #1142: one discovery (postfix_local_names) asks Postfix for myorigin and reads
+    # the file it names; this stands in for /etc/mailname.
+    monkeypatch.setattr(er, '_read_name_file',
+                        lambda path: 'tak.example.test' if path == '/etc/mailname' else '',
+                        raising=False)
 
 
 def _deploy(monkeypatch, settings, files=None):

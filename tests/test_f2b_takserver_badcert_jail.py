@@ -170,7 +170,9 @@ def test_uninstall_removes_the_badcert_files():
 
 def test_recidive_ignores_badcert_bans():
     written = {}
-    ns = _ns(consts=('_F2B_RECIDIVE_BANTIME',), funcs=('_f2b_banaction', '_f2b_write_recidive_config'),
+    ns = _ns(consts=('_F2B_RECIDIVE_BANTIME', '_F2B_UFW_ACTION_PATH'),
+             funcs=('_f2b_banaction', '_f2b_write_recidive_config'),
+             _f2b_ensure_ufw_action=lambda: False,          # _f2b_banaction may write the action file
              _distro_family=lambda: 'debian', _makedirs_priv=lambda *a, **k: None,
              _write_priv=lambda p, c, **k: written.__setitem__(p, c),
              _read_priv=lambda p: '[Definition]\ndbfile = x\n', _sudo_wrap=lambda c: c,

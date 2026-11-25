@@ -117,6 +117,7 @@ def _load(nb, settings, tmp_path, monkeypatch):
         '_get_authentik_env_value': lambda s, k: None,
         '_ensure_app_access_policies': lambda *a: None,
         '_sudo_wrap': lambda argv: argv,
+        '_fw_allow': lambda port, proto='tcp': (True, ''),  # STUN rule, ops #1176
         'save_settings': lambda s: None,
         'generate_caddyfile': lambda s: None,
         '_caddy_reload': lambda timeout=90: None,

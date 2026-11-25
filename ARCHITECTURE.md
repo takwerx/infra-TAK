@@ -14,7 +14,7 @@ infra-TAK is a **single-service appliance**: one clone, one systemd unit
 (`takwerx-console`), one password, one port (`:5001`). That deployment shape is
 the point — it's what makes "no more SSH" possible:
 
-- **Universal recovery** is `git fetch && git checkout` (see README). No build
+- **Universal recovery** is `git fetch && git checkout` (see [docs/RECOVERY.md](docs/RECOVERY.md)). No build
   step, no dependency graph of services to resurrect.
 - **One auditable surface** for CJIS-class deployments: one process, one auth
   path, one log stream.

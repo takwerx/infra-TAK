@@ -74,11 +74,12 @@ def _env(installed, pf_facts, upload_dir, container=False, family='debian',
               'run_takserver_58_container_migration'):
         n[w] = (lambda name: type(name, (), {'__call__': lambda self: None,
                                               '__name__': name})())(w)
-    for c in ('_TAK_VER_RE', 'TAK_GATE_BLOCK_FROM'):
+    for c in ('_TAK_VER_RE', '_TAK_RELEASE_RE', 'TAK_GATE_BLOCK_FROM'):
         exec(_const(c), n)
     n['TAK_GATE_MESSAGE'] = 'gate'
     for f in ('_tak_artifact_version', '_tak_target_version_gate', '_tak_already_on_58',
-              'takserver_update'):
+              '_tak_release_key', '_tak_package_downgrade', '_tak_fmt_release',     # ops #1218
+              '_tak_cross_minor_downgrade_message', 'takserver_update'):
         exec(_cut(f), n)
     return n, started
 
@@ -155,3 +156,19 @@ def test_preflight_crash_falls_back_to_the_old_behaviour(tmp_path):
         raise RuntimeError('db down')
     n['_tak_58_preflight'] = boom
     assert n['_tak_already_on_58']() is False
+
+
+# ops #1218: the Ubuntu update button goes back inside a major.minor, never across one.
+def test_older_release_of_the_same_minor_is_started_not_refused(tmp_path):
+    resp, started = _click(tmp_path, 'takserver_5.8-RELEASE89_all.deb', '5.8-RELEASE90',
+                           {'already_migrated': True, 'pg_running_major': 18})
+    assert resp == {'success': True}
+    assert started == ['run_takserver_upgrade']
+
+
+def test_a_57_package_on_a_58_box_is_refused_before_anything_starts(tmp_path):
+    resp, started = _click(tmp_path, 'takserver_5.7-RELEASE32_all.deb', '5.8-RELEASE90',
+                           {'already_migrated': True, 'pg_running_major': 18})
+    body, code = resp
+    assert code == 400 and 'different major.minor' in body['error']
+    assert started == []

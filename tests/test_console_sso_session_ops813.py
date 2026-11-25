@@ -698,11 +698,23 @@ def test_hardened_idle_lock_still_locks_a_password_session(console, clock):
 
 # --- 6. the pieces the check depends on stay in place -----------------------------------
 
-def test_console_vhost_still_hands_the_group_header_to_the_console():
+def test_console_vhost_hands_the_console_only_the_username_header():
+    """ops #1208: the console takes no decision from the group header, so Caddy no longer copies
+    it (a person in a few hundred groups gave HTTP 431). The client-sent copy is still stripped."""
     src = _func('generate_caddyfile') or APP
-    block = src[src.index('forward_auth @needs_sso'):]
-    block = block[:block.index('reverse_proxy 127.0.0.1:5001')]
-    assert 'X-Authentik-Groups' in block
+    # ops #1081: the block comes from the one writer of every forward_auth block. The console
+    # hands it its own header list (ops #1208: the name only) and its own matcher.
+    call = src[src.index("_caddy_forward_auth_lines(ak_up, \"        \", _CONSOLE_AK_COPY_HEADERS,"):]
+    call = call[:call.index('reverse_proxy 127.0.0.1:5001')]
+    assert "matcher='@needs_sso'" in call
+    assert 'X-Authentik-Groups' not in call
+    assert "_CONSOLE_AK_COPY_HEADERS = 'X-Authentik-Username'\n" in APP
+    writer = APP[APP.index('def _caddy_forward_auth_lines('):]
+    writer = writer[:writer.index('\ndef ')]
+    # ops #1108: the caller's list is written as it is; one header is added to it only for
+    # the application compare, and never taken away.
+    assert "check.append(f'    copy_headers {copy}')" in writer
+    assert "if locked and not keep else copy_headers" in writer
     assert "'X-Authentik-Groups'" in src[src.index('_AK_FWD_HEADERS = ('):][:200], \
         'the client-sent group header must be stripped before forward_auth sets the real one'
 

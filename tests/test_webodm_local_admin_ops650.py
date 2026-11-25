@@ -108,7 +108,7 @@ def test_no_authentik_lines_close_welcome_before_the_proxy():
 
 def test_authentik_branch_closes_welcome_too():
     sec = _webodm_section()
-    fa = sec.index('forward_auth {ak_up}')
+    fa = sec.index('_caddy_forward_auth_lines(ak_up, ')
     assert fa < sec.index('lines += _webodm_proxy_lines(wo_up)')
     # ops #648: client-sent X-Authentik-* headers are removed first in the route
     route = sec.index('lines.append(f"    route {{")')

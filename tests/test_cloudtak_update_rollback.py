@@ -382,11 +382,17 @@ def test_update_prefetches_then_snapshots_before_the_build():
 
 
 def test_a_successful_update_drops_the_rollback_pins():
+    # ops #1262: not right after `up -d` any more: the pins are what a rollback needs if the api
+    # then restart-loops, so they go only after the api has stayed up for 2 minutes
     b = _update_body()
     i_up = b.index("_cloudtak_compose_run(cloudtak_dir, ['up', '-d'], timeout=1800)")
     i_ok = b.index('plog("✓ Containers rebuilt and restarted")')
-    assert '_cloudtak_drop_rollback_pins(_ct_snap)' in b[i_up:i_ok]
+    i_watch = b.index('_cloudtak_api_stability_watch(')
+    i_done = b.index('✓ CloudTAK updated to')
     assert 'expect_version=from_ver' in b[i_up:i_ok]
+    assert '_cloudtak_drop_rollback_pins(_ct_snap)' in b[i_up:i_ok]          # files moved to Garage: no rollback
+    assert '_cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=' in b[i_watch:i_done]
+    assert 'expect_version=from_ver' in b[i_watch:i_done]
 
 
 def test_every_local_failure_after_the_build_puts_the_image_tags_back():
@@ -515,8 +521,8 @@ def test_remote_up_failure_rolls_back_unless_the_files_just_moved_to_garage():
     i_rb = after.index('_cloudtak_rollback_after_failed_up(None, prev_sha, _ct_snap, plog,')
     assert i_mig < i_rb and 'else:' in after[i_mig:i_rb]
     assert 'expect_version=from_ver, remote_cfg=remote_cfg' in after
-    # success: the pins go
-    assert after.rstrip().endswith('_cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=remote_cfg)')
+    # success: the pins stay for the api stability watch (ops #1262), which drops them
+    assert '_cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=remote_cfg)' not in after.rstrip().rsplit('return', 1)[-1]
     # the MinIO check brackets the Garage step
     assert r.index('_had_minio_store = ') < r.index('_cloudtak_remote_compose_is_garage(remote_cfg)') \
         < r.index('_migrated_now = ')

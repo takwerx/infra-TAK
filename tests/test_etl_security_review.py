@@ -73,7 +73,7 @@ def test_gate_refusal_blocks_the_build(b):
               and n.name != '_is_etl_build')
     # the gate check comes before the env is set and before subprocess.run
     body = ast.get_source_segment(b.__loader__.get_source('tb_etl_sr'), fn)
-    assert body.index('_etl_egress_gate()') < body.index("DOCKER_BUILDKIT='0'") < body.index('subprocess.run(argv')
+    assert body.index('_etl_egress_gate()') < body.index("DOCKER_BUILDKIT='0'") < body.index('_run_maybe_ufw_locked(argv')
 
 
 def test_git_is_https_only_without_lfs():

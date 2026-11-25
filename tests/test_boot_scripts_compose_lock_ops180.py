@@ -102,6 +102,7 @@ def box(tmp_path):
     (stubs / 'id').write_text('#!/bin/sh\nexit 1\n')                 # no local postgres
     (stubs / 'systemctl').write_text('#!/bin/sh\nexit 1\n')          # no MediaMTX
     (stubs / 'timeout').write_text('#!/bin/sh\nexit 1\n')            # every TCP probe: down
+    (stubs / 'curl').write_text('#!/bin/sh\nprintf 200\n')           # Authentik's core is ready (ops #1039)
     # sleep only moves a fake clock; tak-post-start.sh reads it through _now (ops #1122), so
     # its late LDAP re-check sees ten minutes pass without the test waiting for them.
     clock = tmp_path / 'clock'
