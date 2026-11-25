@@ -61830,6 +61830,157 @@ _CT_REPEATABLE_CAUSES = ('Likely cause: a CloudTAK PLUGIN server route',
                          'Likely cause: the CloudTAK web app build (vite)')
 
 
+# ops #1262: a Marketplace plugin (Replay) leaves server files in CloudTAK's api tree. After the
+# update to CloudTAK 14 the api could not start: replay-export.js imports `csv-stringify`, and
+# 14.x no longer lists it. The image still BUILT (tsc does not stop on it), the Update button said
+# "updated", and the api then restarted about every 90 seconds, so the map and video answered 502
+# until someone uninstalled Replay (about 40 minutes on the test box). Two guards:
+#   1. before the build, refuse when a plugin file in api/ imports a package the NEW api does not
+#      have, and name the plugin and the way out;
+#   2. after the restart, watch the api container for 2 minutes; a restart loop rolls the update back.
+# Why refuse and not remove the plugin's files (the ask offered both): the files belong to the
+# TAK Portal Marketplace. Deleting them behind its back leaves its list saying "installed" for a
+# plugin that is gone, and it would take away a feature without the customer choosing it.
+_CT_NODE_BUILTINS = frozenset((
+    'assert async_hooks buffer child_process cluster console constants crypto dgram '
+    'diagnostics_channel dns domain events fs http http2 https inspector module net os path '
+    'perf_hooks process punycode querystring readline repl stream string_decoder sys timers tls '
+    'trace_events tty url util v8 vm wasi worker_threads zlib test').split())
+_CT_API_SKIP_DIRS = ('node_modules', 'dist', 'coverage', 'test', 'tests', '__tests__')
+
+
+def _cloudtak_api_plugin_missing_packages(cloudtak_dir):
+    """{npm package: [api-relative files]} that files a plugin added to api/ import, while the
+    api in this tree (package.json + lock file) does not have the package. Only UNTRACKED files
+    are read: CloudTAK's own files are its own business. Never raises; {} = nothing found."""
+    try:
+        api = os.path.join(cloudtak_dir, 'api')
+        have = set()
+        with open(os.path.join(api, 'package.json'), encoding='utf-8') as f:
+            pkg = json.load(f)
+        for k in ('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'):
+            have.update((pkg.get(k) or {}).keys())
+        try:   # hoisted transitive packages resolve too
+            with open(os.path.join(api, 'package-lock.json'), encoding='utf-8') as f:
+                have.update(p[len('node_modules/'):] for p in (json.load(f).get('packages') or {})
+                            if p.startswith('node_modules/') and '/node_modules/' not in p)
+        except (OSError, ValueError):
+            pass
+        r = subprocess.run(['git', '-c', f'safe.directory={cloudtak_dir}', '-C', cloudtak_dir,
+                            'ls-files', '--others', '--exclude-standard', '-z', '--', 'api'],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            return {}
+        missing = {}
+        for rel in sorted(x for x in r.stdout.split('\0') if x.startswith('api/')):
+            sub = rel[len('api/'):]
+            if (not sub.endswith(('.ts', '.js', '.mjs', '.cjs')) or sub.endswith('.d.ts')
+                    or re.search(r'\.(?:test|spec)\.\w+$', sub)
+                    or any(d in sub.split('/')[:-1] for d in _CT_API_SKIP_DIRS)):
+                continue
+            try:
+                with open(os.path.join(api, sub), encoding='utf-8', errors='replace') as f:
+                    src = f.read(500000)
+            except OSError:
+                continue
+            for m in _CT_IMPORT_RE.finditer(src):
+                spec = (m.group(1) or m.group(2) or m.group(3)).split('?', 1)[0]
+                if not spec or spec.startswith(('.', '/', '#', '~', '@/', 'node:')):
+                    continue
+                parts = spec.split('/')
+                dep = '/'.join(parts[:2]) if spec.startswith('@') else parts[0]
+                if dep in have or dep in _CT_NODE_BUILTINS or not _CT_NPM_NAME_RE.fullmatch(dep):
+                    continue
+                if sub not in missing.setdefault(dep, []):
+                    missing[dep].append(sub)
+        return missing
+    except Exception:
+        return {}
+
+
+def _cloudtak_api_plugin_preflight(cloudtak_dir, plog, release_tag=''):
+    """ops #1262: True when the plugin files in api/ can start on the NEW tree. False (with the
+    reason and the way out already logged) when one imports a package the new api lacks: the
+    caller stops before any build and reverts the checkout. Never raises."""
+    try:
+        missing = _cloudtak_api_plugin_missing_packages(cloudtak_dir)
+        if not missing:
+            return True
+        files = sorted({f for fl in missing.values() for f in fl})
+        _f, names = _cloudtak_lint_files_from_plugins(files, cloudtak_dir)
+        who = ', '.join(names) if names else 'a plugin you installed'
+        pk = ', '.join(sorted(missing))
+        target = f"CloudTAK {release_tag}" if release_tag else 'the new CloudTAK'
+        plog(f"✗ Update stopped before the build: {who} needs the npm package {pk}, which {target} no longer includes.")
+        plog("  If the update went on, CloudTAK would restart again and again and the map and video would not load.")
+        plog(f"  Files: {', '.join('api/' + f for f in files[:6])}" + (' …' if len(files) > 6 else ''))
+        plog(f"  To update: open TAK Portal → CloudTAK Marketplace, uninstall {who if names else 'that plugin'}, then press Update again.")
+        plog("  Install it again when its author supports this CloudTAK version.")
+        return False
+    except Exception as e:
+        plog(f"  ⚠ Plugin package check skipped (non-fatal): {str(e)[:160]}")
+        return True
+
+
+_CT_MODULE_MISSING_RE = re.compile(r"Cannot find (?:package|module) '([^']+)'")
+
+
+def _cloudtak_api_stability_watch(cloudtak_dir, plog, remote_cfg=None, seconds=120, interval=10,
+                                  sleep=None):
+    """ops #1262: after `up -d`, is the api container STAYING up? Watches `seconds` seconds.
+    (True, '') when it ran the whole time. (False, reason) when it is restarting or stopped, was
+    restarted by Docker, or started again during the watch. The count and start time are taken
+    from the first look, so one start-up retry before it does not count. Never raises."""
+    sleep = sleep or time.sleep
+    try:
+        cid = ''
+        for _i in range(4):
+            rc, out = _cloudtak_compose_at(cloudtak_dir, ['ps', '-q', 'api'], remote_cfg=remote_cfg, timeout=60)
+            cid = (out.strip().splitlines() or [''])[0].strip() if rc == 0 else ''
+            if re.fullmatch(r'[0-9a-f]{12,64}', cid):
+                break
+            cid = ''
+            sleep(5)
+        if not cid:
+            return False, 'the CloudTAK API container is not there'
+        base = None
+        waited = 0
+        while True:
+            rc, out, _err = _cloudtak_docker(
+                ['docker', 'inspect', '-f',
+                 '{{.State.Status}}|{{.State.Restarting}}|{{.RestartCount}}|{{.State.StartedAt}}', cid],
+                remote_cfg=remote_cfg, timeout=60)
+            parts = out.strip().split('|') if rc == 0 else []
+            if len(parts) == 4:
+                status, restarting, count, started = parts
+                bad = ''
+                if restarting == 'true' or status in ('restarting', 'exited', 'dead', 'removing'):
+                    bad = f'the CloudTAK API is {"restarting" if restarting == "true" or status == "restarting" else status}'
+                elif base is None:
+                    base = (count, started)
+                elif count != base[0]:
+                    bad = f'Docker restarted the CloudTAK API ({count} restarts)'
+                elif started != base[1]:
+                    bad = 'the CloudTAK API started again by itself'
+                if bad:
+                    why = ''
+                    try:
+                        lrc, lout, lerr = _cloudtak_docker(['docker', 'logs', '--tail', '80', cid],
+                                                           remote_cfg=remote_cfg, timeout=60)
+                        m = _CT_MODULE_MISSING_RE.search((lout or '') + '\n' + (lerr or ''))
+                        if m:
+                            why = f" It cannot find the package '{m.group(1)}'."
+                    except Exception:
+                        pass
+                    return False, bad + '.' + why
+            if waited >= seconds:
+                return True, ''
+            sleep(interval)
+            waited += interval
+    except Exception as e:
+        return False, f'the stability check failed: {str(e)[:160]}'
+
+
 def _cloudtak_update_failed_note(plog, hints=None):
     plog("  CloudTAK is still running on the previous build — nothing was removed.")
     if any(str(h).strip().startswith(_CT_REPEATABLE_CAUSES) for h in (hints or ())):
@@ -62514,6 +62665,14 @@ def run_cloudtak_update():
                 plog(f"  Fix or remove {_hname} in {_cloudtak_hooks_dir()}, then run Update again.")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #1262: a plugin's server files that import a package the NEW api no longer has
+            # build fine and then crash the api in a loop. Stop here, before anything is built.
+            if not _cloudtak_api_plugin_preflight(cloudtak_dir, plog, release_tag):
+                _undo_plugin_moves()
+                _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                plog("  CloudTAK is still running on the previous build — nothing was built or removed.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
 
         plog("")
         plog("━━━ Step 3/3: Rebuilding and restarting ━━━")
@@ -62578,7 +62737,7 @@ def run_cloudtak_update():
                     plog(f"✗ CloudTAK update failed at docker compose up -d: {_why}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
-            _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=remote_cfg)
+            # ops #1262: the rollback pins stay until the api has stayed up (checked below).
         else:
             cloudtak_dir = os.path.expanduser('~/CloudTAK')
             dcc = _compose_cmd()
@@ -62710,7 +62869,7 @@ def run_cloudtak_update():
                     plog(f"✗ CloudTAK update failed at docker compose up -d: {_why}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
-            _cloudtak_drop_rollback_pins(_ct_snap)
+            # ops #1262: the rollback pins stay until the api has stayed up (checked below).
         plog("✓ Containers rebuilt and restarted")
         # Converge the postgis role password to .env BEFORE declaring success — the
         # rebuild restarts the API, which is exactly when a latent password mismatch
@@ -62727,6 +62886,32 @@ def run_cloudtak_update():
         if not is_remote:
             _cloudtak_print_converge(cloudtak_dir, plog)   # ops #222: TAK Portal's Print + /print-api
             _cloudtak_verify_plugins_in_app(cloudtak_dir, plog)   # ops #301: plugins survived the new CloudTAK?
+        # ops #1262: "restarted" is not "working". A plugin file the new api cannot load keeps the
+        # api restarting about every 90 seconds while this log said done. Watch it for 2 minutes
+        # (after the steps above, which may legitimately restart it); a restart loop is undone.
+        plog("  Checking that the CloudTAK API stays up (2 minutes)…")
+        _stable, _why_unstable = _cloudtak_api_stability_watch(
+            cloudtak_dir if not is_remote else None, plog,
+            remote_cfg=(remote_cfg if is_remote else None))
+        if not _stable:
+            plog(f"✗ The update did not hold: {_why_unstable}")
+            if _migrated_now:
+                _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=(remote_cfg if is_remote else None))
+                plog("  Not rolling back: this update already moved CloudTAK's files into Garage,")
+                plog("  which the previous version cannot read. Open the CloudTAK log, fix the cause, then press Update again.")
+            else:
+                _undo_plugin_moves()
+                if _cloudtak_rollback_after_failed_up(None if is_remote else cloudtak_dir, prev_sha, _ct_snap, plog,
+                                                      expect_version=from_ver,
+                                                      remote_cfg=(remote_cfg if is_remote else None)):
+                    plog("  CloudTAK is running the previous version again — the update was undone, nothing was lost.")
+                else:
+                    plog("  ⚠ CloudTAK could not be put back on the previous version — open the CloudTAK page.")
+                plog("  A plugin you installed from the TAK Portal Marketplace is the usual cause. Uninstall it there, then press Update again.")
+            plog(f"✗ CloudTAK update failed: {_why_unstable}")
+            cloudtak_deploy_status.update({'running': False, 'error': True})
+            return
+        _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=(remote_cfg if is_remote else None))
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")
