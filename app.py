@@ -39568,6 +39568,26 @@ def _mediamtx_remote_hls_via_editor(settings):
         return False
 
 
+# ops #1149: the remote MediaMTX host whose web editor the console has seen answer TLS on
+# its port, with a certificate this box trusts for the stream name (one line: the host).
+# Caddy then speaks https to that editor. A file in CONFIG_DIR, like the mark above.
+_MEDIAMTX_REMOTE_EDITOR_TLS_FILE = 'mediamtx_remote_editor_tls'
+
+
+def _mediamtx_remote_editor_tls(settings):
+    """ops #1149: True when MediaMTX is on a remote host and the console has seen the editor
+    there answer TLS (_mediamtx_remote_editor_tls_road). Caddy then uses https for that hop."""
+    try:
+        cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+        host = ((cfg.get('remote') or {}).get('host') or '').strip()
+        if cfg.get('target_mode') != 'remote' or not host:
+            return False
+        with open(os.path.join(CONFIG_DIR, _MEDIAMTX_REMOTE_EDITOR_TLS_FILE)) as f:
+            return f.read().strip() == host
+    except Exception:
+        return False
+
+
 def _mediamtx_hls_direct(settings, use_sso, mtx_up):
     """Does Caddy send the stream site's /hls-proxy/* straight to MediaMTX (True), or through
     the login to the editor (False)? Straight without Authentik (no stream site deciding
@@ -39580,7 +39600,8 @@ def _mediamtx_hls_direct(settings, use_sso, mtx_up):
     return not _mediamtx_remote_hls_via_editor(settings)
 
 
-def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue, login_ok=False):
+def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_rescue, login_ok=False,
+                        editor_tls=False):
     """Append the MediaMTX stream-domain vhost to `lines` (called by generate_caddyfile).
 
     v10.2.6: with Authentik, /hls-proxy/* goes through the login to the web editor, whose
@@ -39618,7 +39639,25 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
     the person's name from the token it has checked and not from the plain name header.
     The two lines are written together here and nowhere else: an editor never sees the
     marker from a Caddyfile that does not pass the token.
+
+    editor_tls (ops #1149): True for an editor on a remote host that answers TLS on its port
+    (_mediamtx_remote_editor_tls). Every hop to the editor is then https, the certificate
+    checked against the stream name (the upstream is an address). `header_up Host {hostport}`
+    keeps the site's own name for the editor: since Caddy 2.11 an https upstream gets the
+    upstream address as Host otherwise
+    (https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#https).
     """
+    def _to_editor(indent):
+        if not editor_tls:
+            lines.append(f"{indent}reverse_proxy {mtx_up}")
+            return
+        lines.append(f"{indent}reverse_proxy https://{mtx_up} {{")
+        lines.append(f"{indent}    header_up Host {{hostport}}")
+        lines.append(f"{indent}    transport http {{")
+        lines.append(f"{indent}        tls_server_name {mtx_host.split(':')[0]}")
+        lines.append(f"{indent}    }}")
+        lines.append(f"{indent}}}")
+
     lines.append(_MEDIAMTX_VHOST_MARKER)
     lines.append(f"{mtx_host} {{")
     if hls:
@@ -39642,7 +39681,7 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
             lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
             emit_strip("        ")
             lines.append(f"        {_MEDIAMTX_IDENTITY_MARKER}")
-            lines.append(f"        reverse_proxy {mtx_up}")
+            _to_editor("        ")
             lines.append("    }")
         lines.append("    route {")
         lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
@@ -39657,7 +39696,7 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
         lines.append(f"            {_MEDIAMTX_AK_COPY_HEADERS}")
         lines.append("            trusted_proxies private_ranges")
         lines.append("        }")
-        lines.append(f"        reverse_proxy {mtx_up}")
+        _to_editor("        ")
         lines.append("    }")
     elif login_ok:
         # ops #649: no Authentik. The editor's own login stands in front (its default login
@@ -39666,7 +39705,7 @@ def _emit_mediamtx_site(lines, mtx_host, mtx_up, ak_up, hls, emit_strip, emit_re
         lines.append("    route {")
         lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
         emit_strip("        ")
-        lines.append(f"        reverse_proxy {mtx_up}")
+        _to_editor("        ")
         lines.append("    }")
     else:
         # ops #649: the editor may still answer admin/admin, so it is not published.
@@ -43882,7 +43921,8 @@ def generate_caddyfile(settings=None):
             ak_up if _mtx_ak else None,
             _get_mediamtx_hls_upstream(settings) if _mtx_direct else None,
             _emit_ak_header_strip, _emit_outpost_callback_rescue,
-            login_ok=_mtx_ak or _mediamtx_editor_login_ok(settings))
+            login_ok=_mtx_ak or _mediamtx_editor_login_ok(settings),
+            editor_tls=_mediamtx_remote_editor_tls(settings))
         _emit_alias_redirect(_get_service_alias(settings, 'mediamtx'), mtx_host)
         if _mtx_direct:
             # ops #1149: the direct road needs the HLS port this console closed on the host
@@ -51704,6 +51744,14 @@ paths:
     else:
         plog("  No domain configured — skipping SSL (RTSP unencrypted only)")
 
+    # ops #1149: the stream certificate is on the host now (when there is one). Ask the editor
+    # there for TLS; Caddy changes to https for that hop only after a trusted answer.
+    try:
+        if _mediamtx_remote_editor_tls_road(settings, cfg, plog) == 'switched' and mtx_domain:
+            generate_caddyfile(settings)
+            _caddy_apply_and_verify(plog, 'MediaMTX', [mtx_domain], settings)
+    except Exception as _ed_tls_e:
+        plog(f"⚠ Could not check TLS on the web editor of the remote host: {str(_ed_tls_e)[:160]}")
     # ops #1149: Caddy runs its final site now. Close the HLS port to the console when Caddy
     # no longer reads it (or open it again when it does).
     try:
@@ -117249,6 +117297,103 @@ def _startup_converge_mediamtx_remote_hls_road(after=None):
         print(f"{tag} error (non-fatal): {e}", flush=True)
         return 'failed'
 
+# The console's word for the editor's answer, in plain text.
+_MEDIAMTX_REMOTE_EDITOR_TLS_REASONS = {
+    'unreached': 'the console could not open port 5080 there',
+    'no-tls': 'the editor there answered without TLS (no stream certificate on that box, or '
+              'stream site code from before this change)',
+    'cert': 'its certificate is not one this box trusts for the stream name',
+}
+
+
+def _mediamtx_remote_editor_tls_probe(host, name, timeout=10):
+    """ops #1149: does the web editor on `host` answer TLS on port 5080 with a certificate this
+    box trusts for `name`? The same check Caddy makes (system trust store, the stream name).
+    One word: 'ok', 'no-tls', 'cert' or 'unreached'."""
+    try:
+        raw = socket.create_connection((host, 5080), timeout=timeout)
+    except OSError:
+        return 'unreached'
+    try:
+        ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls = ctx.wrap_socket(raw, server_hostname=name)
+    except ssl.SSLCertVerificationError:
+        raw.close()
+        return 'cert'
+    except (ssl.SSLError, OSError, ValueError):
+        raw.close()
+        return 'no-tls'
+    try:
+        tls.sendall(b'HEAD /login HTTP/1.0\r\nHost: ' + name.encode('ascii', 'ignore') + b'\r\n\r\n')
+        return 'ok' if tls.recv(5) == b'HTTP/' else 'no-tls'
+    except (ssl.SSLError, OSError):
+        return 'no-tls'
+    finally:
+        tls.close()
+
+
+def _mediamtx_remote_editor_tls_road(settings, cfg, log):
+    """ops #1149: the hop from Caddy on the console to the web editor on a REMOTE MediaMTX
+    host goes over TLS.
+
+    The stream site code on the host takes TLS on the editor's port with the stream
+    certificate the console copies there, and still takes plain http. ORDER: the console
+    asks the port first, with the check Caddy makes. Only when it answers TLS with a
+    trusted certificate for the stream name is the host written to
+    _MEDIAMTX_REMOTE_EDITOR_TLS_FILE, which makes generate_caddyfile write https for the
+    hop. A later failed check never removes that file: Caddy stays on https, the stream
+    site stays down until the certificate on the host is valid again, and the log says so.
+
+    Does not touch Caddy (the caller regenerates). Returns 'none' (no remote host),
+    'switched' (just marked), 'on' (marked before, answers), 'kept' (marked before, no
+    valid answer now) or 'plain' (not marked: the hop stays plain http)."""
+    host = ((cfg.get('remote') or {}).get('host') or '').strip()
+    if cfg.get('target_mode') != 'remote' or not host:
+        return 'none'
+    name = (_get_service_domain(settings, 'mediamtx') if (settings.get('fqdn') or '').strip() else '') or ''
+    name = name.split(':')[0]
+    if not name:
+        return 'plain'          # no name: Caddy has no stream site
+    marked = _mediamtx_remote_editor_tls(settings)
+    word = _mediamtx_remote_editor_tls_probe(host, name)
+    if word == 'ok':
+        if marked:
+            return 'on'
+        fd, tmp = tempfile.mkstemp(prefix='.mediamtx-editor-tls-', dir=CONFIG_DIR)   # 0600
+        with os.fdopen(fd, 'w') as f:
+            f.write(host + '\n')
+        os.replace(tmp, os.path.join(CONFIG_DIR, _MEDIAMTX_REMOTE_EDITOR_TLS_FILE))
+        log(f"✓ The web editor on {host} answers TLS with the stream certificate. Caddy now "
+            "speaks https to it.")
+        return 'switched'
+    why = _MEDIAMTX_REMOTE_EDITOR_TLS_REASONS.get(word, 'no usable answer')
+    if marked:
+        log(f"✗ The web editor on {host} gives no valid TLS answer now ({why}). Caddy stays on "
+            "https to it, so the stream site does not load until that box has a valid stream "
+            "certificate again. The next console start checks again.")
+        return 'kept'
+    log(f"⚠ The hop to the web editor on {host} stays plain http ({why}). The next console "
+        "start checks again.")
+    return 'plain'
+
+
+def _startup_converge_mediamtx_remote_editor_tls(settings, cfg, log):
+    """ops #1149, console start: the TLS check of the editor hop, then Caddy when the hop
+    just changed to https (the same steps as the video road pass)."""
+    road = _mediamtx_remote_editor_tls_road(settings, cfg, log)
+    if road != 'switched':
+        return road
+    generate_caddyfile()
+    if not _CADDY_REGISTRY_READY.is_set():
+        log("Caddy change queued: written with the Caddyfile after the modules load")
+        return road
+    ok, detail = _caddy_reload_if_changed(timeout=60)
+    log("✓ Caddy loaded the stream site with https to the web editor" if ok
+        else f"✗ Caddy did not load the new stream site: {str(detail)[:160]}")
+    return road
+
+
 def _startup_converge_mediamtx_remote_hls_port(after=None, wait_s=180):
     """ops #1149, console start: after the video road pass (`after`, its thread, which itself
     waits for the firewall check), close the HLS port on the remote host when the running
@@ -117265,6 +117410,11 @@ def _startup_converge_mediamtx_remote_hls_port(after=None, wait_s=180):
         host = ((cfg.get('remote') or {}).get('host') or '').strip()
         if cfg.get('target_mode') != 'remote' or not cfg.get('deployed') or not host:
             return 'none'
+        try:
+            _startup_converge_mediamtx_remote_editor_tls(
+                settings, cfg, lambda ln: print(f"Startup migration: [MediaMTX remote editor TLS] {ln}", flush=True))
+        except Exception as _tls_e:
+            print(f"Startup migration: [MediaMTX remote editor TLS] error (non-fatal): {_tls_e}", flush=True)
         if _mediamtx_remote_hls_via_editor(settings) and not _mediamtx_remote_hls_closed(cfg):
             end = time.time() + wait_s
             while time.time() < end and _mediamtx_remote_caddy_reads_hls(host) is not False:
