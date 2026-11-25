@@ -80830,6 +80830,45 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 except Exception:
                     pass
 
+        # ops #1039: the heal found a client that came back with no groups again after it was dropped, with
+        # LDAP healthy: TAK's messaging process holds an empty answer for that user (test12 Nov 25: only
+        # `systemctl restart takserver-messaging` cleared it). Restart only that process, never TAK Server,
+        # at most once per `_TAK_MESSAGING_RESTART_GAP_S` (shared with the 1-minute groupless-client check).
+        # If it helped, the HTTPS check below still runs. A Docker TAK, a changed LDAP credential and a
+        # restart that can't be done (no such unit) keep the old full restart.
+        if verdict == 'broken' and not _tak_is_container() and not must_restart:
+            claimed, ago = _tak_messaging_restart_claim()
+            prev = ago
+            if not claimed:
+                plog(f"  ✗ {tag}: {summary} — TAK's messaging was already restarted {ago} min ago, at most one "
+                     f"restart per {_TAK_MESSAGING_RESTART_GAP_S // 60} min: NOT restarting again, alert sent")
+                _tak_messaging_alert(plog, 'limited', summary, minutes_ago=ago)
+                _finish('messaging restart skipped: once per 30 min', healed_ldap_start=ldap_start,
+                        healed_gd_restart=gd_restart)
+                return False
+            plog(f"  {tag}: {summary} — restarting only TAK's messaging process (takserver-messaging), not TAK Server")
+            m_state, m_sum = _tak_messaging_only_restart(plog, tag)
+            if m_state == 'failed':
+                _tak_messaging_restart_unclaim(prev)
+                plog(f"  {tag}: {m_sum} — falling back to restarting TAK Server")
+            else:
+                time.sleep(60)    # the phones reconnect by themselves
+                try:
+                    v2, s2 = _tak_heal_ldap_sessions(plog, tag, ldap_pass)
+                except Exception as e:
+                    v2, s2 = 'unknown', f"client heal error: {str(e)[:120]}"
+                if v2 in ('ok', 'healed'):
+                    plog(f"  ✓ {tag}: clients have their groups again after restarting only TAK's messaging process; {s2}")
+                    _tak_messaging_alert(plog, 'restarted', f"{summary}; {m_sum}; after it: {s2}")
+                    verdict, summary = 'healed', f"{summary}; fixed by restarting only TAK's messaging process"
+                else:
+                    plog(f"  ✗ {tag}: STILL no groups after restarting only TAK's messaging process: {s2}. "
+                         f"Not restarting TAK Server; open the TAK Server page and restart it by hand")
+                    _tak_messaging_alert(plog, 'still', f"{summary}; {m_sum}; after it: {s2}")
+                    _finish('messaging restarted, clients still without groups', healed_ldap_start=ldap_start,
+                            healed_gd_restart=gd_restart)
+                    return False
+
         if verdict in ('ok', 'healed'):
             # ops #316: a restart drops every connected client to fix the HTTPS side alone, and
             # on test6 that side came back by itself 75-204 s after an outpost restart (the
@@ -81176,6 +81215,10 @@ def _tak_stuck_mass_loop():
             _tak_stuck_mass_check(log)
         except Exception as e:
             log(f"error (non-fatal): {str(e)[:200]}")
+        try:
+            _tak_groupless_clients_check(log)     # ops #1039: one named phone with no groups
+        except Exception as e:
+            log(f"groupless-client check error (non-fatal): {str(e)[:200]}")
 
 
 def _tak_stuck_mass_escalate(plog, n_stuck, n_total, minutes, tak_up_min):
@@ -81264,6 +81307,298 @@ def _tak_stuck_clients_alert(plog, outcome, detail, after_boot=False, restarted_
         _guarddog_send_alert_email_via_relay(to_addr, subj, body)
     except Exception as e:
         plog(f"  TAK stuck-phones check: Guard Dog alert email failed: {str(e)[:120]}")
+
+
+# ops #1039 (test12, Nov 25, found in the 10.4.4 T&E): TAK's messaging process (the 8089 side) can keep
+# an EMPTY group result for a cert user after LDAP was unusable for it. The emulator sat on __ANON__
+# with its name and no groups; a forced reconnect, a re-authentication and `systemctl restart
+# takserver-api` all left it there, while LDAP and TAK's 8443 side gave the user its groups.
+# `systemctl restart takserver-messaging` (about 1 min, the API untouched) gave them back. Not
+# proved: that CoreConfig's x509useGroupCache="true" is the cause. The console used to do nothing
+# for ONE such phone when it had seen no outage (the stuck-phones check above needs "no user at all"
+# on at least half of the connections; the outage heal needs an outage it can see).
+# So a 1-minute check looks for a connected cert client that TAK named but gave no groups while
+# LDAP gives that user groups. `_TAK_GROUPLESS_CHECKS` checks in a row: drop that one connection
+# (it reconnects and is looked up again). If the client comes back with no groups again for
+# `_TAK_GROUPLESS_CHECKS` checks, restart ONLY takserver-messaging: never TAK Server, never the API.
+# At most one messaging restart per `_TAK_MESSAGING_RESTART_GAP_S` per box; inside that gap the Guard Dog
+# alert goes out instead (at most hourly). No action while LDAP does not answer, while a console
+# update runs, or in the first `_TAK_STUCK_MASS_DEADLINE_S` after TAK started (the box-boot grace the
+# mass check uses). A Docker TAK has no separate messaging process to restart: the alert only.
+_TAK_GROUPLESS_CHECKS = 2
+_TAK_GROUPLESS_DROP_MEMORY_S = 3600
+_TAK_MESSAGING_RESTART_GAP_S = 1800
+_TAK_MESSAGING_ALERT_GAP_S = 3600
+_TAK_MESSAGING_WAIT_S = 600
+_TAK_MESSAGING_BACK_WAIT_S = 120
+# streak per connection uid; dropped: cn (lower case) → (epoch, uid) of our one drop; refused: uids TAK
+# would not drop (a ghost it still lists), never judged again.
+_tak_groupless = {'tak_start': None, 'seen': {}, 'dropped': {}, 'refused': set()}
+
+
+def _tak_messaging_only_restart(plog, tag):
+    """ops #1039: restart ONLY TAK's messaging process (native install: `systemctl restart
+    takserver-messaging`) and wait for 8089 to accept connections again. Phones reconnect by
+    themselves; the API (8443) is not touched. Returns (state, summary): 'restarted' (8089 is up
+    again), 'not_up' (restarted, 8089 not up in time) or 'failed' (the restart itself failed, for
+    example no such unit: nothing was restarted)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takserver-messaging']),
+                           capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        plog(f"  {tag}: restart of takserver-messaging still running after 240s - waiting for 8089 anyway")
+        r = None
+    if r is not None and r.returncode != 0:
+        return 'failed', f"takserver-messaging could not be restarted: {((r.stderr or '') + (r.stdout or '')).strip()[-200:]}"
+    t0 = time.time()
+    while not _tcp_accepts(8089):
+        if time.time() - t0 >= _TAK_MESSAGING_WAIT_S:
+            return 'not_up', f"8089 was not accepting connections {int(time.time() - t0)}s after restarting takserver-messaging"
+        time.sleep(5)
+    plog(f"  {tag}: TAK's messaging process accepts 8089 again ({int(time.time() - t0)}s after the messaging-only restart)")
+    return 'restarted', f"8089 accepts connections again {int(time.time() - t0)}s after the messaging-only restart"
+
+
+def _tak_messaging_restart_claim():
+    """ops #1039: the one messaging-only restart per `_TAK_MESSAGING_RESTART_GAP_S` per box. Returns
+    (True, the previous restart's epoch) and records the restart BEFORE it is done (a console restart
+    in the middle must not repeat it), or (False, minutes since the last one). When the record can't
+    be read or written the answer is no. A restart that could not be done at all gives the slot back
+    (`_tak_messaging_restart_unclaim`)."""
+    now = time.time()
+    try:
+        s = load_settings()
+        st = dict(s.get('tak_messaging_heal') or {})
+        last = float(st.get('restart_epoch') or 0)
+        if now - last < _TAK_MESSAGING_RESTART_GAP_S:
+            return False, int((now - last) // 60)
+        st['restart_epoch'] = now
+        s['tak_messaging_heal'] = st
+        save_settings(s)
+    except Exception:
+        return False, 0
+    return True, last
+
+
+def _tak_messaging_restart_unclaim(prev):
+    """ops #1039: the restart claimed above could not be done (the restart command failed: nothing was
+    restarted), so the slot goes back to the previous restart's time."""
+    try:
+        s = load_settings()
+        st = dict(s.get('tak_messaging_heal') or {})
+        st['restart_epoch'] = prev
+        s['tak_messaging_heal'] = st
+        save_settings(s)
+    except Exception:
+        pass
+
+
+def _tak_messaging_alert(plog, kind, detail, minutes_ago=None):
+    """ops #1039: Guard Dog email in plain words, one per action. kind: 'restarted' (only TAK's
+    messaging process was restarted), 'limited' (the one restart per 30 min was used, nothing done),
+    'failed' (the restart failed), 'docker' (a Docker TAK cannot restart messaging alone). 'limited',
+    'failed' and 'docker' go out at most hourly. Activity log line always; email when a recipient is
+    set. Never raises."""
+    when = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    if kind != 'restarted':
+        try:
+            s = load_settings()
+            st = dict(s.get('tak_messaging_heal') or {})
+            if time.time() - float(st.get('alert_epoch') or 0) < _TAK_MESSAGING_ALERT_GAP_S:
+                return
+            st['alert_epoch'] = time.time()
+            s['tak_messaging_heal'] = st
+            save_settings(s)
+        except Exception:
+            pass
+    try:
+        _write_priv('/var/log/takguard/restarts.log',
+                    ' '.join(f"{when} | tak-groupless-client | {kind} | {detail}".split()) + '\n', mode='a')
+    except Exception as e:
+        plog(f"  TAK groupless-client check: Guard Dog activity line not written: {str(e)[:120]}")
+    try:
+        settings = load_settings()
+        to_addr = (settings.get('guarddog_alert_email') or '').strip()
+        if not to_addr:
+            plog("  TAK groupless-client check: Guard Dog alert email SUPPRESSED (no recipient configured)")
+            return
+        ident = _guarddog_server_identifier(settings) or socket.gethostname()
+        if kind == 'restarted':
+            subj = f"⚠ TAK messaging restarted: a phone had no groups ({ident})"
+            body = (f"A phone was connected but had no groups, so it could not see other users. Login (LDAP) was "
+                    f"working. Guard Dog restarted only TAK's messaging part. This takes about 1 minute. Phones "
+                    f"reconnect by themselves. TAK Server itself and its web side were not restarted.\n\n"
+                    f"Detail: {detail}\n\nIf a phone still sees nobody in 5 minutes, open the TAK Server page "
+                    f"and restart TAK Server.\n\nConsole: {ident}\n\n— Guard Dog")
+        elif kind == 'limited':
+            subj = f"⚠ A phone has no groups again: TAK NOT restarted ({ident})"
+            body = (f"A phone is connected with no groups. Guard Dog restarted TAK's messaging part "
+                    f"{minutes_ago} min ago for the same problem. It restarts it at most once every "
+                    f"{_TAK_MESSAGING_RESTART_GAP_S // 60} minutes, so it did not restart it again.\n\n"
+                    f"Open the TAK Server page and restart TAK Server. If phones still have no groups after "
+                    f"that, open the Authentik page and check the LDAP outpost.\n\nDetail: {detail}\n\n"
+                    f"Console: {ident}\n\n— Guard Dog")
+        elif kind == 'still':
+            subj = f"⚠ A phone still has no groups after TAK messaging restarted ({ident})"
+            body = (f"A phone was connected with no groups. Guard Dog restarted only TAK's messaging part, and the "
+                    f"phone still has no groups. Guard Dog did not restart TAK Server.\n\nOpen the TAK Server "
+                    f"page and restart TAK Server. If phones still have no groups after that, open the Authentik "
+                    f"page and check the LDAP outpost.\n\nDetail: {detail}\n\nConsole: {ident}\n\n— Guard Dog")
+        elif kind == 'docker':
+            subj = f"⚠ A phone has no groups: TAK Server needs a restart ({ident})"
+            body = (f"A phone is connected with no groups, and dropping its connection did not help. This TAK "
+                    f"Server runs in Docker, so Guard Dog cannot restart only its messaging part and did not "
+                    f"restart anything.\n\nOpen the TAK Server page and restart TAK Server.\n\n"
+                    f"Detail: {detail}\n\nConsole: {ident}\n\n— Guard Dog")
+        else:
+            subj = f"⚠ A phone has no groups: restart of TAK messaging failed ({ident})"
+            body = (f"A phone is connected with no groups. Guard Dog tried to restart TAK's messaging part, and "
+                    f"the restart failed.\n\nOpen the TAK Server page and restart TAK Server.\n\n"
+                    f"Detail: {detail}\n\nConsole: {ident}\n\n— Guard Dog")
+        _guarddog_send_alert_email_via_relay(to_addr, subj, body)
+    except Exception as e:
+        plog(f"  TAK groupless-client check: Guard Dog alert email failed: {str(e)[:120]}")
+
+
+def _tak_groupless_clients_check(plog):
+    """ops #1039: one run of the 1-minute check for a connected cert client that TAK named but gave
+    no groups while LDAP gives its user groups (see the block comment above). Returns what it did:
+    'dropped', 'restart' (only takserver-messaging), 'alert' (nothing restarted, mail sent) or None."""
+    tag = 'TAK groupless-client check'
+    st = _tak_groupless
+
+    def _reset():
+        st['seen'] = {}
+
+    if not os.path.exists('/opt/tak/CoreConfig.xml') or not _coreconfig_has_ldap():
+        _reset()
+        return None
+    tak_start = _tak_started_epoch()
+    if tak_start is None:
+        _reset()
+        return None
+    if st.get('tak_start') is None or abs(tak_start - st['tak_start']) > 1:
+        _reset()                  # a count is about one TAK start; a restarted TAK starts over
+        st['dropped'], st['refused'], st['tak_start'] = {}, set(), tak_start
+    now = time.time()
+    if now - tak_start < _TAK_STUCK_MASS_DEADLINE_S or _console_update_in_progress():
+        _reset()
+        return None
+    sessions = _tak_client_sessions()
+    if sessions is None:
+        return None               # a busy API is not a verdict: keep the count, add nothing
+    file_users = _tak_file_users()
+    by_cn = {}
+    for s in sessions:
+        if s['cn'] and not s['unnamed'] and s['cn'].lower() not in file_users:
+            by_cn.setdefault(s['cn'].lower(), []).append(s)
+    # A user with a connection that HAS its groups is looked up fine; its empty ones are old ghosts or
+    # extra connections, not a stuck lookup. It also starts that client over for the next time.
+    for cn, ss in by_cn.items():
+        if any(x['groups'] for x in ss):
+            st['dropped'].pop(cn, None)
+    empty = [s for ss in by_cn.values() if not any(x['groups'] for x in ss) for s in ss
+             if s['uid'] not in st['refused']]
+    if not empty:
+        _reset()
+        return None
+    ldap_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+    counts = (_ldap_users_tak_group_counts(ldap_pass, sorted({s['cn'] for s in empty}))
+              if ldap_pass and _ensure_ldapsearch() else None)
+    if counts is None:
+        if st['seen']:
+            plog(f"  {tag}: LDAP does not answer — nothing to heal while it is down")
+        _reset()
+        return None               # no groups there is not a fault the console can heal
+    owed = [s for s in empty if counts.get(s['cn'].lower(), 0) > 0]
+    st['seen'] = {s['uid']: st['seen'].get(s['uid'], 0) + 1 for s in owed}
+    ripe = [s for s in owed if st['seen'][s['uid']] >= _TAK_GROUPLESS_CHECKS]
+    for s in list(ripe):
+        if st['dropped'].get(s['cn'].lower(), (0, ''))[1] == s['uid']:
+            st['refused'].add(s['uid'])      # TAK said dropped, still lists it: a ghost, not a client
+            ripe.remove(s)
+    if not ripe:
+        return None
+    again = [s for s in ripe if s['cn'].lower() in st['dropped']
+             and now - st['dropped'][s['cn'].lower()][0] < _TAK_GROUPLESS_DROP_MEMORY_S]
+    if not again:
+        dropped = []
+        for s in sorted(ripe, key=lambda s: _subscription_num(s['uid'])):
+            ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/subscriptions/delete/{urllib.parse.quote(s["uid"])}',
+                                           timeout=20, method='DELETE')
+            if ok is None:
+                plog(f"  {tag}: couldn't drop {s['uid']} ({s['cn']}): {err} — not judging it again")
+                st['refused'].add(s['uid'])
+                continue
+            st['dropped'][s['cn'].lower()] = (now, s['uid'])
+            st['seen'].pop(s['uid'], None)
+            dropped.append(f"{s['uid']} ({s['cn']})")
+        if dropped:
+            plog(f"  {tag}: dropped {len(dropped)} connection(s) TAK named but gave no groups while LDAP gives "
+                 f"their users groups ({', '.join(dropped[:15])}); the clients reconnect and are looked up again")
+            return 'dropped'
+        return None
+    return _tak_groupless_escalate(plog, again)
+
+
+def _tak_groupless_escalate(plog, stuck):
+    """ops #1039: these connections came back with no groups after the console dropped them once, while
+    LDAP gives their users groups: restart only TAK's messaging process, at most once per
+    `_TAK_MESSAGING_RESTART_GAP_S`. Returns 'restart', 'alert' or None."""
+    tag = 'TAK groupless-client check'
+    names = sorted({s['cn'] for s in stuck})
+    detail = (f"{len(names)} client(s) had no groups after their connection was dropped once, while LDAP gave "
+              f"their users groups: {', '.join(names[:5])}{' …' if len(names) > 5 else ''}")
+    if _tak_is_container():
+        plog(f"  ✗ {tag}: {detail}. A Docker TAK has no separate messaging process: nothing restarted, alert sent")
+        _tak_messaging_alert(plog, 'docker', detail)
+        return 'alert'
+    if not _tak_ldap_recycle_lock.acquire(blocking=False):
+        return None               # the LDAP outage heal is working on TAK right now: it owns this
+    try:
+        claimed, ago = _tak_messaging_restart_claim()
+        prev = ago
+        if not claimed:
+            plog(f"  ✗ {tag}: {detail}. TAK's messaging was already restarted {ago} min ago; at most one restart per "
+                 f"{_TAK_MESSAGING_RESTART_GAP_S // 60} min — NOT restarting again")
+            _tak_messaging_alert(plog, 'limited', detail, minutes_ago=ago)
+            return 'alert'
+        plog(f"  ✗ {tag}: {detail}. Restarting only TAK's messaging process (takserver-messaging); the API "
+             f"and TAK Server itself keep running")
+        state, summary = _tak_messaging_only_restart(plog, tag)
+        if state == 'failed':
+            _tak_messaging_restart_unclaim(prev)
+            plog(f"  ✗ {tag}: {summary}")
+            _tak_messaging_alert(plog, 'failed', f"{detail}; {summary}")
+            return 'alert'
+        _tak_groupless['seen'] = {}
+        back = _tak_wait_groups_back(plog, tag, names)
+        _tak_messaging_alert(plog, 'restarted', f"{detail}; {summary}; {back}")
+        return 'restart'
+    finally:
+        _tak_ldap_recycle_lock.release()
+
+
+def _tak_wait_groups_back(plog, tag, names):
+    """After a messaging-only restart: wait up to `_TAK_MESSAGING_BACK_WAIT_S` for these users'
+    connections to be back with their groups. Returns one plain sentence for the log and the mail."""
+    t0 = time.time()
+    want = {n.lower() for n in names}
+    back = set()
+    while True:
+        sessions = _tak_client_sessions()
+        if sessions is not None:
+            back = {s['cn'].lower() for s in sessions if s['groups'] and s['cn'].lower() in want}
+            if want <= back:
+                msg = f"all {len(want)} client(s) were back with their groups {int(time.time() - t0)}s after 8089 came up"
+                plog(f"  ✓ {tag}: {msg}")
+                return msg
+        if time.time() - t0 >= _TAK_MESSAGING_BACK_WAIT_S:
+            msg = (f"{len(want - back)} client(s) were not back with groups "
+                   f"{_TAK_MESSAGING_BACK_WAIT_S}s after 8089 came up (they may be offline)")
+            plog(f"  {tag}: {msg}")
+            return msg
+        time.sleep(5)
 
 
 # New-user enrollment race (root cause of ops #565, nuc 2026-11-09). The LDAP provider runs

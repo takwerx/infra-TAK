@@ -96,7 +96,7 @@ class Box:
                  subs=None, ldap_users=None, tak_ldap_ok=True, dead_pool=0, online=True, api_ok=True,
                  history=None, https='ok', https_after_restart='ok', https_flaky=0, api_busy=0,
                  gd_restart=None, ghosts=(), ghosts_leave=False, outpost='user', api_back_after=None,
-                 api_restart='unavailable'):
+                 api_restart='unavailable', messaging_restart='unavailable', stuck_cache=()):
         self.t = T0
         # What the local outpost's log shows of TAK's lookups during HTTPS logins (ops #158):
         # 'user' = each login is looked up; 'others' = TAK looks the console's admin cert up on
@@ -145,6 +145,12 @@ class Box:
         # ops #1039: what `systemctl restart takserver-api` does: 'fixes' (HTTPS gives groups again),
         # 'no_fix' (still none), 'unavailable' (no such unit: the old behaviour of every older test)
         self.api_restart = api_restart
+        # ops #1039: what `systemctl restart takserver-messaging` does: 'fixes' (TAK's messaging process forgets
+        # the empty group answers it kept: those clients come back with their groups), 'no_fix', 'unavailable'
+        # (no such unit: the old behaviour of every older test). `stuck_cache` = cert users whose lookups TAK's
+        # messaging process answers with 'looked up, no groups' (named, __ANON__ only) until it is restarted.
+        self.messaging_restart, self.stuck_cache = messaging_restart, set(stuck_cache)
+        self.msg_alerts = []           # ops #1039: Guard Dog mails of the messaging-only restart (kind, detail, minutes ago)
         self.leaf_certs, self.user_api, self.workdirs, self.missions = [], [], [], set()
         self.alerts = []               # GH #549: Guard Dog alerts (at, args, kwargs)
 
@@ -210,6 +216,8 @@ class Box:
             return None
         if not self.tak_ldap_ok:
             return None
+        if cn in self.stuck_cache:
+            return []
         return ['OPS'] if self.ldap_users.get(cn, 0) else []
 
     def _materialize(self):
@@ -313,6 +321,20 @@ class Box:
                 self.ports_up_at = self.t + 120
                 self.https = self.https_after_restart
             return subprocess.CompletedProcess(cmd, self.restart_rc, stdout='', stderr='boom' if self.restart_rc else '')
+        if cmd == ['systemctl', 'restart', 'takserver-messaging']:
+            self.t += 20
+            if self.messaging_restart == 'unavailable':
+                return subprocess.CompletedProcess(cmd, 5, stdout='', stderr='Unit takserver-messaging.service not found.\n')
+            self.ports_up_at = self.t + 60
+            if self.messaging_restart == 'fixes':
+                self.stuck_cache.clear()
+                for old in [x for x in self.subs if x['_cn'] in self.ldap_users and self.ldap_users[x['_cn']]
+                            and not [g for g in x['groups'] if g['name'] != '__ANON__']]:
+                    self.subs.remove(old)       # the phone reconnects and is looked up again
+                    self.subs.append(dict(sess(self.next_uid, old['_cn'], ['OPS'], client=old['clientUid']),
+                                          callsign=f'tls:{self.next_uid}'))
+                    self.next_uid += 1
+            return ok()
         if cmd == ['systemctl', 'restart', 'takserver-api']:
             self.t += 20
             if self.api_restart == 'unavailable':
@@ -350,7 +372,10 @@ class Box:
         self.t += s
 
     def restarts(self):
-        return [c for c in self.calls if c[1:2] == ['restart'] and c[2:3] != ['takserver-api']]
+        return [c for c in self.calls if c[1:2] == ['restart'] and c[2:3] not in (['takserver-api'], ['takserver-messaging'])]
+
+    def messaging_restarts(self):
+        return [c for c in self.calls if c == ['systemctl', 'restart', 'takserver-messaging']]
 
     def api_restarts(self):
         return [c for c in self.calls if c == ['systemctl', 'restart', 'takserver-api']]
@@ -413,6 +438,12 @@ class Box:
             if re.search(r'^%s = \d+' % c, APP, re.M):
                 ns[c] = _const(c)
         ns['_tak_https_broken_alert'] = lambda *a, **k: box.alerts.append((box.t, a, k))
+        ns['_tak_messaging_alert'] = lambda plog, kind, detail, minutes_ago=None: box.msg_alerts.append((kind, detail, minutes_ago))
+        for c in ('_TAK_GROUPLESS_CHECKS', '_TAK_GROUPLESS_DROP_MEMORY_S', '_TAK_MESSAGING_RESTART_GAP_S', '_TAK_MESSAGING_ALERT_GAP_S',
+                  '_TAK_MESSAGING_WAIT_S', '_TAK_MESSAGING_BACK_WAIT_S', '_TAK_STUCK_MASS_DEADLINE_S'):   # ops #1039
+            if re.search(r'^%s = \d+' % c, APP, re.M):
+                ns[c] = _const(c)
+        ns['_tak_groupless'] = {'tak_start': None, 'seen': {}, 'dropped': {}, 'refused': set()}
         ns['_tak_ldap_recycle_lock'] = threading.Lock()
         for name in ('_epoch_from_rfc3339', '_docker_started_epoch', '_tak_started_epoch', '_tak_wait_ready', '_tak_api_only_restart',
                      '_tak_ldap_recycle_request', '_tak_recycle_after_ldap_outage',
@@ -422,8 +453,13 @@ class Box:
                      '_tak_device_usernames', '_tak_client_sessions', '_tak_client_sessions_wait',
                      '_tak_log_removed_subscriptions', '_tak_heal_ldap_sessions',
                      '_tak_api_user_check_once', '_tak_api_user_check',
-                     '_ldap_outpost_tak_searches', '_tak_api_check_stuck'):
-            if name == '_tak_api_only_restart' and 'def _tak_api_only_restart(' not in APP:
+                     '_ldap_outpost_tak_searches', '_tak_api_check_stuck',
+                     '_tak_messaging_only_restart', '_tak_messaging_restart_claim', '_tak_messaging_restart_unclaim',
+                     '_tak_groupless_clients_check',
+                     '_tak_groupless_escalate', '_tak_wait_groups_back'):
+            if name in ('_tak_api_only_restart', '_tak_messaging_only_restart', '_tak_messaging_restart_claim',
+                        '_tak_groupless_clients_check', '_tak_groupless_escalate', '_tak_wait_groups_back', '_tak_messaging_restart_unclaim') \
+                    and f'def {name}(' not in APP:
                 continue   # ops #1039: absent on the base code, so the new tests fail on their own asserts
             exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)
         return ns
