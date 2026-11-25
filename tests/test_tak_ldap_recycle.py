@@ -461,9 +461,9 @@ class Box:
                      '_ldap_outpost_tak_searches', '_tak_api_check_stuck',
                      '_tak_messaging_only_restart', '_tak_messaging_restart_claim', '_tak_messaging_restart_unclaim',
                      '_tak_groupless_clients_check',
-                     '_tak_groupless_escalate', '_tak_wait_groups_back'):
+                     '_tak_groupless_escalate', '_tak_wait_groups_back', '_ak_log_names'):
             if name in ('_tak_api_only_restart', '_tak_messaging_only_restart', '_tak_messaging_restart_claim',
-                        '_tak_groupless_clients_check', '_tak_groupless_escalate', '_tak_wait_groups_back', '_tak_messaging_restart_unclaim') \
+                        '_tak_groupless_clients_check', '_tak_groupless_escalate', '_tak_wait_groups_back', '_tak_messaging_restart_unclaim', '_ak_log_names') \
                     and f'def {name}(' not in APP:
                 continue   # ops #1039: absent on the base code, so the new tests fail on their own asserts
             exec(compile(_src(name), f'app.py:{name}', 'exec'), ns)

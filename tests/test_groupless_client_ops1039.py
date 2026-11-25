@@ -283,6 +283,19 @@ def test_a_client_the_messaging_restart_did_not_fix_never_restarts_messaging_aga
     assert 'restart' in run_until(tick, 'restart', most=14) and len(box.messaging_restarts()) == 2
 
 
+def test_a_client_name_with_control_characters_cannot_forge_a_log_line():
+    box = stuck_named_box()
+    tick = checker(box)
+    real = tick.ns['_tak_client_sessions']
+    tick.ns['_tak_client_sessions'] = lambda devices=None, errs=None: [
+        dict(s, cn=s['cn'] + '\nforged line') if s['uid'].endswith(':16') else s for s in (real(devices, errs) or [])]
+    tick.ns['_ldap_users_tak_group_counts'] = lambda p, cns: {c.lower(): 1 for c in cns}
+    tick()
+    tick()
+    assert box.drops() == ['tls:16']
+    assert any('dropped 1 connection(s)' in l for l in box.log) and not any('\nforged' in l for l in box.log)
+
+
 def test_file_users_are_never_touched():
     box = stuck_named_box(stuck_cache=())
     box.subs.append(sess(18, 'admin', ('__ANON__',)))

@@ -81637,7 +81637,7 @@ def _tak_groupless_clients_check(plog):
             ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/subscriptions/delete/{urllib.parse.quote(s["uid"])}',
                                            timeout=20, method='DELETE')
             if ok is None:
-                plog(f"  {tag}: couldn't drop {s['uid']} ({s['cn']}): {err} — not judging it again")
+                plog(f"  {tag}: couldn't drop {_ak_log_names([s['uid'], s['cn']], 2)}: {err} — not judging it again")
                 st['refused'].add(s['uid'])
                 continue
             st['dropped'][s['cn'].lower()] = (now, s['uid'])
@@ -81645,7 +81645,7 @@ def _tak_groupless_clients_check(plog):
             dropped.append(f"{s['uid']} ({s['cn']})")
         if dropped:
             plog(f"  {tag}: dropped {len(dropped)} connection(s) TAK named but gave no groups while LDAP gives "
-                 f"their users groups ({', '.join(dropped[:15])}); the clients reconnect and are looked up again")
+                 f"their users groups ({_ak_log_names(dropped, 15)}); the clients reconnect and are looked up again")
             return 'dropped'
         return None
     return _tak_groupless_escalate(plog, again)
@@ -81658,7 +81658,7 @@ def _tak_groupless_escalate(plog, stuck):
     tag = 'TAK groupless-client check'
     names = sorted({s['cn'] for s in stuck})
     detail = (f"{len(names)} client(s) had no groups after their connection was dropped once, while LDAP gave "
-              f"their users groups: {', '.join(names[:5])}{' …' if len(names) > 5 else ''}")
+              f"their users groups: {_ak_log_names(names, 5)}")
     if _tak_is_container():
         plog(f"  ✗ {tag}: {detail}. A Docker TAK has no separate messaging process: nothing restarted, alert sent")
         _tak_messaging_alert(plog, 'docker', detail)
