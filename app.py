@@ -1771,7 +1771,7 @@ CLOUDTAK_VETTED_RELEASE = "13.127.0"    # OFFLINE FALLBACK ONLY since v10.1.17 â
 # console rollback, a v11 ETL layer); raise it only after the same test passes for the next major.
 # A box that still has the old MinIO folder stops at the newest 13.x first: _cloudtak_tag_for_minio_store().
 # tests/test_cloudtak_major_cap_ops1074.py
-CLOUDTAK_MAX_MAJOR = 14
+CLOUDTAK_MAX_MAJOR = 13
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
 # Caddy's certificate store, and the issuer subdirectory Let's Encrypt lands in.
 # Caddy namespaces the store by the ACME directory URL, so the issuer name is NOT a
