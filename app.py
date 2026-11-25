@@ -13174,6 +13174,14 @@ def console_rollback_api():
                                               'modules/atlas_signed_identity.py')) or {}
         except Exception as _arb:
             print(f'Rollback: ATLAS sign-in step error (non-fatal): {str(_arb)[:160]}', flush=True)
+        # ops #1149: a release without the closed HLS port on a remote MediaMTX box gets the
+        # port back (bind and firewall rule) before the checkout. A failure does not stop the
+        # rollback.
+        hls_port_reset = 'none'
+        try:
+            hls_port_reset = _mediamtx_remote_hls_port_before_rollback(s, console_dir, prev_tag)
+        except Exception as _hpr:
+            print(f'Rollback: MediaMTX HLS port step error (non-fatal): {str(_hpr)[:160]}', flush=True)
         checkout_r = subprocess.run(
             git_cfg + ['checkout', '--force', prev_tag],
             cwd=console_dir, capture_output=True, text=True, timeout=30,
@@ -13192,6 +13200,10 @@ def console_rollback_api():
                         'format, so its accounts got new passwords. The admin password is on '
                         'the MediaMTX page. All of them are in '
                         '/opt/mediamtx-webeditor/initial_admin_password.txt on the editor box.')
+        if hls_port_reset == 'failed':
+            message += (' Port 8888 on the MediaMTX box could not be opened again for that '
+                        'version. If video on the stream site does not play, press Deploy on '
+                        'the MediaMTX page.')
         if 'failed' in atlas_reset.values():
             message += (' ATLAS could not be set back to the sign-in of that version. If the '
                         'ATLAS console refuses administrators, press Update Now again.')
@@ -44154,6 +44166,12 @@ def generate_caddyfile(settings=None):
             login_ok=_mtx_ak or _mediamtx_editor_login_ok(settings),
             app=_fa_app(mtx_host))
         _emit_alias_redirect(_get_service_alias(settings, 'mediamtx'), mtx_host)
+        if _mtx_direct:
+            # ops #1149: the direct road needs the HLS port this console closed on the host
+            # (Authentik was removed). Open it again, in the background.
+            _mtx_dep_cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+            if _mediamtx_remote_hls_closed(_mtx_dep_cfg):
+                _mediamtx_remote_hls_reopen_bg(settings, _mtx_dep_cfg)
 
     fedhub = modules.get('fedhub', {})
     if fedhub.get('installed'):
@@ -51063,10 +51081,32 @@ def _mediamtx_remote_editor_check(deploy_cfg, plog):
 _MEDIAMTX_REMOTE_FW_RULES = (('allow', 8554, 'tcp'), ('allow', 8322, 'tcp'),
                              ('allow', 8890, 'udp'), ('deny', 9898, 'tcp'))
 _MEDIAMTX_REMOTE_CONSOLE_PORTS = (5080, 8888)
+# ops #1149: once Caddy on the console sends video through the sign-in to the editor on the
+# host (ops #1110), nothing on the console reads MediaMTX's HLS port there. The port is then
+# closed to the console too and MediaMTX binds it to loopback (the editor on the host reads
+# it there). A file in CONFIG_DIR holds the host this console closed it on (one line).
+_MEDIAMTX_REMOTE_HLS_PORT = 8888
+_MEDIAMTX_REMOTE_HLS_CLOSED_FILE = 'mediamtx_remote_hls_port_closed'
 
 
-def _mediamtx_remote_console_scope_sh(console_ip=None):
+def _mediamtx_remote_hls_closed(cfg):
+    """ops #1149: True when this console closed the HLS port on the remote host in `cfg`."""
+    try:
+        host = ((cfg.get('remote') or {}).get('host') or '').strip()
+        if cfg.get('target_mode') != 'remote' or not host:
+            return False
+        with open(os.path.join(CONFIG_DIR, _MEDIAMTX_REMOTE_HLS_CLOSED_FILE)) as f:
+            return f.read().strip() == host
+    except Exception:
+        return False
+
+
+def _mediamtx_remote_console_scope_sh(console_ip=None, hls_open=True):
     """Shell: only the console may reach the remote editor (5080) and HLS (8888). ops #630.
+
+    ops #1149: with hls_open=False the HLS port is open to nobody. Every allow rule for it
+    is removed, whatever its source (a console address from an earlier deploy too), and
+    SCOPE_RC=1 when one is still there afterwards.
 
     Sources: the console's address as the remote sees it ($SSH_CLIENT, right on a
     private-LAN split) plus Settings → Server IP (validated IPv4 by the caller), the same
@@ -51076,7 +51116,9 @@ def _mediamtx_remote_console_scope_sh(console_ip=None):
     allow FIRST, add the scoped allows, re-add the deny LAST. The pre-#630 deploy put the
     deny in before the allow, so with ufw on, the console's own Caddy was blocked."""
     extra = console_ip or ''
-    ports = ' '.join(str(p) for p in _MEDIAMTX_REMOTE_CONSOLE_PORTS)
+    ports = ' '.join(str(p) for p in _MEDIAMTX_REMOTE_CONSOLE_PORTS
+                     if hls_open or p != _MEDIAMTX_REMOTE_HLS_PORT)
+    shut = '' if hls_open else str(_MEDIAMTX_REMOTE_HLS_PORT)
     return (
         _REMOTE_SUDO_SH +
         'SRCS=; for A in "${SSH_CLIENT%% *}" "' + extra + '"; do '
@@ -51088,13 +51130,28 @@ def _mediamtx_remote_console_scope_sh(console_ip=None):
         '    $S firewall-cmd --permanent --add-rich-rule="rule family=\'$FAM\' source address=\'$A\' '
         'port port=\'$P\' protocol=\'tcp\' accept" >/dev/null 2>&1 || RC=1; done; '
         '    $S firewall-cmd --permanent --remove-port=$P/tcp >/dev/null 2>&1; done; '
+        f'  for P in {shut}; do '
+        '    $S firewall-cmd --permanent --list-rich-rules 2>/dev/null | grep -F "port port=\\"$P\\" protocol=\\"tcp\\" accept" | '
+        '    while IFS= read -r R; do $S firewall-cmd --permanent --remove-rich-rule="$R" >/dev/null 2>&1; done; '
+        '    $S firewall-cmd --permanent --remove-port=$P/tcp >/dev/null 2>&1; done; '
         '  $S firewall-cmd --reload >/dev/null 2>&1 || RC=1; '
+        f'  for P in {shut}; do '
+        '    if $S firewall-cmd --list-rich-rules 2>/dev/null | grep -qF "port port=\\"$P\\" protocol=\\"tcp\\" accept"; then RC=1; fi; '
+        '    if $S firewall-cmd --list-ports 2>/dev/null | tr " " "\\n" | grep -qx "$P/tcp"; then RC=1; fi; done; '
         'elif command -v ufw >/dev/null 2>&1; then '
         f'  for P in {ports}; do '
         '    $S ufw --force delete deny $P/tcp >/dev/null 2>&1; '
         '    $S ufw --force delete allow $P/tcp >/dev/null 2>&1; '
         '    for A in $SRCS; do $S ufw allow from $A to any port $P proto tcp >/dev/null 2>&1 || RC=1; done; '
         '    $S ufw deny $P/tcp >/dev/null 2>&1 || RC=1; done; '
+        f'  for P in {shut}; do '
+        '    $S ufw --force delete deny $P/tcp >/dev/null 2>&1; '
+        '    $S ufw --force delete allow $P/tcp >/dev/null 2>&1; '
+        '    $S ufw --force delete allow $P >/dev/null 2>&1; '
+        '    $S ufw show added 2>/dev/null | sed -n "s|^ufw allow from \\([0-9a-fA-F:./]*\\) to any port $P proto tcp\\$|\\1|p" | '
+        '    while read -r A; do $S ufw --force delete allow from "$A" to any port $P proto tcp >/dev/null 2>&1; done; '
+        '    $S ufw deny $P/tcp >/dev/null 2>&1 || RC=1; '
+        '    if $S ufw show added 2>/dev/null | grep -Eq "^ufw (allow|limit) (.* port $P( |\\$)|$P(/tcp)?\\$)"; then RC=1; fi; done; '
         'else RC=1; fi; '
         'echo "SCOPE_RC=$RC"'
     )
@@ -51118,19 +51175,195 @@ def _mediamtx_remote_firewall(settings, deploy_cfg, plog):
         if not ok:
             failed.append(f'{verb} {port}/{proto}: {msg[:120]}')
     console_ip = _fedhub_caddy_source_ip(settings)
-    ok, out = _module_run(deploy_cfg, _mediamtx_remote_console_scope_sh(console_ip), timeout=60)
+    # ops #1149: a HLS port this console closed stays closed (a console start must not open
+    # it for the minutes until _mediamtx_remote_hls_port looks again).
+    hls_closed = _mediamtx_remote_hls_closed(deploy_cfg)
+    ok, out = _module_run(deploy_cfg, _mediamtx_remote_console_scope_sh(console_ip, hls_open=not hls_closed),
+                          timeout=60)
     srcs = (re.search(r'SCOPE_SRCS=([^\n]*)', out or '') or [None, ''])[1].split()
     if not ok or 'SCOPE_RC=0' not in (out or ''):
-        failed.append(f'console-only 5080/8888: {(out or "")[-160:]}')
+        failed.append(('console-only 5080, 8888 closed: ' if hls_closed else 'console-only 5080/8888: ')
+                      + (out or "")[-160:])
     if failed:
         plog("✗ Firewall is on, but these rules did NOT apply on the target:")
         for f in failed:
             plog(f"    {f}")
         plog("  Fix the target's firewall before using this box.")
+    elif hls_closed:
+        plog("✓ Firewall on. RTSP/RTSPS/SRT public; web editor open to the console only "
+             f"({', '.join(srcs) or 'no console address found: closed to all'}); HLS and API closed")
     else:
         plog("✓ Firewall on. RTSP/RTSPS/SRT public; web editor and HLS open to the console only "
              f"({', '.join(srcs) or 'no console address found: closed to all'}); API closed")
     return 'on', failed
+
+
+# ops #1149. Runs ON the remote MediaMTX host: put MediaMTX's HLS listener on W (loopback when
+# the console no longer reads it, all interfaces when it does again). MediaMTX loads a changed
+# mediamtx.yml by itself and reopens only the HLS listener; when the listener is not on W
+# after 10 s, MediaMTX is restarted once. A stopped MediaMTX is left stopped, and a host with
+# no `ss` to look with gets no restart. Prints HLS_BIND=ok (also: ok-restarted, ok-stopped,
+# ok-unchecked), noline (no hlsAddress line to change) or fail.
+_MEDIAMTX_REMOTE_HLS_BIND_SH = (
+    _REMOTE_SUDO_SH +
+    'F=/usr/local/etc/mediamtx.yml; W="__ADDR__:__PORT__"; '
+    'good() { L=$(ss -ltnH 2>/dev/null | awk \'$4 ~ /:__PORT__$/ {print $4}\'); [ -n "$L" ] || return 1; '
+    'for X in $L; do case "$W" in 127.0.0.1:*) [ "$X" = "$W" ] || return 1;; '
+    '*) [ "$X" = "127.0.0.1:__PORT__" ] && return 1;; esac; done; return 0; }; '
+    'CUR=$($S sed -n "s/^hlsAddress:[[:space:]]*//p" "$F" 2>/dev/null | head -n 1); '
+    '[ -n "$CUR" ] || { echo HLS_BIND=noline; exit 0; }; '
+    'if [ "$CUR" != "$W" ]; then '
+    '$S sed -i "s|^hlsAddress:.*|hlsAddress: $W|" "$F" || { echo HLS_BIND=fail; exit 0; }; fi; '
+    'systemctl is-active --quiet mediamtx || { echo HLS_BIND=ok-stopped; exit 0; }; '
+    'command -v ss >/dev/null 2>&1 || { echo HLS_BIND=ok-unchecked; exit 0; }; '
+    'for I in 1 2 3 4 5; do good && { echo HLS_BIND=ok; exit 0; }; sleep 2; done; '
+    '$S systemctl restart mediamtx >/dev/null 2>&1; '
+    'for I in 1 2 3 4 5 6; do sleep 2; good && { echo HLS_BIND=ok-restarted; exit 0; }; done; '
+    'echo HLS_BIND=fail'
+)
+
+
+def _mediamtx_remote_hls_bind(cfg, loopback):
+    """ops #1149: MediaMTX's HLS listener on the remote host to loopback (True) or to every
+    interface (False: the console's Caddy reads it, the firewall lets only the console in).
+    Returns the host's word: 'ok', 'ok-restarted', 'ok-stopped', 'noline', 'fail'."""
+    addr = '127.0.0.1' if loopback else '0.0.0.0'
+    sh = (_MEDIAMTX_REMOTE_HLS_BIND_SH.replace('__ADDR__', addr)
+          .replace('__PORT__', str(_MEDIAMTX_REMOTE_HLS_PORT)))
+    ok, out = _module_run(cfg, sh, timeout=90)
+    m = re.search(r'^HLS_BIND=([a-z-]{1,20})$', out or '', re.M)
+    return m.group(1) if (ok and m) else 'fail'
+
+
+def _mediamtx_remote_caddy_reads_hls(host):
+    """ops #1149: does the RUNNING Caddy have an upstream on `<host>:8888`? True, False, or
+    None when that cannot be known.
+
+    The admin API answers for a root console. On the private layout (ops #814) the admin API
+    is a unix socket for root and `caddy` only, so a non-root console cannot open it. There
+    the Caddyfile on disk answers, but only after Caddy took that exact file: the broker's
+    caddy_reload runs `caddy reload` without --force, which loads the file when it differs
+    from the running config and does nothing when they match
+    (https://caddyserver.com/docs/command-line#caddy-reload). The operator's include files
+    are read with it (Caddy imports them). A file Caddy refuses, a file that changed
+    meanwhile, a file the console cannot read, or no broker: None."""
+    needle = f'{host}:{_MEDIAMTX_REMOTE_HLS_PORT}'
+    uses = _caddy_running_config_has(needle)
+    if uses is not None:
+        return uses
+
+    def _on_disk():
+        parts = [_read_priv(CADDYFILE_PATH) or '']
+        if not parts[0].strip():
+            return None
+        parts += [_read_priv(path) or '' for path in _caddy_operator_include_files()]
+        return '\n'.join(parts)
+
+    try:
+        if not (_caddy_private() and _broker_should_route() and _broker_available()):
+            return None
+        text = _on_disk()
+        if text is None:
+            return None
+        if not _broker_request({'op': 'caddy_reload'}, timeout=75).get('ok'):
+            return None
+        if _on_disk() != text:
+            return None         # written again while Caddy was asked: the next look decides
+        live = '\n'.join(ln for ln in text.splitlines() if not ln.lstrip().startswith('#'))
+        return re.search(r'(?<![\w.-])' + re.escape(needle) + r'(?!\d)', live) is not None
+    except Exception:
+        return None
+
+
+_MEDIAMTX_REMOTE_HLS_PORT_LOCK = threading.Lock()
+
+
+def _mediamtx_remote_hls_port(settings, cfg, log, force_open=False):
+    """One caller at a time (a console start, a deploy, a rollback and the background reopen
+    can meet): see _mediamtx_remote_hls_port_locked."""
+    with _MEDIAMTX_REMOTE_HLS_PORT_LOCK:
+        return _mediamtx_remote_hls_port_locked(settings, cfg, log, force_open)
+
+
+def _mediamtx_remote_hls_port_locked(settings, cfg, log, force_open=False):
+    """ops #1149: close MediaMTX's HLS port (8888) on a remote host to the console once the
+    console no longer reads it, and open it again when the console does.
+
+    After ops #1110, Caddy on the console sends stream site video through the sign-in to the
+    editor on the host, and the editor reads MediaMTX on loopback there. The port still was
+    open to the console's address and bound to every interface. Nothing we ship reads it then
+    (CloudTAK's media server pulls RTSP on 8554, ops #797).
+
+    ORDER: the RUNNING Caddy is asked first (_mediamtx_remote_caddy_reads_hls). The port closes only when Caddy has
+    no upstream `<host>:8888` and the console has marked the host as serving video through the
+    editor: firewall rule first, then the bind. When Caddy does dial the port (no Authentik,
+    or an editor that does not serve video yet), a port this console closed is opened again:
+    bind first, then the rule. When Caddy cannot be asked, nothing changes.
+    force_open: open it whatever Caddy says (a console rollback to a release without this).
+
+    Returns 'none' (no remote host), 'closed', 'open' or 'kept' (nothing changed, or the
+    host did not do what was asked: the log line says which)."""
+    host = ((cfg.get('remote') or {}).get('host') or '').strip()
+    if cfg.get('target_mode') != 'remote' or not host:
+        return 'none'
+    port = _MEDIAMTX_REMOTE_HLS_PORT
+    closed = _mediamtx_remote_hls_closed(cfg)
+    mark = os.path.join(CONFIG_DIR, _MEDIAMTX_REMOTE_HLS_CLOSED_FILE)
+    if force_open:
+        want_open = True
+    else:
+        uses = _mediamtx_remote_caddy_reads_hls(host)
+        if uses is None:
+            if closed or _mediamtx_remote_hls_via_editor(settings):
+                log(f"⚠ Port {port} on {host} stays as it is: the console could not ask the "
+                    "running Caddy which road it uses. The next console start tries again.")
+            return 'kept'
+        if not uses and not _mediamtx_remote_hls_via_editor(settings):
+            return 'kept'       # no reader, but not on the road through the editor: as it was
+        want_open = bool(uses)
+    console_ip = _fedhub_caddy_source_ip(settings)
+    if not want_open:
+        if not closed:
+            # A rule in a firewall that is off closes nothing (ops #630).
+            act_ok, _be, _act_msg = _module_fw_ensure_active(cfg)
+            if not act_ok:
+                log(f"✗ Port {port} on {host} was not closed to the console: the firewall there "
+                    "is not on. The next console start tries again.")
+                return 'kept'
+            ok, out = _module_run(cfg, _mediamtx_remote_console_scope_sh(console_ip, hls_open=False),
+                                  timeout=60)
+            if not ok or 'SCOPE_RC=0' not in (out or ''):
+                log(f"✗ Port {port} on {host} could not be closed to the console (the firewall "
+                    "there did not take the change). The next console start tries again.")
+                return 'kept'
+            fd, tmp = tempfile.mkstemp(prefix='.mediamtx-hls-port-', dir=CONFIG_DIR)   # 0600
+            with os.fdopen(fd, 'w') as f:
+                f.write(host + '\n')
+            os.replace(tmp, mark)
+        word = _mediamtx_remote_hls_bind(cfg, True)
+        if word.startswith('ok'):
+            if not closed:
+                log(f"✓ Port {port} on {host} is closed to the console and MediaMTX there listens "
+                    "on it for its own box only. Video goes through the web editor.")
+        else:
+            log(f"⚠ Port {port} on {host} is closed in the firewall, but MediaMTX there still "
+                f"listens on it for every address ({word}). The next console start tries again.")
+        return 'closed'
+    if not closed and not force_open:
+        return 'open'
+    word = _mediamtx_remote_hls_bind(cfg, False)
+    ok, out = _module_run(cfg, _mediamtx_remote_console_scope_sh(console_ip, hls_open=True), timeout=60)
+    if not word.startswith('ok') or not ok or 'SCOPE_RC=0' not in (out or ''):
+        log(f"✗ Port {port} on {host} could not be opened to the console again "
+            f"(MediaMTX: {word}). Video on the stream site may fail until it is.")
+        return 'kept'
+    try:
+        os.remove(mark)
+    except OSError:
+        pass
+    log(f"✓ Port {port} on {host} is open to the console again (and to no one else): Caddy on "
+        "the console sends video straight to MediaMTX.")
+    return 'open'
 
 
 # ops #892: Step 1 of the remote deploy ran a bare `apt-get`, so a Rocky/RHEL 9 remote host stopped
@@ -51302,6 +51535,9 @@ def _run_mediamtx_deploy_remote(settings, deploy_cfg, plog):
     # apiAddress stays on 127.0.0.1 (webedit Flask calls it locally on the remote host).
     # hlsAddress is 0.0.0.0 so Caddy on the console can reverse-proxy HLS streams;
     # UFW below restricts port 8888 to the console IP only.
+    # ops #1149: loopback on a host where this console closed the port (video goes through
+    # the editor there). _mediamtx_remote_hls_port at the end of the deploy looks again.
+    _hls_bind_addr = '127.0.0.1' if _mediamtx_remote_hls_closed(deploy_cfg) else '0.0.0.0'
     mediamtx_yml = f"""# MediaMTX - infra-TAK remote
 logLevel: info
 logDestinations: [stdout]
@@ -51323,7 +51559,7 @@ rtcpAddress: :8001
 rtmp: no
 rtmpAddress: :1935
 hls: yes
-hlsAddress: 0.0.0.0:8888
+hlsAddress: {_hls_bind_addr}:8888
 hlsAllowOrigins: ['*']
 hlsTrustedProxies: ['127.0.0.1']
 webrtc: no
@@ -51751,6 +51987,13 @@ paths:
             plog("  Go to Caddy page, reload, then redeploy to retry")
     else:
         plog("  No domain configured — skipping SSL (RTSP unencrypted only)")
+
+    # ops #1149: Caddy runs its final site now. Close the HLS port to the console when Caddy
+    # no longer reads it (or open it again when it does).
+    try:
+        _mediamtx_remote_hls_port(settings, cfg, plog)
+    except Exception as _hls_port_e:
+        plog(f"⚠ Could not check the HLS port on the remote host: {str(_hls_port_e)[:160]}")
 
     # Register MediaMTX proxy provider + application in Authentik (if running)
     ak_dir = os.path.expanduser('~/authentik')
@@ -116547,7 +116790,8 @@ def _mediamtx_remote_fw_alert(settings, host, state, failed):
         body = (f"The firewall on the remote MediaMTX box {host} is on, but these rules did not "
                 f"apply:\n\n" + '\n'.join(f"  {f}" for f in failed) +
                 f"\n\nCheck the box's firewall rules for ports 5080 and 8888: they should allow "
-                f"only the infra-TAK console.\n\nConsole: {ident}\n\n— Guard Dog")
+                f"only the infra-TAK console (port 8888 is closed to every address when video "
+                f"goes through the web editor).\n\nConsole: {ident}\n\n— Guard Dog")
     try:
         ok = _guarddog_send_alert_email_via_relay(to_addr, subj, body)
     except Exception as e:
@@ -117295,6 +117539,84 @@ def _startup_converge_mediamtx_remote_hls_road(after=None):
     except Exception as e:
         print(f"{tag} error (non-fatal): {e}", flush=True)
         return 'failed'
+
+def _startup_converge_mediamtx_remote_hls_port(after=None, wait_s=180):
+    """ops #1149, console start: after the video road pass (`after`, its thread, which itself
+    waits for the firewall check), close the HLS port on the remote host when the running
+    Caddy no longer reads it (_mediamtx_remote_hls_port). The road pass may have queued its
+    Caddy change until the modules load, so a host on the road through the editor is looked
+    at for up to `wait_s` seconds before the port is left as it is until the next console
+    start."""
+    tag = 'Startup migration: [MediaMTX remote HLS port]'
+    try:
+        if after is not None:
+            after.join(1800)
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+        host = ((cfg.get('remote') or {}).get('host') or '').strip()
+        if cfg.get('target_mode') != 'remote' or not cfg.get('deployed') or not host:
+            return 'none'
+        if _mediamtx_remote_hls_via_editor(settings) and not _mediamtx_remote_hls_closed(cfg):
+            end = time.time() + wait_s
+            while time.time() < end and _mediamtx_remote_caddy_reads_hls(host) is not False:
+                time.sleep(10)
+        return _mediamtx_remote_hls_port(settings, cfg, lambda ln: print(f"{tag} {ln}", flush=True))
+    except Exception as e:
+        print(f"{tag} error (non-fatal): {e}", flush=True)
+        return 'failed'
+
+
+_MEDIAMTX_REMOTE_HLS_REOPEN_LOCK = threading.Lock()
+
+
+def _mediamtx_remote_hls_reopen_bg(settings, cfg):
+    """ops #1149: generate_caddyfile is about to write the direct road to a HLS port this
+    console closed (Authentik was removed). Open the port again, in the background: the
+    Caddyfile is never held up by SSH to another box. One run at a time."""
+    def _run():
+        if not _MEDIAMTX_REMOTE_HLS_REOPEN_LOCK.acquire(False):
+            return
+        try:
+            _mediamtx_remote_hls_port(
+                settings, cfg, lambda ln: print(f"[MediaMTX remote HLS port] {ln}", flush=True),
+                force_open=True)
+        except Exception as e:
+            print(f"[MediaMTX remote HLS port] error (non-fatal): {e}", flush=True)
+        finally:
+            _MEDIAMTX_REMOTE_HLS_REOPEN_LOCK.release()
+    threading.Thread(target=_run, daemon=True, name='mediamtx-remote-hls-reopen').start()
+
+
+def _console_release_app_has(console_dir, tag, needle):
+    """Does app.py of console release `tag` hold the fixed text `needle`? True, False, or None
+    when git cannot say."""
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', str(tag or '')):
+        return None   # never let a stored value reach git as an option
+    try:
+        r = subprocess.run(
+            ['git', '-c', f'safe.directory={console_dir}', 'grep', '-q', '-F', '-e', needle,
+             tag, '--', 'app.py'],
+            cwd=console_dir, capture_output=True, text=True, timeout=30,
+            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+    except Exception:
+        return None
+    return True if r.returncode == 0 else (False if r.returncode == 1 else None)
+
+
+def _mediamtx_remote_hls_port_before_rollback(settings, console_dir, tag):
+    """ops #1149, console rollback: a release without this change may send video straight to
+    the HLS port on the remote host, and its console start opens the firewall rule again but
+    not MediaMTX's bind. So open the port (bind and rule) before the checkout. Returns
+    'none' (nothing to do), 'opened' or 'failed' (the rollback goes on)."""
+    cfg = _get_module_deployment_config(settings, 'mediamtx_deployment')
+    if not _mediamtx_remote_hls_closed(cfg):
+        return 'none'
+    if _console_release_app_has(console_dir, tag, '_MEDIAMTX_REMOTE_HLS_CLOSED_FILE'):
+        return 'none'
+    res = _mediamtx_remote_hls_port(
+        settings, cfg, lambda ln: print(f'Rollback: MediaMTX {ln}', flush=True), force_open=True)
+    return 'opened' if res == 'open' else 'failed'
+
 
 def _startup_converge_mediamtx_unit_nonroot():
     """v10.1.33: move a legacy `User=root` mediamtx.service onto takwerx.
@@ -121867,8 +122189,13 @@ def _startup_migrations():
         # ops #1110 — then the video road: once the editor there serves /hls-proxy/, Caddy
         # sends video through the sign-in (_startup_converge_mediamtx_remote_hls_road runs
         # _startup_converge_mediamtx_overlay_remote first, in the same thread).
-        threading.Thread(target=_startup_converge_mediamtx_remote_hls_road, args=(_mtx_remote_fw_t,),
-                         daemon=True, name='startup-mediamtx-remote-overlay').start()
+        _mtx_remote_road_t = threading.Thread(target=_startup_converge_mediamtx_remote_hls_road, args=(_mtx_remote_fw_t,),
+                                              daemon=True, name='startup-mediamtx-remote-overlay')
+        _mtx_remote_road_t.start()
+        # ops #1149 — then the HLS port on that box: closed to the console once the running
+        # Caddy no longer reads it. After the road pass, never beside it.
+        threading.Thread(target=_startup_converge_mediamtx_remote_hls_port, args=(_mtx_remote_road_t,),
+                         daemon=True, name='startup-mediamtx-remote-hls-port').start()
 
         try:
             _startup_converge_mediamtx_ssl()
