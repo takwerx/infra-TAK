@@ -108,7 +108,7 @@ def _expected_ak(up, direct_hls=None):
         '        reverse_proxy /outpost.goauthentik.io/* 127.0.0.1:9090',
         '        forward_auth 127.0.0.1:9090 {',
         '            uri /outpost.goauthentik.io/auth/caddy',
-        '            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt',
+        '            copy_headers X-Authentik-Username X-Authentik-Jwt',
         '            trusted_proxies private_ranges',
         '        }',
         f'        reverse_proxy {up}',

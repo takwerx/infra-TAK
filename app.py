@@ -11933,6 +11933,120 @@ def _git_ls_remote(*patterns, repo=None):
     except Exception:
         return None
 
+# --- Newest release of a GitHub repo, without spending the 60-an-hour API budget (ops #1217) ---
+# api.github.com allows 60 unauthenticated calls an hour per IP address. A box that shares its
+# address (test12 twice: ops #1065, ops #1214) is refused (HTTP 403) for the rest of the hour, and
+# every "what is the newest release" lookup then failed alone: the Guard Dog "Update pending"
+# mail skipped its run, the Authentik and NetBird cards saw nothing new. This is the one place
+# that asks. Order: the github.com /releases/latest redirect (not rate limited that way, GitHub
+# never points it at a draft or pre-release), then the API, then the last answer we got (kept on
+# disk, so a restart does not forget it). Never raises. A tag is remote input: callers that put
+# it in a command or a file check its shape again (_ak_tag_is_sane, _REMOTE_ASSIST_TAG_RE).
+_GH_LATEST_TTL = 600        # 10 minutes: release cadence is days
+_GH_LATEST_RETRY = 60       # after a total failure, ask again after a minute, not on every page
+_GH_LATEST_FILE = 'github-latest-release.json'
+_GH_REPO_RE = re.compile(r'^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$')
+_GH_TAG_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+/-]{0,79}$')
+_gh_latest_mem = {}         # repo -> {'tag', 'ok_at', 'try_at'}
+_gh_latest_lock = threading.Lock()
+
+
+def _gh_latest_from_redirect(repo):
+    """Tag from the github.com /releases/latest redirect, or ''. The redirect has to END on this
+    repo's own release pages (a renamed or moved repo gives '', not another repo's tag)."""
+    import urllib.request as _ur
+    import urllib.parse as _up
+    base = f'https://github.com/{repo}/releases/'
+    req = _ur.Request(base + 'latest', method='HEAD', headers={'User-Agent': 'infra-TAK'})
+    with _ur.urlopen(req, timeout=8) as r:
+        final = str(r.geturl() or '')
+    prefix = base + 'tag/'
+    if not final.lower().startswith(prefix.lower()):
+        return ''
+    tag = _up.unquote(final[len(prefix):].split('?', 1)[0].split('#', 1)[0])
+    return tag if _GH_TAG_RE.fullmatch(tag) else ''
+
+
+def _gh_latest_from_api(repo):
+    """Tag from api.github.com releases/latest, or ''. Raises on 403 / network trouble."""
+    import urllib.request as _ur
+    req = _ur.Request(f'https://api.github.com/repos/{repo}/releases/latest',
+                      headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
+    with _ur.urlopen(req, timeout=8) as resp:
+        tag = str((json.loads(resp.read().decode()) or {}).get('tag_name') or '').strip()
+    return tag if _GH_TAG_RE.fullmatch(tag) else ''
+
+
+def _gh_latest_disk_read():
+    try:
+        with open(os.path.join(CONFIG_DIR, _GH_LATEST_FILE), encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _gh_latest_disk_write(repo, tag):
+    """Keep the last good answer for `repo` (mode 600, written whole, then moved into place)."""
+    tmp = None
+    try:
+        d = _gh_latest_disk_read()
+        if (d.get(repo) or {}).get('tag') == tag:
+            return
+        d[repo] = {'tag': tag, 'at': int(time.time())}
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix='.gh-latest-', suffix='.tmp')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(d, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, os.path.join(CONFIG_DIR, _GH_LATEST_FILE))
+        tmp = None
+    except Exception:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
+def _gh_latest_release_tag(repo, *, fresh=False):
+    """Newest published release tag of `repo` ('owner/name'), as GitHub names it ('v10.4.1-alpha',
+    'version/2026.8.5'), or None when we have never been able to read one. See the block above."""
+    if not _GH_REPO_RE.fullmatch(str(repo or '')):
+        return None
+    now = time.time()
+    with _gh_latest_lock:
+        m = _gh_latest_mem.get(repo)
+        if m and not fresh:
+            if m.get('tag') and now - m['ok_at'] < _GH_LATEST_TTL:
+                return m['tag']
+            if now - m['try_at'] < _GH_LATEST_RETRY:
+                return m.get('tag')
+    tag = ''
+    for source in (_gh_latest_from_redirect, _gh_latest_from_api):
+        try:
+            tag = source(repo)
+        except Exception as e:
+            print(f"[gh-latest] {repo}: {source.__name__} failed (non-fatal): {str(e)[:120]}", flush=True)
+            tag = ''
+        if tag:
+            break
+    with _gh_latest_lock:
+        m = _gh_latest_mem.setdefault(repo, {'tag': '', 'ok_at': 0, 'try_at': 0})
+        m['try_at'] = now
+        if tag:
+            m.update(tag=tag, ok_at=now)
+        elif not m['tag']:
+            last = str((_gh_latest_disk_read().get(repo) or {}).get('tag') or '')
+            m['tag'] = last if _GH_TAG_RE.fullmatch(last) else ''
+        result = m['tag'] or None
+    if tag:
+        _gh_latest_disk_write(repo, tag)
+    return result
+
+
 @app.route('/api/update/check')
 @login_required
 def update_check():
@@ -12122,7 +12236,27 @@ def _fetch_latest_tag_name():
         versions.sort(key=lambda x: x[0], reverse=True)
         return versions[0][1]  # full tag name e.g. v0.2.3-alpha
     except Exception:
+        # ops #1217: the API refused (60 an hour per IP). Update Now used to fall back to
+        # origin/main here, i.e. to something other than the newest release. git is not limited.
+        return _fetch_latest_tag_name_from_git()
+
+
+def _fetch_latest_tag_name_from_git():
+    """Newest `v<digits>...` tag of the public repo from `git ls-remote`, or None."""
+    refs = _git_ls_remote('refs/tags/*')
+    versions = []
+    for ref in (refs or {}):
+        name = ref.rsplit('/', 1)[-1]
+        if name.endswith('^{}'):
+            continue
+        try:
+            versions.append((tuple(int(p) for p in name.lstrip('v').replace('-alpha', '').replace('-beta', '').split('.')), name))
+        except ValueError:
+            continue
+    if not versions:
         return None
+    versions.sort(key=lambda x: x[0], reverse=True)
+    return versions[0][1]
 
 
 def _repo_ownership_selfheal(trigger=''):
@@ -29880,11 +30014,17 @@ def _console_pending_update(settings):
     gh_headers = {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
     channel = (settings.get('update_channel') or 'main').strip().lower()
     if channel == 'dev':
-        req = urllib.request.Request(
-            f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=dev&per_page=1', headers=gh_headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-        remote_full = (data[0].get('sha') or '') if data else ''
+        try:
+            req = urllib.request.Request(
+                f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=dev&per_page=1', headers=gh_headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            remote_full = (data[0].get('sha') or '') if data else ''
+        except Exception:
+            # ops #1217: API refused (60 an hour per IP); git is not limited that way.
+            remote_full = (_git_ls_remote('refs/heads/dev') or {}).get('refs/heads/dev', '')
+            if not remote_full:
+                raise
         try:
             local = subprocess.run(
                 ['git', f'--git-dir={os.path.join(os.path.dirname(os.path.abspath(__file__)), ".git")}',
@@ -29897,11 +30037,10 @@ def _console_pending_update(settings):
                     'target': f'dev@{remote_full[:7]}', 'identity': remote_full[:7],
                     'how': 'Console page → Update Now.'}
         return None
-    req = urllib.request.Request(
-        f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest', headers=gh_headers)
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode())
-    tag = (data.get('tag_name') or '').strip()
+    # ops #1217: the newest tag without the API's 60-an-hour budget; last good answer on 403
+    tag = (_gh_latest_release_tag(GITHUB_REPO) or '').strip()
+    if not tag:
+        raise RuntimeError('newest infra-TAK release could not be read from GitHub')
 
     def _vt(v):
         return tuple(int(p) for p in v.lstrip('vV').replace('-alpha', '').replace('-beta', '').split('.'))
@@ -29916,10 +30055,11 @@ def _console_pending_update(settings):
             # leaves the box exposed. Newest first (ops #505): the latest fix is the reason
             # to update. Unreadable release list = unknown, not security.
             try:
-                req = urllib.request.Request(
-                    f'https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=50', headers=gh_headers)
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    rels = json.loads(resp.read().decode())
+                # ops #1217: cached 30 minutes with the last good list served when the API
+                # refuses; None means unreadable, which is "unknown", never "no security fix".
+                rels = _gh_json_cached(f'https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=50')
+                if not isinstance(rels, list):
+                    raise ValueError('release list unreadable')
                 sec = []
                 notes = []
                 for rel in rels if isinstance(rels, list) else []:
@@ -39401,8 +39541,11 @@ _MEDIAMTX_VHOST_MARKER = '# MediaMTX Web Console'
 # when Caddy passes it. These two lines are that contract, and the overlay holds the same
 # header name and value (IDENTITY_MARKER_HEADER, IDENTITY_MARKER_SIGNED; a test keeps them
 # equal). `request_header NAME VALUE` replaces whatever a client sent under that name.
-_MEDIAMTX_AK_COPY_HEADERS = ('copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email '
-                             'X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt')
+# ops #1208: the editor overlay reads X-Authentik-Username and X-Authentik-Jwt only (groups come
+# from Authentik's API, ops #1082), so no other X-Authentik header is copied to it.
+_MEDIAMTX_AK_COPY_HEADERS = 'copy_headers X-Authentik-Username X-Authentik-Jwt'
+# ops #1208: the console's own vhost. The console reads X-Authentik-Username only.
+_CONSOLE_AK_COPY_HEADERS = 'X-Authentik-Username'
 _MEDIAMTX_IDENTITY_MARKER = 'request_header X-Infratak-Identity signed'
 
 # ops #1110: the remote MediaMTX host whose stream site the console has checked serves
@@ -40829,6 +40972,10 @@ def _ensure_infratak_network_for_authentik():
 # which leaves the worker and Postgres exactly where they were. PLAN-v10.1.59.
 
 TAKPORTAL_WEB_SERVICE = 'tak-portal'   # upstream's SERVICE_NAME in ./takportal
+# ops #1208: the most request header bytes TAK Portal's Node server takes (its default is 16384).
+# Fleet constant: 128 KiB holds the groups list and the signed token of a person in well over
+# a thousand groups. Written into the compose override by _write_takportal_override.
+TAKPORTAL_MAX_HEADER_BYTES = 131072
 
 
 def _takportal_dir():
@@ -41095,6 +41242,11 @@ def _write_takportal_override():
                 f"  {_svc}:\n"
                 "    extra_hosts:\n"
                 f"{_extra_hosts}"
+                # ops #1208: TAK Portal reads X-Authentik-Groups (who is an admin) and
+                # X-Authentik-Jwt, so Caddy must send them. Node refuses a request whose
+                # headers are over 16 KB together (431); a person in a few hundred groups is.
+                "    environment:\n"
+                f"      NODE_OPTIONS: \"--max-http-header-size={TAKPORTAL_MAX_HEADER_BYTES}\"\n"
                 "    networks:\n"
                 "      - default\n"
                 f"      - {INFRATAK_DOCKER_NETWORK}\n"
@@ -42539,6 +42691,25 @@ def _startup_caddy_nodered_login_converge():
 _TAKPORTAL_VHOST_MARKER = '# TAK Portal'
 _TAKPORTAL_PUBLIC_PATHS = '/request-access* /lookup* /locate/* /styles.css /favicon.ico /branding/* /public/*'
 _CADDY_STRIP_AUTHENTIK_HEADERS = 'request_header -X-Authentik-*'
+def _fedhub_forward_auth_lines(ak_up, indent):
+    """Caddy `forward_auth` lines for the Federation Hub site (ops #1204).
+
+    Authentik decides who may open the hub's page. Nothing is copied to the hub.
+    Federation Hub signs its own users in (its OIDC login or a client certificate) and reads
+    no X-Authentik-* header. `copy_headers X-Authentik-Groups` used to send the person's whole
+    group list to it: an admin in about 150 TAK groups made one header of about 8,000 bytes, and
+    the hub's web server (Jetty, request header limit 8,192 bytes) answered
+    `HTTP ERROR 431 Request Header Fields Too Large` for every page. The same lines would grow
+    with every new group, so no header list is a safe fix: send none.
+    """
+    return [
+        f"{indent}forward_auth {ak_up} {{",
+        f"{indent}    uri /outpost.goauthentik.io/auth/caddy",
+        f"{indent}    trusted_proxies private_ranges",
+        f"{indent}}}",
+    ]
+
+
 _TAKPORTAL_AK_COPY_HEADERS = ('X-Authentik-Username X-Authentik-Groups X-Authentik-Entitlements '
                               'X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt '
                               'X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider '
@@ -43407,7 +43578,11 @@ def generate_caddyfile(settings=None):
         lines.append(f"        }}")
         lines.append(f"        forward_auth @needs_sso {ak_up} {{")
         lines.append(f"            uri /outpost.goauthentik.io/auth/caddy")
-        lines.append(f"            copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
+        # ops #1208: the console reads X-Authentik-Username and nothing else (who may sign
+        # in comes from Authentik's own API, ops #1082), so only that header is copied.
+        # The groups list of a person in a few hundred groups is over 10,000 bytes, and
+        # gunicorn answers 431 above about 8,190 bytes for one header.
+        lines.append(f"            copy_headers {_CONSOLE_AK_COPY_HEADERS}")
         lines.append(f"            trusted_proxies private_ranges")
         lines.append(f"        }}")
         # v10.1.1 S1: attach the proxy-auth secret AFTER forward_auth, on the same
@@ -43745,6 +43920,8 @@ def generate_caddyfile(settings=None):
                 # Static/UI assets must not go through forward_auth — Authentik returns HTML and the browser
                 # rejects CSS/JS as wrong MIME type. Fed Hub also serves some files from site root (poly-*.js, PNG).
                 lines.append(f"    route {{")
+                # ops #1204: Federation Hub reads no Authentik identity header, so none reaches it.
+                lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
                 lines.append(f"        @fh_pub {{")
                 lines.append(f"            path /static/* /favicon.ico /Parsons_TAK.png /poly-*")
                 lines.append(f"        }}")
@@ -43755,11 +43932,7 @@ def generate_caddyfile(settings=None):
                 lines.append(f"        handle {{")
                 _emit_outpost_callback_rescue(f"{_pub_url(fh_host, settings)}/")
                 lines.append(f"            reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-                lines.append(f"            forward_auth {ak_up} {{")
-                lines.append(f"                uri /outpost.goauthentik.io/auth/caddy")
-                lines.append(f"                copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
-                lines.append(f"                trusted_proxies private_ranges")
-                lines.append(f"            }}")
+                lines.extend(_fedhub_forward_auth_lines(ak_up, '            '))
                 for rp_line in fh_rp_block:
                     lines.append(f"            {rp_line}")
                 lines.append(f"        }}")
@@ -45725,12 +45898,8 @@ def _get_authentik_latest_release_tag(use_cache=True):
     if use_cache and _authentik_release_cache['tag'] and (_time.time() - _authentik_release_cache['ts'] < 14400):
         return _authentik_release_cache['tag']
     try:
-        import urllib.request as _ur
-        req = _ur.Request('https://api.github.com/repos/goauthentik/authentik/releases/latest',
-                          headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
-        resp = _ur.urlopen(req, timeout=10)
-        data = json.loads(resp.read().decode())
-        tag = (data.get('tag_name') or '').strip()
+        # ops #1217: shared lookup (github.com redirect, API, last good answer on disk)
+        tag = (_gh_latest_release_tag('goauthentik/authentik', fresh=not use_cache) or '').strip()
         if tag.startswith('version/'):
             tag = tag[len('version/'):]
         tag = tag.lstrip('vV').strip() or None
@@ -46655,12 +46824,8 @@ def _get_netbird_github_latest(repo, use_cache=True):
         if cached and (_time.time() - cached.get('ts', 0) < 14400):
             return cached.get('tag')
     try:
-        req = _ur.Request(
-            f'https://api.github.com/repos/netbirdio/{repo}/releases/latest',
-            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
-        resp = _ur.urlopen(req, timeout=10)
-        data = json.loads(resp.read().decode())
-        tag = (data.get('tag_name') or '').strip()
+        # ops #1217: shared lookup (github.com redirect, API, last good answer on disk)
+        tag = (_gh_latest_release_tag(f'netbirdio/{repo}', fresh=not use_cache) or '').strip()
         if tag:
             _netbird_release_cache[cache_key] = {'tag': tag, 'ts': _time.time()}
             return tag
