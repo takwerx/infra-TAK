@@ -56,6 +56,7 @@ NAMES = (
     # this change
     '_MEDIAMTX_REMOTE_HLS_PORT', '_MEDIAMTX_REMOTE_HLS_CLOSED_FILE', '_mediamtx_remote_hls_closed',
     '_MEDIAMTX_REMOTE_HLS_BIND_SH', '_mediamtx_remote_hls_bind', '_mediamtx_remote_hls_port',
+    '_MEDIAMTX_REMOTE_HLS_PORT_LOCK', '_mediamtx_remote_hls_port_locked',
     '_startup_converge_mediamtx_remote_hls_port', '_console_release_app_has',
     '_mediamtx_remote_hls_port_before_rollback',
     # what it builds on
@@ -265,12 +266,14 @@ class Console:
                     'remote': {'host': HOST, 'ssh_user': 'ops', 'ssh_port': 22}}
         self.settings = {'fqdn': 'example.org', 'server_ip': CONSOLE, 'mediamtx_deployment': self.cfg}
         self.road_calls = []
+        self.firewall_on = True
         ns = {
             'os': os, 're': re, 'tempfile': tempfile, 'time': time, 'threading': threading,
             'subprocess': subprocess, 'CONFIG_DIR': str(self.cfg_dir),
             '_get_module_deployment_config': lambda s, k: self.cfg,
             '_module_run': host.module_run,
-            '_module_fw_ensure_active': lambda cfg, log_fn=None: (True, host.firewall, ''),
+            '_module_fw_ensure_active': lambda cfg, log_fn=None: (
+                (True, host.firewall, '') if self.firewall_on else (False, host.firewall, 'inactive')),
             '_module_fw': lambda cfg, verb, port, proto='tcp', log_fn=None: (True, ''),
             '_fedhub_caddy_source_ip': lambda s: CONSOLE,
             '_caddy_running_config_has': self._caddy_has,
@@ -379,6 +382,58 @@ def test_a_firewall_that_refuses_keeps_everything(console, host):
     assert any('could not be closed' in ln for ln in console.log)
 
 
+def test_a_firewall_that_is_off_is_never_called_closed(console, host):
+    console.firewall_on = False
+    assert console.port() == 'kept'
+    assert host.sent == [] and console.closed_mark() is None and host.bind() == '0.0.0.0:8888'
+    assert any('the firewall there is not on' in ln for ln in console.log)
+
+
+def test_two_callers_never_work_on_the_host_at_once(console, host):
+    inside, overlap = [], []
+    real = host.module_run
+
+    def slow(cfg, sh, timeout=120, log_fn=None):
+        inside.append(1)
+        if len(inside) > 1:
+            overlap.append(1)
+        time.sleep(0.05)
+        try:
+            return real(cfg, sh, timeout, log_fn)
+        finally:
+            inside.pop()
+
+    console.ns['_module_run'] = slow
+    threads = [threading.Thread(target=console.port, kwargs={'force_open': i % 2 == 1}) for i in range(4)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(60)
+    assert overlap == [], 'a close and an open talked to the host at the same time'
+    # whatever the order, the mark and the host agree
+    assert (console.closed_mark() == HOST) == (host.allows(8888) == [])
+
+
+def test_ufw_rule_with_no_protocol_goes_too(tmp_path):
+    (tmp_path / 'host').mkdir()
+    h = Host(tmp_path / 'host', 'ufw')
+    h.seed_rules()
+    with open(h.dir / 'ufw.rules', 'a') as f:
+        f.write('ufw allow 8888\n')
+    assert Console(tmp_path, h).port() == 'closed'
+    assert 'ufw allow 8888' not in (h.dir / 'ufw.rules').read_text().splitlines()
+
+
+def test_ufw_limit_rule_for_the_port_is_not_called_closed(tmp_path):
+    (tmp_path / 'host').mkdir()
+    h = Host(tmp_path / 'host', 'ufw')
+    h.seed_rules()
+    with open(h.dir / 'ufw.rules', 'a') as f:
+        f.write('ufw limit 8888/tcp\n')
+    c = Console(tmp_path, h)
+    assert c.port() == 'kept' and c.closed_mark() is None
+
+
 def test_an_unreachable_host_changes_nothing(console, host):
     host.reachable = False
     assert console.port() == 'kept'
@@ -425,9 +480,15 @@ def test_a_file_without_the_line_is_said_and_the_firewall_still_closes(console, 
     assert any('still listens on it for every address (noline)' in ln for ln in console.log)
 
 
-def test_bind_takes_only_the_two_addresses(console, host):
-    assert console.ns['_mediamtx_remote_hls_bind'](console.cfg, '0.0.0.0; reboot') == 'fail'
-    assert host.sent == []
+def test_bind_sends_only_the_two_fixed_addresses(console, host):
+    sent = []
+    console.ns['_module_run'] = lambda cfg, sh, timeout=120, log_fn=None: (sent.append(sh), (True, 'HLS_BIND=ok'))[1]
+    bind = console.ns['_mediamtx_remote_hls_bind']
+    assert bind(console.cfg, True) == 'ok' and bind(console.cfg, False) == 'ok'
+    assert bind(console.cfg, '0.0.0.0; reboot') == 'ok'       # any true value is loopback
+    assert [re.search(r'W="([^"]*)"', sh).group(1) for sh in sent] == [
+        '127.0.0.1:8888', '0.0.0.0:8888', '127.0.0.1:8888']
+    assert not any('reboot' in sh or '__' in sh for sh in sent)
 
 
 # ── later console starts ───────────────────────────────────────────────────────────────────

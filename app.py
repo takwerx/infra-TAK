@@ -50863,10 +50863,11 @@ def _mediamtx_remote_console_scope_sh(console_ip=None, hls_open=True):
         f'  for P in {shut}; do '
         '    $S ufw --force delete deny $P/tcp >/dev/null 2>&1; '
         '    $S ufw --force delete allow $P/tcp >/dev/null 2>&1; '
+        '    $S ufw --force delete allow $P >/dev/null 2>&1; '
         '    $S ufw show added 2>/dev/null | sed -n "s|^ufw allow from \\([0-9a-fA-F:./]*\\) to any port $P proto tcp\\$|\\1|p" | '
         '    while read -r A; do $S ufw --force delete allow from "$A" to any port $P proto tcp >/dev/null 2>&1; done; '
         '    $S ufw deny $P/tcp >/dev/null 2>&1 || RC=1; '
-        '    if $S ufw show added 2>/dev/null | grep -Eq "^ufw allow (.* port $P( |\\$)|$P/tcp\\$)"; then RC=1; fi; done; '
+        '    if $S ufw show added 2>/dev/null | grep -Eq "^ufw (allow|limit) (.* port $P( |\\$)|$P(/tcp)?\\$)"; then RC=1; fi; done; '
         'else RC=1; fi; '
         'echo "SCOPE_RC=$RC"'
     )
@@ -50916,19 +50917,21 @@ def _mediamtx_remote_firewall(settings, deploy_cfg, plog):
 # ops #1149. Runs ON the remote MediaMTX host: put MediaMTX's HLS listener on W (loopback when
 # the console no longer reads it, all interfaces when it does again). MediaMTX loads a changed
 # mediamtx.yml by itself and reopens only the HLS listener; when the listener is not on W
-# after 10 s, MediaMTX is restarted once. A stopped MediaMTX is left stopped. Prints
-# HLS_BIND=ok (also: ok-restarted, ok-stopped), noline (no hlsAddress line to change) or fail.
+# after 10 s, MediaMTX is restarted once. A stopped MediaMTX is left stopped, and a host with
+# no `ss` to look with gets no restart. Prints HLS_BIND=ok (also: ok-restarted, ok-stopped,
+# ok-unchecked), noline (no hlsAddress line to change) or fail.
 _MEDIAMTX_REMOTE_HLS_BIND_SH = (
     _REMOTE_SUDO_SH +
     'F=/usr/local/etc/mediamtx.yml; W="__ADDR__:__PORT__"; '
     'good() { L=$(ss -ltnH 2>/dev/null | awk \'$4 ~ /:__PORT__$/ {print $4}\'); [ -n "$L" ] || return 1; '
     'for X in $L; do case "$W" in 127.0.0.1:*) [ "$X" = "$W" ] || return 1;; '
     '*) [ "$X" = "127.0.0.1:__PORT__" ] && return 1;; esac; done; return 0; }; '
-    'CUR=$(sed -n "s/^hlsAddress:[[:space:]]*//p" "$F" 2>/dev/null | head -n 1); '
+    'CUR=$($S sed -n "s/^hlsAddress:[[:space:]]*//p" "$F" 2>/dev/null | head -n 1); '
     '[ -n "$CUR" ] || { echo HLS_BIND=noline; exit 0; }; '
     'if [ "$CUR" != "$W" ]; then '
     '$S sed -i "s|^hlsAddress:.*|hlsAddress: $W|" "$F" || { echo HLS_BIND=fail; exit 0; }; fi; '
     'systemctl is-active --quiet mediamtx || { echo HLS_BIND=ok-stopped; exit 0; }; '
+    'command -v ss >/dev/null 2>&1 || { echo HLS_BIND=ok-unchecked; exit 0; }; '
     'for I in 1 2 3 4 5; do good && { echo HLS_BIND=ok; exit 0; }; sleep 2; done; '
     '$S systemctl restart mediamtx >/dev/null 2>&1; '
     'for I in 1 2 3 4 5 6; do sleep 2; good && { echo HLS_BIND=ok-restarted; exit 0; }; done; '
@@ -50936,11 +50939,11 @@ _MEDIAMTX_REMOTE_HLS_BIND_SH = (
 )
 
 
-def _mediamtx_remote_hls_bind(cfg, addr):
-    """ops #1149: MediaMTX's HLS listener on the remote host to `addr` ('127.0.0.1' or
-    '0.0.0.0'). Returns the host's word: 'ok', 'ok-restarted', 'ok-stopped', 'noline', 'fail'."""
-    if addr not in ('127.0.0.1', '0.0.0.0'):
-        return 'fail'
+def _mediamtx_remote_hls_bind(cfg, loopback):
+    """ops #1149: MediaMTX's HLS listener on the remote host to loopback (True) or to every
+    interface (False: the console's Caddy reads it, the firewall lets only the console in).
+    Returns the host's word: 'ok', 'ok-restarted', 'ok-stopped', 'noline', 'fail'."""
+    addr = '127.0.0.1' if loopback else '0.0.0.0'
     sh = (_MEDIAMTX_REMOTE_HLS_BIND_SH.replace('__ADDR__', addr)
           .replace('__PORT__', str(_MEDIAMTX_REMOTE_HLS_PORT)))
     ok, out = _module_run(cfg, sh, timeout=90)
@@ -50948,7 +50951,17 @@ def _mediamtx_remote_hls_bind(cfg, addr):
     return m.group(1) if (ok and m) else 'fail'
 
 
+_MEDIAMTX_REMOTE_HLS_PORT_LOCK = threading.Lock()
+
+
 def _mediamtx_remote_hls_port(settings, cfg, log, force_open=False):
+    """One caller at a time (a console start, a deploy, a rollback and the background reopen
+    can meet): see _mediamtx_remote_hls_port_locked."""
+    with _MEDIAMTX_REMOTE_HLS_PORT_LOCK:
+        return _mediamtx_remote_hls_port_locked(settings, cfg, log, force_open)
+
+
+def _mediamtx_remote_hls_port_locked(settings, cfg, log, force_open=False):
     """ops #1149: close MediaMTX's HLS port (8888) on a remote host to the console once the
     console no longer reads it, and open it again when the console does.
 
@@ -50984,6 +50997,12 @@ def _mediamtx_remote_hls_port(settings, cfg, log, force_open=False):
     console_ip = _fedhub_caddy_source_ip(settings)
     if not want_open:
         if not closed:
+            # A rule in a firewall that is off closes nothing (ops #630).
+            act_ok, _be, _act_msg = _module_fw_ensure_active(cfg)
+            if not act_ok:
+                log(f"✗ Port {port} on {host} was not closed to the console: the firewall there "
+                    "is not on. The next console start tries again.")
+                return 'kept'
             ok, out = _module_run(cfg, _mediamtx_remote_console_scope_sh(console_ip, hls_open=False),
                                   timeout=60)
             if not ok or 'SCOPE_RC=0' not in (out or ''):
@@ -50994,7 +51013,7 @@ def _mediamtx_remote_hls_port(settings, cfg, log, force_open=False):
             with os.fdopen(fd, 'w') as f:
                 f.write(host + '\n')
             os.replace(tmp, mark)
-        word = _mediamtx_remote_hls_bind(cfg, '127.0.0.1')
+        word = _mediamtx_remote_hls_bind(cfg, True)
         if word.startswith('ok'):
             if not closed:
                 log(f"✓ Port {port} on {host} is closed to the console and MediaMTX there listens "
@@ -51005,7 +51024,7 @@ def _mediamtx_remote_hls_port(settings, cfg, log, force_open=False):
         return 'closed'
     if not closed and not force_open:
         return 'open'
-    word = _mediamtx_remote_hls_bind(cfg, '0.0.0.0')
+    word = _mediamtx_remote_hls_bind(cfg, False)
     ok, out = _module_run(cfg, _mediamtx_remote_console_scope_sh(console_ip, hls_open=True), timeout=60)
     if not word.startswith('ok') or not ok or 'SCOPE_RC=0' not in (out or ''):
         log(f"✗ Port {port} on {host} could not be opened to the console again "
