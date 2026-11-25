@@ -163,7 +163,7 @@ def test_every_debian_postgis_path_writes_the_pin():
     assert body.index('_pgdg_gis_pin_ensure(log_step)') < body.index('_apt_update_capture(')
     # TAK upgrade: before apt-get install of the new .deb
     body = _fn('_tak_upgrade_apt_install')
-    assert body.index('_pgdg_gis_pin_ensure(') < body.index("apt-get install -y ./")
+    assert body.index('_pgdg_gis_pin_ensure(') < body.index("apt-get install -y --allow-downgrades ./")  # ops #1218
     # 5.7 -> 5.8 upgrade: right before its apt-get install command is built
     i = APP.index("'--allow-change-held-packages ' + shlex.quote(pkg_path)")
     assert '_pgdg_gis_pin_ensure(_say)' in APP[i - 300:i]

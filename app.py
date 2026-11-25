@@ -99546,6 +99546,81 @@ def _tak_target_version_gate(*filenames):
     return None
 
 
+# ops #1218: "5.8-RELEASE105" (dpkg/rpm version) and "takserver_5.8-RELEASE104_all.deb" (artifact
+# name) both carry major.minor-RELEASE<n>. The container bundle writes it "5.7-RELEASE-43".
+_TAK_RELEASE_RE = re.compile(r'(\d+)\.(\d+)-RELEASE-?(\d+)', re.I)
+
+
+def _tak_release_key(text):
+    """(major, minor, release) from a TAK Server version string or artifact name, or None."""
+    m = _TAK_RELEASE_RE.search(os.path.basename(str(text or '')))
+    if not m:
+        return None
+    try:
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _tak_package_downgrade(pkg_filename, installed_version=None):
+    """Compare an uploaded TAK Server package with the installed one (ops #1218).
+
+    Returns None when either side cannot be read or the package is not older, else a dict
+    {'installed': (maj, min, rel), 'package': (maj, min, rel), 'cross_minor': bool}.
+    cross_minor is True when the package is an older major.minor (5.8 box, 5.7 package):
+    that database is on a newer schema and PostgreSQL than the package expects.
+    """
+    if installed_version is None:
+        try:
+            installed_version = _get_takserver_version_info().get('version') or ''
+        except Exception:
+            installed_version = ''
+    inst, pkg = _tak_release_key(installed_version), _tak_release_key(pkg_filename)
+    if not inst or not pkg or pkg >= inst:
+        return None
+    return {'installed': inst, 'package': pkg, 'cross_minor': pkg[:2] < inst[:2]}
+
+
+def _tak_fmt_release(key):
+    return '%d.%d-RELEASE%d' % key
+
+
+def _tak_cross_minor_downgrade_message(*pkg_filenames):
+    """The refusal text when an upload is an older MAJOR.MINOR than the installed TAK Server.
+
+    ops #1218: the Ubuntu update path now installs an older package on purpose
+    (--allow-downgrades), which is what a customer wants for R105 -> R104. Going from
+    5.8 to 5.7 is a different thing: the 5.8 database is on PostgreSQL 18 and a newer
+    schema, and the plain package install does not move it back. That stays refused.
+    """
+    for fn in pkg_filenames:
+        d = _tak_package_downgrade(fn)
+        if d and d['cross_minor']:
+            return ('%s is older than the installed TAK Server %s, and it is a different '
+                    'major.minor version. The update button only installs an older package '
+                    'inside the same major.minor (for example RELEASE105 back to RELEASE104), '
+                    'because the database does not go back with the package. Remove this '
+                    'package and upload one of version %d.%d, or restore a snapshot taken '
+                    'before the upgrade from Snapshots & Recovery.'
+                    % (os.path.basename(str(fn)), _tak_fmt_release(d['installed']),
+                       d['installed'][0], d['installed'][1]))
+    return None
+
+
+def _tak_log_if_downgrade(pkg_filename, ulog, snap_label=None):
+    """Write the downgrade warning to the update log; returns True if it is a downgrade."""
+    d = _tak_package_downgrade(pkg_filename)
+    if not d:
+        return False
+    ulog("⚠ DOWNGRADE: %s is OLDER than the installed TAK Server %s."
+         % (os.path.basename(str(pkg_filename)), _tak_fmt_release(d['installed'])))
+    ulog("  Installing it on purpose. The package changes; the database is not changed by it.")
+    if snap_label:
+        ulog("  A snapshot of the current state was saved first: [%s] (Snapshots & Recovery)."
+             % snap_label)
+    return True
+
+
 def _tak_already_on_58():
     """True when this box already runs TAK Server 5.8+ on PostgreSQL 18.
 
@@ -99770,6 +99845,9 @@ def takserver_update():
         _g = _gate(core_pkg, db_pkg)
         if _g:
             return jsonify({'error': _g}), 400
+        _dg = _tak_cross_minor_downgrade_message(core_pkg)
+        if _dg:
+            return jsonify({'error': _dg}), 400
         s1 = tak_cfg.get('server_one', {})
         if not s1.get('host'):
             return jsonify({'error': 'Server One host not configured in deployment settings.'}), 400
@@ -99788,6 +99866,9 @@ def takserver_update():
         _g = _gate(single_pkgs[0])
         if _g:
             return jsonify({'error': _g}), 400
+        _dg = _tak_cross_minor_downgrade_message(single_pkgs[0])
+        if _dg:
+            return jsonify({'error': _dg}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
         threading.Thread(target=_tak_update_job('upgrade', run_takserver_upgrade, upgrade_log, upgrade_status),
@@ -99814,7 +99895,11 @@ def _tak_upgrade_apt_install(cwd, pkg_name, upgrade_log, timeout_sec=600):
     # v10.0.5 non-root: pass env via Popen instead of a literal `env` wrapper, so
     # `apt-get` is the direct command and resolves to the broker shim on PATH (root).
     _aenv = dict(os.environ, DEBIAN_FRONTEND='noninteractive', NEEDRESTART_MODE='l')
-    cmd = f'stdbuf -oL -eL apt-get install -y ./{qn} 2>&1'
+    # ops #1218: --allow-downgrades, or apt refuses an older package with "Packages were
+    # downgraded and -y was used without --allow-downgrades" (exit 100) and the customer has no
+    # way back from a bad release. A cross-major.minor downgrade is refused in takserver_update()
+    # before this runs; the caller logs the downgrade warning.
+    cmd = f'stdbuf -oL -eL apt-get install -y --allow-downgrades ./{qn} 2>&1'
     proc = subprocess.Popen(
         cmd, shell=True, cwd=cwd, env=_aenv,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -100995,11 +101080,43 @@ def _tak_rollback(label, plog=None):
     except Exception as _e_nr:
         plog(f"  rollback: Node-RED restart error (non-fatal): {_e_nr}")
 
+    _pkg_note = _tak_rollback_package_note(label)
     if _db_err:
-        plog(f"  ✗ rollback [{label}]: config files and certs restored, database NOT restored")
+        plog(f"  ✗ rollback [{label}]: config files and certs restored, database NOT restored. {_pkg_note}")
         return False, _db_err
-    plog(f"  ✓ rollback [{label}]: complete")
+    # ops #1218: the Snapshots screen shows only this LAST line. It used to say just "complete",
+    # and a customer who rolled back after a bad update believed the old TAK Server was back
+    # while dpkg still held the new package. Say what came back and what did not.
+    plog(f"  ✓ rollback [{label}]: configuration, certificates and database restored. {_pkg_note}")
     return True, None
+
+
+def _tak_rollback_package_note(label):
+    """One sentence: which TAK Server package is installed after a rollback (ops #1218).
+
+    A rollback restores configuration, certificates and the database from a snapshot. It never
+    reinstalls the TAK Server package, so after an update the newer package stays.
+    """
+    try:
+        installed = (_get_takserver_version_info().get('version') or '').strip()
+    except Exception:
+        installed = ''
+    snap_ver = ''
+    try:
+        for sn in (load_settings().get('tak_snapshots') or []):
+            if sn.get('label') == label:
+                snap_ver = (sn.get('tak_version') or '').strip()
+                break
+    except Exception:
+        pass
+    if not installed:
+        return 'The TAK Server package was not changed.'
+    ik, sk = _tak_release_key(installed), _tak_release_key(snap_ver)
+    if snap_ver and ik and sk and ik != sk:
+        return ('TAK Server package is still %s (the snapshot was taken on %s); rollback does not '
+                'reinstall the package. To go back to %s, upload that package and use Update.'
+                % (installed, snap_ver, snap_ver))
+    return 'TAK Server package version: %s (not changed by a rollback).' % installed
 
 
 # Snapshot/rollback log stream
@@ -102503,6 +102620,7 @@ def run_takserver_upgrade(pkg_path):
         else:
             wait_for_apt_lock(ulog, upgrade_log)
             ulog("")
+            _tak_log_if_downgrade(pkg_name, ulog, snap_label)
             ulog("Installing upgrade package: " + pkg_name)
             try:
                 rc = _tak_upgrade_apt_install(os.path.dirname(pkg_path), pkg_name, upgrade_log, timeout_sec=3600)
@@ -103317,6 +103435,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
             ulog("Core already installed via re-unpack + configure — skipping redundant apt-get install.")
         else:
             wait_for_apt_lock(ulog, upgrade_log)
+            _tak_log_if_downgrade(core_name, ulog)
             ulog(f"Installing {core_name}...")
             try:
                 rc = _tak_upgrade_apt_install(os.path.dirname(core_pkg_path), core_name, upgrade_log, timeout_sec=3600)
@@ -103364,7 +103483,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog("✓ Package copied to Server One")
 
         install_cmd = (
-            f'cd /tmp && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ./{db_name} 2>&1'
+            f'cd /tmp && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades ./{db_name} 2>&1'
         )
         ulog(f"Installing {db_name} on Server One...")
         ok, install_out = _ssh_probe(s1_cfg, install_cmd, timeout=600)
