@@ -911,7 +911,7 @@ function takeSnapshot(){
 }
 
 function restoreSnapshot(label){
-  if(!confirm('Restore TAK Server from snapshot "'+label+'"?\n\nThis will:\n• Stop TAK Server\n• Restore CoreConfig.xml, UserAuthenticationFile.xml, certs, and database\n• Restart TAK Server\n\nCurrent data will be overwritten.'))return;
+  if(!confirm('Restore TAK Server from snapshot "'+label+'"?\n\nThis will:\n• Stop TAK Server\n• Restore CoreConfig.xml, UserAuthenticationFile.xml, certs, and database\n• Restart TAK Server\n\nThe TAK Server package stays as it is now. To go back to an older package, use Update with that package.\n\nCurrent data will be overwritten.'))return;
   var prog=document.getElementById('snap-progress');
   if(prog){prog.style.display='';prog.style.color='var(--yellow)';prog.textContent='Restoring snapshot…';}
   fetch('/api/takserver/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label})})
