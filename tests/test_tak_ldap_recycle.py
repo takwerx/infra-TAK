@@ -96,7 +96,7 @@ class Box:
                  subs=None, ldap_users=None, tak_ldap_ok=True, dead_pool=0, online=True, api_ok=True,
                  history=None, https='ok', https_after_restart='ok', https_flaky=0, api_busy=0,
                  gd_restart=None, ghosts=(), ghosts_leave=False, outpost='user', api_back_after=None,
-                 api_restart='unavailable', messaging_restart='unavailable', stuck_cache=()):
+                 api_restart='unavailable', messaging_restart='unavailable', stuck_cache=(), stuck_unmapped=False):
         self.t = T0
         # What the local outpost's log shows of TAK's lookups during HTTPS logins (ops #158):
         # 'user' = each login is looked up; 'others' = TAK looks the console's admin cert up on
@@ -150,6 +150,9 @@ class Box:
         # (no such unit: the old behaviour of every older test). `stuck_cache` = cert users whose lookups TAK's
         # messaging process answers with 'looked up, no groups' (named, __ANON__ only) until it is restarted.
         self.messaging_restart, self.stuck_cache = messaging_restart, set(stuck_cache)
+        # test12 Nov 25: the stuck connection has NO DN and NO username (only a callsign): True = a user in
+        # `stuck_cache` reconnects that way too (TAK's client history still names its device)
+        self.stuck_unmapped = stuck_unmapped
         self.msg_alerts = []           # ops #1039: Guard Dog mails of the messaging-only restart (kind, detail, minutes ago)
         self.leaf_certs, self.user_api, self.workdirs, self.missions = [], [], [], set()
         self.alerts = []               # GH #549: Guard Dog alerts (at, args, kwargs)
@@ -261,9 +264,10 @@ class Box:
                 old = gone[0]
                 cn = old['_cn']
                 g = self._tak_lookup(cn)
-                new = dict(sess(self.next_uid, cn, g or (), client=old['clientUid'], unmapped=g is None),
+                new = dict(sess(self.next_uid, cn, g or (), client=old['clientUid'],
+                                unmapped=g is None or (cn in self.stuck_cache and self.stuck_unmapped)),
                            callsign=f'tls:{self.next_uid}')     # no callsign before its first SA
-                if g == []:
+                if g == [] and new['dn'] is not None:
                     new['groups'] = [{'name': '__ANON__', 'direction': d} for d in ('IN', 'OUT')]
                 self.next_uid += 1
                 self.reconnects.append((self.t + 15, new))
@@ -440,10 +444,11 @@ class Box:
         ns['_tak_https_broken_alert'] = lambda *a, **k: box.alerts.append((box.t, a, k))
         ns['_tak_messaging_alert'] = lambda plog, kind, detail, minutes_ago=None: box.msg_alerts.append((kind, detail, minutes_ago))
         for c in ('_TAK_GROUPLESS_CHECKS', '_TAK_GROUPLESS_DROP_MEMORY_S', '_TAK_MESSAGING_RESTART_GAP_S', '_TAK_MESSAGING_ALERT_GAP_S',
-                  '_TAK_MESSAGING_WAIT_S', '_TAK_MESSAGING_BACK_WAIT_S', '_TAK_STUCK_MASS_DEADLINE_S'):   # ops #1039
+                  '_TAK_MESSAGING_WAIT_S', '_TAK_MESSAGING_BACK_WAIT_S', '_TAK_GROUPLESS_FUTILE_S',
+                  '_TAK_STUCK_MASS_DEADLINE_S'):   # ops #1039
             if re.search(r'^%s = \d+' % c, APP, re.M):
                 ns[c] = _const(c)
-        ns['_tak_groupless'] = {'tak_start': None, 'seen': {}, 'dropped': {}, 'refused': set()}
+        ns['_tak_groupless'] = {'tak_start': None, 'seen': {}, 'dropped': {}, 'refused': set(), 'futile': {}}
         ns['_tak_ldap_recycle_lock'] = threading.Lock()
         for name in ('_epoch_from_rfc3339', '_docker_started_epoch', '_tak_started_epoch', '_tak_wait_ready', '_tak_api_only_restart',
                      '_tak_ldap_recycle_request', '_tak_recycle_after_ldap_outage',

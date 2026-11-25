@@ -32,7 +32,7 @@ import re
 import pytest
 
 from test_tak_ldap_recycle import (APP, Box, HOUR, T0, _const, _src, healthy_box, sess)
-from test_stuck_unnamed_client_ops565 import monitor, stuck_box   # a client with NO user at all (the other check)
+from test_stuck_unnamed_client_ops565 import monitor   # the 10-min check for a client with no user at all
 
 TICK = 60   # the check's period
 
@@ -44,6 +44,18 @@ def stuck_named_box(**kw):
     kw.setdefault('stuck_cache', {'takdev-emu'})
     box = healthy_box(**kw)
     box.subs.append(sess(16, 'takdev-emu', ('__ANON__',)))
+    return box
+
+
+def stuck_unnamed_box(**kw):
+    """test12 Nov 25 (the real state): TAK gave the connection no DN and no username, only the callsign and
+    __ANON__; it comes back the same way after a drop. TAK's client history still knows the device's user."""
+    kw.setdefault('tak_start', T0 - 3 * 24 * HOUR)
+    kw.setdefault('messaging_restart', 'fixes')
+    kw.setdefault('stuck_cache', {'takdev-emu'})
+    kw.setdefault('stuck_unmapped', True)
+    box = healthy_box(**kw)
+    box.subs.append(sess(16, 'takdev-emu', (), unmapped=True))
     return box
 
 
@@ -222,12 +234,41 @@ def test_a_connection_tak_refuses_to_drop_is_not_judged_again_and_never_restarts
     assert box.messaging_restarts() == []
 
 
-def test_a_phone_with_no_user_at_all_is_left_to_the_other_checks():
-    box = stuck_box(messaging_restart='fixes')      # TAK gave it no user and no groups (ops #565)
+def test_a_phone_tak_gave_no_user_at_all_but_client_history_names_is_healed_the_same_way():
+    """test12 Nov 25: the stuck emulator had no DN and no username; its device's history says takdev-emu."""
+    box = stuck_unnamed_box()
+    tick = checker(box)
+    assert tick() is None and tick() == 'dropped'
+    box.t += 20
+    [again] = box.live('takdev-emu')
+    assert again['dn'] is None and not again['groups']          # back the same way
+    assert tick() is None and tick() == 'restart'
+    assert box.messaging_restarts() == [['systemctl', 'restart', 'takserver-messaging']] and box.restarts() == []
+    [now] = box.live('takdev-emu')
+    assert now['username'] == 'takdev-emu' and now['groups']
+    assert [k for k, _d, _a in box.msg_alerts] == ['restarted']
+
+
+def test_a_phone_with_no_user_and_no_history_is_left_to_the_other_checks():
+    box = stuck_unnamed_box(history={})                         # nothing says whose it is
     tick = checker(box)
     for _ in range(8):
         assert tick() is None
     assert box.drops() == [] and box.messaging_restarts() == []
+
+
+def test_a_client_the_messaging_restart_did_not_fix_never_restarts_messaging_again_for_hours():
+    box = stuck_named_box(messaging_restart='no_fix')
+    tick = checker(box)
+    assert 'restart' in run_until(tick, 'restart')
+    assert [k for k, _d, _a in box.msg_alerts] == ['still']
+    box.t += _const('_TAK_MESSAGING_RESTART_GAP_S') + 600       # the 30-min limit is over, the client is still stuck
+    for _ in range(10):
+        tick()
+    assert len(box.messaging_restarts()) == 1
+    box.t += _const('_TAK_GROUPLESS_FUTILE_S')                  # six hours later it may try once more
+    box.subs = [x for x in box.subs if x['_cn'] != 'takdev-emu'] + [sess(70, 'takdev-emu', ('__ANON__',))]
+    assert 'restart' in run_until(tick, 'restart', most=14) and len(box.messaging_restarts()) == 2
 
 
 def test_file_users_are_never_touched():

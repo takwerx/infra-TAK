@@ -81331,9 +81331,12 @@ _TAK_MESSAGING_RESTART_GAP_S = 1800
 _TAK_MESSAGING_ALERT_GAP_S = 3600
 _TAK_MESSAGING_WAIT_S = 600
 _TAK_MESSAGING_BACK_WAIT_S = 120
+_TAK_GROUPLESS_FUTILE_S = 21600
 # streak per connection uid; dropped: cn (lower case) → (epoch, uid) of our one drop; refused: uids TAK
-# would not drop (a ghost it still lists), never judged again.
-_tak_groupless = {'tak_start': None, 'seen': {}, 'dropped': {}, 'refused': set()}
+# would not drop (a ghost it still lists), never judged again; futile: cn → epoch of a messaging restart that
+# did not give that client its groups (not repeated for it within `_TAK_GROUPLESS_FUTILE_S`: one phone TAK
+# cannot look up must not restart messaging for everybody every 30 minutes).
+_tak_groupless = {'tak_start': None, 'seen': {}, 'dropped': {}, 'refused': set(), 'futile': {}}
 
 
 def _tak_messaging_only_restart(plog, tag):
@@ -81351,6 +81354,10 @@ def _tak_messaging_only_restart(plog, tag):
     if r is not None and r.returncode != 0:
         return 'failed', f"takserver-messaging could not be restarted: {((r.stderr or '') + (r.stdout or '')).strip()[-200:]}"
     t0 = time.time()
+    # The init script returns at once (test12: 1 s), while the old process may still hold 8089: wait for the
+    # port to close first (at most 60 s), then for the new process to open it.
+    while _tcp_accepts(8089) and time.time() - t0 < 60:
+        time.sleep(2)
     while not _tcp_accepts(8089):
         if time.time() - t0 >= _TAK_MESSAGING_WAIT_S:
             return 'not_up', f"8089 was not accepting connections {int(time.time() - t0)}s after restarting takserver-messaging"
@@ -81487,10 +81494,14 @@ def _tak_groupless_clients_check(plog):
     sessions = _tak_client_sessions()
     if sessions is None:
         return None               # a busy API is not a verdict: keep the count, add nothing
+    # test12 Nov 25: TAK gave the stuck connection neither a DN nor a username (only the callsign TIGRE, __ANON__);
+    # its device's last username in TAK's client history names it, the same way the outage heal does.
+    if any(not s['cn'] and s['client'] for s in sessions):
+        sessions = _tak_client_sessions(_tak_device_usernames()) or sessions
     file_users = _tak_file_users()
     by_cn = {}
     for s in sessions:
-        if s['cn'] and not s['unnamed'] and s['cn'].lower() not in file_users:
+        if s['cn'] and s['cn'].lower() not in file_users:
             by_cn.setdefault(s['cn'].lower(), []).append(s)
     # A user with a connection that HAS its groups is looked up fine; its empty ones are old ghosts or
     # extra connections, not a stuck lookup. It also starts that client over for the next time.
@@ -81517,6 +81528,9 @@ def _tak_groupless_clients_check(plog):
         if st['dropped'].get(s['cn'].lower(), (0, ''))[1] == s['uid']:
             st['refused'].add(s['uid'])      # TAK said dropped, still lists it: a ghost, not a client
             ripe.remove(s)
+    if not ripe:
+        return None
+    ripe = [s for s in ripe if now - st['futile'].get(s['cn'].lower(), 0) >= _TAK_GROUPLESS_FUTILE_S]
     if not ripe:
         return None
     again = [s for s in ripe if s['cn'].lower() in st['dropped']
@@ -81572,8 +81586,10 @@ def _tak_groupless_escalate(plog, stuck):
             _tak_messaging_alert(plog, 'failed', f"{detail}; {summary}")
             return 'alert'
         _tak_groupless['seen'] = {}
-        back = _tak_wait_groups_back(plog, tag, names)
-        _tak_messaging_alert(plog, 'restarted', f"{detail}; {summary}; {back}")
+        back, not_back = _tak_wait_groups_back(plog, tag, names)
+        for n in not_back:
+            _tak_groupless['futile'][n.lower()] = time.time()
+        _tak_messaging_alert(plog, 'still' if not_back else 'restarted', f"{detail}; {summary}; {back}")
         return 'restart'
     finally:
         _tak_ldap_recycle_lock.release()
@@ -81581,7 +81597,8 @@ def _tak_groupless_escalate(plog, stuck):
 
 def _tak_wait_groups_back(plog, tag, names):
     """After a messaging-only restart: wait up to `_TAK_MESSAGING_BACK_WAIT_S` for these users'
-    connections to be back with their groups. Returns one plain sentence for the log and the mail."""
+    connections to be back with their groups. Returns (one plain sentence for the log and the mail, the
+    names that are not back)."""
     t0 = time.time()
     want = {n.lower() for n in names}
     back = set()
@@ -81592,12 +81609,12 @@ def _tak_wait_groups_back(plog, tag, names):
             if want <= back:
                 msg = f"all {len(want)} client(s) were back with their groups {int(time.time() - t0)}s after 8089 came up"
                 plog(f"  ✓ {tag}: {msg}")
-                return msg
+                return msg, set()
         if time.time() - t0 >= _TAK_MESSAGING_BACK_WAIT_S:
             msg = (f"{len(want - back)} client(s) were not back with groups "
                    f"{_TAK_MESSAGING_BACK_WAIT_S}s after 8089 came up (they may be offline)")
             plog(f"  {tag}: {msg}")
-            return msg
+            return msg, want - back
         time.sleep(5)
 
 
