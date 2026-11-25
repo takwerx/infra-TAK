@@ -30265,6 +30265,9 @@ KNOWN_SECURITY_RELEASES = (
      'reason': 'a certificate bundle that still trusted a distrusted root (eMudhra)'},
     # ops #1253: CloudTAK plugins from TAK Portal's Marketplace use component `plugin:<id>`
     # (the Marketplace id). Add a plugin's security release here only once it is public.
+    # Dispatcher 1.8.1 (public Nov 25, 2026; its release notes say "Security update").
+    {'component': 'plugin:dispatcher', 'fixed_in': '1.8.1',
+     'reason': 'a missing access check on connections in TAK-CAD mode'},
 )
 
 
