@@ -54,7 +54,8 @@ OLD = '''services:
 WANT = {'WEBODM_VERSION', 'WEBODM_IMAGES', '_webodm_pin_images', 'WEBODM_OLEFILE_STRIP',
         '_webodm_strip_olefile', 'WEBODM_DB_VOLUME', 'WEBODM_DB_DUMP_PREFIX', 'WEBODM_UPGRADE_WAIT_S', 'WEBODM_PULL_TIMEOUT_S',
         '_webodm_db_sh', '_webodm_db_needs_upgrade', '_webodm_answers', '_webodm_db_room_check', '_webodm_backup_db_95',
-        '_webodm_wait_upgraded', '_webodm_restore_95', '_run_webodm_update'}
+        '_webodm_wait_upgraded', '_webodm_restore_95', '_run_webodm_update',
+        '_FREE_SPACE_BACKUPS_HINT'}
 
 
 class Box:

@@ -38,7 +38,7 @@ GB = 1024 ** 3
 _FUNCS = {'_cloudtak_fs_free_local', '_cloudtak_fs_free_remote',
           '_cloudtak_update_space_problem', '_cloudtak_update_space_lines'}
 _CONSTS = {'_CLOUDTAK_UPDATE_MEASURED_GB', '_CLOUDTAK_UPDATE_MIN_FREE',
-           '_CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT'}
+           '_CLOUDTAK_UPDATE_MIN_FREE_CHECKOUT', '_FREE_SPACE_BACKUPS_HINT'}
 REMOTE = {'host': '203.0.113.7', 'ssh_user': 'root'}
 
 
@@ -168,7 +168,7 @@ def test_message_says_nothing_changed_and_what_to_do():
     text = '\n'.join(lines)
     assert '3.0 GB free' in text and 'about 25 GB' in text
     assert 'Nothing was changed' in text and 'press Update again' in text
-    assert 'docker builder prune -f' in text and 'Do not delete Docker volumes' in text
+    assert 'docker builder prune -af' in text and 'Do not delete Docker volumes' in text
 
 
 # --------------------------------------------------------------------------- #

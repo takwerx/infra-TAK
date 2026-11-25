@@ -347,7 +347,7 @@ def _precheck(deployment, mode='remote', managed_major=18, size=2 * GIB, local_c
         return _done('', 1)
     n['_pg_exec'] = local_pg
     exec(_cut('_cotdb_fmt_bytes'), n)
-    for c in ('_TAK58_MIN_DISK_RATIO', '_TAK58_MANAGED_STORAGE'):
+    for c in ('_TAK58_MIN_DISK_RATIO', '_TAK58_MANAGED_STORAGE', '_FREE_SPACE_BACKUPS_HINT'):
         exec(_const(c), n)
     for f in ('_tak58_fmt_measured', '_tak58_preflight_summary_line', '_tak_58_preflight'):
         exec(_cut(f), n)
@@ -399,7 +399,7 @@ def test_precheck_local_disk_gate_still_blocks_when_space_is_short(monkeypatch):
         '_cot_db_size_for_dump': lambda *a, **k: pytest.fail('local box asked the managed reader'),
     }
     exec(_cut('_cotdb_fmt_bytes'), n)
-    for c in ('_TAK58_MIN_DISK_RATIO', '_TAK58_MANAGED_STORAGE'):
+    for c in ('_TAK58_MIN_DISK_RATIO', '_TAK58_MANAGED_STORAGE', '_FREE_SPACE_BACKUPS_HINT'):
         exec(_const(c), n)
     for f in ('_tak58_fmt_measured', '_tak58_preflight_summary_line', '_tak_58_preflight'):
         exec(_cut(f), n)

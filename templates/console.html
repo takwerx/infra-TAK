@@ -487,10 +487,12 @@ body{display:flex;flex-direction:row;min-height:100vh}
 {% if not mod.get('icon_url') or key in ('takportal', 'fedhub', 'emailrelay', 'fail2ban', 'webodm', 'tak_video_restreamer', 'netbird', 'connectivity', 'clientfeed') %}<div class="module-name">{{ mod.name }}</div>{% endif %}
 </div>
 {% if key != 'tak_video_restreamer' %}<div class="module-desc">{{ mod.description }}</div>{% endif %}
-{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available or v.node_security %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if key == 'authentik' %}{% if v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'cloudtak' %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('latest') %} <span style="color:var(--green);font-size:10px" title="Tracking upstream CloudTAK — running the latest release">latest ✓</span>{% endif %}{% elif key == 'takportal' %}{% if v.get('channel') == 'beta' %} <span style="color:var(--yellow);font-size:10px" title="Beta Mode is ON in TAK Portal — this is a main-branch build, not a published release. Turn off Enable Beta Features inside TAK Portal to track releases.">· beta</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}{% elif v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}</div>{% endif %}{% endif %}
+{% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available or v.node_security %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key in ('mediamtx', 'tak_video_restreamer', 'remote_assist') %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if key == 'authentik' %}{% if v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned at v{{ v.get('vetted_release','') }} — what production customers run">· main: v{{ v.get('vetted_release','') }}</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('ahead_of_vetted') %} <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ v.get('vetted_release','') }}) — not yet validated on main channel">! unvetted</span>{% elif v.get('channel') != 'dev' and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% elif key == 'netbird' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted','') }}">· main: v{{ v.get('vetted','') }}</span>{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">· update</span>{% endif %}{% elif key == 'netbird' and v.get('vetted') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% elif key == 'cloudtak' %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif v.get('latest') %} <span style="color:var(--green);font-size:10px" title="Tracking upstream CloudTAK — running the latest release">latest ✓</span>{% endif %}{% elif key == 'takportal' %}{% if v.get('channel') == 'beta' %} <span style="color:var(--yellow);font-size:10px" title="Beta Mode is ON in TAK Portal — this is a main-branch build, not a published release. Turn off Enable Beta Features inside TAK Portal to track releases.">· beta</span>{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}{% elif v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% endif %}{% if v.update_available and v.get('release_notes_url') %} <span class="whats-new-link" role="link" tabindex="0" data-url="{{ v.release_notes_url }}" style="color:var(--cyan);font-size:10px;text-decoration:underline;cursor:pointer" title="Open the release notes on GitHub">What's new</span>{% endif %}</div>{% endif %}{% endif %}
 <span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+{% if key == 'takserver' and mod.installed %}{% set _tt = module_versions.get('takserver') or {} %}{% set _st = _tt.get('tested_state') if _tt.get('tested') else '' %}<div id="takserver-card-tested" data-state="{{ _tt.get('tested_state', '') }}"{% if _st in ('behind', 'current') %} title="Latest we tested: {{ _tt.get('tested') }}"{% endif %} style="font-family:'JetBrains Mono',monospace;font-size:10px;color:{% if _st == 'behind' %}var(--yellow,#eab308){% elif _st == 'current' %}var(--green){% else %}var(--text-dim){% endif %};margin-top:4px{% if _st not in ('behind', 'current') %};display:none{% endif %}">{% if _st == 'behind' %}Newer Version Available{% elif _st == 'current' %}Current Release{% endif %}</div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
+{% if key == 'fedhub' and mod.installed %}{% set _ft = module_versions.get('fedhub') or {} %}{% set _fst = _ft.get('tested_state') if _ft.get('tested') else '' %}<div id="fedhub-card-tested" data-state="{{ _ft.get('tested_state', '') }}"{% if _fst in ('behind', 'current') %} title="Latest release we tested: {{ _ft.get('tested') }}"{% endif %} style="font-family:'JetBrains Mono',monospace;font-size:10px;color:{% if _fst == 'behind' %}var(--yellow,#eab308){% elif _fst == 'current' %}var(--green){% else %}var(--text-dim){% endif %};margin-top:4px{% if _fst not in ('behind', 'current') %};display:none{% endif %}">{% if _fst == 'behind' %}Newer Version Available{% elif _fst == 'current' %}Current Release{% endif %}</div>{% endif %}
 {% if key == 'caddy' and mod.installed %}<div id="caddy-card-cert-days" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 </a>
 {% endfor %}
@@ -787,8 +789,35 @@ function updateGuardDogOverallHealth(){
 }
 setInterval(refreshModuleCards,8000);
 setTimeout(refreshModuleCards,3000);
+// infra-TAK #627: "What's new" sits inside the module card, which is itself a link, so it is a
+// span (an <a> cannot hold an <a>). Open the release page in a new tab; only github.com URLs.
+function openWhatsNew(e){
+    var t=e.target&&e.target.closest?e.target.closest('.whats-new-link'):null;
+    if(!t)return;
+    if(e.type==='keydown'&&e.key!=='Enter'&&e.key!==' ')return;
+    e.preventDefault();e.stopPropagation();
+    var u=t.getAttribute('data-url')||'';
+    if(u.indexOf('https://github.com/')===0)window.open(u,'_blank','noopener,noreferrer');
+}
+document.addEventListener('click',openWhatsNew);
+document.addEventListener('keydown',openWhatsNew);
+function applyTakTested(d,id,what){
+    // ops #1119: "Current Release / Newer Version Available" on the TAK Server and Federation Hub cards. Text only, never HTML: the version came from a signed file.
+    var el=document.getElementById(id||'takserver-card-tested');
+    if(!el)return;
+    // AJ (ops #1119): two words only. Behind = "Newer Version Available", on it = "Current Release". Ahead of what we tested: no line.
+    var note=d&&d.tested?{behind:['Newer Version Available','var(--yellow,#eab308)'],current:['Current Release','var(--green)']}[d.tested_state]:null;
+    if(!note){el.style.display='none';el.textContent='';el.removeAttribute('data-state');el.removeAttribute('title');return;}
+    el.textContent=note[0];
+    el.style.color=note[1];
+    el.title=(what||'Latest we tested')+': '+d.tested;
+    el.setAttribute('data-state',d.tested_state||'');
+    el.style.display='';
+}
 function refreshModuleVersions(){
     fetch('/api/modules/version').then(function(r){return r.json()}).then(function(data){
+        try{if(data&&data.takserver)applyTakTested(data.takserver);}catch(e){}  // the extra line must never stop the version badges below
+        try{if(data&&data.fedhub)applyTakTested(data.fedhub,'fedhub-card-tested','Latest release we tested');}catch(e){}
         for(var key in data){
             var el=document.getElementById('module-version-'+key);
             if(!el)continue;
@@ -822,6 +851,7 @@ function refreshModuleVersions(){
             }else if(key==='authentik'&&d.vetted_release){
                 s+=' <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>';
             }
+            if(d.update_available&&typeof d.release_notes_url==='string'&&d.release_notes_url.indexOf('https://github.com/')===0)s+=(s?' ':'')+'<span class="whats-new-link" role="link" tabindex="0" data-url="'+escapeHtml(d.release_notes_url)+'" style="color:var(--cyan);font-size:10px;text-decoration:underline;cursor:pointer" title="Open the release notes on GitHub">What\'s new</span>';
             if(d.node_security)s+=(s?' ':'')+'<span style="color:var(--red);font-size:10px;font-weight:600" title="'+escapeHtml(d.node_security)+'">🔒 Node.js out of date — press Update</span>';
             el.innerHTML=s;if(s)el.style.display='';
         }
