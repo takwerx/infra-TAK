@@ -11933,6 +11933,120 @@ def _git_ls_remote(*patterns, repo=None):
     except Exception:
         return None
 
+# --- Newest release of a GitHub repo, without spending the 60-an-hour API budget (ops #1217) ---
+# api.github.com allows 60 unauthenticated calls an hour per IP address. A box that shares its
+# address (test12 twice: ops #1065, ops #1214) is refused (HTTP 403) for the rest of the hour, and
+# every "what is the newest release" lookup then failed alone: the Guard Dog "Update pending"
+# mail skipped its run, the Authentik and NetBird cards saw nothing new. This is the one place
+# that asks. Order: the github.com /releases/latest redirect (not rate limited that way, GitHub
+# never points it at a draft or pre-release), then the API, then the last answer we got (kept on
+# disk, so a restart does not forget it). Never raises. A tag is remote input: callers that put
+# it in a command or a file check its shape again (_ak_tag_is_sane, _REMOTE_ASSIST_TAG_RE).
+_GH_LATEST_TTL = 600        # 10 minutes: release cadence is days
+_GH_LATEST_RETRY = 60       # after a total failure, ask again after a minute, not on every page
+_GH_LATEST_FILE = 'github-latest-release.json'
+_GH_REPO_RE = re.compile(r'^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$')
+_GH_TAG_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+/-]{0,79}$')
+_gh_latest_mem = {}         # repo -> {'tag', 'ok_at', 'try_at'}
+_gh_latest_lock = threading.Lock()
+
+
+def _gh_latest_from_redirect(repo):
+    """Tag from the github.com /releases/latest redirect, or ''. The redirect has to END on this
+    repo's own release pages (a renamed or moved repo gives '', not another repo's tag)."""
+    import urllib.request as _ur
+    import urllib.parse as _up
+    base = f'https://github.com/{repo}/releases/'
+    req = _ur.Request(base + 'latest', method='HEAD', headers={'User-Agent': 'infra-TAK'})
+    with _ur.urlopen(req, timeout=8) as r:
+        final = str(r.geturl() or '')
+    prefix = base + 'tag/'
+    if not final.lower().startswith(prefix.lower()):
+        return ''
+    tag = _up.unquote(final[len(prefix):].split('?', 1)[0].split('#', 1)[0])
+    return tag if _GH_TAG_RE.fullmatch(tag) else ''
+
+
+def _gh_latest_from_api(repo):
+    """Tag from api.github.com releases/latest, or ''. Raises on 403 / network trouble."""
+    import urllib.request as _ur
+    req = _ur.Request(f'https://api.github.com/repos/{repo}/releases/latest',
+                      headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
+    with _ur.urlopen(req, timeout=8) as resp:
+        tag = str((json.loads(resp.read().decode()) or {}).get('tag_name') or '').strip()
+    return tag if _GH_TAG_RE.fullmatch(tag) else ''
+
+
+def _gh_latest_disk_read():
+    try:
+        with open(os.path.join(CONFIG_DIR, _GH_LATEST_FILE), encoding='utf-8') as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _gh_latest_disk_write(repo, tag):
+    """Keep the last good answer for `repo` (mode 600, written whole, then moved into place)."""
+    tmp = None
+    try:
+        d = _gh_latest_disk_read()
+        if (d.get(repo) or {}).get('tag') == tag:
+            return
+        d[repo] = {'tag': tag, 'at': int(time.time())}
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix='.gh-latest-', suffix='.tmp')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(d, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, os.path.join(CONFIG_DIR, _GH_LATEST_FILE))
+        tmp = None
+    except Exception:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
+def _gh_latest_release_tag(repo, *, fresh=False):
+    """Newest published release tag of `repo` ('owner/name'), as GitHub names it ('v10.4.1-alpha',
+    'version/2026.8.5'), or None when we have never been able to read one. See the block above."""
+    if not _GH_REPO_RE.fullmatch(str(repo or '')):
+        return None
+    now = time.time()
+    with _gh_latest_lock:
+        m = _gh_latest_mem.get(repo)
+        if m and not fresh:
+            if m.get('tag') and now - m['ok_at'] < _GH_LATEST_TTL:
+                return m['tag']
+            if now - m['try_at'] < _GH_LATEST_RETRY:
+                return m.get('tag')
+    tag = ''
+    for source in (_gh_latest_from_redirect, _gh_latest_from_api):
+        try:
+            tag = source(repo)
+        except Exception as e:
+            print(f"[gh-latest] {repo}: {source.__name__} failed (non-fatal): {str(e)[:120]}", flush=True)
+            tag = ''
+        if tag:
+            break
+    with _gh_latest_lock:
+        m = _gh_latest_mem.setdefault(repo, {'tag': '', 'ok_at': 0, 'try_at': 0})
+        m['try_at'] = now
+        if tag:
+            m.update(tag=tag, ok_at=now)
+        elif not m['tag']:
+            last = str((_gh_latest_disk_read().get(repo) or {}).get('tag') or '')
+            m['tag'] = last if _GH_TAG_RE.fullmatch(last) else ''
+        result = m['tag'] or None
+    if tag:
+        _gh_latest_disk_write(repo, tag)
+    return result
+
+
 @app.route('/api/update/check')
 @login_required
 def update_check():
@@ -12122,7 +12236,27 @@ def _fetch_latest_tag_name():
         versions.sort(key=lambda x: x[0], reverse=True)
         return versions[0][1]  # full tag name e.g. v0.2.3-alpha
     except Exception:
+        # ops #1217: the API refused (60 an hour per IP). Update Now used to fall back to
+        # origin/main here, i.e. to something other than the newest release. git is not limited.
+        return _fetch_latest_tag_name_from_git()
+
+
+def _fetch_latest_tag_name_from_git():
+    """Newest `v<digits>...` tag of the public repo from `git ls-remote`, or None."""
+    refs = _git_ls_remote('refs/tags/*')
+    versions = []
+    for ref in (refs or {}):
+        name = ref.rsplit('/', 1)[-1]
+        if name.endswith('^{}'):
+            continue
+        try:
+            versions.append((tuple(int(p) for p in name.lstrip('v').replace('-alpha', '').replace('-beta', '').split('.')), name))
+        except ValueError:
+            continue
+    if not versions:
         return None
+    versions.sort(key=lambda x: x[0], reverse=True)
+    return versions[0][1]
 
 
 def _repo_ownership_selfheal(trigger=''):
@@ -29867,11 +30001,17 @@ def _console_pending_update(settings):
     gh_headers = {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'}
     channel = (settings.get('update_channel') or 'main').strip().lower()
     if channel == 'dev':
-        req = urllib.request.Request(
-            f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=dev&per_page=1', headers=gh_headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-        remote_full = (data[0].get('sha') or '') if data else ''
+        try:
+            req = urllib.request.Request(
+                f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=dev&per_page=1', headers=gh_headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            remote_full = (data[0].get('sha') or '') if data else ''
+        except Exception:
+            # ops #1217: API refused (60 an hour per IP); git is not limited that way.
+            remote_full = (_git_ls_remote('refs/heads/dev') or {}).get('refs/heads/dev', '')
+            if not remote_full:
+                raise
         try:
             local = subprocess.run(
                 ['git', f'--git-dir={os.path.join(os.path.dirname(os.path.abspath(__file__)), ".git")}',
@@ -29884,11 +30024,10 @@ def _console_pending_update(settings):
                     'target': f'dev@{remote_full[:7]}', 'identity': remote_full[:7],
                     'how': 'Console page → Update Now.'}
         return None
-    req = urllib.request.Request(
-        f'https://api.github.com/repos/{GITHUB_REPO}/releases/latest', headers=gh_headers)
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode())
-    tag = (data.get('tag_name') or '').strip()
+    # ops #1217: the newest tag without the API's 60-an-hour budget; last good answer on 403
+    tag = (_gh_latest_release_tag(GITHUB_REPO) or '').strip()
+    if not tag:
+        raise RuntimeError('newest infra-TAK release could not be read from GitHub')
 
     def _vt(v):
         return tuple(int(p) for p in v.lstrip('vV').replace('-alpha', '').replace('-beta', '').split('.'))
@@ -29903,10 +30042,11 @@ def _console_pending_update(settings):
             # leaves the box exposed. Newest first (ops #505): the latest fix is the reason
             # to update. Unreadable release list = unknown, not security.
             try:
-                req = urllib.request.Request(
-                    f'https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=50', headers=gh_headers)
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    rels = json.loads(resp.read().decode())
+                # ops #1217: cached 30 minutes with the last good list served when the API
+                # refuses; None means unreadable, which is "unknown", never "no security fix".
+                rels = _gh_json_cached(f'https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=50')
+                if not isinstance(rels, list):
+                    raise ValueError('release list unreadable')
                 sec = []
                 notes = []
                 for rel in rels if isinstance(rels, list) else []:
@@ -45745,12 +45885,8 @@ def _get_authentik_latest_release_tag(use_cache=True):
     if use_cache and _authentik_release_cache['tag'] and (_time.time() - _authentik_release_cache['ts'] < 14400):
         return _authentik_release_cache['tag']
     try:
-        import urllib.request as _ur
-        req = _ur.Request('https://api.github.com/repos/goauthentik/authentik/releases/latest',
-                          headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
-        resp = _ur.urlopen(req, timeout=10)
-        data = json.loads(resp.read().decode())
-        tag = (data.get('tag_name') or '').strip()
+        # ops #1217: shared lookup (github.com redirect, API, last good answer on disk)
+        tag = (_gh_latest_release_tag('goauthentik/authentik', fresh=not use_cache) or '').strip()
         if tag.startswith('version/'):
             tag = tag[len('version/'):]
         tag = tag.lstrip('vV').strip() or None
@@ -46675,12 +46811,8 @@ def _get_netbird_github_latest(repo, use_cache=True):
         if cached and (_time.time() - cached.get('ts', 0) < 14400):
             return cached.get('tag')
     try:
-        req = _ur.Request(
-            f'https://api.github.com/repos/netbirdio/{repo}/releases/latest',
-            headers={'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
-        resp = _ur.urlopen(req, timeout=10)
-        data = json.loads(resp.read().decode())
-        tag = (data.get('tag_name') or '').strip()
+        # ops #1217: shared lookup (github.com redirect, API, last good answer on disk)
+        tag = (_gh_latest_release_tag(f'netbirdio/{repo}', fresh=not use_cache) or '').strip()
         if tag:
             _netbird_release_cache[cache_key] = {'tag': tag, 'ts': _time.time()}
             return tag
