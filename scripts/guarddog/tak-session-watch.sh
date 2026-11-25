@@ -436,6 +436,14 @@ fi
 NOW=$(date +%s)
 STATE_KEY="api_broken=$API_BROKEN invisible=$([ "$INVISIBLE" -gt 0 ] && echo 1 || echo 0) groupless=$([ "$GROUPLESS" -gt 0 ] && echo 1 || echo 0) leftover=$([ "$GLLEFT" -gt 0 ] && echo 1 || echo 0) storm_uid=$STORM_UID storm_ip=$STORM_IP"
 PREV_KEY=""; [ -f "$STATE_FILE" ] && PREV_KEY=$(cat "$STATE_FILE" 2>/dev/null)
+# ops #1148: the leftover flag comes and goes by itself (it needs a matching-socket proof and 5 min of
+# silence, and the same device's entry can drop out of both for a check or two). test8, Nov 23-24:
+# every flip restarted the 24 h clock and mailed at once, 11 mails in a row. Once a leftover has been
+# seen in this state, keep it in the key until the box is healthy again. Going from "not a leftover"
+# TO a leftover still restarts the clock, because the advice in the email changes.
+if [ "$STATE_KEY" != "$PREV_KEY" ] && [ "${STATE_KEY/leftover=0/leftover=1}" = "$PREV_KEY" ]; then
+  STATE_KEY="$PREV_KEY"
+fi
 if [ "$STATE_KEY" != "$PREV_KEY" ]; then
   echo "$STATE_KEY" > "$STATE_FILE"
   echo "$NOW" > "$STATE_SINCE_FILE"

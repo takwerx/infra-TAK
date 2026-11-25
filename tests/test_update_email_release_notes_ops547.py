@@ -109,10 +109,16 @@ def _console(routes, version='10.3.6-alpha', channel='main'):
                 return _Resp(json.dumps(v).encode())
         raise AssertionError('unexpected url ' + url)
     fake = types.SimpleNamespace(Request=_ur.Request, urlopen=urlopen)
+    import tempfile, threading
     n = {'json': json, 'subprocess': _real_subprocess, 'os': os, 're': re, 'VERSION': version,
-         'GITHUB_REPO': 'takwerx/infra-TAK'}
+         'GITHUB_REPO': 'takwerx/infra-TAK', 'time': time, 'threading': threading,
+         'tempfile': tempfile, 'CONFIG_DIR': tempfile.mkdtemp(), '_git_ls_remote': lambda *a, **k: None}
+    # ops #1217: the newest release comes from the shared lookup, the release list from the cache
     _exec(n, '_console_pending_update', '_release_security_summary', '_security_section_summary',
-          '_release_notes_line', consts=NOTES_CONSTS)
+          '_release_notes_line', '_gh_latest_from_redirect', '_gh_latest_from_api', '_gh_latest_disk_read',
+          '_gh_latest_disk_write', '_gh_latest_release_tag', '_gh_json_cached',
+          consts=NOTES_CONSTS + ('_GH_LATEST_TTL', '_GH_LATEST_RETRY', '_GH_LATEST_FILE', '_GH_REPO_RE',
+               '_GH_TAG_RE', '_gh_latest_mem', '_gh_latest_lock', '_GH_JSON_CACHE', '_GH_JSON_TTL',))
     real = sys.modules['urllib.request']
     old_attr = _ur
     import urllib

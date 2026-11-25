@@ -1533,6 +1533,37 @@ def test_state_saved_by_the_old_console_does_not_restart_tak_at_the_first_update
     assert len(box2.restarts()) == 1
 
 
+def test_outpost_start_reasons_added_during_update_do_not_make_the_old_restart_hard_ops1117():
+    """ops #1117, T&E on 10.4.6 (fi-20261124-111132, Rocky, Ubuntu and ARM): the baseline console
+    saved restart=True with only the outpost-recreate request. During Update Now a first,
+    deferred call ran with the outpost also started 28 min after TAK; that kept
+    'LDAP outpost restarted while TAK Server was running' next to the request, so the pending
+    list was no longer 'only the outpost-recreate request' and the final call restarted TAK
+    (the journal said 'a TAK Server restart was asked for'). The outpost-start reasons never ask
+    for a restart themselves, so they must not turn the saved flag into a hard one."""
+    box = outage_box(tak_start=T0 - 53 * 60, ldap_start=T0 - 25 * 60, update_in_progress=True)
+    box.settings['tak_ldap_recycle'] = {'need_groups': True, 'restart': True,
+                                        'pending': [YOUNG_REASON + ' under a running TAK Server'],
+                                        'requested_epoch': T0 - 50 * 60}
+    assert box.recycle(trigger='end of Authentik Reconfigure', final=False) is False
+    st = box.settings['tak_ldap_recycle']
+    assert any(p.startswith('LDAP outpost restarted while TAK Server was running') for p in st['pending'])
+    box.update_in_progress = False
+    assert box.recycle() is False
+    assert box.restarts() == []
+    assert not any('a TAK Server restart was asked for' in l for l in box.log)
+    # a hard request (changed credential) kept next to the same reasons still restarts
+    box2 = outage_box(tak_start=T0 - 53 * 60, ldap_start=T0 - 25 * 60, update_in_progress=True)
+    box2.settings['tak_ldap_recycle'] = {'need_groups': True, 'restart': True,
+                                         'pending': [YOUNG_REASON + ' under a running TAK Server',
+                                                     'CoreConfig LDAP credential changed'],
+                                         'requested_epoch': T0 - 50 * 60}
+    assert box2.recycle(trigger='end of Authentik Reconfigure', final=False) is False
+    box2.update_in_progress = False
+    assert box2.recycle() is True
+    assert len(box2.restarts()) == 1
+
+
 def test_young_tak_request_still_restarts_while_tak_is_young_ops1117():
     """The GH #616 case is kept: carried out at once under a TAK that is still young."""
     box = outage_box(tak_start=T0 - 60)

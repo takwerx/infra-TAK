@@ -24,7 +24,7 @@ check below found the same gap for TAK Video Restreamer's and CloudTAK's video p
 
 The rule these tests enforce is docs/MODULE-DEVELOPMENT.md section 9.3: a public port
 is in the module's `ports`, the relay's forward lists, RELAY-SETUP.md (table and the
-paste-in rule JSON), the README's Tier 1 table and DDNS-SETUP.md's router table.
+paste-in rule JSON), the Tier 1 table in docs/PORTS.md and DDNS-SETUP.md's router table.
 """
 
 import ast
@@ -45,7 +45,7 @@ BOOTSTRAP_PATH = 'scripts/connectivity-anchor-bootstrap.sh'
 BOOTSTRAP = (REPO / BOOTSTRAP_PATH).read_text(encoding='utf-8')
 RELAY_DOC = (REPO / 'docs' / 'RELAY-SETUP.md').read_text(encoding='utf-8')
 DDNS_DOC = (REPO / 'docs' / 'DDNS-SETUP.md').read_text(encoding='utf-8')
-README = (REPO / 'README.md').read_text(encoding='utf-8')
+PORTS_DOC = (REPO / 'docs' / 'PORTS.md').read_text(encoding='utf-8')
 
 # Public ports a relay deliberately does not carry. Each one needs its reason.
 NOT_RELAYED = {
@@ -121,7 +121,7 @@ def _table_ports(markdown):
 
 
 def _readme_tier1():
-    return README.split('### Tier 1', 1)[1].split('\n### ', 1)[0]
+    return PORTS_DOC.split('## Tier 1', 1)[1].split('\n## ', 1)[0]
 
 
 def _declared_module_ports():
@@ -181,17 +181,17 @@ def test_every_declared_module_port_reaches_relays_and_the_docs(module, port, pr
     assert port in relayed, '%s: %d/%s is in no relay forward list (%s)' % (module, port, proto, BOOTSTRAP_PATH)
     assert port in _table_ports(RELAY_DOC), '%s: %d missing from the port table in docs/RELAY-SETUP.md' % (module, port)
     assert port in _ingress_ports(proto), '%s: %d/%s missing from the ingress.json block in docs/RELAY-SETUP.md' % (module, port, proto)
-    assert port in _table_ports(_readme_tier1()), '%s: %d missing from the README Tier 1 ports table' % (module, port)
+    assert port in _table_ports(_readme_tier1()), '%s: %d missing from the docs/PORTS.md Tier 1 ports table' % (module, port)
     assert port in _table_ports(DDNS_DOC), '%s: %d missing from the router table in docs/DDNS-SETUP.md' % (module, port)
 
 
 def test_every_readme_public_port_is_relayed():
     """Built-in services (TAK Server, MediaMTX, CloudTAK, Remote Assist) have no manifest,
-    so the README's Tier 1 table is their list. CloudTAK's video ports were public there
+    so the Tier 1 table in docs/PORTS.md is their list. CloudTAK's video ports were public there
     and forwarded by no relay until v10.2.9."""
     relayed = _relay_tcp_forwards() | _relay_udp_forwards()
     missing = sorted(_table_ports(_readme_tier1()) - relayed - set(NOT_RELAYED))
-    assert not missing, 'README Tier 1 ports no relay forwards: %s' % missing
+    assert not missing, 'docs/PORTS.md Tier 1 ports no relay forwards: %s' % missing
 
 
 def test_relay_guide_opens_every_forwarded_port_in_the_cloud_firewall():
@@ -363,9 +363,9 @@ def test_relay_doc_tells_existing_relays_to_add_9997():
 
 def test_9997_is_on_every_port_list_the_note_points_at():
     """The note says Paste 2 adds 9997 and the rest of the docs agree: the guide's table, the
-    paste-in rules, the README's Tier 1 table and the router guide all carry TCP 9997."""
+    paste-in rules, the Tier 1 table in docs/PORTS.md and the router guide all carry TCP 9997."""
     assert 9997 in _table_ports(RELAY_DOC)
     assert 9997 in _ingress_ports('tcp')
-    assert 9997 in _table_ports(README)
+    assert 9997 in _table_ports(PORTS_DOC)
     assert 9997 in _table_ports(DDNS_DOC)
     assert 'Opening one more port' in RELAY_DOC
