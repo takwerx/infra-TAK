@@ -24,7 +24,7 @@ Back to the [README](README.md).
 - NetBird moves to 0.83.2 and its dashboard to v2.98.0. On an existing NetBird server, press **Update** on the NetBird page.
 - Update Now no longer restarts TAK Server by force when only an Authentik outpost start asked for it.
 - The newest-release checks (console update check, MediaMTX web editor, Guard Dog update email) keep working when GitHub answers "rate limit" (HTTP 403).
-- TAK Server on Ubuntu: the update button can install an older package when you choose it. The rollback pop-up says which package stays installed.
+- TAK Server on Ubuntu: the update button can install an older package when you choose it. After a TAK Server rollback, the result message says which package is still installed.
 - CloudTAK Update: the "not enough free disk" message names the clean-up commands that free what `docker system df` shows.
 
 **Firewall and restarts.**
