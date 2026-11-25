@@ -42538,6 +42538,25 @@ def _startup_caddy_nodered_login_converge():
 _TAKPORTAL_VHOST_MARKER = '# TAK Portal'
 _TAKPORTAL_PUBLIC_PATHS = '/request-access* /lookup* /locate/* /styles.css /favicon.ico /branding/* /public/*'
 _CADDY_STRIP_AUTHENTIK_HEADERS = 'request_header -X-Authentik-*'
+def _fedhub_forward_auth_lines(ak_up, indent):
+    """Caddy `forward_auth` lines for the Federation Hub site (ops #1204).
+
+    Authentik decides who may open the hub's page. Nothing is copied to the hub.
+    Federation Hub signs its own users in (its OIDC login or a client certificate) and reads
+    no X-Authentik-* header. `copy_headers X-Authentik-Groups` used to send the person's whole
+    group list to it: an admin in about 150 TAK groups made one header of about 8,000 bytes, and
+    the hub's web server (Jetty, request header limit 8,192 bytes) answered
+    `HTTP ERROR 431 Request Header Fields Too Large` for every page. The same lines would grow
+    with every new group, so no header list is a safe fix: send none.
+    """
+    return [
+        f"{indent}forward_auth {ak_up} {{",
+        f"{indent}    uri /outpost.goauthentik.io/auth/caddy",
+        f"{indent}    trusted_proxies private_ranges",
+        f"{indent}}}",
+    ]
+
+
 _TAKPORTAL_AK_COPY_HEADERS = ('X-Authentik-Username X-Authentik-Groups X-Authentik-Entitlements '
                               'X-Authentik-Email X-Authentik-Name X-Authentik-Uid X-Authentik-Jwt '
                               'X-Authentik-Meta-Jwks X-Authentik-Meta-Outpost X-Authentik-Meta-Provider '
@@ -43748,6 +43767,8 @@ def generate_caddyfile(settings=None):
                 # Static/UI assets must not go through forward_auth — Authentik returns HTML and the browser
                 # rejects CSS/JS as wrong MIME type. Fed Hub also serves some files from site root (poly-*.js, PNG).
                 lines.append(f"    route {{")
+                # ops #1204: Federation Hub reads no Authentik identity header, so none reaches it.
+                lines.append(f"        {_CADDY_STRIP_AUTHENTIK_HEADERS}")
                 lines.append(f"        @fh_pub {{")
                 lines.append(f"            path /static/* /favicon.ico /Parsons_TAK.png /poly-*")
                 lines.append(f"        }}")
@@ -43758,11 +43779,7 @@ def generate_caddyfile(settings=None):
                 lines.append(f"        handle {{")
                 _emit_outpost_callback_rescue(f"{_pub_url(fh_host, settings)}/")
                 lines.append(f"            reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-                lines.append(f"            forward_auth {ak_up} {{")
-                lines.append(f"                uri /outpost.goauthentik.io/auth/caddy")
-                lines.append(f"                copy_headers X-Authentik-Username X-Authentik-Groups X-Authentik-Email X-Authentik-Name X-Authentik-Uid")
-                lines.append(f"                trusted_proxies private_ranges")
-                lines.append(f"            }}")
+                lines.extend(_fedhub_forward_auth_lines(ak_up, '            '))
                 for rp_line in fh_rp_block:
                     lines.append(f"            {rp_line}")
                 lines.append(f"        }}")
