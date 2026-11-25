@@ -79293,7 +79293,8 @@ _TAK_HTTPS_BROKEN_RESTART_S = 900
 # clear it, `systemctl restart takserver-api` did, and the API answered again 248 s after it).
 # Restarting only the API process drops no 8089 client, so unlike a TAK restart it needs no
 # 15-minute wait: it is done once per episode, as soon as the HTTPS check has waited its own
-# `_TAK_API_CHECK_WAIT_S` and still finds no groups. The API needs this long to answer again.
+# `_TAK_API_CHECK_WAIT_S` and still finds no groups. The API needs this long to answer again
+# (248 s on test12, 301 s on a cloud box), so the check after the restart waits this long too.
 _TAK_API_ONLY_RESTART_WAIT_S = 480
 # GH #549: at box boot TAK and the outpost start together, so the outpost-start test above
 # never fires, and a TAK that came up while Authentik answered 502 was never checked. Once
@@ -80140,7 +80141,9 @@ def _tak_api_only_restart(plog, tag, ldap_pass):
             return 'unknown', f"the API (8443) was not up {int(time.time() - t0)}s after restarting takserver-api"
         time.sleep(5)
     plog(f"  {tag}: TAK's API answers on 8443 ({int(time.time() - t0)}s after the API-only restart)")
-    return _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_CHECK_WAIT_S)
+    # The API needs about 250 to 300 s to give groups again (test12 248 s, cloud box 301 s), so the usual
+    # 300 s check wait would pass or fail on a second. Wait as long as the API-only restart allows.
+    return _tak_api_user_check(plog, tag, ldap_pass, wait_s=_TAK_API_ONLY_RESTART_WAIT_S)
 
 
 def _tak_ldap_recycle_request(reason, need_groups=True, restart=False, restart_if_young=False):

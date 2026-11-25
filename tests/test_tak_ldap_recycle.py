@@ -1006,6 +1006,14 @@ def test_ops1039_no_takserver_api_unit_falls_back_to_the_old_wait():
     assert box.settings['tak_ldap_recycle']['https_broken_since'] >= T0
 
 
+def test_ops1039_check_after_the_api_only_restart_waits_longer_than_the_api_needs_to_answer():
+    # Cloud box Nov 25: the API gave groups again 301 s after `systemctl restart takserver-api`
+    # (test12: 248 s). The usual check wait is 300 s, so the verdict hung on one second of luck.
+    src = _src('_tak_api_only_restart')
+    assert 'wait_s=_TAK_API_ONLY_RESTART_WAIT_S' in src
+    assert _const('_TAK_API_ONLY_RESTART_WAIT_S') >= 400 > _const('_TAK_API_CHECK_WAIT_S')
+
+
 def test_ops1039_docker_tak_never_gets_an_api_only_restart():
     box = healthy_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others',
                       container=True, api_restart='fixes')
