@@ -42915,6 +42915,25 @@ def _caddy_app_lock_converge(plog=None):
         log('sign-in application compare: converge error (non-fatal): %s' % str(e)[:160])
 
 
+def _caddy_app_lock_after_deploy(plog=None, ak_url=None, ak_headers=None):
+    """ops #1247 — the end of a deploy that put a new provider on the outpost. A module that
+    writes its Caddy site first and makes its Authentik application second (WebODM) leaves
+    a site with the first lock and no application compare until some later Caddyfile build,
+    because nothing builds one after the application exists. This runs the step the console
+    start runs, once Authentik answers again (the outpost reload restarts it). With ak_url and
+    ak_headers it first waits for the API (2 minutes at most). Never raises."""
+    log = plog or (lambda m: print(f'Deploy: {m}', flush=True))
+    try:
+        if ak_url and ak_headers is not None and not _wait_for_authentik_api(
+                ak_url, ak_headers, max_attempts=24, plog=plog):
+            log('sign-in application compare: Authentik did not answer in 2 minutes, '
+                'the next console start adds it (ops #1247).')
+            return
+        _caddy_app_lock_converge(log)
+    except Exception as e:
+        log('sign-in application compare: deploy step error (non-fatal): %s' % str(e)[:160])
+
+
 def _caddyfile_forward_auth_pinned(caddyfile):
     """True when every forward_auth block in the infra-TAK part of a Caddyfile text is the
     one _caddy_forward_auth_lines writes: X-Forwarded-Host and -Proto set by Caddy, and no
@@ -50444,9 +50463,13 @@ def run_takportal_deploy():
         plog(f"  Access: http://{server_ip}:{port}")
         # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
+            # ops #1247: the TAK Portal application was made above, so the build asks again.
+            _caddy_app_lock_cache['ts'] = 0.0
             generate_caddyfile(settings)
             # ops #580: say "updated" only after Caddy loaded it and serves a valid certificate.
             _caddy_apply_and_verify(plog, 'TAK Portal', [_get_service_domain(settings, 'takportal')], settings)
+            # ops #1247: the compare is there when this deploy ends, also when Authentik was slow.
+            _caddy_app_lock_after_deploy(plog)
             plog(f"  Open: https://{_pub_hostport(_get_service_domain(settings, 'takportal'))}")
         plog("=" * 50)
         plog("")
@@ -67772,6 +67795,8 @@ def _outpost_add_providers_safe(ak_url, ak_headers, provider_pks_to_add, plog=No
         # returning an Authentik 'Not Found'. Only here (added > 0), so idempotent
         # re-runs don't restart Authentik.
         _reload_embedded_outpost(plog=plog)
+        # ops #1247: the new site gets its application compare now, not at the next build.
+        _caddy_app_lock_after_deploy(plog, ak_url, ak_headers)
         return True
     except Exception as e:
         _log(f"  ⚠ Outpost error: {str(e)[:80]}")
@@ -87070,6 +87095,7 @@ entries:
             else:
                 plog("  ⚠ Authentik HTTP not ready in time — Caddy may 502 briefly; retry in a minute.")
             plog("  Updating Caddy config...")
+            _caddy_app_lock_cache['ts'] = 0.0      # ops #1247: the applications above are new
             generate_caddyfile(settings)
             _cad_ok, _cad_detail = _caddy_reload_checked(timeout=90)
             # v10.1.38 (GH #59) — this used to print an unconditional
