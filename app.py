@@ -19844,6 +19844,19 @@ def _takserver_tested_page_state(installed_version):
     return _tst.page_state(installed_version, _takserver_tested_record())
 
 
+def _takserver_tested_card_state(installed_version):
+    """What the TAK Server card on the console shows (ops #1119): same data as the page, but it never
+    waits for the network. The card is polled every 30 seconds, so it reads the verified cache only
+    and, when the 30-minute check is due, starts the refresh in a background thread. Never raises."""
+    try:
+        if not _takserver_tested_attempt['ts'] or \
+                time.time() - _takserver_tested_attempt['ts'] >= _tst.TESTED_CHECK_SEC:
+            threading.Thread(target=_takserver_tested_refresh, daemon=True).start()
+        return _tst.page_state(installed_version, _tst.cached(_TAKSERVER_TESTED_CACHE))
+    except Exception:
+        return {'tested': '', 'tested_date': '', 'state': 'unknown'}
+
+
 def _takserver_tested_items(unknown):
     """Guard Dog pending items (0 or 1): this box runs an older TAK Server than the one we tested.
     A box with no TAK Server, or one whose version cannot be read, gets none; an unreadable source
@@ -33816,6 +33829,10 @@ def federation_hub_page():
     _fedhub_sso_prime_url = f'https://tak.{_fqdn}' if _fqdn else ''
     _ak = modules.get('authentik', {})
     _fedhub_ver = _get_fedhub_version_info().get('version', '') if fh.get('installed') else ''
+    try:  # ops #1119: the Fed Hub page shows the same "Latest we tested" row as the TAK Server page
+        _fedhub_tested = _takserver_tested_page_state(_fedhub_ver) if _fedhub_ver else None
+    except Exception:
+        _fedhub_tested = None
     _fh_dn = _fedhub_cert_dn(settings)
     _fh_cert_pw_eff = _get_fedhub_cert_password(settings)
     _fh_root_disp = (settings.get('fedhub_root_ca') or settings.get('root_ca_name') or 'FEDHUB-ROOT-CA').strip()
@@ -33824,6 +33841,7 @@ def federation_hub_page():
         settings=settings, fh=fh, fedhub_deploy_cfg=fedhub_deploy_cfg, version=VERSION,
         fedhub_colocation_blocked=_takserver_installed_local(),
         fedhub_version=_fedhub_ver,
+        fedhub_tested=_fedhub_tested,
         fedhub_public_url=_fedhub_public_url,
         fedhub_sso_prime_url=_fedhub_sso_prime_url,
         fedhub_service_domain=_fedhub_host,
@@ -47400,8 +47418,29 @@ def get_all_module_versions():
         _set('takportal', _get_takportal_version_info)
     if modules.get('takserver', {}).get('installed'):
         _set('takserver', _get_takserver_version_info)
+        # ops #1119: "Latest we tested" line on the card. Its own field names, so the card's update
+        # badge (which reads `latest` and `update_available`) is untouched. Copy: the helper caches its dict.
+        try:
+            if isinstance(result.get('takserver'), dict):
+                _ts = _takserver_tested_card_state(result['takserver'].get('version') or '')
+                if _ts.get('tested'):
+                    result['takserver'] = {**result['takserver'], 'tested': _ts['tested'],
+                                           'tested_date': _ts['tested_date'], 'tested_state': _ts['state']}
+        except Exception as e:
+            print(f"version-info: takserver tested lookup failed (non-fatal): {e}", flush=True)
     if modules.get('fedhub', {}).get('installed'):
         _set('fedhub', _get_fedhub_version_info)
+        # ops #1119: same "Current Release / Newer Version Available" line as the TAK Server card. Federation Hub
+        # ships in the same tak.gov release as TAK Server (the package version reads 5.8-RELEASE105 for both), so the
+        # one signed "latest tested" file drives both. Own field names; `latest` and `update_available` stay as they are.
+        try:
+            if isinstance(result.get('fedhub'), dict):
+                _fs = _takserver_tested_card_state(result['fedhub'].get('version') or '')
+                if _fs.get('tested'):
+                    result['fedhub'] = {**result['fedhub'], 'tested': _fs['tested'],
+                                        'tested_date': _fs['tested_date'], 'tested_state': _fs['state']}
+        except Exception as e:
+            print(f"version-info: fedhub tested lookup failed (non-fatal): {e}", flush=True)
     if modules.get('fail2ban', {}).get('installed'):
         _set('fail2ban', _get_fail2ban_version_info)
     if modules.get('webodm', {}).get('installed'):
