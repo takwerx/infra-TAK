@@ -1,4 +1,4 @@
-module takwerx_console_confined 2.1;
+module takwerx_console_confined 2.2;
 
 ########################################
 # infra-TAK console — CONFINED SELinux domain (v1.1: permissive, enforce-ready)
@@ -137,6 +137,17 @@ module takwerx_console_confined 2.1;
 #        already had relabelfrom/relabelto on usr_t (the install tree); this
 #        extends the SAME permission to user_home_t (module trees), which is
 #        where the assets actually land. No new KIND of privilege.
+#   2.2  ops #1229. The broker's nosuid boot unit (ops #645 W2.5) remounts
+#        /opt/infratak and /home/takwerx nosuid,nodev. On a kernel with the
+#        policy capability nnp_nosuid_transition=1 (Rocky/RHEL 9: see
+#        /sys/fs/selinux/policy_capabilities/nnp_nosuid_transition), a domain
+#        change that execs from a nosuid mount needs `process2 nosuid_transition`.
+#        systemd (init_t) starting the console (SELinuxContext=takwerx_console_t,
+#        gunicorn in /opt/infratak/.venv) did not have it: 203/EXEC "Permission
+#        denied", console restart-looping (nuc, Tue Nov 24, 2026). One rule,
+#        init_t -> takwerx_console_t only; no nnp_transition (the unit sets no
+#        NoNewPrivileges). The broker also refuses to apply the nosuid mounts
+#        while this module is older than 2.2 (see _nosuid_selinux_block).
 #
 # Delivery: start.sh installs on provision; on EXISTING boxes the root broker
 # refreshes this module at daemon startup when the shipped version differs from
@@ -242,6 +253,7 @@ require {
 	class udp_socket { connect create getattr setopt };
 	class unix_stream_socket { connectto getattr ioctl };
 	class process { transition dyntransition siginh rlimitinh noatsecure sigchld setcap execmem };
+	class process2 nosuid_transition;
 	class filesystem getattr;
 }
 
@@ -257,6 +269,9 @@ permissive takwerx_console_t;
 # --- structural: systemd launch transition + broker-socket connect ---
 allow init_t takwerx_console_t:process { transition dyntransition siginh rlimitinh noatsecure };
 allow takwerx_console_t init_t:process sigchld;
+# v2.2 (ops #1229): the console's folders are nosuid (broker, ops #645 W2.5); with
+# nnp_nosuid_transition=1 systemd needs this to start the console from them.
+allow init_t takwerx_console_t:process2 nosuid_transition;
 allow takwerx_console_t user_home_t:file entrypoint;
 allow init_t user_home_dir_t:dir search;
 allow init_t user_home_t:file { open read getattr execute execute_no_trans map ioctl };
