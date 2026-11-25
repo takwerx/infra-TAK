@@ -150,3 +150,43 @@ def test_last_rollback_line_is_not_a_bare_complete():
     body = _cut('_tak_rollback')
     assert 'configuration, certificates and database restored. {_pkg_note}' in body
     assert 'rollback [{label}]: complete"' not in body
+
+
+# ── the broker keeps dpkg's `downgrade` for an apt call that asks for it ────────
+# Measured on a fresh Ubuntu 22.04 box (non-root console, TAK Server R105 -> R104): the
+# broker's DPKG_FORCE=confdef,confold replaces dpkg's defaults, `downgrade` included, so
+# `apt-get install --allow-downgrades ./R104.deb` planned the downgrade, dpkg said
+# "will not downgrade ... skipping" in term.log only, and apt exited 0 on R105.
+
+def _broker():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('takwerx_broker_ops1218',
+                                                  REPO / 'broker' / 'takwerx_broker.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _apt_env(monkeypatch, argv):
+    B = _broker()
+    monkeypatch.delenv('DPKG_FORCE', raising=False)
+    seen = {}
+
+    def run(argv_, **kw):
+        seen['env'] = kw.get('env')
+        return types.SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
+    monkeypatch.setattr(B, '_run_maybe_ufw_locked', run)
+    monkeypatch.setattr(B, '_pkg_stage_verified', lambda a, cwd, t: (a, None))
+    assert B._do_exec({'argv': argv})['ok']
+    return seen['env']
+
+
+def test_broker_apt_with_allow_downgrades_keeps_dpkg_downgrade(monkeypatch):
+    env = _apt_env(monkeypatch, ['apt-get', 'install', '-y', '--allow-downgrades',
+                                 './takserver_5.8-RELEASE104_all.deb'])
+    assert env['DPKG_FORCE'].split(',') == ['confdef', 'confold', 'downgrade']
+
+
+def test_broker_apt_without_allow_downgrades_never_gets_downgrade(monkeypatch):
+    env = _apt_env(monkeypatch, ['apt-get', 'install', '-y', './takserver_5.8-RELEASE105_all.deb'])
+    assert env['DPKG_FORCE'] == 'confdef,confold'

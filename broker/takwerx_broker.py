@@ -4397,7 +4397,16 @@ def _do_exec(req):
         # installed) died at "end of file on stdin at conffile prompt" and was left iU.
         # Keep the file on disk — the same choice the OS upgrade makes (L4). Fixed value,
         # set here because the -o Dpkg::Options form is denied by _check_pkgmgr.
-        env.setdefault('DPKG_FORCE', 'confdef,confold')
+        _dpkg_force = 'confdef,confold'
+        # ops #1218: DPKG_FORCE REPLACES dpkg's built-in defaults, and `downgrade` is one of
+        # them. With it gone, `apt-get install --allow-downgrades ./older.deb` plans the
+        # downgrade, then dpkg prints "will not downgrade ... skipping" (term.log only) and
+        # apt exits 0 with the newer package still installed (measured on a fresh Ubuntu
+        # 22.04 box, TAK Server R105 -> R104: adding `downgrade` made it install). Put it back
+        # only when the caller passed apt's own --allow-downgrades, which is the opt-in.
+        if '--allow-downgrades' in argv[1:]:
+            _dpkg_force += ',downgrade'
+        env.setdefault('DPKG_FORCE', _dpkg_force)
     if _docker_cp_needs_stage(argv):
         # ops #645 W0 (hardening, both modes): a docker cp whose host path is not on
         # the allowlist never lets root open that path; the console user does the
