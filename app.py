@@ -81550,6 +81550,10 @@ def _tak_stuck_mass_loop():
             _tak_groupless_clients_check(log)     # ops #1039: one named phone with no groups
         except Exception as e:
             log(f"groupless-client check error (non-fatal): {str(e)[:200]}")
+        try:
+            _tak_bootstrap_leftover_check(log)    # ops #1267: the replaced CloudTAK container's empty connection
+        except Exception as e:
+            log(f"bootstrap-cert leftover check error (non-fatal): {str(e)[:200]}")
 
 
 def _tak_stuck_mass_escalate(plog, n_stuck, n_total, minutes, tak_up_min):
@@ -81952,6 +81956,69 @@ def _tak_wait_groups_back(plog, tag, names):
             plog(f"  {tag}: {msg}")
             return msg, want - back
         time.sleep(5)
+
+
+# ops #1267 (test12, Nov 25, found in the ops #1147 box test): after a TAK Portal Marketplace install the
+# CloudTAK container is replaced. The old container's connection of the CloudTAK Core Events cert
+# (cloudtak-svc-bootstrap) stays in TAK's list with NO groups, while the new container's connection has every
+# channel. The 1-minute check above never judges it (a file user: LDAP says nothing about it; an empty
+# connection OLDER than one with groups is a ghost for phones), so it sat there for good and the T&E client
+# check (`anon named=0`) and Guard Dog's no-channel count both read it as a fault.
+# So: this cert's connection that has no groups while a NEWER connection of the same cert has groups is a
+# leftover of the replaced container. `_TAK_GROUPLESS_CHECKS` checks in a row: drop only that connection.
+# Nothing is restarted and no mail goes out. The newest connection is never touched, and a connection TAK
+# refuses to drop is tried once.
+_tak_bootstrap_leftover = {'tak_start': None, 'seen': {}, 'refused': set()}
+
+
+def _tak_bootstrap_leftover_check(plog):
+    """ops #1267: one run of the 1-minute check for a leftover connection of the CloudTAK bootstrap cert (see
+    the block comment above). Returns 'dropped' when it dropped one or more, else None."""
+    tag = 'TAK bootstrap-cert leftover check'
+    st = _tak_bootstrap_leftover
+
+    def _reset():
+        st['seen'] = {}
+
+    if (not os.path.exists('/opt/tak/CoreConfig.xml') or _tak_core_is_remote()
+            or not _tak_bootstrap_cert_present()):
+        _reset()
+        return None
+    tak_start = _tak_started_epoch()
+    if tak_start is None:
+        _reset()
+        return None
+    if st.get('tak_start') is None or abs(tak_start - st['tak_start']) > 1:
+        _reset()                  # a restarted TAK lists no old connection: start over
+        st['refused'], st['tak_start'] = set(), tak_start
+    if time.time() - tak_start < _TAK_STUCK_MASS_DEADLINE_S or _console_update_in_progress():
+        _reset()
+        return None
+    sessions = _tak_client_sessions()
+    if sessions is None:
+        return None               # a busy API is not a verdict: keep the count, add nothing
+    mine = [s for s in sessions if s['cn'].lower() == CLOUDTAK_BOOTSTRAP_CERT_CN]
+    newest_ok = max((_subscription_num(s['uid']) for s in mine if s['groups']), default=-1)
+    stale = [s for s in mine if not s['groups'] and _subscription_num(s['uid']) < newest_ok
+             and s['uid'] not in st['refused']]
+    st['seen'] = {s['uid']: st['seen'].get(s['uid'], 0) + 1 for s in stale}
+    ripe = [s for s in stale if st['seen'][s['uid']] >= _TAK_GROUPLESS_CHECKS]
+    dropped = []
+    for s in sorted(ripe, key=lambda s: _subscription_num(s['uid'])):
+        ok, err = _tak_admin_marti_req(f'{_TAK_MARTI_API}/subscriptions/delete/{urllib.parse.quote(s["uid"])}',
+                                       timeout=20, method='DELETE')
+        st['seen'].pop(s['uid'], None)
+        if ok is None:
+            plog(f"  {tag}: TAK would not drop {_ak_log_names([s['uid']], 1)}: {err} — not trying it again")
+            st['refused'].add(s['uid'])
+            continue
+        dropped.append(s['uid'])
+    if dropped:
+        plog(f"  {tag}: dropped {len(dropped)} leftover connection(s) of the CloudTAK bootstrap cert "
+             f"({_ak_log_names(dropped, 5)}): they had no groups, and a newer connection of the same cert has "
+             f"its groups")
+        return 'dropped'
+    return None
 
 
 # New-user enrollment race (root cause of ops #565, nuc 2026-11-09). The LDAP provider runs
