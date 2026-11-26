@@ -44690,10 +44690,12 @@ def generate_caddyfile(settings=None):
         # behind Authentik; the app keeps its own login as well. Without Authentik the host
         # answers 503: the dashboard is never published bare.
         mr_host = sd.get('meshrelay') or _get_service_domain(settings, 'meshrelay')
+        mr_fa = []
+        if ak:
+            mr_fa = _caddy_forward_auth_lines(ak_up, "        ", app=_fa_app(mr_host))
         mod_registry.meshrelay.append_caddy_vhost(
             lines, mr_host, bool(ak), ak_up, _CADDY_STRIP_AUTHENTIK_HEADERS,
-            _emit_outpost_callback_rescue, f"{_pub_url(mr_host, settings)}/",
-            _caddy_forward_auth_lines(ak_up, "        ", app=_fa_app(mr_host)) if ak else [])
+            _emit_outpost_callback_rescue, f"{_pub_url(mr_host, settings)}/", mr_fa)
         _emit_alias_redirect(_get_service_alias(settings, 'meshrelay'), mr_host)
 
     nb_mod = modules.get('netbird', {})
@@ -66787,7 +66789,7 @@ def _ensure_authentik_meshrelay_app(fqdn, ak_token, plog=None, flow_pk=None, inv
             req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
                 data=json.dumps({'name': 'MeshRelay Proxy', 'authorization_flow': flow_pk,
                     'invalidation_flow': inv_flow_pk, 'external_host': host, 'mode': 'forward_single',
-                    'token_validity': 'hours=24', 'cookie_domain': cookie}).encode(),
+                    'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': cookie}).encode(),
                 headers=_ak_headers, method='POST')
             provider_pk = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['pk']
             log("  ✓ Proxy provider created")
@@ -66804,6 +66806,8 @@ def _ensure_authentik_meshrelay_app(fqdn, ak_token, plog=None, flow_pk=None, inv
                 req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
                     data=json.dumps({'name': 'MeshRelay Proxy', 'authorization_flow': flow_pk,
                         'invalidation_flow': inv_flow_pk, 'mode': 'forward_single',
+                        'access_token_validity': _proxy_session_validity_to_write(
+                            results[0].get('access_token_validity')),
                         'external_host': host, 'cookie_domain': cookie}).encode(),
                     headers=_ak_headers, method='PATCH')
                 _urlreq.urlopen(req, timeout=10)
@@ -68542,7 +68546,7 @@ _AUTHENTIK_DEFAULT_ACCESS_TOKEN_VALIDITY = 'hours=1'
 # provider on the box belongs to the operator.
 _INFRATAK_PROXY_PROVIDER_NAMES = frozenset({
     'infra-TAK', 'TAK Portal Proxy', 'Node-RED Proxy', 'MediaMTX', 'Federation Hub Proxy',
-    'WebODM Proxy', 'TAK Video Restreamer Proxy', 'ATLAS MDM Proxy',
+    'WebODM Proxy', 'TAK Video Restreamer Proxy', 'ATLAS MDM Proxy', 'MeshRelay Proxy',
 })
 
 

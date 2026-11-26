@@ -583,7 +583,9 @@ def test_module_never_writes_its_own_forward_auth_or_trusted_proxies():
     M.append_caddy_vhost(lines, 'm.example.test', True, 'ak:9000', 'strip', lambda url: None, 'https://m/', [])
     assert 'forward_auth' not in '\n'.join(lines)
     i = APP.index('mod_registry.meshrelay.append_caddy_vhost')
-    assert '_caddy_forward_auth_lines(' in APP[i:i + 600]
+    # the block is made just above the call (a plain `if ak:` line, so the Caddyfile guard
+    # tests that count the writer's calls see it)
+    assert '_caddy_forward_auth_lines(ak_up, "        ", app=_fa_app(mr_host))' in APP[i - 400:i + 600]
 
 
 def test_app_wires_the_vhost_the_proxy_app_and_the_seams():
@@ -609,8 +611,24 @@ def test_descriptor_requires_authentik_and_routes_need_a_console_login():
 
 # ── condition 4: pinned release, no install.sh ────────────────────────────────────────
 
-def test_nothing_installs_until_a_release_is_pinned():
-    assert M.pin_problem() != ''                # shipped state: no pin yet, deploy fails closed
+def test_an_empty_pin_fails_closed():
+    empty = {'tag': '', 'assets': {'amd64': ('ptt-server-linux', ''),
+                                   'arm64': ('ptt-server-linux-arm64', '')},
+             'web': ('web.tar.gz', '')}
+    assert M.pin_problem(empty) != ''
+
+
+def test_the_shipped_pin_is_ryans_public_v490_with_the_hashes_of_its_files():
+    """The values come from files downloaded from the public release and equal its
+    SHA256SUMS (ops #973, Thu Nov 26, 2026). A drifted value would refuse every install."""
+    assert M.RELEASE['tag'] == 'v4.9.0'
+    assert M.RELEASE['assets']['amd64'] == (
+        'ptt-server-linux', '4fb1aea80a2b0f78cba1581da0c6b8528e94b817463d9872eecc1750f6fd53d0')
+    assert M.RELEASE['assets']['arm64'] == (
+        'ptt-server-linux-arm64', '227d223f3cd0d040e1cab5b7bad3904ec4f00cab3649f37346031a73fa737b54')
+    assert M.RELEASE['web'] == (
+        'web.tar.gz', '947a9c35822a7ff316eccdc043627cfee3509161fb99b9156db2239850598539')
+    assert M.pin_problem(arch='amd64') == '' and M.pin_problem(arch='arm64') == ''
 
 
 def test_pin_problem_cases(monkeypatch):
@@ -626,6 +644,9 @@ def test_pin_problem_cases(monkeypatch):
 
 
 def test_deploy_with_no_pin_runs_nothing(monkeypatch):
+    monkeypatch.setattr(M, 'RELEASE', {'tag': '', 'assets': {'amd64': ('ptt-server-linux', ''),
+                                                             'arm64': ('ptt-server-linux-arm64', '')},
+                                       'web': ('web.tar.gz', '')})
     b = Box(b'')
     b.fetch = lambda *a, **k: pytest.fail('downloaded with no pin')
     job = {'running': True, 'complete': False, 'error': False, 'log': []}
@@ -965,9 +986,12 @@ class _FakeAuthentik:
     """Authentik 2026.8.5 as seen on a box: a POST of an existing provider or app is a 400, and a
     PATCH of a proxy provider without `mode` is a 400 too (ops #708: validated as mode=proxy)."""
 
-    def __init__(self):
+    def __init__(self, provider_exists=True, current_validity='hours=1'):
         self.calls = []
         self.patched = []
+        self.created = []
+        self.provider_exists = provider_exists
+        self.current_validity = current_validity
 
     def urlopen(self, req, timeout=None):
         url, method = req.full_url, (getattr(req, 'method', None) or 'GET')
@@ -981,9 +1005,12 @@ class _FakeAuthentik:
         if 'flows/instances/?designation=invalidation' in url:
             return _AkResp({'results': [{'pk': 'flow-i', 'slug': 'default-invalidation-flow'}]})
         if url.endswith('/providers/proxy/') and method == 'POST':
-            refuse('{"name":["provider with this name already exists."]}')
+            if self.provider_exists:
+                refuse('{"name":["provider with this name already exists."]}')
+            self.created.append(body)
+            return _AkResp({'pk': 7})
         if 'providers/proxy/?search=MeshRelay' in url:
-            return _AkResp({'results': [{'pk': 7}]})
+            return _AkResp({'results': [{'pk': 7, 'access_token_validity': self.current_validity}]})
         if '/providers/proxy/7/' in url and method == 'PATCH':
             if 'mode' not in body:
                 refuse('{"internal_host":["Internal host cannot be empty when forward auth is disabled."]}')
@@ -1005,6 +1032,14 @@ def _load_ak_app_func(monkeypatch, fake, logs):
           '_get_service_domain': lambda s, k: 'meshrelay.example.test',
           '_outpost_add_providers_safe': lambda *a, **k: logs.append('outpost'),
           }
+    # the sign-in length helpers are the real ones from app.py (ops #1159), not stand-ins
+    for n in tree.body:
+        name = n.name if isinstance(n, ast.FunctionDef) else None
+        if isinstance(n, ast.Assign):
+            name = next((t.id for t in n.targets if isinstance(t, ast.Name)), None)
+        if name in ('_PROXY_SESSION_VALIDITY', '_AUTHENTIK_DEFAULT_ACCESS_TOKEN_VALIDITY',
+                    '_proxy_session_validity_to_write'):
+            exec(compile(ast.Module([n], []), 'app.py', 'exec'), ns)
     exec(compile(ast.Module([fn], []), 'app.py', 'exec'), ns)
     monkeypatch.setattr(urllib.request, 'urlopen', fake.urlopen)
     return ns['_ensure_authentik_meshrelay_app']
@@ -1018,3 +1053,37 @@ def test_second_deploy_updates_the_existing_authentik_provider_with_its_mode(mon
     assert fake.patched[0]['external_host'] == 'https://meshrelay.example.test'
     assert not [m for m in logs if 'error' in str(m).lower()], logs
     assert 'outpost' in logs         # the provider still reaches the embedded outpost
+
+
+# ── sign-in length (ops #1159: Authentik has access_token_validity, not token_validity) ──
+
+def test_a_new_provider_gets_the_real_sign_in_length_field(monkeypatch):
+    """Red before: the body sent `token_validity`, which Authentik ignores, so dashboard
+    sign-ins ended after Authentik's one-hour default instead of 24 hours."""
+    fake, logs = _FakeAuthentik(provider_exists=False), []
+    ensure = _load_ak_app_func(monkeypatch, fake, logs)
+    assert ensure('example.test', 'tok', plog=logs.append, settings={}) is True
+    (body,) = fake.created
+    assert body['access_token_validity'] == 'hours=24'
+    assert 'token_validity' not in body
+
+
+def test_an_existing_provider_on_the_default_moves_to_24_hours(monkeypatch):
+    fake, logs = _FakeAuthentik(current_validity='hours=1'), []
+    ensure = _load_ak_app_func(monkeypatch, fake, logs)
+    assert ensure('example.test', 'tok', plog=logs.append, settings={}) is True
+    assert fake.patched[0]['access_token_validity'] == 'hours=24'
+
+
+def test_an_existing_provider_keeps_a_length_the_operator_chose(monkeypatch):
+    fake, logs = _FakeAuthentik(current_validity='hours=8'), []
+    ensure = _load_ak_app_func(monkeypatch, fake, logs)
+    assert ensure('example.test', 'tok', plog=logs.append, settings={}) is True
+    assert fake.patched[0]['access_token_validity'] == 'hours=8'
+
+
+def test_the_console_repairs_the_meshrelay_provider_like_the_others():
+    """_INFRATAK_PROXY_PROVIDER_NAMES lists the providers infra-TAK owns, so an existing one
+    on the one-hour default is moved to 24 hours by the start-up repair."""
+    m = re.search(r'_INFRATAK_PROXY_PROVIDER_NAMES = frozenset\(\{(.*?)\}\)', APP, re.S)
+    assert m and "'MeshRelay Proxy'" in m.group(1)

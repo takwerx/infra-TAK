@@ -66,17 +66,22 @@ PTT_PORT = 5000                           # UDP, public: the phones connect here
 WEB_PORT = 8187
 REPO = 'RyanR3/MeshRelayServer'
 
-# The pinned release. Nothing installs until every value is filled in: Ryan's repo is
-# private and has no tagged release yet (ops #973). Update these in a PR, with the SHA-256
-# of each file as built by Ryan's release job and checked by a second person.
+# The pinned release: Ryan's public v4.9.0 (RyanR3/MeshRelayServer, AGPL-3.0, published
+# Wed Nov 25, 2026, 11:01 PM PT; annotated tag commit d5952ddcdf5051c4f9d3111779f4af13fbed41e6).
+# The SHA-256 values below were computed from files downloaded from the public release
+# (ops #973) and match the release's SHA256SUMS and GitHub's own asset digests. Raise the
+# pin only in a PR, with every value re-checked the same way. An empty or wrong value
+# makes the install refuse (pin_problem).
 RELEASE = {
-    'tag': '',
+    'tag': 'v4.9.0',
     'assets': {
         # arch -> (file name in the release, sha256)
-        'amd64': ('ptt-server-linux', ''),
-        'arm64': ('ptt-server-linux-arm64', ''),
+        'amd64': ('ptt-server-linux',
+                  '4fb1aea80a2b0f78cba1581da0c6b8528e94b817463d9872eecc1750f6fd53d0'),
+        'arm64': ('ptt-server-linux-arm64',
+                  '227d223f3cd0d040e1cab5b7bad3904ec4f00cab3649f37346031a73fa737b54'),
     },
-    'web': ('web.tar.gz', ''),
+    'web': ('web.tar.gz', '947a9c35822a7ff316eccdc043627cfee3509161fb99b9156db2239850598539'),
 }
 
 _SHA_RE = re.compile(r'^[0-9a-f]{64}$')
