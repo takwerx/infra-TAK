@@ -127771,10 +127771,13 @@ def _startup_f2b_docker_twins():
 
     Runs AFTER _startup_f2b_ufw_lock_switch(). A plain reload would only add the action
     for NEW bans (fail2ban rebans current ones in a new action only when the address is
-    banned again), so fail2ban is restarted to put every current ban in DOCKER-USER too.
-    The restart unbans every address through each jail's own action first, so it waits
-    while any jail is still on the stock, unlocked `ufw` action (the lock switch moves
-    them; the next console start tries again)."""
+    banned again), so fail2ban is restarted once to put every current ban in DOCKER-USER
+    too. That restart is keyed on a settings flag, not on this function changing a file:
+    an earlier startup step (the ignoreip re-apply) rewrites jails through the writers,
+    which add the line, and only reloads; on the first box test that left a current ban
+    off the Docker ports. The restart unbans every address through each jail's own action
+    first, so it waits while any jail is still on the stock, unlocked `ufw` action (the
+    lock switch moves them; the next console start tries again)."""
     _log = lambda m: print(f"Startup migration: {m}", flush=True)
     try:
         import glob as _glob
@@ -127798,19 +127801,31 @@ def _startup_f2b_docker_twins():
             if new != txt:
                 _write_priv(path, new)
                 changed.append(os.path.basename(path))
-        if not changed:
+        done = (load_settings().get(_F2B_DOCKER_FLAG) or {}).get('last_outcome') == 'applied'
+        if done and not changed:
             return
         act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                              capture_output=True, text=True, timeout=15).stdout.strip()
+        ok = True
         if act == 'active':
             r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'fail2ban']),
                                capture_output=True, text=True, timeout=120)
-            how = 'restarted' if r.returncode == 0 else f'restart FAILED (rc {r.returncode})'
+            ok = r.returncode == 0
+            how = 'restarted' if ok else f'restart FAILED (rc {r.returncode}), tries again next start'
         else:
-            how = f'not running ({act or "unknown"}), left stopped'
-        _log(f"fail2ban: bans now cover Docker-published ports too ({', '.join(changed)}); fail2ban {how}")
+            how = f'not running ({act or "unknown"}); its next start loads the new action'
+        if ok:
+            s = load_settings()
+            s[_F2B_DOCKER_FLAG] = {'last_outcome': 'applied',
+                                   'applied_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+            save_settings(s)
+        _log(f"fail2ban: bans now cover Docker-published ports too "
+             f"({', '.join(changed) or 'jails already had the action'}); fail2ban {how}")
     except Exception as e:
         _log(f"fail2ban Docker-port bans error (non-fatal): {str(e)[:160]}")
+
+
+_F2B_DOCKER_FLAG = 'f2b_docker_ports'   # settings key: the once-per-box restart is done
 
 
 _startup_f2b_docker_twins()

@@ -66,7 +66,7 @@ def _load(tmp_path, have_dir=True):
     exec('\n\n'.join(src), ns)
     act_dir = tmp_path / 'action.d'
     if have_dir:
-        act_dir.mkdir()
+        act_dir.mkdir(exist_ok=True)
     path = str(act_dir / 'infratak-docker.conf')
     ns['_F2B_DOCKER_ACTION_PATH'] = path
     real_isdir = os.path.isdir
@@ -279,3 +279,70 @@ def test_startup_migration_runs_after_the_ufw_lock_switch_and_restarts():
     # waits while a jail is still on the stock unlocked ufw action (restart unbans through it)
     assert src.index('_f2b_stale_ufw_jails()') < src.index("'restart', 'fail2ban'")
     assert src.index('_f2b_ensure_docker_action()') < src.index('_write_priv(path, new)')
+
+
+def _migration_ns(tmp_path, monkeypatch, files, settings, restart_rc=0, active='active'):
+    """_startup_f2b_docker_twins against a fake box: jail files, settings, systemctl."""
+    import types
+    ns = _load(tmp_path)
+    src = next(_seg(n) for n in TREE.body
+               if isinstance(n, ast.FunctionDef) and n.name == '_startup_f2b_docker_twins')
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        if argv[:2] == ['systemctl', 'is-active']:
+            return types.SimpleNamespace(returncode=0, stdout=active + '\n', stderr='')
+        return types.SimpleNamespace(returncode=restart_rc, stdout='', stderr='')
+    act_dir = ns['os'].path.isdir                      # the fake from _load
+    import os as _os
+    import time as _time
+    fake_os = types.SimpleNamespace(path=types.SimpleNamespace(isdir=act_dir, basename=_os.path.basename))
+    glob_mod = types.ModuleType('glob')
+    glob_mod.glob = lambda pat: sorted(files)
+    import sys
+    ns.update(os=fake_os, time=_time, subprocess=types.SimpleNamespace(run=run),
+              _sudo_wrap=lambda a: a, _distro_family=lambda: 'debian',
+              _f2b_stale_ufw_jails=lambda: [],
+              _f2b_read_text=lambda p: files.get(p),
+              load_settings=lambda: dict(settings),
+              save_settings=lambda s: (settings.clear(), settings.update(s)))
+    real_write = ns['_write_priv']
+    ns['_write_priv'] = lambda p, t, **k: files.__setitem__(p, t) if p in files else real_write(p, t)
+    exec(next(_seg(n) for n in TREE.body if isinstance(n, ast.Assign)
+              and any(getattr(t, 'id', None) == '_F2B_DOCKER_FLAG' for t in n.targets)), ns)
+    exec(src, ns)
+    monkeypatch.setitem(sys.modules, 'glob', glob_mod)
+    return ns, calls
+
+
+RESTART = ['systemctl', 'restart', 'fail2ban']
+
+
+def test_migration_restarts_once_even_when_a_writer_already_added_the_line(tmp_path, monkeypatch):
+    """Box test, Nov 25: the ignoreip re-apply rewrote the jail (with the line) and only
+    reloaded, so a migration keyed on its own diff skipped the restart and the current
+    ban never reached the Docker ports."""
+    j = '/etc/fail2ban/jail.d/infratak-authentik.conf'
+    files = {j: AUTHENTIK.replace('infratak-ufw\n', 'infratak-ufw\n         infratak-docker\n')}
+    settings = {}
+    ns, calls = _migration_ns(tmp_path, monkeypatch, files, settings)
+    ns['_startup_f2b_docker_twins']()
+    assert calls.count(RESTART) == 1
+    assert settings['f2b_docker_ports']['last_outcome'] == 'applied'
+    calls.clear()
+    ns['_startup_f2b_docker_twins']()                 # next console start: nothing to do
+    assert RESTART not in calls
+
+
+def test_migration_adds_the_line_and_retries_a_failed_restart(tmp_path, monkeypatch):
+    j = '/etc/fail2ban/jail.d/infratak-authentik.conf'
+    files = {j: AUTHENTIK}
+    settings = {}
+    ns, calls = _migration_ns(tmp_path, monkeypatch, files, settings, restart_rc=1)
+    ns['_startup_f2b_docker_twins']()
+    assert 'infratak-docker' in files[j] and calls.count(RESTART) == 1
+    assert 'f2b_docker_ports' not in settings         # failed: the next start tries again
+    ns2, calls2 = _migration_ns(tmp_path, monkeypatch, files, settings)
+    ns2['_startup_f2b_docker_twins']()
+    assert calls2.count(RESTART) == 1 and settings['f2b_docker_ports']['last_outcome'] == 'applied'
