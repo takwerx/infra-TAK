@@ -39,11 +39,13 @@ APP = (REPO / 'app.py').read_text(encoding='utf-8')
 TREE = ast.parse(APP)
 
 _CONSTS = ('_PORT_GUARD_NAME_RE', 'REMOTE_AUTHENTIK_GUARD_PORTS', 'REMOTE_CLOUDTAK_GUARD_PORTS',
-           '_REMOTE_MODULE_DEPLOYMENT_KEYS', 'SERVICE_DOMAIN_DEFAULTS', '_DOCKER_SOCKET_PATHS')
+           '_REMOTE_MODULE_DEPLOYMENT_KEYS', 'SERVICE_DOMAIN_DEFAULTS', '_DOCKER_SOCKET_PATHS',
+           'AUTHENTIK_REDIS_IMAGE')
 _FUNCS = ('_docker_port_guard_files', '_remote_docker_port_guard', '_remote_module_peer_ips',
           '_remote_authentik_port_guard', '_remote_cloudtak_port_guard', '_authentik_loopback_port',
           '_ensure_authentik_compose_patches', '_remote_cloudtak_guard_ports', '_get_service_domain',
-          '_authentik_volume_is_docker_socket', '_authentik_strip_docker_socket')   # ops #1103
+          '_authentik_volume_is_docker_socket', '_authentik_strip_docker_socket',   # ops #1103
+          '_authentik_redis_image_target')   # ops #1147: the patcher pins an existing redis service
 
 
 def _ns(module_run=None, server_ip=None):

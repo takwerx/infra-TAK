@@ -38,7 +38,8 @@ TREE = ast.parse(APP)
 
 _FUNCS = ('_authentik_volume_is_docker_socket', '_authentik_strip_docker_socket',
           '_ensure_authentik_compose_patches', '_ensure_authentik_compose_patches_legacy',
-          '_authentik_loopback_port', '_authentik_docker_socket_converge')
+          '_authentik_loopback_port', '_authentik_docker_socket_converge',
+          '_authentik_redis_image_target')   # ops #1147: the patchers call it
 _CONSTS = ('_DOCKER_SOCKET_PATHS', 'AUTHENTIK_REDIS_IMAGE')
 
 STOCK = """\
