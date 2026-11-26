@@ -145,6 +145,26 @@ def test_running_version_is_asked_only_for_a_floating_tag_and_a_failure_is_not_a
     assert ahead('nodered/node-red:latest', PIN, broken) is False      # unknown: old behaviour
 
 
+def test_the_docker_template_prints_only_the_one_variable_asked_for():
+    """A container's environment holds secrets (Node-RED's .env), so the template filters in
+    Docker and nothing else reaches this process. Checked on the real Docker CLI (box test)."""
+    formats = []
+
+    def run(cmd, **kw):
+        formats.append(cmd[cmd.index('--format') + 1])
+        return types.SimpleNamespace(returncode=1, stdout='', stderr='')
+    ns = _ns(subprocess=types.SimpleNamespace(run=run))
+    ns['_docker_env_version']('nodered', env_name='NODE_RED_VERSION')
+    assert formats and all('NODE_RED_VERSION' in f and 'split' in f for f in formats)
+    assert not any(re.search(r'range \.Config\.Env\}\}\{\{println \.\}\}', f) for f in formats)
+    # a name that is not a plain variable name is refused before any command runs
+    formats.clear()
+    assert ns['_docker_env_version']('nodered', env_name='X"}}{{.Config') is None and formats == []
+    cmd = NS['_nodered_remote_image_cmd']() if '_nodered_remote_image_cmd' in NS else _remote_cmd()
+    assert 'NODE_RED_VERSION' in cmd and 'split' in cmd
+    assert not re.search(r'range \.Config\.Env\}\}\{\{println \.\}\}', cmd)
+
+
 def test_docker_env_version_reads_the_container_then_the_image():
     seen = []
 

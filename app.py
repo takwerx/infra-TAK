@@ -63929,11 +63929,17 @@ def _docker_env_version(*targets, env_name, timeout=20):
     """(major, minor, patch) that `env_name` (for example NODE_RED_VERSION) holds in the first of
     `targets` Docker knows, a container name or an image reference, or None. A container's
     environment is the one of the image it was created from, so this is the version that ran,
-    not the one a later pull put on disk. Best-effort; never raises."""
+    not the one a later pull put on disk. Best-effort; never raises.
+
+    The Go template prints only the one variable asked for: a container's environment holds
+    secrets (Node-RED's .env, database passwords), and they must not pass through this process."""
+    if not re.fullmatch(r'[A-Z][A-Z0-9_]*', env_name or ''):
+        return None
+    fmt = ('{{range .Config.Env}}{{$p := split . "="}}{{if eq (index $p 0) "' + env_name + '"}}'
+           '{{println .}}{{end}}{{end}}')
     for target in targets:
         try:
-            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format',
-                                           '{{range .Config.Env}}{{println .}}{{end}}', target]),
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', fmt, target]),
                                capture_output=True, text=True, timeout=timeout)
         except Exception:
             continue
@@ -69693,7 +69699,9 @@ def _nodered_remote_image_cmd():
         'docker-compose.yml | head -n 1); '
         'if printf "%s" "$cur" | grep -qE "^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9]+)?(-[A-Za-z][A-Za-z0-9._]*)?$"; '
         'then key=$(printf "%s" "$cur" | sed -E "s/^v//; s/-[A-Za-z][A-Za-z0-9._]*$//; s/-/./g"); '
-        'else key=$(docker inspect nodered --format "{{range .Config.Env}}{{println .}}{{end}}" 2>/dev/null '
+        # only NODE_RED_VERSION is printed: the container's environment holds its .env secrets
+        "else key=$(docker inspect nodered --format '{{range .Config.Env}}{{$p := split . \"=\"}}"
+        "{{if eq (index $p 0) \"NODE_RED_VERSION\"}}{{println .}}{{end}}{{end}}' 2>/dev/null "
         '| sed -n -E "s/^NODE_RED_VERSION=v?([0-9]+\\.[0-9]+\\.[0-9]+).*/\\1/p" | head -n 1); fi; '
         f'if [ -n "$key" ] && [ "$key" != "{_pin_key}" ] '
         f'&& [ "$(printf "%s\\n%s\\n" "$key" "{_pin_key}" | sort -V | tail -n 1)" = "$key" ]; '
