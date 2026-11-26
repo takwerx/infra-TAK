@@ -128165,6 +128165,9 @@ _MODULE_CTX = {
     # ops #755: ATLAS refreshes its own database container; which PostgreSQL minors carry the
     # security fix is the console's one table (POSTGRES_SECURITY_RELEASES), not a copy in the module.
     '_pg_releases_missing': _pg_releases_missing,
+    # ops #1266: ATLAS re-homes its own root-era deployments at startup; the path rewrite
+    # is the one the other modules use (.env and compose files only), not a second copy.
+    '_rehome_rewrite_paths': _rehome_rewrite_paths,
     'VERSION': VERSION,
 }
 # Deliberately NOT wrapped in try/except: a broken module file must fail fast at
@@ -128174,6 +128177,16 @@ _registry_loaded = mod_registry.load_all(_MODULE_CTX)
 mod_registry.init_registry(app, _MODULE_CTX, login_required)
 print(f"[startup] module registry loaded: {_registry_loaded}", flush=True)
 _caddy_registry_loaded()
+
+# ops #1266: ATLAS was missing from the v10.0.5 re-home list above. A box flipped to non-root left
+# /root/atlas serving but unmanageable (tile said Stopped, no update/restart/logs). It lives in the
+# module, not in that loop, because it nests one stack per deployment and re-points the database's
+# bind volume; it runs here because it needs the module's ctx. No-op on a root console, on a born-
+# non-root box and once every deployment is under ~/atlas. Never raises.
+try:
+    mod_registry.atlas.rehome_root_era(_MODULE_CTX)
+except Exception as _atlas_rh_e:
+    print(f"[rehome:atlas] skipped (non-fatal): {str(_atlas_rh_e)[:160]}", flush=True)
 
 # ops #814 (every start until applied, then a cheap self-check): Caddy's admin API moves
 # from 127.0.0.1:2019 to a unix socket and the proxy-auth values leave the Caddyfile for

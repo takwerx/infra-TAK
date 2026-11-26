@@ -824,7 +824,10 @@ function renderInstances(data){
     // ⚠️ An unfinished deployment says so. The record is written before the
     // build so the slug is held while it runs; when the build then fails, the
     // record is all that is left and it must not read as a working deployment.
-    const state = i.built ? i.mode : i.mode + '  (not finished)';
+    // ⚠️ A stranded deployment is neither: it is up (or down) with its files
+    // out of reach, so it says that, never "not finished" (ops #1266).
+    const state = i.stranded ? i.mode + '  (' + stateLabel(i) + ')'
+                : i.built ? i.mode : i.mode + '  (not finished)';
     return '  ' + name.padEnd(24) + String(i.size_gb || 0).padStart(5) +
            ' GB ' + held.padEnd(9) + ' ' + state;
   });
@@ -943,7 +946,11 @@ function stateLabel(i){
   // like. It must not read as "not finished", because the action that state
   // offers is Deploy, and deploying would build a second copy of something
   // already serving.
-  if (i.stranded) return 'running, but this console cannot reach its files';
+  // ⚠️ Says which it is (ops #1266). It used to say "running" for every
+  // stranded row, true or not, and the tile now follows the container too.
+  if (i.stranded)
+    return (i.running ? 'running' : 'stopped') +
+           ', but this console cannot reach its files';
   // ⚠️ Three states, not two. "Stopped" and "never finished" both mean "not
   // serving" and need opposite actions — start it, or deploy it — so a page
   // that collapsed them would offer the wrong button for the one an operator
