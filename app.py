@@ -92707,9 +92707,11 @@ _ak_group_names_state = {'at': 0.0, 'result': None, 'logged': set()}
 
 
 def _ak_group_name_findings(names):
-    """Which of `names` can be read as other groups. A name is listed when it holds "|"
-    (the header's own separator), or when a part of it between "|", ";" or "," is the
-    name of ANOTHER group (compared without case and outer spaces, as such readers do).
+    """Which of `names` hold a separator ("|", ";" or ","). ops #1294: every such name is
+    listed, because TAK Portal 2.0.42 refuses the three in NEW group names but does not
+    clean old ones and still splits the groups header on them. `reads_as` lists the
+    ANOTHER groups a part of the name equals (compared without case and outer spaces, as
+    such readers do): a non-empty list is the dangerous case (the red wording).
     Returns [{'name': ..., 'reads_as': [other group names]}], sorted by name."""
     names = [n for n in names if isinstance(n, str) and n]
     by_key = {}
@@ -92729,8 +92731,7 @@ def _ak_group_name_findings(names):
             key = part.strip().lower()
             if key and key != own and key in by_key and by_key[key] not in reads_as:
                 reads_as.append(by_key[key])
-        if '|' in n or reads_as:
-            out.append({'name': n, 'reads_as': reads_as})
+        out.append({'name': n, 'reads_as': reads_as})
     return out
 
 
@@ -92767,11 +92768,12 @@ def _ak_group_names_scan(force=False, max_age=AK_GROUP_NAME_SCAN_SECONDS):
         _ak_group_names_state['logged'].update(f['name'] for f in fresh)
     for f in fresh:
         detail = ('%r can be read as %s' % (f['name'], ', '.join(repr(x) for x in f['reads_as']))
-                  if f['reads_as'] else '%r holds the separator "|"' % f['name'])
+                  if f['reads_as'] else '%r holds a separator ("|", ";" or ",")' % f['name'])
         print('[authentik] \u26a0 GROUP NAME WARNING: the Authentik group %s by an app that '
-              'splits the group list. If you did not make this group on purpose, look at who '
-              'made it and who is in it (Authentik Admin, Directory, Groups), then rename or '
-              'delete it.' % detail, flush=True)
+              'splits the group list. Step: Authentik Admin, Directory, Groups, rename %r '
+              'without those characters (check who made it and who is in it first). '
+              'infra-TAK does not rename it: a rename can drop access.'
+              % (detail, f['name']), flush=True)
         try:
             audit('authentik:group-name-separator', detail, force=True)
         except Exception:
