@@ -300,7 +300,10 @@ def _mtx_ns(box):
              '_MODULE_FW_ACTIVE_KEY', '_remote_fw_ensure_sh', '_module_fw_ensure_active',
              '_MEDIAMTX_REMOTE_FW_RULES', '_MEDIAMTX_REMOTE_CONSOLE_PORTS',
              '_mediamtx_remote_console_scope_sh', '_mediamtx_remote_firewall',
-             '_fedhub_caddy_source_ip')
+             '_fedhub_caddy_source_ip',
+             # ops #1149: the firewall check asks if this console closed the HLS port (here: no)
+             '_MEDIAMTX_REMOTE_HLS_PORT', '_MEDIAMTX_REMOTE_HLS_CLOSED_FILE',
+             '_mediamtx_remote_hls_closed')
     return _ns(names,
                _module_run=lambda cfg, cmd, timeout=120, log_fn=None: box.run(cmd),
                _fw_backend=lambda: 'ufw', _fw_allow=None, _fw_deny=None, _fw_remove=None)

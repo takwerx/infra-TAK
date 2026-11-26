@@ -81,18 +81,18 @@ def _family(v):
     return tuple(int(x) for x in re.findall(r'\d+', v))[:2]
 
 
-def test_pins_promoted_to_2026_8_6():
-    # ops #1087: same-minor bugfix bump (8.5 -> 8.6), no migration named in the notes, so no new upgrade step.
+def test_pins_promoted_to_2026_8_7():
+    # ops #1276: same-minor SECURITY patch (8.6 -> 8.7), no migration named in the notes, so no new upgrade step.
     ns = _ns()
-    assert ns['AUTHENTIK_VETTED_RELEASE'] == '2026.8.6'
-    assert ns['AUTHENTIK_DEV_RELEASE'] == '2026.8.6'
+    assert ns['AUTHENTIK_VETTED_RELEASE'] == '2026.8.7'
+    assert ns['AUTHENTIK_DEV_RELEASE'] == '2026.8.7'
     assert ns['AUTHENTIK_UPGRADE_STEPS'] == ('2026.5.7',)
 
 
-@pytest.mark.parametrize('installed', ['2026.8.5', '2026.8.4', '2026.8.1', '2026.5.7'])
-def test_update_reaches_2026_8_6_in_one_press(installed):
+@pytest.mark.parametrize('installed', ['2026.8.6', '2026.8.5', '2026.8.4', '2026.8.1', '2026.5.7'])
+def test_update_reaches_2026_8_7_in_one_press(installed):
     main = _ns({'update_channel': 'main'})['_get_authentik_target_release']
-    assert main(installed=installed) == '2026.8.6'
+    assert main(installed=installed) == '2026.8.7'
 
 
 @pytest.mark.parametrize('installed,expected', [
@@ -134,14 +134,46 @@ def test_every_hop_chain_satisfies_upstream_skip_guard(start):
 
 def test_target_release_main_and_dev_channels():
     main = _ns({'update_channel': 'main'})['_get_authentik_target_release']
-    assert main() == '2026.8.6'                           # fresh install: the pin itself
+    assert main() == '2026.8.7'                           # fresh install: the pin itself
     assert main(installed='2026.2.7') == '2026.5.7'
-    assert main(installed='2026.5.7') == '2026.8.6'
-    dev = _ns({'update_channel': 'dev'}, latest='2026.8.6')['_get_authentik_target_release']
-    assert dev() == '2026.8.6'                            # dev tracks upstream latest, not the pin
+    assert main(installed='2026.5.7') == '2026.8.7'
+    dev = _ns({'update_channel': 'dev'}, latest='2026.8.7')['_get_authentik_target_release']
+    assert dev() == '2026.8.7'                            # dev tracks upstream latest, not the pin
     assert dev(installed='2026.2.7') == '2026.5.7'
     offline = _ns({'update_channel': 'dev'}, latest=None)['_get_authentik_target_release']
-    assert offline() == '2026.8.6'
+    assert offline() == '2026.8.7'
+
+
+# ops #1276: the oldest release of each family that carries no advisory we know of. Authentik
+# shipped a security release on 2026-11-25: 2026.8.7, and 2026.5.9 for the older line.
+# Raise a floor when a new advisory lands, in the same PR that moves the pin. A family with no
+# entry here fails the test below, so promoting a new family forces this table to be filled in.
+AUTHENTIK_SECURITY_FLOOR = {(2026, 8): (2026, 8, 7), (2026, 5): (2026, 5, 9)}
+
+
+def _ver(v):
+    return tuple(int(x) for x in re.findall(r'\d+', v))
+
+
+@pytest.mark.parametrize('name', ['AUTHENTIK_VETTED_RELEASE', 'AUTHENTIK_DEV_RELEASE'])
+def test_pin_is_never_below_the_security_floor(name):
+    """A stale 2026.8.6 pin (below the 2026-11-25 security release) must not ship."""
+    pin = _ns()[name]
+    floor = AUTHENTIK_SECURITY_FLOOR.get(_family(pin))
+    assert floor, f'{name} {pin}: family has no security floor entry, add one'
+    assert _ver(pin) >= floor, f'{name} {pin} is below the security floor {floor}'
+
+
+def test_the_guard_catches_the_stale_pin():
+    # The red half of the proof: 2026.8.6 is below the floor, 2026.8.7 is not.
+    floor = AUTHENTIK_SECURITY_FLOOR[(2026, 8)]
+    assert _ver('2026.8.6') < floor <= _ver('2026.8.7')
+
+
+@pytest.mark.parametrize('installed', ['2026.8.6', '2026.8.1', '2026.5.9'])
+def test_main_channel_offers_nothing_below_the_floor(installed):
+    main = _ns({'update_channel': 'main'})['_get_authentik_target_release']
+    assert _ver(main(installed=installed)) >= AUTHENTIK_SECURITY_FLOOR[(2026, 8)]
 
 
 def test_steps_are_ascending_and_below_the_pin():

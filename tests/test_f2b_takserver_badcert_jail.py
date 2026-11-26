@@ -63,7 +63,8 @@ def _consts(*names):
 
 
 def _ns(consts=(), funcs=(), **extra):
-    ns = {'re': re, 'os': os, 'time': time}
+    ns = {'re': re, 'os': os, 'time': time,
+          '_f2b_docker_twin': lambda primary: ''}   # #736, its own test
     ns.update(extra)
     exec(_consts(*consts) if consts else '', ns)
     for f in funcs:

@@ -850,15 +850,15 @@ function loadSnapshots(fromBtn){
       var src=s.source||'manual';
       var srcColor=src==='pre-upgrade'?'var(--cyan)':src==='scheduled'?'var(--green)':'var(--text-dim)';
       return '<tr style="border-bottom:1px solid var(--border)">'
-        +'<td style="padding:6px 8px;font-size:11px;font-family:JetBrains Mono,monospace;color:var(--text-secondary)">'+s.label+'</td>'
-        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+( s.taken_at||'' ).replace('T',' ').replace('Z','')+'</td>'
-        +'<td style="padding:6px 8px;font-size:11px;color:'+srcColor+'">'+src+'</td>'
-        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.tak_version||'?')+'</td>'
-        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.size_mb||0)+' MB</td>'
+        +'<td style="padding:6px 8px;font-size:11px;font-family:JetBrains Mono,monospace;color:var(--text-secondary)">'+escapeHtml(s.label)+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+escapeHtml(( s.taken_at||'' ).replace('T',' ').replace('Z',''))+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:'+srcColor+'">'+escapeHtml(src)+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+escapeHtml(s.tak_version||'?')+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+escapeHtml(s.size_mb||0)+' MB</td>'
         +'<td style="padding:6px 8px;white-space:nowrap">'
-+'<button onclick="restoreSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(16,185,129,0.1);color:var(--green);border:1px solid rgba(16,185,129,0.4);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">↩ Restore</button>'
-+'<button onclick="downloadSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(6,182,212,0.08);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">⬇ Download</button>'
-+'<button onclick="deleteSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:5px;font-size:11px;cursor:pointer">Delete</button>'
++'<button onclick="restoreSnapshot('+jsArg(s.label)+')" style="padding:4px 10px;background:rgba(16,185,129,0.1);color:var(--green);border:1px solid rgba(16,185,129,0.4);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">↩ Restore</button>'
++'<button onclick="downloadSnapshot('+jsArg(s.label)+')" style="padding:4px 10px;background:rgba(6,182,212,0.08);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">⬇ Download</button>'
++'<button onclick="deleteSnapshot('+jsArg(s.label)+')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:5px;font-size:11px;cursor:pointer">Delete</button>'
         +'</td></tr>';
     }).join('');
     c.innerHTML='<div class="table-wrap"><table style="width:100%;border-collapse:collapse">'
@@ -873,7 +873,7 @@ function loadSnapshots(fromBtn){
   }).catch(function(e){
     var btn2=document.getElementById('snap-refresh-btn');
     if(btn2){btn2.disabled=false;btn2.style.opacity='1';btn2.textContent='↻ Refresh';}
-    c.innerHTML='<div style="color:var(--red);font-size:12px">Failed to load snapshots — '+((e&&e.message)||'network error')+'</div>';
+    c.innerHTML='<div style="color:var(--red);font-size:12px">Failed to load snapshots — '+escapeHtml((e&&e.message)||'network error')+'</div>';
   });
 }
 
@@ -911,7 +911,7 @@ function takeSnapshot(){
 }
 
 function restoreSnapshot(label){
-  if(!confirm('Restore TAK Server from snapshot "'+label+'"?\n\nThis will:\n• Stop TAK Server\n• Restore CoreConfig.xml, UserAuthenticationFile.xml, certs, and database\n• Restart TAK Server\n\nCurrent data will be overwritten.'))return;
+  if(!confirm('Restore TAK Server from snapshot "'+label+'"?\n\nThis will:\n• Stop TAK Server\n• Restore CoreConfig.xml, UserAuthenticationFile.xml, certs, and database\n• Restart TAK Server\n\nThe TAK Server package stays as it is now. To go back to an older package, use Update with that package.\n\nCurrent data will be overwritten.'))return;
   var prog=document.getElementById('snap-progress');
   if(prog){prog.style.display='';prog.style.color='var(--yellow)';prog.textContent='Restoring snapshot…';}
   fetch('/api/takserver/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label})})
