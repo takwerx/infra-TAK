@@ -57,5 +57,11 @@ allow unconfined_service_t user_home_t:file entrypoint;
 # file stopped at 10,485,194 bytes on Sep 10 and the denial repeated all day.
 # A roll is: rename the full log, create a new one, gzip the old one, delete the
 # oldest beyond roll_keep. Granted on httpd_log_t only (logs), nothing else.
+# Measured on Rocky 9.9 (sesearch, 2026-11-26): the stock policy already gives
+# httpd_t add_name/create/read/setattr/write on the directory and create/open/read/
+# setattr (+ append via logfile) on the file. What was MISSING, and so what this
+# adds in effect, is dir remove_name and file write, rename and unlink. The other
+# permissions are listed too so the rule still holds on a policy build that
+# differs by a minor release.
 allow httpd_t httpd_log_t:dir { search getattr open read write add_name remove_name };
 allow httpd_t httpd_log_t:file { open read getattr write append create setattr rename unlink };
