@@ -44692,7 +44692,8 @@ def generate_caddyfile(settings=None):
         mr_host = sd.get('meshrelay') or _get_service_domain(settings, 'meshrelay')
         mod_registry.meshrelay.append_caddy_vhost(
             lines, mr_host, bool(ak), ak_up, _CADDY_STRIP_AUTHENTIK_HEADERS,
-            _emit_outpost_callback_rescue, f"{_pub_url(mr_host, settings)}/")
+            _emit_outpost_callback_rescue, f"{_pub_url(mr_host, settings)}/",
+            _caddy_forward_auth_lines(ak_up, "        ", app=_fa_app(mr_host)) if ak else [])
         _emit_alias_redirect(_get_service_alias(settings, 'meshrelay'), mr_host)
 
     nb_mod = modules.get('netbird', {})

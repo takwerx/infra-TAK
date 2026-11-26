@@ -556,7 +556,8 @@ def test_caddy_vhost_sits_behind_forward_auth_and_proxies_to_loopback_only():
     lines = []
     M.append_caddy_vhost(lines, 'meshrelay.example.test', True, 'ak:9000',
                          'request_header -X-Authentik-*', lambda url: lines.append('RESCUE'),
-                         'https://meshrelay.example.test/')
+                         'https://meshrelay.example.test/',
+                         ['        forward_auth ak:9000 {', '        }'])
     text = '\n'.join(lines)
     assert text.index('forward_auth ak:9000') < text.index('reverse_proxy 127.0.0.1:%d' % M.WEB_PORT)
     assert 'request_header -X-Authentik-*' in text and 'RESCUE' in text
@@ -570,6 +571,19 @@ def test_caddy_vhost_without_authentik_is_a_503_and_never_a_proxy():
                          'request_header -X-Authentik-*', lambda url: None, 'https://x/')
     text = '\n'.join(lines)
     assert ' 503' in text and 'reverse_proxy' not in text
+
+
+def test_module_never_writes_its_own_forward_auth_or_trusted_proxies():
+    """The red-team scan fails a forward_auth block written outside _caddy_forward_auth_lines()
+    (X-Forwarded-Host pins and the application lock, ops #1082, #1108) and a trusted_proxies line."""
+    src = open(M.__file__).read()
+    assert 'trusted_proxies' not in src
+    assert not re.search(r'append\([^)]*forward_auth', src)
+    lines = []
+    M.append_caddy_vhost(lines, 'm.example.test', True, 'ak:9000', 'strip', lambda url: None, 'https://m/', [])
+    assert 'forward_auth' not in '\n'.join(lines)
+    i = APP.index('mod_registry.meshrelay.append_caddy_vhost')
+    assert '_caddy_forward_auth_lines(' in APP[i:i + 600]
 
 
 def test_app_wires_the_vhost_the_proxy_app_and_the_seams():

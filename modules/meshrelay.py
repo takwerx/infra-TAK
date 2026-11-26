@@ -176,12 +176,15 @@ def unit_text(selinux=False):
     return '\n'.join(lines)
 
 
-def append_caddy_vhost(lines, host, authentik, ak_up, strip_header, emit_rescue, root_url):
+def append_caddy_vhost(lines, host, authentik, ak_up, strip_header, emit_rescue, root_url, forward_auth_lines=()):
     """Append the dashboard's Caddy site block to `lines` (Security condition 3).
 
     Phones use UDP 5000 only (the app's web router has no route a phone calls), so the whole
     HTTP host sits behind Authentik forward_auth. Without Authentik the host answers 503: the
-    dashboard is never published bare. The upstream is loopback only."""
+    dashboard is never published bare. The upstream is loopback only. The forward_auth block is
+    written by the console's one writer (`_caddy_forward_auth_lines`, with the X-Forwarded-Host
+    pins and the application lock) and handed in as `forward_auth_lines`; this module never
+    writes its own (ops #1082, #1108)."""
     lines.append("# MeshRelay PTT server dashboard (ops #973)")
     lines.append(f"{host} {{")
     if authentik:
@@ -189,10 +192,7 @@ def append_caddy_vhost(lines, host, authentik, ak_up, strip_header, emit_rescue,
         lines.append(f"        {strip_header}")
         emit_rescue(root_url)
         lines.append(f"        reverse_proxy /outpost.goauthentik.io/* {ak_up}")
-        lines.append(f"        forward_auth {ak_up} {{")
-        lines.append("            uri /outpost.goauthentik.io/auth/caddy")
-        lines.append("            trusted_proxies private_ranges")
-        lines.append("        }")
+        lines.extend(forward_auth_lines)
         lines.append(f"        reverse_proxy 127.0.0.1:{WEB_PORT}")
         lines.append("    }")
     else:
