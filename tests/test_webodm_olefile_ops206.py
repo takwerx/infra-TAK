@@ -59,7 +59,8 @@ LEGACY = '''services:
 
 def _ns():
     want = {'WEBODM_VERSION', 'WEBODM_IMAGES', 'WEBODM_DOCKER_COMPOSE', '_webodm_pin_images',
-            'WEBODM_OLEFILE_STRIP', '_webodm_strip_olefile'}
+            'WEBODM_OLEFILE_STRIP', '_webodm_strip_olefile',
+            '_IMAGE_EXACT_TAG_RE', '_image_ref_parts', '_image_exact_version', '_image_ahead_of_pin'}
     ns = {'re': re}
     for node in TREE.body:
         names = ({t.id for t in node.targets if isinstance(t, ast.Name)} if isinstance(node, ast.Assign)
