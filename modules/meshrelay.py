@@ -32,6 +32,7 @@ This file imports NOTHING from app.py: every seam arrives through the ctx dict.
 """
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -111,6 +112,20 @@ _MAX_WEB = 40 * 1024 * 1024
 
 def _plog(msg):
     return job_log(KEY, msg)
+
+
+# What the update and rollback buttons answer when something breaks. Fixed sentences only:
+# the exception text (paths, commands, library messages) goes to the console log and never
+# into the reply (CodeQL py/stack-trace-exposure, ops #973).
+UPDATE_FAILED_REPLY = 'The update failed. The old version was put back where possible. The console log has the details.'
+ROLLBACK_FAILED_REPLY = 'The rollback failed. The console log has the details.'
+NO_BACKUP_REPLY = 'There is no backup to roll back to.'
+
+_LOG = logging.getLogger('takwerx.meshrelay')
+
+
+class NoBackup(RuntimeError):
+    """rollback() was asked to restore a backup that does not exist."""
 
 
 # ── pin, config, unit: pure functions (tested without a box) ─────────────────
@@ -723,16 +738,18 @@ def update(ctx, plog=None):
         return {'success': True}
     except Exception as e:
         plog(f"✗ Update failed: {str(e)[:300]}")
+        _LOG.error('MeshRelay update failed: %s', e, exc_info=True)
         if swapped:
             try:
                 rollback(ctx, plog)
             except Exception as e2:
                 plog(f"✗ Rollback also failed: {str(e2)[:200]}")
+                _LOG.error('MeshRelay rollback after a failed update also failed: %s', e2, exc_info=True)
         elif stopped:
             # stopped for the backup, failed before any file was swapped: the old version is
             # still in place, so start it again rather than leave phones with no server
             _priv(ctx, ['systemctl', 'start', UNIT], check=False)
-        return {'success': False, 'error': str(e)[:300]}
+        return {'success': False, 'error': UPDATE_FAILED_REPLY}
     finally:
         if stage:
             shutil.rmtree(stage, ignore_errors=True)
@@ -750,7 +767,7 @@ def rollback(ctx, plog=None):
     """Put the backed-up binary and web files back and restart. Config is never touched."""
     plog = plog or _plog
     if not _have_backup():
-        raise RuntimeError('no backup to roll back to')
+        raise NoBackup('no backup to roll back to')
     _stop_service(ctx)
     _priv(ctx, ['cp', BACKUP_DIR + '/ptt-server', BIN_PATH])
     _priv(ctx, ['chmod', '755', BIN_PATH])
@@ -826,8 +843,11 @@ def register(ctx):
         try:
             rollback(ctx)
             return jsonify({'success': True})
+        except NoBackup:
+            return jsonify({'success': False, 'error': NO_BACKUP_REPLY}), 500
         except Exception as e:
-            return jsonify({'success': False, 'error': str(e)[:300]}), 500
+            _LOG.error('MeshRelay rollback failed: %s', e, exc_info=True)
+            return jsonify({'success': False, 'error': ROLLBACK_FAILED_REPLY}), 500
         finally:
             _BUSY.release()
 

@@ -444,6 +444,72 @@ def test_update_that_fails_after_the_stop_but_before_any_swap_starts_the_old_ser
     assert ['cp', M.BACKUP_DIR + '/ptt-server', M.BIN_PATH] not in cmds     # nothing was swapped
 
 
+SECRET_TEXT = 'boom /srv/secret-path/token-abc123 Traceback'
+
+
+def test_update_reply_has_no_exception_text_and_the_console_log_has_it(box, monkeypatch, caplog):
+    """CodeQL py/stack-trace-exposure (ops #973): the reply is a fixed sentence."""
+    box.settings['meshrelay'] = {'tag': 'v4.5.0'}
+    real = M._priv
+
+    def failing(ctx, argv, timeout=120, check=True):
+        if argv[:1] == ['cp'] and argv[2:3] == [M.BACKUP_DIR + '/ptt-server']:
+            raise RuntimeError(SECRET_TEXT)
+        return real(ctx, argv, timeout, check)
+    monkeypatch.setattr(M, '_priv', failing)
+    with caplog.at_level('ERROR', logger='takwerx.meshrelay'):
+        res = M.update(box.ctx(), plog=box.logs.append)
+    assert res == {'success': False, 'error': M.UPDATE_FAILED_REPLY}
+    assert 'secret-path' not in json.dumps(res) and 'Traceback' not in json.dumps(res)
+    assert SECRET_TEXT in caplog.text                      # the details went to the console log
+
+
+def test_update_reply_stays_fixed_when_the_rollback_inside_it_fails_too(box, monkeypatch, caplog):
+    box.settings['meshrelay'] = {'tag': 'v4.5.0'}
+    monkeypatch.setattr(M, 'health', lambda ctx: (False, 'dashboard down'))
+
+    def bad_rollback(ctx, plog=None):
+        raise RuntimeError(SECRET_TEXT)
+    monkeypatch.setattr(M, 'rollback', bad_rollback)
+    with caplog.at_level('ERROR', logger='takwerx.meshrelay'):
+        res = M.update(box.ctx(), plog=box.logs.append)
+    assert res == {'success': False, 'error': M.UPDATE_FAILED_REPLY}
+    assert SECRET_TEXT in caplog.text
+
+
+def test_rollback_reply_has_no_exception_text_and_the_console_log_has_it(box, monkeypatch, caplog):
+    app, routes = _views(monkeypatch, box)
+    monkeypatch.setattr(M, 'job_state', lambda k: {'running': False})
+
+    def bad_rollback(ctx, plog=None):
+        raise RuntimeError(SECRET_TEXT)
+    monkeypatch.setattr(M, 'rollback', bad_rollback)
+    with app.test_request_context(), caplog.at_level('ERROR', logger='takwerx.meshrelay'):
+        resp, code = routes['meshrelay_rollback']()
+    body = resp.get_json()
+    assert code == 500 and body == {'success': False, 'error': M.ROLLBACK_FAILED_REPLY}
+    assert 'secret-path' not in json.dumps(body)
+    assert SECRET_TEXT in caplog.text
+    assert not M._BUSY.locked()
+
+
+def test_rollback_with_no_backup_says_so_in_a_fixed_sentence(box, monkeypatch):
+    app, routes = _views(monkeypatch, box)
+    monkeypatch.setattr(M, 'job_state', lambda k: {'running': False})
+    monkeypatch.setattr(M, '_have_backup', lambda: False)
+    with app.test_request_context():
+        resp, code = routes['meshrelay_rollback']()
+    assert code == 500 and resp.get_json() == {'success': False, 'error': M.NO_BACKUP_REPLY}
+
+
+def test_no_view_reply_is_built_from_an_exception():
+    """The two replies CodeQL flagged must never carry str(e) again; the module's own
+    reply constants are the only error text a view or update() returns."""
+    src = (REPO / 'modules/meshrelay.py').read_text(encoding='utf-8')
+    body = src[src.index('def update(ctx'):src.index('def uninstall(')] + src[src.index('def register(ctx)'):]
+    assert not re.search(r"['\"]error['\"]\s*:\s*[^,}\n]*str\(", body)
+
+
 class _Pw:
     def __init__(self, uid=998, gid=997, shell='/usr/sbin/nologin'):
         self.pw_uid, self.pw_gid, self.pw_shell = uid, gid, shell
