@@ -2656,7 +2656,47 @@ function toggleFedFirewall(){
     loadFederationInfo();
   }).catch(function(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;});
 }
-if(document.getElementById('federation-body')){loadFederationInfo();}
+/* gh #755: federate groups saved as cn=tak_<channel> match no user, so data flows one way. */
+function loadFedGroupsCheck(){
+  var box=document.getElementById('fed-groups-box');
+  if(!box)return;
+  fetch('/api/takserver/federation-groups-check',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var list=document.getElementById('fed-groups-list');
+    if(!d||!d.supported||!d.count||!d.federates||!d.federates.length){box.style.display='none';return;}
+    if(list){
+      list.textContent='';
+      d.federates.forEach(function(f){
+        (f.groups||[]).forEach(function(g){
+          var li=document.createElement('li');
+          li.textContent=f.name+': '+g.group+' \u2192 '+g.plain+' ('+g.directions.join(', ').toLowerCase()+')';
+          list.appendChild(li);
+        });
+        (f.maps||[]).forEach(function(m){
+          var li=document.createElement('li');
+          li.textContent=f.name+': mapping '+m.remote+' \u2192 '+m.local+' becomes '+m.plain;
+          list.appendChild(li);
+        });
+      });
+    }
+    box.style.display='block';
+  }).catch(function(){});
+}
+function fixFedGroups(){
+  var btn=document.getElementById('fed-groups-btn');
+  var msg=document.getElementById('fed-groups-msg');
+  if(btn)btn.disabled=true;
+  if(msg){msg.textContent='Fixing...';msg.style.color='var(--text-dim)';}
+  fetch('/api/takserver/federation-groups-fix',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(d&&d.success){
+      if(msg){msg.textContent='Fixed '+d.changed+' name(s)';msg.style.color='var(--green)';}
+      setTimeout(loadFedGroupsCheck,1500);
+    }else{
+      if(msg){msg.textContent=(d&&(d.error||(d.errors&&d.errors[0])))||'Failed';msg.style.color='var(--red)';}
+      if(btn)btn.disabled=false;
+    }
+  }).catch(function(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;});
+}
+if(document.getElementById('federation-body')){loadFederationInfo();loadFedGroupsCheck();}
 
 /* ── TAK Server Plugins ─────────────────────────────────────────────── */
 var _takPluginPendingFiles=[],_takPluginLogIdx=0,_takPluginLogInterval=null;
