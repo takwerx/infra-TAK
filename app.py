@@ -121649,6 +121649,24 @@ if __name__ == '__main__':
 '''
 
 
+# gh #735 (v10.4.7-alpha): these three `actionban` values joined the dashboard log line and the
+# ban e-mail with ` ; `. fail2ban's config reader sets inline_comment_prefixes=';'
+# (fail2ban/client/configparserinc.py), so ` ;` starts a comment and everything after it was
+# dropped: the ban was logged but infratak-f2b-notify never ran and no ban e-mail went out.
+# Each command now sits on its own indented continuation line: they still run one after the
+# other whatever the last one did, and no ` ;` or ` #` is left in the value. Plain strings (not
+# built by a helper) so tests can load each constant alone. Never put ` ;` or ` #` in an action.
+_F2B_AUTHENTIK_GUARDDOG_ACTION = (
+    "[Definition]\n"
+    "actionban  = mkdir -p /var/log/takguard\n"
+    "             echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
+    " | fail2ban: Banned <ip> (Authentik brute-force)\""
+    " >> /var/log/takguard/restarts.log\n"
+    "             /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> authentik\n"
+    "actionunban =\n"
+)
+
+
 def _fail2ban_add_guarddog_hook(plog):
     """Add Guard Dog email notification + dashboard log hook to fail2ban (v0.9.0 — idempotent).
 
@@ -121661,7 +121679,9 @@ def _fail2ban_add_guarddog_hook(plog):
     4. Reloads fail2ban.
 
     Prerequisites: fail2ban must be installed (/etc/fail2ban must exist).
-    Idempotent: skips if settings.fail2ban_setup.guarddog_hook == 'applied_v2'.
+    Idempotent: skips if settings.fail2ban_setup.guarddog_hook == 'applied_v4'
+    (v4 = gh #735: the ban action no longer drops the e-mail call; bumping the marker
+    makes every existing box rewrite the action file once).
     """
     import datetime as _dt3
     if not os.path.exists('/etc/fail2ban'):
@@ -121669,7 +121689,7 @@ def _fail2ban_add_guarddog_hook(plog):
         return False
 
     s = load_settings()
-    if s.get('fail2ban_setup', {}).get('guarddog_hook') == 'applied_v3':
+    if s.get('fail2ban_setup', {}).get('guarddog_hook') == 'applied_v4':
         plog("fail2ban guarddog hook: idempotent-noop (already applied)")
         return False
 
@@ -121684,15 +121704,7 @@ def _fail2ban_add_guarddog_hook(plog):
     # %% in ini = literal % after ConfigParser interpolation → shell %
     # On actionban: write Guard Dog dashboard log line + send email alert
     _makedirs_priv('/var/log/takguard', exist_ok=True)
-    action_conf = (
-        "[Definition]\n"
-        "actionban  = mkdir -p /var/log/takguard"
-        " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
-        " | fail2ban: Banned <ip> (Authentik brute-force)\""
-        " >> /var/log/takguard/restarts.log"
-        " ; /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> authentik\n"
-        "actionunban =\n"
-    )
+    action_conf = _F2B_AUTHENTIK_GUARDDOG_ACTION
     action_path = '/etc/fail2ban/action.d/infratak-guarddog.conf'
     _makedirs_priv('/etc/fail2ban/action.d', exist_ok=True)
     _write_priv(action_path, action_conf)
@@ -121709,7 +121721,7 @@ def _fail2ban_add_guarddog_hook(plog):
 
     # ── Step 5: Record outcome ────────────────────────────────────────────────
     s2 = load_settings()
-    s2.setdefault('fail2ban_setup', {})['guarddog_hook'] = 'applied_v3'
+    s2.setdefault('fail2ban_setup', {})['guarddog_hook'] = 'applied_v4'
     s2['fail2ban_setup']['guarddog_hook_applied_at'] = _dt3.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
     save_settings(s2)
     plog("fail2ban guarddog hook: complete — email alerts + dashboard log active")
@@ -121720,21 +121732,21 @@ def _fail2ban_add_guarddog_hook(plog):
 # converge can replace a box's old copy, which called every ban a "port scan".
 _F2B_TAK_GUARDDOG_ACTION = (
     "[Definition]\n"
-    "actionban  = mkdir -p /var/log/takguard"
-    " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
+    "actionban  = mkdir -p /var/log/takguard\n"
+    "             echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
     " | fail2ban: Banned <ip> (TAK Server: failed TLS handshakes, blocked from TAK ports only)\""
-    " >> /var/log/takguard/restarts.log"
-    " ; /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> takserver\n"
+    " >> /var/log/takguard/restarts.log\n"
+    "             /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> takserver\n"
     "actionunban =\n"
 )
 _F2B_TAK_BADCERT_GUARDDOG_ACTION = (
     "[Definition]\n"
-    "actionban  = mkdir -p /var/log/takguard"
-    " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
+    "actionban  = mkdir -p /var/log/takguard\n"
+    "             echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
     " | fail2ban: Banned <ip> (TAK Server: refused-certificate flood, blocked from TAK streaming"
     " for 10 min, enrollment 8446 still open)\""
-    " >> /var/log/takguard/restarts.log"
-    " ; /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> takserver-badcert\n"
+    " >> /var/log/takguard/restarts.log\n"
+    "             /usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify <ip> takserver-badcert\n"
     "actionunban =\n"
 )
 
