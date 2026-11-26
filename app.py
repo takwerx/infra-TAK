@@ -32885,6 +32885,9 @@ def _update_notify_loop():
                 if r.get('retry_soon') and quick_retries < UPDATE_NOTIFY_QUICK_RETRIES:
                     quick_retries += 1
                     next_full = 0.0
+                    print(f"[update-notify] full sweep incomplete (GitHub unreadable or mail not sent): "
+                          f"again in {PATCH_NOW_CHECK_INTERVAL_S // 60} min "
+                          f"(retry {quick_retries} of {UPDATE_NOTIFY_QUICK_RETRIES})", flush=True)
                 else:
                     quick_retries = 0
             if r.get('quiet_until'):
@@ -32901,6 +32904,11 @@ def _update_notify_loop():
             if full and quick_retries < UPDATE_NOTIFY_QUICK_RETRIES:
                 quick_retries += 1      # ops #1305: a full sweep that died is tried again in an hour
                 next_full = 0.0
+                try:
+                    print(f"[update-notify] full sweep again in {PATCH_NOW_CHECK_INTERVAL_S // 60} min "
+                          f"(retry {quick_retries} of {UPDATE_NOTIFY_QUICK_RETRIES})", flush=True)
+                except Exception:
+                    pass
         time.sleep(wait)
 
 

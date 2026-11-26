@@ -173,6 +173,7 @@ def _loop(results, iterations):
     sweep returns (the last one repeats). Returns the list of (hour, 'full'|'fast') calls."""
     clock = {'t': 0.0, 'slept': 0}
     calls = []
+    logged = []
     results = list(results)
 
     def check(fast=False):
@@ -192,7 +193,7 @@ def _loop(results, iterations):
 
     n = {'time': types.SimpleNamespace(time=lambda: clock['t'], sleep=sleep),
          '_update_notify_lock': types.SimpleNamespace(__enter__=lambda s: None, __exit__=lambda s, *a: None),
-         '_update_notify_check_once': check, 'print': lambda *a, **k: None}
+         '_update_notify_check_once': check, 'print': lambda *a, **k: logged.append(a[0] if a else '')}
 
     class _Lock:
         def __enter__(self):
@@ -207,6 +208,7 @@ def _loop(results, iterations):
     _exec(n, '_update_notify_loop', consts=consts)
     with pytest.raises(_Stop):
         n['_update_notify_loop']()
+    _loop.logged = logged
     return calls
 
 
@@ -227,6 +229,11 @@ def test_loop_repeats_the_full_sweep_an_hour_after_a_failed_one():
         [kind for _, kind in calls[:2]] == ['full', 'full']
     first, second = [h for h, kind in calls if kind == 'full'][:2]
     assert second - first == pytest.approx(1.0, abs=0.1)
+
+
+def test_loop_says_in_the_journal_why_it_looks_again():
+    _loop([RETRY, GOOD], 6)
+    assert any('full sweep incomplete' in m and 'retry 1 of' in m for m in _loop.logged)
 
 
 def test_loop_repeats_a_full_sweep_that_raised():
