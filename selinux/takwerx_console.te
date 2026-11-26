@@ -1,4 +1,4 @@
-module takwerx_console 1.0;
+module takwerx_console 1.1;
 
 # infra-TAK console — SELinux policy for RHEL/Rocky (EL9 family).
 #
@@ -18,6 +18,9 @@ module takwerx_console 1.0;
 # process lands in that unconfined domain; the rest of the box (TAK Server,
 # Authentik, etc.) stays confined under enforcing.
 #
+# 1.1 (ops #1299): Caddy (httpd_t) may rename, create and delete files in the
+# httpd_log_t log tree, so its OWN log roll works (see the last block).
+#
 # Installed by start.sh on SELinux-capable hosts (semodule -i). Built with:
 #   checkmodule -M -m -o takwerx_console.mod takwerx_console.te
 #   semodule_package -o takwerx_console.pp -m takwerx_console.mod
@@ -28,9 +31,12 @@ require {
     type unconfined_service_t;
     type user_home_t;
     type user_home_dir_t;
-    class dir search;
+    type httpd_t;
+    type httpd_log_t;
+    class dir { search getattr open read write add_name remove_name };
     class lnk_file read;
-    class file { open read getattr execute execute_no_trans map ioctl entrypoint };
+    class file { open read getattr execute execute_no_trans map ioctl entrypoint
+                 write append create setattr rename unlink };
 }
 
 # systemd (init_t): traverse home, read + exec the venv entrypoint.
@@ -40,3 +46,22 @@ allow init_t user_home_t:lnk_file read;
 
 # Enter the unconfined service domain via the in-home entrypoint binary.
 allow unconfined_service_t user_home_t:file entrypoint;
+
+# ops #1299 — Caddy rolls its own access logs (roll_size 10MiB in the Caddyfile
+# the console writes). The log tree /var/log/caddy is httpd_log_t and Caddy runs
+# as httpd_t (the COPR rpm labels the binary httpd_exec_t). The stock policy lets
+# httpd_t write a log it already has but not rename or delete one, so at 10 MiB
+# the roll failed ("can't rename log file ... permission denied", AVC remove_name
+# on the log directory), every later access line was dropped, and the TAK Portal
+# fail2ban jail, which reads that log, went blind. Seen on nuc (Rocky 9.8): the
+# file stopped at 10,485,194 bytes on Sep 10 and the denial repeated all day.
+# A roll is: rename the full log, create a new one, gzip the old one, delete the
+# oldest beyond roll_keep. Granted on httpd_log_t only (logs), nothing else.
+# Measured on Rocky 9.9 (sesearch, 2026-11-26): the stock policy already gives
+# httpd_t add_name/create/read/setattr/write on the directory and create/open/read/
+# setattr (+ append via logfile) on the file. What was MISSING, and so what this
+# adds in effect, is dir remove_name and file write, rename and unlink. The other
+# permissions are listed too so the rule still holds on a policy build that
+# differs by a minor release.
+allow httpd_t httpd_log_t:dir { search getattr open read write add_name remove_name };
+allow httpd_t httpd_log_t:file { open read getattr write append create setattr rename unlink };
