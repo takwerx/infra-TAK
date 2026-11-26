@@ -70,7 +70,8 @@ def _load(results):
 
 
 PLUGIN = _cp(0)
-COPR_DOWN = _cp(1, 'Error: Failed to connect to copr.fedorainfracloud.org port 443: Connection timed out')
+COPR_DOWN_TEXT = 'Error: Failed to connect to copr.fedorainfracloud.org port 443: Connection timed out'
+COPR_DOWN = _cp(1, COPR_DOWN_TEXT)
 ENABLED = _cp(0)
 NO_MATCH = _cp(1, 'Error: Unable to find a match: caddy')
 INSTALLED = _cp(0, 'Complete!')
@@ -85,7 +86,7 @@ def test_a_failed_dnf_step_prints_what_dnf_said():
     assert ns['_caddy_dnf_install'](rec.logs.append, tries=1) is False
     text = '\n'.join(rec.logs)
     assert 'dnf copr enable @caddy/caddy failed (try 1 of 1)' in text
-    assert 'copr.fedorainfracloud.org' in text
+    assert COPR_DOWN_TEXT in text
 
 
 def test_only_the_last_300_characters_of_dnf_output_are_printed():
