@@ -23433,6 +23433,9 @@ _F2B_UFW_ACTION_PATH = '/etc/fail2ban/action.d/infratak-ufw.conf'
 # recidive restore raced the console's boot `ufw delete` calls and 31 IPv4 rules —
 # 22/80/443/8089 among them — were lost; the box answered ping and nothing else. The
 # comment format matches the stock 1.0 action so the console's ban list reads the same.
+# The ban is `ufw prepend`, as the stock 1.0 action does: `ufw insert 1` refuses an IPv6
+# address with "ERROR: Invalid position '1'" (ufw 0.36.1 and 0.36.2, also with no other
+# rule), so no IPv6 ban ever reached ufw. fail2ban 0.11's stock action still has that bug.
 _F2B_UFW_ACTION_CONF = (
     "# Managed by infra-TAK — rewritten on console start. fail2ban's stock ufw action\n"
     "# with every ufw call holding /run/infratak-ufw.lock, the lock the console's\n"
@@ -23441,11 +23444,10 @@ _F2B_UFW_ACTION_CONF = (
     "actionstart =\n"
     "actionstop =\n"
     "actioncheck =\n"
-    f"actionban = flock -w 90 {_UFW_LOCK_PATH} ufw insert <insertpos> <blocktype> from <ip> to <destination> comment \"<comment>\"\n"
+    f"actionban = flock -w 90 {_UFW_LOCK_PATH} ufw prepend <blocktype> from <ip> to <destination> comment \"<comment>\"\n"
     f"actionunban = flock -w 90 {_UFW_LOCK_PATH} ufw delete <blocktype> from <ip> to <destination>\n"
     "\n"
     "[Init]\n"
-    "insertpos = 1\n"
     "blocktype = reject\n"
     "destination = any\n"
     "comment = by Fail2Ban after <failures> attempts against <name>\n"
@@ -23470,6 +23472,18 @@ def _f2b_ensure_ufw_action():
             return False
         _write_priv(_F2B_UFW_ACTION_PATH, _F2B_UFW_ACTION_CONF)
         return True
+    except Exception:
+        return False
+
+
+def _f2b_ufw_action_outdated():
+    """True when the infratak-ufw action file is on disk but is not the current one (an
+    older release wrote it). fail2ban reads an action file only when it starts or
+    reloads, and a reload leaves current bans on the old action, so the box needs the
+    locked stop and start below to pick it up."""
+    try:
+        with open(_F2B_UFW_ACTION_PATH) as f:
+            return f.read() != _F2B_UFW_ACTION_CONF
     except Exception:
         return False
 
@@ -127571,7 +127585,8 @@ def _startup_f2b_ufw_lock_switch():
         if not os.path.isdir('/etc/fail2ban/action.d'):
             return
         stale = _f2b_stale_ufw_jails()
-        if stale:
+        outdated = _f2b_ufw_action_outdated()
+        if stale or outdated:
             act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                                  capture_output=True, text=True, timeout=15).stdout.strip()
             if act == 'active':
@@ -127602,7 +127617,10 @@ def _startup_f2b_ufw_lock_switch():
                 how = 'restarted' if r2.returncode == 0 else f'start FAILED (rc {r2.returncode})'
             else:
                 how = f'not running ({act or "unknown"}), left stopped'
-            _log(f"fail2ban: jails moved to the locked infratak-ufw action ({names}); fail2ban {how}")
+            if stale:
+                _log(f"fail2ban: jails moved to the locked infratak-ufw action ({names}); fail2ban {how}")
+            else:
+                _log(f"fail2ban: infratak-ufw action updated (IPv6 bans use ufw prepend); fail2ban {how}")
         else:
             _f2b_ensure_ufw_action()          # keep the file current (a later release may change it)
         _ufw_ipv4_parity_heal(_log)

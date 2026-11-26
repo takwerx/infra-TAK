@@ -180,11 +180,13 @@ def test_fail2ban_action_takes_the_lock_on_ban_and_unban():
     unban = re.search(r'(?m)^actionunban = (.*)$', conf).group(1)
     for cmd in (ban, unban):
         assert cmd.startswith(f'flock -w 90 {B.UFW_LOCK_PATH} ufw ')
-    assert 'ufw insert <insertpos> <blocktype> from <ip> to <destination>' in ban
+    # ops #1275: `ufw insert 1` refuses an IPv6 address (Invalid position '1'); prepend does not
+    assert 'ufw prepend <blocktype> from <ip> to <destination>' in ban
+    assert 'insert' not in ban and 'insertpos' not in conf
     assert 'ufw delete <blocktype> from <ip> to <destination>' in unban
     timeout = int(re.search(r'(?m)^timeout = (\d+)$', conf).group(1))
     assert timeout > 90                                # fail2ban must not kill a waiting ban
-    for key in ('insertpos', 'blocktype', 'destination', 'comment'):
+    for key in ('blocktype', 'destination', 'comment'):
         assert re.search(rf'(?m)^{key} = \S', conf), key   # every tag is defined here (0.11 and 1.0)
 
 
@@ -237,7 +239,7 @@ def test_ban_action_choice():
 
 # ── the move ────────────────────────────────────────────────────────────────
 
-def _switch(stop_rc=0, active='active'):
+def _switch(stop_rc=0, active='active', stale=True, outdated=False):
     calls, writes, logs = [], {}, []
 
     def run(argv, **kw):
@@ -253,7 +255,8 @@ def _switch(stop_rc=0, active='active'):
           'subprocess': types.SimpleNamespace(run=run), '_sudo_wrap': lambda c: list(c),
           '_UFW_LOCK_PATH': B.UFW_LOCK_PATH,
           '_f2b_stale_ufw_jails': lambda: [('/etc/fail2ban/jail.d/infratak-sshd.conf',
-                                            'action   = ufw\n         infratak-guarddog\n')],
+                                            'action   = ufw\n         infratak-guarddog\n')] if stale else [],
+          '_f2b_ufw_action_outdated': lambda: outdated,
           '_f2b_ensure_ufw_action': lambda: calls.append(['ENSURE']) or True,
           '_F2B_STALE_UFW_RE': _stale_re(),
           '_write_priv': lambda p, t: writes.__setitem__(p, t),
@@ -291,6 +294,38 @@ def test_move_on_a_stopped_fail2ban_rewrites_without_starting_it():
     assert list(B.FLOCK_F2B_STOP_ARGV) not in calls
     assert ['systemctl', 'start', 'fail2ban'] not in calls
     assert writes
+
+
+def test_old_action_file_on_a_box_already_moved_is_loaded_by_a_locked_restart():
+    # ops #1275: boxes on the 10.4.6+ action (ufw insert 1) get the prepend action; a reload
+    # would leave current bans on the old action, so fail2ban stops under the lock and starts
+    calls, writes, logs = _switch(stale=False, outdated=True)
+    i_stop = calls.index(list(B.FLOCK_F2B_STOP_ARGV))
+    i_ensure = calls.index(['ENSURE'])
+    i_start = calls.index(['systemctl', 'start', 'fail2ban'])
+    assert i_stop < i_ensure < i_start
+    assert writes == {}                                 # no jail file changes: only the action file
+    assert any('action updated' in m and 'restarted' in m for m in logs)
+
+
+def test_current_action_file_and_moved_jails_do_not_restart_fail2ban():
+    calls, writes, logs = _switch(stale=False, outdated=False)
+    assert list(B.FLOCK_F2B_STOP_ARGV) not in calls
+    assert ['systemctl', 'start', 'fail2ban'] not in calls
+    assert ['ENSURE'] in calls                          # the file is still kept current
+
+
+def test_outdated_check_compares_the_file_with_the_current_action(tmp_path):
+    ns = {'_UFW_LOCK_PATH': B.UFW_LOCK_PATH}
+    exec(_const('_F2B_UFW_ACTION_CONF'), ns)
+    f = tmp_path / 'infratak-ufw.conf'
+    ns['_F2B_UFW_ACTION_PATH'] = str(f)
+    exec(_func('_f2b_ufw_action_outdated'), ns)
+    assert ns['_f2b_ufw_action_outdated']() is False    # no file: nothing to update
+    f.write_text(ns['_F2B_UFW_ACTION_CONF'].replace('ufw prepend', 'ufw insert 1'))
+    assert ns['_f2b_ufw_action_outdated']() is True
+    f.write_text(ns['_F2B_UFW_ACTION_CONF'])
+    assert ns['_f2b_ufw_action_outdated']() is False
 
 
 # ── IPv4 repair ─────────────────────────────────────────────────────────────
