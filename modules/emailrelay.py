@@ -24,6 +24,52 @@ PROVIDERS = {
     'custom':  {'name': 'Custom',  'host': '',                      'port': '587', 'url': ''},
 }
 
+# ops #1200 (infra-TAK GH #703): only the Custom provider may send with no login. It is for
+# a company's own mail relay or Microsoft 365 Direct Send, which allow mail by source address.
+# The three hosted providers always need a login, whatever the request says.
+TLS_MODES = ('may', 'encrypt', 'none')   # opportunistic (the old fixed value), required, off
+_CTRL_RE = re.compile(r'[\x00-\x20\x7f]')
+
+
+def relay_configured(relay):
+    """Is the relay set up? A login-less Custom relay has no smtp_user, so the old test
+    `relay_host and smtp_user` called it unconfigured. Every Email Relay card, the portal
+    push, diagnostics and the health check use this one test (ops #1200)."""
+    relay = relay or {}
+    if not relay.get('relay_host'):
+        return False
+    return bool(relay.get('smtp_user')) or relay.get('smtp_auth') is False
+
+
+def render_main_cf_block(relay_host, relay_port, smtp_auth=True, tls='may'):
+    """The TAKWERX block appended to main.cf. With smtp_auth False there is no SASL map, so
+    Postfix never looks for credentials. TLS is its own setting and does not depend on the
+    login (ops #1200). Access control is unchanged: mynetworks stays local plus Docker."""
+    tls = tls if tls in TLS_MODES else 'may'
+    lines = [
+        '',
+        '# TAKWERX Email Relay \u2014 managed by TAK-infra',
+        'inet_interfaces = all',
+        'mynetworks = 127.0.0.0/8 [::1]/128 172.16.0.0/12',
+        '# Send-only smarthost: never treat the base domain as a local destination',
+        '# (default mydestination includes $mydomain -> 550 "User unknown in local',
+        '# recipient table" for any address at the TAK base domain, GH #48)',
+        'mydestination = $myhostname, localhost.localdomain, localhost',
+        f'relayhost = [{relay_host}]:{relay_port}',
+    ]
+    if smtp_auth:
+        lines += ['smtp_sasl_auth_enable = yes',
+                  'smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd',
+                  'smtp_sasl_security_options = noanonymous']
+    else:
+        lines += ['smtp_sasl_auth_enable = no']
+    lines += [f'smtp_tls_security_level = {tls}']
+    if tls != 'none':
+        lines += ['smtp_use_tls = yes']
+    lines += ['header_size_limit = 4096000',
+              'smtp_generic_maps = hash:/etc/postfix/generic']
+    return '\n'.join(lines) + '\n'
+
 
 def accepted_message(settings, to_addr):
     """What a successful test send actually proves, in words (v10.2.8 W6, GH #87).
@@ -292,24 +338,42 @@ def postfix_local_names(settings):
 def deploy_validate(data):
     """Request-side validation for /deploy and /swap (the byte-identical clone
     collapsed onto one view). Resolves the relay host/port here so the custom
-    provider never mutates PROVIDERS."""
+    provider never mutates PROVIDERS.
+
+    ops #1200: the Custom provider may turn the SMTP login off (`smtp_auth` false), for a
+    company mail relay or Microsoft 365 Direct Send. Only Custom: any other provider keeps
+    the login required, so a hand-made request cannot skip it."""
     provider = data.get('provider', 'brevo')
     smtp_user = (data.get('smtp_user') or '').strip()
     smtp_pass = (data.get('smtp_pass') or '').strip()
     from_addr = (data.get('from_addr') or '').strip()
     from_name = (data.get('from_name') or '').strip()
-    if not smtp_user or not smtp_pass or not from_addr:
-        return None, 'SMTP username, password, and from address are required'
+    smtp_auth = not (provider == 'custom' and data.get('smtp_auth') in (False, 'false', 'no', 0, '0'))
+    if smtp_auth:
+        if not smtp_user or not smtp_pass or not from_addr:
+            return None, 'SMTP username, password, and from address are required'
+    else:
+        if not from_addr:
+            return None, 'From address is required'
+        smtp_user, smtp_pass = '', ''   # nothing typed in the hidden boxes is ever stored
     p = PROVIDERS.get(provider, PROVIDERS['brevo'])
     relay_host, relay_port = p['host'], p['port']
+    smtp_tls = 'may'
     if provider == 'custom':
         relay_host = (data.get('custom_host') or '').strip()
         relay_port = (data.get('custom_port') or '587').strip()
         if not relay_host:
             return None, 'Custom host is required'
+        # The host and port go into main.cf as one line: no space, no line break.
+        if _CTRL_RE.search(relay_host) or not relay_port.isdigit():
+            return None, 'Custom host or port is not valid'
+        smtp_tls = (data.get('smtp_tls') or 'may').strip().lower()
+        if smtp_tls not in TLS_MODES:
+            return None, 'TLS mode must be one of: ' + ', '.join(TLS_MODES)
     return {'provider': provider, 'smtp_user': smtp_user, 'smtp_pass': smtp_pass,
             'from_addr': from_addr, 'from_name': from_name,
-            'relay_host': relay_host, 'relay_port': relay_port}, None
+            'relay_host': relay_host, 'relay_port': relay_port,
+            'smtp_auth': smtp_auth, 'smtp_tls': smtp_tls}, None
 
 
 def deploy(ctx, job, params):
@@ -318,6 +382,8 @@ def deploy(ctx, job, params):
     smtp_user, smtp_pass = params['smtp_user'], params['smtp_pass']
     from_addr, from_name = params['from_addr'], params['from_name']
     relay_host, relay_port = params['relay_host'], params['relay_port']
+    smtp_auth = params.get('smtp_auth', True)       # ops #1200: False = no SMTP login
+    smtp_tls = params.get('smtp_tls', 'may')
     try:
         settings = ctx['load_settings']()
         provider = PROVIDERS.get(provider_key, PROVIDERS['brevo'])
@@ -360,23 +426,7 @@ def deploy(ctx, job, params):
         plog("✓ Postfix installed")
 
         plog("📧 Step 2/5 — Configuring main.cf...")
-        main_cf_additions = f"""
-# TAKWERX Email Relay — managed by TAK-infra
-inet_interfaces = all
-mynetworks = 127.0.0.0/8 [::1]/128 172.16.0.0/12
-# Send-only smarthost: never treat the base domain as a local destination
-# (default mydestination includes $mydomain -> 550 "User unknown in local
-# recipient table" for any address at the TAK base domain, GH #48)
-mydestination = $myhostname, localhost.localdomain, localhost
-relayhost = [{relay_host}]:{relay_port}
-smtp_sasl_auth_enable = yes
-smtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd
-smtp_sasl_security_options = noanonymous
-smtp_tls_security_level = may
-smtp_use_tls = yes
-header_size_limit = 4096000
-smtp_generic_maps = hash:/etc/postfix/generic
-"""
+        main_cf_additions = render_main_cf_block(relay_host, relay_port, smtp_auth, smtp_tls)
         # Read existing main.cf and strip any previous TAKWERX block. v10.0.5
         # non-root: /etc/postfix is root-owned — read+write via the broker (raw
         # open(...,'w') EPERM'd as the takwerx console: [Errno 13] /etc/postfix/main.cf).
@@ -399,20 +449,28 @@ smtp_generic_maps = hash:/etc/postfix/generic
         ctx['_write_priv'](main_cf_path, existing + '\n' + main_cf_additions)
         plog("✓ main.cf configured")
 
-        plog("📧 Step 3/5 — Writing credentials...")
-        sasl_line = f"[{relay_host}]:{relay_port}    {smtp_user}:{smtp_pass}"
-        # ops #632: empty and 0600 FIRST, then the password. The chmod below only ran
-        # after postmap succeeded, so a failed postmap left the SMTP password 0644.
-        ctx['_write_priv']('/etc/postfix/sasl_passwd', '', perm=0o600)
-        ctx['_write_priv']('/etc/postfix/sasl_passwd', sasl_line + '\n', perm=0o600)
-        if not _postmap(ctx, '/etc/postfix/sasl_passwd', plog):
-            # Without the hashed map postfix cannot authenticate to the smarthost
-            # and every message queues forever. Fail the deploy rather than report
-            # a relay that is configured but cannot send.
-            plog("✗ SASL credential map could not be built — relay would queue mail silently")
-            job.update({'running': False, 'error': True})
-            return
-        subprocess.run(ctx['_sudo_wrap'](['chmod', '600', '/etc/postfix/sasl_passwd', '/etc/postfix/sasl_passwd.db']), capture_output=True)
+        if smtp_auth:
+            plog("📧 Step 3/5 — Writing credentials...")
+            sasl_line = f"[{relay_host}]:{relay_port}    {smtp_user}:{smtp_pass}"
+            # ops #632: empty and 0600 FIRST, then the password. The chmod below only ran
+            # after postmap succeeded, so a failed postmap left the SMTP password 0644.
+            ctx['_write_priv']('/etc/postfix/sasl_passwd', '', perm=0o600)
+            ctx['_write_priv']('/etc/postfix/sasl_passwd', sasl_line + '\n', perm=0o600)
+            if not _postmap(ctx, '/etc/postfix/sasl_passwd', plog):
+                # Without the hashed map postfix cannot authenticate to the smarthost
+                # and every message queues forever. Fail the deploy rather than report
+                # a relay that is configured but cannot send.
+                plog("✗ SASL credential map could not be built — relay would queue mail silently")
+                job.update({'running': False, 'error': True})
+                return
+            subprocess.run(ctx['_sudo_wrap'](['chmod', '600', '/etc/postfix/sasl_passwd', '/etc/postfix/sasl_passwd.db']), capture_output=True)
+        else:
+            # ops #1200: no login. Remove credentials an earlier provider left behind, so a
+            # password for a service the box no longer uses does not stay on disk.
+            plog("📧 Step 3/5 — No SMTP login: skipping credentials, removing old ones...")
+            subprocess.run(ctx['_sudo_wrap'](['rm', '-f', '/etc/postfix/sasl_passwd',
+                                              '/etc/postfix/sasl_passwd.db']),
+                           capture_output=True, timeout=30)
 
         # Generic map for from address rewriting. One list of names feeds this map and the
         # root recipient map (sync_root_alias below): the saved FQDN, what Postfix says it
@@ -425,7 +483,7 @@ smtp_generic_maps = hash:/etc/postfix/generic
                  "sender rewrite covers each of them")
         ctx['_write_priv']('/etc/postfix/generic', generic_text)
         _postmap(ctx, '/etc/postfix/generic', plog)
-        plog("✓ Credentials written and hashed")
+        plog("✓ Credentials written and hashed" if smtp_auth else "✓ Sender map written (no SMTP login)")
         # GH #667: mail the host sends to root reaches a person. Postfix restarts in
         # Step 4, so no reload here.
         sync_root_alias(ctx, settings, plog, from_addr=from_addr, reload=False, names=names)
@@ -457,12 +515,19 @@ smtp_generic_maps = hash:/etc/postfix/generic
         }
         # Store password separately (still in settings.json, local only)
         settings['email_relay']['smtp_pass'] = smtp_pass
+        # ops #1200: written only when it differs from the old behavior, so a box that has
+        # never used it keeps the exact settings it had before.
+        if not smtp_auth:
+            settings['email_relay']['smtp_auth'] = False
+        if smtp_tls != 'may':
+            settings['email_relay']['smtp_tls'] = smtp_tls
         ctx['save_settings'](settings)
         plog("✓ Configuration saved")
         plog("")
         plog("✅ Email Relay deployed successfully!")
         plog(f"   Provider: {provider['name'] if provider_key != 'custom' else 'Custom'}")
         plog(f"   Relay:    {relay_host}:{relay_port}")
+        plog(f"   Login:    {'SMTP login' if smtp_auth else 'none (relay allows this server without a login)'}")
         plog(f"   From:     {from_name} <{from_addr}>")
 
         # Auto-configure Authentik if installed (SMTP + recovery flow)
