@@ -23433,6 +23433,9 @@ _F2B_UFW_ACTION_PATH = '/etc/fail2ban/action.d/infratak-ufw.conf'
 # recidive restore raced the console's boot `ufw delete` calls and 31 IPv4 rules —
 # 22/80/443/8089 among them — were lost; the box answered ping and nothing else. The
 # comment format matches the stock 1.0 action so the console's ban list reads the same.
+# The ban is `ufw prepend`, as the stock 1.0 action does: `ufw insert 1` refuses an IPv6
+# address with "ERROR: Invalid position '1'" (ufw 0.36.1 and 0.36.2, also with no other
+# rule), so no IPv6 ban ever reached ufw. fail2ban 0.11's stock action still has that bug.
 _F2B_UFW_ACTION_CONF = (
     "# Managed by infra-TAK — rewritten on console start. fail2ban's stock ufw action\n"
     "# with every ufw call holding /run/infratak-ufw.lock, the lock the console's\n"
@@ -23441,11 +23444,10 @@ _F2B_UFW_ACTION_CONF = (
     "actionstart =\n"
     "actionstop =\n"
     "actioncheck =\n"
-    f"actionban = flock -w 90 {_UFW_LOCK_PATH} ufw insert <insertpos> <blocktype> from <ip> to <destination> comment \"<comment>\"\n"
+    f"actionban = flock -w 90 {_UFW_LOCK_PATH} ufw prepend <blocktype> from <ip> to <destination> comment \"<comment>\"\n"
     f"actionunban = flock -w 90 {_UFW_LOCK_PATH} ufw delete <blocktype> from <ip> to <destination>\n"
     "\n"
     "[Init]\n"
-    "insertpos = 1\n"
     "blocktype = reject\n"
     "destination = any\n"
     "comment = by Fail2Ban after <failures> attempts against <name>\n"
@@ -23472,6 +23474,161 @@ def _f2b_ensure_ufw_action():
         return True
     except Exception:
         return False
+
+
+def _f2b_ufw_action_outdated():
+    """True when the infratak-ufw action file is on disk but is not the current one (an
+    older release wrote it). fail2ban reads an action file only when it starts or
+    reloads, and a reload leaves current bans on the old action, so the box needs the
+    locked stop and start below to pick it up."""
+    try:
+        with open(_F2B_UFW_ACTION_PATH) as f:
+            return f.read() != _F2B_UFW_ACTION_CONF
+    except Exception:
+        return False
+
+
+_F2B_DOCKER_ACTION_PATH = '/etc/fail2ban/action.d/infratak-docker.conf'
+# infra-TAK #736. ufw, iptables-allports and iptables-multiport all ban in INPUT. A port
+# Docker publishes (Docker TAK Server, CloudTAK media, any container) is DNATed in
+# PREROUTING and goes through FORWARD instead, so a banned address could still reach it.
+# Docker keeps the DOCKER-USER chain for rules like this and checks it before its own.
+# This action is added beside a jail's own ban action (never in place of it) and drops
+# the same address in DOCKER-USER, on the same ports. Matches only inbound connections
+# to a published port (conntrack state DNAT, original direction), so replies to a
+# container's own outbound traffic are never touched. One chain per jail, f2bd-<name>,
+# jumped from DOCKER-USER (all traffic, or one jump per port for a port-scoped jail).
+# Every ban first puts the chain and its jumps back if they are missing (boot before
+# Docker, a firewall reload), so nothing depends on fail2ban's own check/repair.
+# Creating DOCKER-USER before Docker does is safe: Docker keeps it and hooks it into
+# FORWARD when it starts (the port guard does the same, _docker_port_guard_files).
+# Defined in full (no includes) so it reads the same on fail2ban 0.11 and 1.0.
+_F2B_DOCKER_MATCH = '-m conntrack --ctstate DNAT --ctdir ORIGINAL'
+_F2B_DOCKER_ENSURE = (
+    "<ipt> -N DOCKER-USER 2>/dev/null; <ipt> -N <dkchain> 2>/dev/null; "
+    "if [ \"<dports>\" = all ]; then "
+    f"<ipt> -C DOCKER-USER {_F2B_DOCKER_MATCH} -j <dkchain> 2>/dev/null || "
+    f"<ipt> -I DOCKER-USER 1 {_F2B_DOCKER_MATCH} -j <dkchain> || exit 1; "
+    "else for p in $(echo \"<dports>\" | tr ',' ' '); do "
+    f"<ipt> -C DOCKER-USER -p <dkproto> {_F2B_DOCKER_MATCH} --ctorigdstport $p -j <dkchain> 2>/dev/null || "
+    f"<ipt> -I DOCKER-USER 1 -p <dkproto> {_F2B_DOCKER_MATCH} --ctorigdstport $p -j <dkchain> || exit 1; "
+    "done; fi"
+)
+_F2B_DOCKER_ACTION_CONF = (
+    "# Managed by infra-TAK — rewritten on console start. Drops a banned address on\n"
+    "# Docker-published ports too (DOCKER-USER), which bans in INPUT never reach.\n"
+    "[Definition]\n"
+    f"actionstart = {_F2B_DOCKER_ENSURE}\n"
+    "actionstop = <ipt> -S DOCKER-USER 2>/dev/null | sed -n 's/^-A \\(.* -j <dkchain>\\)$/-D \\1/p' | "
+    "while read -r r; do <ipt> $r; done; <ipt> -F <dkchain> 2>/dev/null; <ipt> -X <dkchain> 2>/dev/null; true\n"
+    "actioncheck =\n"
+    f"actionban = {_F2B_DOCKER_ENSURE}\n"
+    "            <ipt> -C <dkchain> -s <ip> -j DROP 2>/dev/null || <ipt> -I <dkchain> 1 -s <ip> -j DROP\n"
+    "actionunban = while <ipt> -D <dkchain> -s <ip> -j DROP 2>/dev/null; do :; done; true\n"
+    "\n"
+    "[Init]\n"
+    "ipt = iptables -w\n"
+    "dkchain = f2bd-<name>\n"
+    "# all = every port; else a comma list like the jail's own iptables-multiport action\n"
+    "dports = all\n"
+    "dkproto = tcp\n"
+    "\n"
+    "[Init?family=inet6]\n"
+    "ipt = ip6tables -w\n"
+)
+
+# The ban actions a jail line can name, and what each covers. Their DOCKER-USER twin is
+# derived from the same text, so a port-scoped jail stays port-scoped in Docker too.
+_F2B_ALLPORTS_ACTIONS = ('ufw', 'infratak-ufw', 'iptables-allports')
+_F2B_ACTION_ITEM_RE = re.compile(r'^\s*(?:action\s*=\s*)?([A-Za-z0-9_.-]+)(?:\[(.*)\])?\s*$')
+_F2B_ACTION_OPT_RE = re.compile(r'(\w+)\s*=\s*("[^"]*"|[^,\]]*)')
+
+
+def _f2b_ensure_docker_action():
+    """Write the infratak-docker fail2ban action if it is missing or different.
+    True when the file on disk is ours afterwards."""
+    try:
+        try:
+            with open(_F2B_DOCKER_ACTION_PATH) as f:
+                if f.read() == _F2B_DOCKER_ACTION_CONF:
+                    return True
+        except (FileNotFoundError, PermissionError):
+            pass
+        if not os.path.isdir('/etc/fail2ban/action.d'):
+            return False
+        _write_priv(_F2B_DOCKER_ACTION_PATH, _F2B_DOCKER_ACTION_CONF)
+        return True
+    except Exception:
+        return False
+
+
+def _f2b_docker_twin_item(line):
+    """The infratak-docker action for ONE ban-action line, or '' when the line is not a
+    ban action we know (guard-dog notify, an operator's own action)."""
+    m = _F2B_ACTION_ITEM_RE.match(line or '')
+    if not m:
+        return ''
+    act, opts = m.group(1), m.group(2) or ''
+    if act in _F2B_ALLPORTS_ACTIONS:
+        # name defaults to the jail name (fail2ban's ActionReader), like the ban itself
+        return 'infratak-docker'
+    if act != 'iptables-multiport':
+        return ''
+    o = {k: v.strip().strip('"').strip() for k, v in _F2B_ACTION_OPT_RE.findall(opts)}
+    port = re.sub(r'\s+', '', o.get('port', ''))
+    if not re.fullmatch(r'\d+(?::\d+)?(?:,\d+(?::\d+)?)*', port):
+        return ''
+    proto = o.get('protocol', 'tcp') or 'tcp'
+    if proto not in ('tcp', 'udp'):
+        return ''
+    name = o.get('name', '')
+    if name and not re.fullmatch(r'[A-Za-z0-9_-]{1,23}', name):
+        return ''
+    head = f'name={name}, ' if name else ''
+    return f'infratak-docker[{head}dports="{port}", dkproto={proto}]'
+
+
+def _f2b_docker_twin(primary):
+    """Jail-file text to put right after a jail's ban action(s) `primary`: one
+    infratak-docker line per ban action, each starting with the same newline + indent
+    the guard-dog notify line uses. '' when the action file cannot be on disk — a jail
+    that names an action with no file stops the WHOLE fail2ban daemon."""
+    items = [t for t in (_f2b_docker_twin_item(ln) for ln in (primary or '').splitlines()) if t]
+    if not items or not _f2b_ensure_docker_action():
+        return ''
+    return ''.join(f'\n         {t}' for t in items)
+
+
+def _f2b_add_docker_twins(text):
+    """Jail-file text with the infratak-docker lines added after its ban action(s), the
+    same text the jail writers now write. Unchanged if they are there already, or if the
+    file has no ban action we know."""
+    if 'infratak-docker' in (text or ''):
+        return text
+    lines = text.split('\n')
+    out, i = [], 0
+    while i < len(lines):
+        ln = lines[i]
+        if re.match(r'^\s*action\s*=', ln):
+            block = [ln]
+            j = i + 1
+            while j < len(lines) and lines[j][:1] in (' ', '\t') and lines[j].strip():
+                block.append(lines[j])
+                j += 1
+            last = -1
+            for k, b in enumerate(block):
+                if _f2b_docker_twin_item(b):
+                    last = k
+            if last >= 0:
+                twin = _f2b_docker_twin('\n'.join(block[:last + 1]))
+                if twin:
+                    block = block[:last + 1] + twin.split('\n')[1:] + block[last + 1:]
+            out.extend(block)
+            i = j
+            continue
+        out.append(ln)
+        i += 1
+    return '\n'.join(out)
 
 
 _F2B_STALE_UFW_RE = re.compile(r'(?m)^(\s*action\s*=\s*)ufw(?=\s|$)')
@@ -25290,7 +25447,7 @@ def _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = {_f2b_banaction()}{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{_f2b_docker_twin(_f2b_banaction())}{guarddog_action}\n"
     )
     _write_priv(jail_path, jail_conf)
 
@@ -25336,7 +25493,7 @@ def _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = {_f2b_banaction_tak()}{guarddog_action}\n"
+        f"action   = {_f2b_banaction_tak()}{_f2b_docker_twin(_f2b_banaction_tak())}{guarddog_action}\n"
     )
     _write_priv(jail_path, jail_conf)
     # The badcert jail lives and dies with this one, with the same whitelist, so every
@@ -25372,7 +25529,7 @@ def _f2b_tak_badcert_jail_text(ignoreip=''):
         f"findtime = {_F2B_TAK_BADCERT_FINDTIME}\n"
         f"bantime  = {_F2B_TAK_BADCERT_BANTIME}\n"
         f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
-        f"action   = {_f2b_banaction_tak_badcert()}{guarddog_action}\n"
+        f"action   = {_f2b_banaction_tak_badcert()}{_f2b_docker_twin(_f2b_banaction_tak_badcert())}{guarddog_action}\n"
     )
 
 
@@ -25824,7 +25981,7 @@ def _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = {_f2b_banaction()}{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{_f2b_docker_twin(_f2b_banaction())}{guarddog_action}\n"
     )
     _write_priv(jail_path, jail_conf)
 
@@ -26505,7 +26662,7 @@ def _f2b_write_mediamtx_jail(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"ignoreip = {_f2b_trusted_ignoreip(ignoreip)}\n"
-        f"action   = {_f2b_banaction_media()}{guarddog_action}\n"
+        f"action   = {_f2b_banaction_media()}{_f2b_docker_twin(_f2b_banaction_media())}{guarddog_action}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-mediamtx-rtsp.conf'
     _write_priv(jail_path, jail_conf)
@@ -26571,7 +26728,7 @@ def _f2b_arm_clientfeed_jail(log_fn=None):
             f"findtime = {CLIENTFEED_F2B_FINDTIME}\n"
             f"bantime  = {CLIENTFEED_F2B_BANTIME}\n"
             f"ignoreip = {_f2b_trusted_ignoreip()}\n"
-            f"action   = {_f2b_banaction()}{guarddog_action}\n"
+            f"action   = {_f2b_banaction()}{_f2b_docker_twin(_f2b_banaction())}{guarddog_action}\n"
         )
         _write_priv('/etc/fail2ban/jail.d/infratak-clientfeed.conf', jail_conf)
 
@@ -26688,7 +26845,7 @@ def _f2b_console_jail_text(extra_ignoreip=''):
         f"findtime = {CONSOLE_F2B_FINDTIME}\n"
         f"bantime  = {CONSOLE_F2B_BANTIME}\n"
         f"ignoreip = {_f2b_trusted_ignoreip(extra_ignoreip)}\n"
-        f"action   = {_f2b_banaction_console()}{guarddog_action}\n"
+        f"action   = {_f2b_banaction_console()}{_f2b_docker_twin(_f2b_banaction_console())}{guarddog_action}\n"
     )
 
 
@@ -27058,7 +27215,7 @@ def _f2b_write_portal_jail(maxretry, findtime, bantime, ignoreip=''):
         f"findtime = {findtime}\n"
         f"bantime  = {bantime}\n"
         f"{ignoreip_line}"
-        f"action   = {_f2b_banaction()}{guarddog_action}\n"
+        f"action   = {_f2b_banaction()}{_f2b_docker_twin(_f2b_banaction())}{guarddog_action}\n"
     )
     _write_priv('/etc/fail2ban/jail.d/infratak-takportal.conf', jail_conf)
 
@@ -27346,7 +27503,7 @@ def _f2b_write_recidive_config(maxretry, findtime):
         # in a day would otherwise become a 7-day all-ports ban.
         "ignoreregex = \\[(?:mediamtx-rtsp|takserver|takserver-badcert|infratak-manual)\\] Ban\n"
         f"ignoreip = {_f2b_trusted_ignoreip()}\n"
-        f"action   = {_f2b_banaction()}\n"
+        f"action   = {_f2b_banaction()}{_f2b_docker_twin(_f2b_banaction())}\n"
     )
     _write_priv('/etc/fail2ban/jail.d/infratak-recidive.conf', jail_conf)
     # The recidive jail reads fail2ban's own log; pre-create it so the jail loads on
@@ -27578,7 +27735,7 @@ def _f2b_manual_jail_text():
         "findtime = 60\n"
         "bantime  = -1\n"
         f"ignoreip = {_f2b_trusted_ignoreip()}\n"
-        f"action   = {_f2b_banaction()}\n"
+        f"action   = {_f2b_banaction()}{_f2b_docker_twin(_f2b_banaction())}\n"
     )
 
 
@@ -121375,7 +121532,7 @@ def _fail2ban_install_and_configure(plog):
         "maxretry = 5\n"
         "findtime = 600\n"
         "bantime  = 3600\n"
-        f"action   = {_f2b_banaction()}\n"
+        f"action   = {_f2b_banaction()}{_f2b_docker_twin(_f2b_banaction())}\n"
     )
     jail_path = '/etc/fail2ban/jail.d/infratak-authentik.conf'
     _write_priv(jail_path, jail_conf)
@@ -127583,7 +127740,8 @@ def _startup_f2b_ufw_lock_switch():
         if not os.path.isdir('/etc/fail2ban/action.d'):
             return
         stale = _f2b_stale_ufw_jails()
-        if stale:
+        outdated = _f2b_ufw_action_outdated()
+        if stale or outdated:
             act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                                  capture_output=True, text=True, timeout=15).stdout.strip()
             if act == 'active':
@@ -127614,7 +127772,10 @@ def _startup_f2b_ufw_lock_switch():
                 how = 'restarted' if r2.returncode == 0 else f'start FAILED (rc {r2.returncode})'
             else:
                 how = f'not running ({act or "unknown"}), left stopped'
-            _log(f"fail2ban: jails moved to the locked infratak-ufw action ({names}); fail2ban {how}")
+            if stale:
+                _log(f"fail2ban: jails moved to the locked infratak-ufw action ({names}); fail2ban {how}")
+            else:
+                _log(f"fail2ban: infratak-ufw action updated (IPv6 bans use ufw prepend); fail2ban {how}")
         else:
             _f2b_ensure_ufw_action()          # keep the file current (a later release may change it)
         _ufw_ipv4_parity_heal(_log)
@@ -127631,6 +127792,73 @@ def _startup_f2b_ufw_lock_switch():
 
 
 _startup_f2b_ufw_lock_switch()
+
+
+def _startup_f2b_docker_twins():
+    """infra-TAK #736: add the infratak-docker action to every jail of ours that does
+    not have it yet, so a ban also covers Docker-published ports. Once per box (the jail
+    writers add it themselves from now on).
+
+    Runs AFTER _startup_f2b_ufw_lock_switch(). A plain reload would only add the action
+    for NEW bans (fail2ban rebans current ones in a new action only when the address is
+    banned again), so fail2ban is restarted once to put every current ban in DOCKER-USER
+    too. That restart is keyed on a settings flag, not on this function changing a file:
+    an earlier startup step (the ignoreip re-apply) rewrites jails through the writers,
+    which add the line, and only reloads; on the first box test that left a current ban
+    off the Docker ports. The restart unbans every address through each jail's own action
+    first, so it waits while any jail is still on the stock, unlocked `ufw` action (the
+    lock switch moves them; the next console start tries again)."""
+    _log = lambda m: print(f"Startup migration: {m}", flush=True)
+    try:
+        import glob as _glob
+        if not os.path.isdir('/etc/fail2ban/action.d'):
+            return
+        paths = sorted(_glob.glob('/etc/fail2ban/jail.d/infratak-*.conf'))
+        if not paths:
+            return
+        if _distro_family() != 'rhel' and _f2b_stale_ufw_jails():
+            _log("fail2ban: jails still on the stock ufw action — Docker-port bans wait for the next start")
+            return
+        if not _f2b_ensure_docker_action():
+            _log("fail2ban: could not write the infratak-docker action — Docker-published ports stay unbanned")
+            return
+        changed = []
+        for path in paths:
+            txt = _f2b_read_text(path)
+            if not txt:
+                continue
+            new = _f2b_add_docker_twins(txt)
+            if new != txt:
+                _write_priv(path, new)
+                changed.append(os.path.basename(path))
+        done = (load_settings().get(_F2B_DOCKER_FLAG) or {}).get('last_outcome') == 'applied'
+        if done and not changed:
+            return
+        act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+        ok = True
+        if act == 'active':
+            r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'fail2ban']),
+                               capture_output=True, text=True, timeout=120)
+            ok = r.returncode == 0
+            how = 'restarted' if ok else f'restart FAILED (rc {r.returncode}), tries again next start'
+        else:
+            how = f'not running ({act or "unknown"}); its next start loads the new action'
+        if ok:
+            s = load_settings()
+            s[_F2B_DOCKER_FLAG] = {'last_outcome': 'applied',
+                                   'applied_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+            save_settings(s)
+        _log(f"fail2ban: bans now cover Docker-published ports too "
+             f"({', '.join(changed) or 'jails already had the action'}); fail2ban {how}")
+    except Exception as e:
+        _log(f"fail2ban Docker-port bans error (non-fatal): {str(e)[:160]}")
+
+
+_F2B_DOCKER_FLAG = 'f2b_docker_ports'   # settings key: the once-per-box restart is done
+
+
+_startup_f2b_docker_twins()
 
 
 # v10.1.18 (SELinux enforce-the-domain): verify the box's
