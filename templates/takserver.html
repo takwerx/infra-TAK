@@ -112,6 +112,20 @@ body{display:flex;flex-direction:row;min-height:100vh}
 <div class="status-info"><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Upload package files from tak.gov to deploy</div></div></div>
 {% endif %}
 </div>
+{# ops #1119: newest TAK Server version that passed our install and update tests (signed file). tak.gov needs a login, so we cannot show what tak.gov has; the line says so. #}
+{% if tak.installed and not deploying and tak_tested and tak_tested.tested %}
+<div id="tak-tested-row" data-state="{{ tak_tested.state }}" style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:12px 20px;margin:-12px 0 24px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.6;color:var(--text-secondary)">
+<div><strong style="color:var(--text-primary)">Latest we tested:</strong> {{ tak_tested.tested }}{% if tak_tested.tested_date %} <span style="color:var(--text-dim)">(tested {{ tak_tested.tested_date }}: fresh install and update both passed)</span>{% endif %}</div>
+{% if tak_tested.state == 'behind' %}
+<div style="color:var(--yellow,#eab308)">This server runs {{ tak_version }}, which is older. Download {{ tak_tested.tested }} from tak.gov, upload it in the update section below, then click Update TAK Server.</div>
+{% elif tak_tested.state == 'current' %}
+<div style="color:var(--green)">This server runs the version we tested.</div>
+{% elif tak_tested.state == 'newer' %}
+<div style="color:var(--text-dim)">This server runs {{ tak_version }}, which is newer than the one we tested. We have not tested it yet.</div>
+{% endif %}
+<div style="color:var(--text-dim)">tak.gov may have a newer version still. It needs a login, so this page cannot check it.</div>
+</div>
+{% endif %}
 {% if tak.installed and not deploying %}
 {# v10.2.26: does TAK Server's certificate carry this box's names? Filled by loadTakCertRow(). #}
 <div id="tak-cert-row" style="display:none;border-radius:12px;padding:14px 20px;margin-bottom:24px;font-family:'JetBrains Mono',monospace;font-size:13px;line-height:1.5"></div>
@@ -836,15 +850,15 @@ function loadSnapshots(fromBtn){
       var src=s.source||'manual';
       var srcColor=src==='pre-upgrade'?'var(--cyan)':src==='scheduled'?'var(--green)':'var(--text-dim)';
       return '<tr style="border-bottom:1px solid var(--border)">'
-        +'<td style="padding:6px 8px;font-size:11px;font-family:JetBrains Mono,monospace;color:var(--text-secondary)">'+s.label+'</td>'
-        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+( s.taken_at||'' ).replace('T',' ').replace('Z','')+'</td>'
-        +'<td style="padding:6px 8px;font-size:11px;color:'+srcColor+'">'+src+'</td>'
-        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.tak_version||'?')+'</td>'
-        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+(s.size_mb||0)+' MB</td>'
+        +'<td style="padding:6px 8px;font-size:11px;font-family:JetBrains Mono,monospace;color:var(--text-secondary)">'+escapeHtml(s.label)+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+escapeHtml(( s.taken_at||'' ).replace('T',' ').replace('Z',''))+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:'+srcColor+'">'+escapeHtml(src)+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+escapeHtml(s.tak_version||'?')+'</td>'
+        +'<td style="padding:6px 8px;font-size:11px;color:var(--text-dim)">'+escapeHtml(s.size_mb||0)+' MB</td>'
         +'<td style="padding:6px 8px;white-space:nowrap">'
-+'<button onclick="restoreSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(16,185,129,0.1);color:var(--green);border:1px solid rgba(16,185,129,0.4);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">↩ Restore</button>'
-+'<button onclick="downloadSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(6,182,212,0.08);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">⬇ Download</button>'
-+'<button onclick="deleteSnapshot(\''+s.label+'\')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:5px;font-size:11px;cursor:pointer">Delete</button>'
++'<button onclick="restoreSnapshot('+jsArg(s.label)+')" style="padding:4px 10px;background:rgba(16,185,129,0.1);color:var(--green);border:1px solid rgba(16,185,129,0.4);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">↩ Restore</button>'
++'<button onclick="downloadSnapshot('+jsArg(s.label)+')" style="padding:4px 10px;background:rgba(6,182,212,0.08);color:var(--cyan);border:1px solid rgba(6,182,212,0.3);border-radius:5px;font-size:11px;cursor:pointer;margin-right:4px">⬇ Download</button>'
++'<button onclick="deleteSnapshot('+jsArg(s.label)+')" style="padding:4px 10px;background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.4);border-radius:5px;font-size:11px;cursor:pointer">Delete</button>'
         +'</td></tr>';
     }).join('');
     c.innerHTML='<div class="table-wrap"><table style="width:100%;border-collapse:collapse">'
@@ -859,7 +873,7 @@ function loadSnapshots(fromBtn){
   }).catch(function(e){
     var btn2=document.getElementById('snap-refresh-btn');
     if(btn2){btn2.disabled=false;btn2.style.opacity='1';btn2.textContent='↻ Refresh';}
-    c.innerHTML='<div style="color:var(--red);font-size:12px">Failed to load snapshots — '+((e&&e.message)||'network error')+'</div>';
+    c.innerHTML='<div style="color:var(--red);font-size:12px">Failed to load snapshots — '+escapeHtml((e&&e.message)||'network error')+'</div>';
   });
 }
 
@@ -897,7 +911,7 @@ function takeSnapshot(){
 }
 
 function restoreSnapshot(label){
-  if(!confirm('Restore TAK Server from snapshot "'+label+'"?\n\nThis will:\n• Stop TAK Server\n• Restore CoreConfig.xml, UserAuthenticationFile.xml, certs, and database\n• Restart TAK Server\n\nCurrent data will be overwritten.'))return;
+  if(!confirm('Restore TAK Server from snapshot "'+label+'"?\n\nThis will:\n• Stop TAK Server\n• Restore CoreConfig.xml, UserAuthenticationFile.xml, certs, and database\n• Restart TAK Server\n\nThe TAK Server package stays as it is now. To go back to an older package, use Update with that package.\n\nCurrent data will be overwritten.'))return;
   var prog=document.getElementById('snap-progress');
   if(prog){prog.style.display='';prog.style.color='var(--yellow)';prog.textContent='Restoring snapshot…';}
   fetch('/api/takserver/rollback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label})})

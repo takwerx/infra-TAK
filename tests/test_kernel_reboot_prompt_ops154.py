@@ -159,7 +159,8 @@ def test_cve_label_while_running_kernel_predates_fix():
 
 
 def test_no_cve_label_once_on_fixed_kernel():
-    assert _cve_ns('jammy')('5.15.0-198-generic') is None
+    # newest fix in the table (ops #1084: CVE-2026-98432, jammy 5.15.0-203)
+    assert _cve_ns('jammy')('5.15.0-203-generic') is None
 
 
 def test_no_cve_label_on_unknown_distro():

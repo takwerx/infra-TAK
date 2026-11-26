@@ -87,13 +87,14 @@
 </style>{% endblock %}
 {% block body_attrs %}{% endblock %}
 {% block content %}<div class="main">
+{% from '_webadmin_email_banner.html' import webadmin_email_banner %}{{ webadmin_email_banner() }}
 <div class="status-banner">
 {% if deploying %}
 <div class="status-info"><div class="status-icon running" style="background:rgba(59,130,246,0.1)">🔄</div><div><div class="status-text" style="color:var(--accent)">Deploying...</div><div class="status-detail">Authentik installation in progress</div></div></div>
 {% elif ak.installed and ak.running %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned to v{{ ak_version_info.vetted_release }} — what production customers run">main: v{{ ak_version_info.vetted_release }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px" title="Update available — click Update to install v{{ ak_version_info.latest }}">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v{{ ak_version_info.upstream_latest }} is newer than the dev pin. Investigate — if it's good, bump AUTHENTIK_DEV_RELEASE. Not auto-installed.">↑ v{{ ak_version_info.upstream_latest }} available upstream</span>{% endif %}{% else %}{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}{% endif %}{% if ak_version_info and ak_version_info.pin_conflict %} · <span style="color:#f59e0b;font-size:10px" title="Docker Compose reads .env for ${AUTHENTIK_TAG} interpolation, and an .env pin OVERRIDES the compose default — so this box keeps resolving v{{ ak_version_info.env_tag }} no matter what the compose file says. Update converges both (v10.1.39).">.env pins v{{ ak_version_info.env_tag }}</span>{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--green)">Running</div><div class="status-detail">Identity provider active{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned to v{{ ak_version_info.vetted_release }} — what production customers run">main: v{{ ak_version_info.vetted_release }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px" title="Update available — click Update to install v{{ ak_version_info.latest }}">v{{ ak_version_info.latest }} available</span>{% if ak_version_info.release_notes_url %} · <a href="{{ ak_version_info.release_notes_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);font-size:11px;text-decoration:underline" title="Open the release notes on GitHub">What's new</a>{% endif %}{% elif ak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v{{ ak_version_info.upstream_latest }} is newer than the dev pin. Investigate — if it's good, bump AUTHENTIK_DEV_RELEASE. Not auto-installed.">↑ v{{ ak_version_info.upstream_latest }} available upstream</span>{% endif %}{% else %}{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% if ak_version_info.release_notes_url %} · <a href="{{ ak_version_info.release_notes_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);font-size:11px;text-decoration:underline" title="Open the release notes on GitHub">What's new</a>{% endif %}{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}{% endif %}{% if ak_version_info and ak_version_info.pin_conflict %} · <span style="color:#f59e0b;font-size:10px" title="Docker Compose reads .env for ${AUTHENTIK_TAG} interpolation, and an .env pin OVERRIDES the compose default — so this box keeps resolving v{{ ak_version_info.env_tag }} no matter what the compose file says. Update converges both (v10.1.39).">.env pins v{{ ak_version_info.env_tag }}</span>{% endif %}</div></div></div>
 {% elif ak.installed %}
-<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned to v{{ ak_version_info.vetted_release }} — what production customers run">main: v{{ ak_version_info.vetted_release }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px" title="Update available — click Update to install v{{ ak_version_info.latest }}">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v{{ ak_version_info.upstream_latest }} is newer than the dev pin. Investigate — if it's good, bump AUTHENTIK_DEV_RELEASE. Not auto-installed.">↑ v{{ ak_version_info.upstream_latest }} available upstream</span>{% endif %}{% else %}{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}{% endif %}{% if ak_version_info and ak_version_info.pin_conflict %} · <span style="color:#f59e0b;font-size:10px" title="Docker Compose reads .env for ${AUTHENTIK_TAG} interpolation, and an .env pin OVERRIDES the compose default — so this box keeps resolving v{{ ak_version_info.env_tag }} no matter what the compose file says. Update converges both (v10.1.39).">.env pins v{{ ak_version_info.env_tag }}</span>{% endif %}</div></div></div>
+<div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--red)">Stopped</div><div class="status-detail">Docker containers not running{% if ak_version_info and ak_version_info.version %} · <span class="os-badge" style="margin-left:4px">v{{ ak_version_info.version }}</span>{% if ak_version_info.channel == 'dev' %} · <span style="color:#f59e0b;font-size:10px" title="Main/vetted channel is pinned to v{{ ak_version_info.vetted_release }} — what production customers run">main: v{{ ak_version_info.vetted_release }}</span>{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px" title="Update available — click Update to install v{{ ak_version_info.latest }}">v{{ ak_version_info.latest }} available</span>{% if ak_version_info.release_notes_url %} · <a href="{{ ak_version_info.release_notes_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);font-size:11px;text-decoration:underline" title="Open the release notes on GitHub">What's new</a>{% endif %}{% elif ak_version_info.upstream_newer %} · <span style="color:var(--cyan);font-size:10px" title="Upstream Authentik v{{ ak_version_info.upstream_latest }} is newer than the dev pin. Investigate — if it's good, bump AUTHENTIK_DEV_RELEASE. Not auto-installed.">↑ v{{ ak_version_info.upstream_latest }} available upstream</span>{% endif %}{% else %}{% if ak_version_info.update_available and ak_version_info.latest %} · <span style="color:var(--cyan);font-size:11px">v{{ ak_version_info.latest }} available</span>{% if ak_version_info.release_notes_url %} · <a href="{{ ak_version_info.release_notes_url }}" target="_blank" rel="noopener noreferrer" style="color:var(--cyan);font-size:11px;text-decoration:underline" title="Open the release notes on GitHub">What's new</a>{% endif %}{% elif ak_version_info.ahead_of_vetted %} · <span style="color:#f59e0b;font-size:10px" title="Installed version is newer than fleet-vetted (v{{ ak_version_info.vetted_release }}) — not yet validated on main channel">! unvetted</span>{% elif not ak_version_info.update_available %} · <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}{% endif %}{% endif %}{% if ak_version_info and ak_version_info.pin_conflict %} · <span style="color:#f59e0b;font-size:10px" title="Docker Compose reads .env for ${AUTHENTIK_TAG} interpolation, and an .env pin OVERRIDES the compose default — so this box keeps resolving v{{ ak_version_info.env_tag }} no matter what the compose file says. Update converges both (v10.1.39).">.env pins v{{ ak_version_info.env_tag }}</span>{% endif %}</div></div></div>
 {% else %}
 <div class="status-info"><div class="status-logo-wrap"><img src="{{ authentik_logo_url }}" alt="" class="status-logo"></div><div><div class="status-text" style="color:var(--text-dim)">Not Installed</div><div class="status-detail">Deploy Authentik for identity management & SSO</div></div></div>
 {% endif %}
@@ -149,6 +150,11 @@
 <div id="admin-accounts-rows" style="display:flex;flex-direction:column;gap:6px;font-family:'JetBrains Mono',monospace;font-size:11px"><div style="color:var(--text-dim)">Loading…</div></div>
 <div id="admin-accounts-msg" style="margin-top:8px;font-family:'JetBrains Mono',monospace;font-size:11px;display:none"></div>
 <div style="margin-top:6px;font-size:10px;color:var(--text-dim);line-height:1.5">If <strong>akadmin</strong> or <strong>webadmin</strong> shows <span style="color:var(--red)">DEACTIVATED</span> (e.g. someone clicked Deactivate in TAK Portal or the Authentik UI), click Reactivate to restore login. Tries Authentik API first, falls back to <code style="color:var(--cyan)">docker exec authentik-server-1 ak shell</code>.</div>
+</div>
+<div id="group-names-warning" style="display:none;margin-top:14px;padding:12px 14px;border:1px solid var(--red);border-radius:8px;background:rgba(239,68,68,.08)">
+<div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:var(--red);margin-bottom:6px">⚠ Group names that need a look</div>
+<div id="group-names-rows" style="display:flex;flex-direction:column;gap:4px;font-family:'JetBrains Mono',monospace;font-size:11px"></div>
+<div style="margin-top:8px;font-size:11px;color:var(--text-secondary);line-height:1.5">Authentik gives a person's groups to each app as one list with a separator between the names. A group name that holds a separator can be read by an app as a different group, and that can give its members access they should not have. If you did not make this group on purpose, check who made it and who is in it (Authentik Admin → Directory → Groups), then rename or delete it. infra-TAK does not change it for you.</div>
 </div>
 </div>
 
@@ -457,6 +463,7 @@ async function refreshAdminAccounts(){
                 btnHtml = reactivateBtn;
             }
             rows += '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span style="color:var(--cyan);min-width:110px">' + escapeHtml(a.username) + '</span>' + pill + btnHtml + '</div>';
+            if (a.exists && typeof a.email === 'string') { rows += adminEmailRow(a, d.smtp_configured); }
         });
         var sourceTag = d.source === 'ak-shell' ? '<div style="margin-top:6px;color:var(--text-dim);font-size:10px">status read via <code>ak shell</code> (Authentik API unavailable)</div>' : '';
         container.innerHTML = (rows || '<div style="color:var(--text-dim)">No accounts reported</div>') + sourceTag;
@@ -465,6 +472,68 @@ async function refreshAdminAccounts(){
     } finally {
         if (refreshBtn) { refreshBtn.disabled = false; }
     }
+}
+
+// Recovery email for the protected admin accounts. A made-up address (admin@takwerx.local,
+// webadmin@<fqdn>) means "Forgot password?" mails the reset link to nobody.
+function adminEmailRow(a, smtp){
+    var u = escapeHtml(a.username);
+    var inp = '<input type="email" id="admin-email-' + u + '" value="' + (a.email_placeholder ? '' : escapeHtml(a.email)) + '" placeholder="you@example.com" autocomplete="off" style="flex:1;min-width:200px;background:var(--bg-dark);border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:11px">'
+        + '<button type="button" id="admin-email-' + u + '-btn" onclick="saveAdminEmail(\'' + u + '\')" style="background:rgba(16,185,129,.15);border:1px solid var(--green);color:var(--green);padding:3px 14px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:11px;font-weight:600;cursor:pointer">Save</button>';
+    var html = '<div style="margin:2px 0 8px 120px">';
+    if (a.email_placeholder) {
+        html += '<div style="padding:8px 10px;border:1px solid var(--yellow,#f59e0b);border-radius:6px;background:rgba(245,158,11,.08)">'
+            + '<div style="color:var(--yellow,#f59e0b);font-weight:600;margin-bottom:4px">\u26a0 No recovery email</div>'
+            + '<div style="color:var(--text-secondary);line-height:1.5;margin-bottom:6px">The email on this account is <code>' + escapeHtml(a.email || 'empty') + '</code>. infra-TAK made it up, and nobody receives mail there. If you forget the password, &quot;Forgot password?&quot; cannot reach you. Enter an address you read.</div>'
+            + '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' + inp + '</div>';
+        if (smtp === false) {
+            html += '<div style="margin-top:6px;color:var(--text-dim);line-height:1.5">Authentik cannot send email yet. Set up <a href="/emailrelay" style="color:var(--cyan)">Email Relay</a> too, or the reset email is not sent.</div>';
+        }
+        html += '</div>';
+    } else {
+        html += '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap"><span style="color:var(--text-dim)">recovery email</span>' + inp + '</div>';
+    }
+    return html + '<div id="admin-email-' + u + '-msg" style="margin-top:4px;display:none"></div></div>';
+}
+
+async function saveAdminEmail(username){
+    var inp = document.getElementById('admin-email-' + username);
+    var btn = document.getElementById('admin-email-' + username + '-btn');
+    var msg = document.getElementById('admin-email-' + username + '-msg');
+    if (!inp) return;
+    if (btn) { btn.disabled = true; btn.textContent = 'Saving\u2026'; }
+    try {
+        var r = await fetch('/api/authentik/admin-email', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({user: username, email: inp.value.trim()})
+        });
+        var d = await r.json();
+        if (msg) { msg.style.display = 'block'; msg.style.color = d.success ? 'var(--green)' : 'var(--red)'; msg.textContent = (d.success ? '\u2713 ' : '\u2717 ') + (d.message || ''); }
+        if (d.success) { setTimeout(refreshAdminAccounts, 1200); }
+    } catch(e) {
+        if (msg) { msg.style.display = 'block'; msg.style.color = 'var(--red)'; msg.textContent = 'Error: ' + e.message; }
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = 'Save'; }
+    }
+}
+
+async function refreshGroupNames(){
+    var box = document.getElementById('group-names-warning');
+    var rows = document.getElementById('group-names-rows');
+    if (!box || !rows) return;
+    try {
+        var r = await fetch('/api/authentik/group-names');
+        var d = await r.json();
+        var found = (d && d.available && d.findings) || [];
+        if (!found.length) { box.style.display = 'none'; return; }
+        rows.innerHTML = found.map(function(f){
+            var why = (f.reads_as && f.reads_as.length)
+                ? 'can be read as ' + f.reads_as.map(function(n){ return '<span style="color:var(--red);font-weight:600">' + escapeHtml(n) + '</span>'; }).join(', ')
+                : 'holds the separator |';
+            return '<div><span style="color:var(--cyan)">' + escapeHtml(f.name) + '</span> <span style="color:var(--text-dim)">' + why + '</span></div>';
+        }).join('');
+        box.style.display = 'block';
+    } catch(e) { box.style.display = 'none'; }
 }
 
 async function reactivateAdmin(username){
@@ -665,6 +734,7 @@ async function resetAdminMfa(username){
 
 document.addEventListener('DOMContentLoaded', function(){
     if (document.getElementById('admin-accounts-status')) { refreshAdminAccounts(); }
+    if (document.getElementById('group-names-warning')) { refreshGroupNames(); }
 });
 
 async function akUpdate(){
@@ -1244,7 +1314,7 @@ document.addEventListener('DOMContentLoaded', function() {
         avail++;
         opts+='<option value="'+escAttr(a.suffix)+'">'+esc(a.name)+' ('+esc(a.groupPrefix)+')</option>';
       });
-      if(!avail){opts='<option value="">- all agencies connected -</option>';}
+      if(!avail){opts='<option value="">'+((D.agencies||[]).length?'- all agencies connected -':'- no agencies in TAK Portal yet -')+'</option>';}
       sel.innerHTML=opts;if(cur){sel.value=cur;}
       idpbPreview();
     }

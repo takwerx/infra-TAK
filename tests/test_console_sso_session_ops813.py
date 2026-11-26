@@ -302,41 +302,106 @@ def test_refused_user_is_told_why(console):
 
 @pytest.mark.parametrize('mode', ['error', 'forbidden'])
 def test_non_admin_refused_when_authentik_api_gives_no_answer(console, authentik, mode):
-    """No answer from the API must not open the door: the group header decides."""
+    """No answer from the API must not open the door."""
     authentik.mode = mode
     b = console.browser()
     assert through_authentik(b, '/console', 'bob', BOB_GROUPS).status_code == 403
     assert b.get('/api/metrics').status_code == 401
 
 
+# ops #1082: the group header is not evidence. The outpost joins the names with "|" and
+# a group name is free text, so a split of the header does not give the exact names.
+
 @pytest.mark.parametrize('mode', ['error', 'forbidden'])
-def test_admin_not_locked_out_when_authentik_api_gives_no_answer(console, authentik, mode):
-    """Upgrade safety: a box whose API token does not work still lets an administrator
-    in on the group header that forward_auth supplied."""
+@pytest.mark.parametrize('groups', [
+    ['tak_x|authentik Admins'],              # ONE group, named with the separator in it
+    ['tak_Users', 'tak_x|authentik Admins|tak_y'],
+    ['authentik Admins|tak_x'],
+    ['authentik Admins'],                    # the header alone, even when it is the real name
+    ['tak_Users,authentik Admins'], ['authentik admins'], [],
+])
+def test_group_header_never_opens_the_console(console, authentik, mode, groups):
+    """Proof test for ops #1082. Authentik's API gives no answer, and the request carries
+    a group header that splits into `authentik Admins`. No session."""
+    authentik.add('mallory', groups)
     authentik.mode = mode
     b = console.browser()
-    assert through_authentik(b, '/console', 'alice', ALICE_GROUPS).status_code == 200
-    assert b.get('/api/metrics').status_code == 200
+    r = through_authentik(b, '/console', 'mallory', groups)
+    assert r.status_code == 403 and b'CONSOLE' not in r.data
+    assert b.get('/api/metrics').status_code == 401
+    assert b.post('/api/restart').status_code == 401
 
 
-@pytest.mark.parametrize('groups', [
-    ['authentik Admins2'], ['not authentik Admins'], ['authentik', 'Admins'],
-    ['authentik admins'], ['tak_Users,authentik Admins'], [],
-])
-def test_group_header_must_name_the_group_exactly(console, authentik, groups):
-    authentik.mode = 'error'   # header-only decision
+def test_group_named_with_the_separator_is_not_the_admin_group(console, authentik):
+    """With the API answering, the name is compared whole."""
+    groups = ['tak_x|authentik Admins']
+    authentik.add('mallory', groups)
     b = console.browser()
-    assert through_authentik(b, '/console', 'bob', groups).status_code == 403
+    assert through_authentik(b, '/console', 'mallory', groups).status_code == 403
     assert b.get('/api/metrics').status_code == 401
 
 
-def test_group_header_is_pipe_separated(console, authentik):
-    authentik.mode = 'error'
+@pytest.mark.parametrize('mode', ['error', 'forbidden'])
+def test_no_answer_refuses_a_new_sign_in_and_says_why(console, authentik, mode):
+    """An administrator nobody confirmed yet gets no session while Authentik gives no
+    answer. The page says so and names the console password, which still works."""
+    authentik.mode = mode
     b = console.browser()
-    r = b.get('/console', headers={'X-Authentik-Username': 'alice',
-                                   'X-Authentik-Groups': 'tak_Users|authentik Admins|tak_ROLE_ADMIN',
-                                   'X-Infratak-Proxy-Auth': PROXY_SECRET})
-    assert r.status_code == 200
+    r = through_authentik(b, '/console', 'alice', ALICE_GROUPS)
+    assert r.status_code == 403
+    text = r.get_data(as_text=True)
+    assert 'alice' in text and 'did not answer' in text and 'console password' in text
+    assert b.get('/api/metrics').status_code == 401
+    assert ('auth:sso-denied' in [e for e, _ in console.audit])
+    assert b.post('/login', data={'password': PASSWORD}).status_code == 302
+    assert b.get('/api/metrics').status_code == 200
+
+
+@pytest.mark.parametrize('mode', ['error', 'forbidden'])
+def test_admin_confirmed_before_an_outage_is_not_locked_out(console, authentik, clock, mode):
+    """Authentik restarts (an update from the console does that). An administrator it
+    confirmed a few minutes ago keeps working, page loads and a second browser included,
+    but only for SSO_UNCONFIRMED_MAX_SECONDS from the last real answer."""
+    b = console.browser()
+    assert through_authentik(b, '/console', 'alice', ALICE_GROUPS).status_code == 200
+    authentik.mode = mode
+    clock.forward(5 * 60)
+    assert through_authentik(b, '/console', 'alice', ALICE_GROUPS).status_code == 200
+    assert b.get('/api/metrics').status_code == 200
+    assert through_authentik(console.browser(), '/console', 'alice', ALICE_GROUPS).status_code == 200
+    # Page loads during the outage do not renew it.
+    clock.forward(9 * 60)
+    assert through_authentik(b, '/console', 'alice', ALICE_GROUPS).status_code == 200
+    clock.forward(2 * 60)
+    assert through_authentik(b, '/console', 'alice', ALICE_GROUPS).status_code == 403
+    assert b.get('/api/metrics').status_code == 401
+    # Someone else does not ride on alice's confirmation.
+    assert through_authentik(console.browser(), '/console', 'bob', [ADMINS]).status_code == 403
+    authentik.mode = 'ok'
+    clock.forward(21)
+    assert through_authentik(b, '/console', 'alice', ALICE_GROUPS).status_code == 200
+
+
+def test_held_session_survives_a_console_restart(console, authentik, clock, tmp_path):
+    """The time of the last real answer travels in the cookie, so a console restart in an
+    Authentik outage does not end a session that was confirmed a moment ago."""
+    b = console.browser()
+    assert through_authentik(b, '/console', 'alice', ALICE_GROUPS).status_code == 200
+    authentik.mode = 'error'
+    console.ns['_sso_dir_cache'].clear()
+    console.ns['_sso_dir_last_admin'].clear()
+    clock.forward(5 * 60)
+    assert through_authentik(b, '/console', 'alice', ALICE_GROUPS).status_code == 200
+    clock.forward(11 * 60)
+    assert through_authentik(b, '/console', 'alice', ALICE_GROUPS).status_code == 403
+
+
+def test_console_does_not_read_the_group_header():
+    """Nothing in app.py takes a decision from X-Authentik-Groups (Caddy still copies it
+    for the apps that need it)."""
+    assert not re.search(r"""headers\.get\(\s*['"]X-Authentik-Groups""", APP, re.I)
+    assert "split('|')" not in (_func('_sso_user_is_console_admin') or '')
+    assert _func('_authentik_header_groups') is None
 
 
 def test_authentik_no_beats_a_stale_group_header(console, authentik):
@@ -445,7 +510,10 @@ def test_sso_session_ends_when_nothing_confirms_it_for_too_long(console, authent
     assert b.get('/api/metrics').status_code == 200
     clock.forward(2 * 60 + 5)
     assert b.get('/api/metrics').status_code == 401
-    # A page that passes forward_auth again starts a new session.
+    # A page that passes forward_auth again starts a new session, once Authentik answers.
+    assert through_authentik(b, '/console', 'alice', ALICE_GROUPS).status_code == 403
+    authentik.mode = 'ok'
+    clock.forward(21)
     assert through_authentik(b, '/console', 'alice', ALICE_GROUPS).status_code == 200
     assert b.get('/api/metrics').status_code == 200
 
@@ -630,11 +698,23 @@ def test_hardened_idle_lock_still_locks_a_password_session(console, clock):
 
 # --- 6. the pieces the check depends on stay in place -----------------------------------
 
-def test_console_vhost_still_hands_the_group_header_to_the_console():
+def test_console_vhost_hands_the_console_only_the_username_header():
+    """ops #1208: the console takes no decision from the group header, so Caddy no longer copies
+    it (a person in a few hundred groups gave HTTP 431). The client-sent copy is still stripped."""
     src = _func('generate_caddyfile') or APP
-    block = src[src.index('forward_auth @needs_sso'):]
-    block = block[:block.index('reverse_proxy 127.0.0.1:5001')]
-    assert 'X-Authentik-Groups' in block
+    # ops #1081: the block comes from the one writer of every forward_auth block. The console
+    # hands it its own header list (ops #1208: the name only) and its own matcher.
+    call = src[src.index("_caddy_forward_auth_lines(ak_up, \"        \", _CONSOLE_AK_COPY_HEADERS,"):]
+    call = call[:call.index('reverse_proxy 127.0.0.1:5001')]
+    assert "matcher='@needs_sso'" in call
+    assert 'X-Authentik-Groups' not in call
+    assert "_CONSOLE_AK_COPY_HEADERS = 'X-Authentik-Username'\n" in APP
+    writer = APP[APP.index('def _caddy_forward_auth_lines('):]
+    writer = writer[:writer.index('\ndef ')]
+    # ops #1108: the caller's list is written as it is; one header is added to it only for
+    # the application compare, and never taken away.
+    assert "check.append(f'    copy_headers {copy}')" in writer
+    assert "if locked and not keep else copy_headers" in writer
     assert "'X-Authentik-Groups'" in src[src.index('_AK_FWD_HEADERS = ('):][:200], \
         'the client-sent group header must be stripped before forward_auth sets the real one'
 

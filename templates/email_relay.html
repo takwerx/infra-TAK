@@ -116,10 +116,23 @@ select.input-field{cursor:pointer}
 <table class="config-table">
 <tr><td>Provider</td><td>{{ providers.get(relay_config.get('provider',''),{}).get('name', relay_config.get('provider','—')) }}</td></tr>
 <tr><td>Relay Host</td><td>{{ relay_config.get('relay_host','—') }}:{{ relay_config.get('relay_port','587') }}</td></tr>
-<tr><td>SMTP Login</td><td>{{ relay_config.get('smtp_user','—') }}</td></tr>
+<tr><td>SMTP Login</td><td>{% if relay_config.get('smtp_auth') == false %}None (the relay accepts this server without a login){% else %}{{ relay_config.get('smtp_user','—') }}{% endif %}</td></tr>
+{% if relay_config.get('smtp_tls') %}<tr><td>TLS</td><td>{{ {'encrypt':'Required (STARTTLS)','none':'Off'}.get(relay_config.get('smtp_tls'), 'When the relay offers it') }}</td></tr>{% endif %}
 <tr><td>From Address</td><td>{{ relay_config.get('from_addr','—') }}</td></tr>
 <tr><td>From Name</td><td>{{ relay_config.get('from_name','—') }}</td></tr>
 </table>
+</div>
+
+<div class="section-title">System Notifications</div>
+<div id="notify-card" style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
+<p style="margin:0 0 12px 0;color:var(--text-muted)">The server sends its own mail too: sudo warnings, cron failures, update reports. Choose who reads it.</p>
+<div style="display:flex;gap:12px;align-items:end">
+<div style="flex:1"><label class="input-label" for="notify-to">Send system notifications to</label>
+<input type="text" id="notify-to" class="input-field" placeholder="{{ notify_default or 'you@example.com' }}" value="{{ notify_to }}" autocomplete="off"></div>
+<button onclick="saveNotifyTo()" id="notify-btn" style="padding:12px 24px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap">Save</button>
+</div>
+<p id="notify-hint" style="margin:8px 0 0 0;font-size:11px;color:var(--text-dim)">Separate several addresses with commas (up to 5). Leave it empty to use {% if notify_default_is_guarddog %}the Guard Dog alert address{% else %}the relay From address (set a Guard Dog alert address to change that){% endif %}{% if notify_default %}: {{ notify_default }}{% endif %}.</p>
+<div id="notify-result" style="margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;display:none"></div>
 </div>
 
 <div class="section-title">App SMTP Settings</div>
@@ -164,9 +177,19 @@ Configure TAK Portal and MediaMTX to use the local relay:<br><br>
 </select>
 <a id="swap-provider-link" href="#" target="_blank" class="provider-link" style="display:none">→ Get credentials from provider ↗</a>
 </div>
-<div class="form-group"><label class="input-label">SMTP Username / Login</label>
+<div class="form-group full" id="swap-auth-fields" style="display:none">
+<label class="input-label"><input type="checkbox" id="swap-smtp_auth" {% if relay_config.get('smtp_auth') != false %}checked{% endif %} onchange="updateProviderUI('swap-')"> Use an SMTP username and password</label>
+<p style="margin:4px 0 0 0;font-size:11px;color:var(--text-dim)">Turn this off for your own mail relay or Microsoft 365 Direct Send, which accept this server by its IP address and need no login. Your relay must allow this server's IP address.</p>
+<label class="input-label" style="margin-top:12px">Encryption (STARTTLS)</label>
+<select class="input-field" id="swap-smtp_tls">
+<option value="may" {% if relay_config.get('smtp_tls','may')=='may' %}selected{% endif %}>Use it when the relay offers it (default)</option>
+<option value="encrypt" {% if relay_config.get('smtp_tls','may')=='encrypt' %}selected{% endif %}>Always use it (refuse to send without it)</option>
+<option value="none" {% if relay_config.get('smtp_tls','may')=='none' %}selected{% endif %}>Off</option>
+</select>
+</div>
+<div class="form-group" id="swap-user-group"><label class="input-label">SMTP Username / Login</label>
 <input type="text" id="swap-smtp_user" class="input-field" placeholder="user@smtp-brevo.com" value="{{ relay_config.get('smtp_user','') }}"></div>
-<div class="form-group"><label class="input-label">SMTP Password / API Key</label>
+<div class="form-group" id="swap-pass-group"><label class="input-label">SMTP Password / API Key</label>
 <input type="password" id="swap-smtp_pass" class="input-field" placeholder="••••••••••••"></div>
 <div class="form-group"><label class="input-label">From Address</label>
 <input type="email" id="swap-from_addr" class="input-field" placeholder="noreply@yourdomain.com" value="{{ relay_config.get('from_addr','') }}"></div>
@@ -206,9 +229,19 @@ Switching providers later requires only updating Postfix credentials — no chan
 </select>
 <a id="deploy-provider-link" href="#" target="_blank" class="provider-link" style="display:none">→ Get credentials from provider ↗</a>
 </div>
-<div class="form-group"><label class="input-label">SMTP Username / Login</label>
+<div class="form-group full" id="deploy-auth-fields" style="display:none">
+<label class="input-label"><input type="checkbox" id="deploy-smtp_auth" checked onchange="updateProviderUI('deploy-')"> Use an SMTP username and password</label>
+<p style="margin:4px 0 0 0;font-size:11px;color:var(--text-dim)">Turn this off for your own mail relay or Microsoft 365 Direct Send, which accept this server by its IP address and need no login. Your relay must allow this server's IP address.</p>
+<label class="input-label" style="margin-top:12px">Encryption (STARTTLS)</label>
+<select class="input-field" id="deploy-smtp_tls">
+<option value="may">Use it when the relay offers it (default)</option>
+<option value="encrypt">Always use it (refuse to send without it)</option>
+<option value="none">Off</option>
+</select>
+</div>
+<div class="form-group" id="deploy-user-group"><label class="input-label">SMTP Username / Login</label>
 <input type="text" id="deploy-smtp_user" class="input-field" placeholder="user@smtp-brevo.com"></div>
-<div class="form-group"><label class="input-label">SMTP Password / API Key</label>
+<div class="form-group" id="deploy-pass-group"><label class="input-label">SMTP Password / API Key</label>
 <input type="password" id="deploy-smtp_pass" class="input-field" placeholder="••••••••••••"></div>
 <div class="form-group"><label class="input-label">From Address</label>
 <input type="email" id="deploy-from_addr" class="input-field" placeholder="noreply@yourdomain.com"></div>
@@ -245,23 +278,44 @@ function updateProviderUI(prefix){
     }
     var customFields = document.getElementById(prefix+'custom-fields');
     if(customFields) customFields.style.display = (key==='custom') ? 'grid' : 'none';
+    // ops #1200: only the Custom provider may send with no login.
+    var authFields = document.getElementById(prefix+'auth-fields');
+    if(authFields) authFields.style.display = (key==='custom') ? 'block' : 'none';
+    var useAuth = smtpAuthOn(prefix);
+    var ug = document.getElementById(prefix+'user-group'), pg = document.getElementById(prefix+'pass-group');
+    if(ug) ug.style.display = useAuth ? '' : 'none';
+    if(pg) pg.style.display = useAuth ? '' : 'none';
+}
+function smtpAuthOn(prefix){
+    var sel = document.getElementById(prefix+'provider');
+    var box = document.getElementById(prefix+'smtp_auth');
+    return !(sel && sel.value==='custom' && box && !box.checked);
+}
+function relayBody(prefix){
+    var provider=document.getElementById(prefix+'provider').value;
+    var auth=smtpAuthOn(prefix);
+    var body={provider:provider,
+        smtp_user:auth?document.getElementById(prefix+'smtp_user').value.trim():'',
+        smtp_pass:auth?document.getElementById(prefix+'smtp_pass').value.trim():'',
+        from_addr:document.getElementById(prefix+'from_addr').value.trim(),
+        from_name:document.getElementById(prefix+'from_name').value.trim()};
+    if(provider==='custom'){
+        body.custom_host=document.getElementById(prefix+'custom_host').value.trim();
+        body.custom_port=document.getElementById(prefix+'custom_port').value.trim();
+        body.smtp_auth=auth;
+        body.smtp_tls=document.getElementById(prefix+'smtp_tls').value;
+    }
+    return body;
 }
 updateProviderUI('swap-');
 updateProviderUI('deploy-');
 
 async function deployRelay(){
     var btn=document.getElementById('deploy-btn');
-    var provider=document.getElementById('deploy-provider').value;
-    var user=document.getElementById('deploy-smtp_user').value.trim();
-    var pass=document.getElementById('deploy-smtp_pass').value.trim();
-    var from=document.getElementById('deploy-from_addr').value.trim();
-    var name=document.getElementById('deploy-from_name').value.trim();
-    if(!user||!pass||!from){alert('SMTP username, password, and From address are required');return}
-    var body={provider,smtp_user:user,smtp_pass:pass,from_addr:from,from_name:name};
-    if(provider==='custom'){
-        body.custom_host=document.getElementById('deploy-custom_host').value.trim();
-        body.custom_port=document.getElementById('deploy-custom_port').value.trim();
-    }
+    var body=relayBody('deploy-');
+    if(smtpAuthOn('deploy-')){
+        if(!body.smtp_user||!body.smtp_pass||!body.from_addr){alert('SMTP username, password, and From address are required');return}
+    }else if(!body.from_addr){alert('From address is required');return}
     btn.disabled=true;btn.textContent='Deploying...';btn.style.opacity='0.7';
     var r=await fetch('/api/emailrelay/deploy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     var d=await r.json();
@@ -272,22 +326,28 @@ async function deployRelay(){
 }
 
 async function swapProvider(){
-    var provider=document.getElementById('swap-provider').value;
-    var user=document.getElementById('swap-smtp_user').value.trim();
-    var pass=document.getElementById('swap-smtp_pass').value.trim();
-    var from=document.getElementById('swap-from_addr').value.trim();
-    var name=document.getElementById('swap-from_name').value.trim();
-    if(!user||!pass||!from){alert('All fields required');return}
-    var body={provider,smtp_user:user,smtp_pass:pass,from_addr:from,from_name:name};
-    if(provider==='custom'){
-        body.custom_host=document.getElementById('swap-custom_host').value.trim();
-        body.custom_port=document.getElementById('swap-custom_port').value.trim();
-    }
+    var body=relayBody('swap-');
+    var provider=body.provider;
+    if(smtpAuthOn('swap-')){
+        if(!body.smtp_user||!body.smtp_pass||!body.from_addr){alert('All fields required');return}
+    }else if(!body.from_addr){alert('From address is required');return}
     if(!confirm('Switch to '+PROVIDERS[provider].name+'? Postfix will restart.')){return}
     var r=await fetch('/api/emailrelay/swap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     var d=await r.json();
     if(d.success){location.reload()}
     else{alert('Error: '+d.error)}
+}
+
+async function saveNotifyTo(){
+    var v=document.getElementById('notify-to').value.trim();
+    var res=document.getElementById('notify-result');
+    res.style.display='block';res.style.color='var(--text-dim)';res.textContent='Saving...';
+    try{
+        var r=await fetch('/api/emailrelay/notify-to',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({notify_to:v})});
+        var d=await r.json();
+        if(d.success){res.style.color='var(--green)';res.textContent='✓ Saved. System mail goes to '+d.goes_to+'.'}
+        else{res.style.color='var(--red)';res.textContent='✗ '+(d.error||'Could not save')}
+    }catch(e){res.style.color='var(--red)';res.textContent='✗ '+e}
 }
 
 async function sendTest(){

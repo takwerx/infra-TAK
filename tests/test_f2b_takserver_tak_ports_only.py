@@ -122,8 +122,9 @@ def test_tak_jail_is_written_with_the_tak_only_action_on_both_families():
 
 def _recidive_ignoreregex():
     written = {}
-    ns = _ns(consts=('_F2B_RECIDIVE_BANTIME',),
+    ns = _ns(consts=('_F2B_RECIDIVE_BANTIME', '_F2B_UFW_ACTION_PATH'),
              funcs=('_f2b_banaction', '_f2b_write_recidive_config'),
+             _f2b_ensure_ufw_action=lambda: False,          # _f2b_banaction may write the action file
              _distro_family=lambda: 'debian',
              _makedirs_priv=lambda *a, **k: None,
              _write_priv=lambda p, c, **k: written.__setitem__(p, c),

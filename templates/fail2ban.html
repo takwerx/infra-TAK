@@ -658,6 +658,10 @@ Existing bans are dropped with it. Your firewall rules are not otherwise changed
 <div class="toast" id="toast"></div>
 
 <script>
+// ops #897: f2bEsc for text that goes into the page, f2bArg for a value that is an argument
+// of an inline handler (JSON makes the JavaScript string, f2bEsc makes it safe in the attribute).
+function f2bEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function f2bArg(v){return f2bEsc(JSON.stringify(v==null?'':String(v)));}
 function showToast(msg, type) {
   var t = document.getElementById('toast');
   t.textContent = msg; t.className = 'toast ' + type; t.style.display = 'block';
@@ -671,8 +675,8 @@ function renderChips(inputId, chipsId) {
   var ips = input.value.trim().split(/\s+/).filter(function(s){ return s.length > 0; });
   if (!ips.length) { container.innerHTML = ''; return; }
   container.innerHTML = ips.map(function(ip) {
-    return '<span class="ip-chip">' + ip +
-      '<button title="Remove" onclick="removeChip(\''+ inputId +'\',\''+ chipsId +'\',\''+ ip +'\')">&times;</button></span>';
+    return '<span class="ip-chip">' + f2bEsc(ip) +
+      '<button title="Remove" onclick="removeChip('+f2bArg(inputId)+','+f2bArg(chipsId)+','+f2bArg(ip)+')">&times;</button></span>';
   }).join('');
 }
 
@@ -868,7 +872,7 @@ function renderAuthBanList(ips){
   if(!ips.length){c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>';return;}
   var sorted=ips.slice().sort(function(a,b){var d=_authIpToNum(a)-_authIpToNum(b);return window._authSortAsc?d:-d;});
   var arrow=window._authSortAsc?' ▲':' ▼';
-  var rows=sorted.map(function(ip){return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td><td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanIP(\''+ip+'\')">Unban</button></td></tr>';}).join('');
+  var rows=sorted.map(function(ip){return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+f2bEsc(ip)+'</td><td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanIP('+f2bArg(ip)+')">Unban</button></td></tr>';}).join('');
   c.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleAuthSort()">IP Address'+arrow+'</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
 }
 function toggleAuthSort(){window._authSortAsc=!window._authSortAsc;filterAuthBanList();}
@@ -991,10 +995,10 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     var attArrow = col==='attempts' ? (asc?' ▲':' ▼') : '';
     var rows = sorted.map(function(w){
       return '<tr style="border-bottom:1px solid var(--border)">'+
-        '<td style="font-family:monospace;padding:5px 8px;color:var(--text-primary);font-size:12px">'+w.ip+'</td>'+
-        '<td style="padding:5px 8px;color:var(--yellow);font-family:monospace;font-size:12px">'+w.attempts+'</td>'+
-        '<td style="padding:5px 8px;color:var(--text-dim);font-family:monospace;font-size:11px">'+w.last_seen+'</td>'+
-        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="manualBanTakIP(\''+w.ip+'\')">Ban Now</button></td></tr>';
+        '<td style="font-family:monospace;padding:5px 8px;color:var(--text-primary);font-size:12px">'+f2bEsc(w.ip)+'</td>'+
+        '<td style="padding:5px 8px;color:var(--yellow);font-family:monospace;font-size:12px">'+f2bEsc(w.attempts)+'</td>'+
+        '<td style="padding:5px 8px;color:var(--text-dim);font-family:monospace;font-size:11px">'+f2bEsc(w.last_seen)+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="manualBanTakIP('+f2bArg(w.ip)+')">Ban Now</button></td></tr>';
     }).join('');
     el.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'+
       '<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakWatchingSort(\'ip\')">IP Address'+ipArrow+'</th>'+
@@ -1167,7 +1171,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     var sorted=ips.slice().sort(function(a,b){var d=_takIpToNum(a)-_takIpToNum(b);return window._takSortAsc?d:-d;});
     var arrow=window._takSortAsc?' ▲':' ▼';
     // Why it is banned, in plain words (bad certificate, scanner, ...) - from TAK's own log.
-    var rows=sorted.map(function(ip){var det=(window._takBanDetails||{})[ip];var why=det&&det.explain?'<div style="margin-top:3px;font-family:inherit;font-size:12px;color:var(--text-secondary);white-space:normal;line-height:1.4">'+_takEsc(det.explain)+'</div>':'';var tag=(window._takBanJail||{})[ip]==='takserver-badcert'?' <span class="badge badge-yellow" style="font-size:9px;padding:1px 6px;font-family:inherit">streaming only · can re-enroll</span>':'';return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+_takEsc(ip)+tag+why+'</td><td style="padding:5px 8px;text-align:right;vertical-align:top"><button class="btn-danger-sm" onclick="unbanTakIP(\''+ip+'\')">Unban</button></td></tr>';}).join('');
+    var rows=sorted.map(function(ip){var det=(window._takBanDetails||{})[ip];var why=det&&det.explain?'<div style="margin-top:3px;font-family:inherit;font-size:12px;color:var(--text-secondary);white-space:normal;line-height:1.4">'+_takEsc(det.explain)+'</div>':'';var tag=(window._takBanJail||{})[ip]==='takserver-badcert'?' <span class="badge badge-yellow" style="font-size:9px;padding:1px 6px;font-family:inherit">streaming only · can re-enroll</span>':'';return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+_takEsc(ip)+tag+why+'</td><td style="padding:5px 8px;text-align:right;vertical-align:top"><button class="btn-danger-sm" onclick="unbanTakIP('+f2bArg(ip)+')">Unban</button></td></tr>';}).join('');
     c.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleTakSort()">IP Address'+arrow+'</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
   };
   window.toggleTakSort = function(){window._takSortAsc=!window._takSortAsc;filterTakBanList();};
@@ -1216,7 +1220,7 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
             var state = r.refused ? (r.refused + ' refusals since ' + _takWhen(r.first) + ', last ' + _takWhen(r.last)) : 'not refused in the last 30 min';
             var ban = r.banned
               ? ' · <span style="color:var(--red)">banned (' + (r.banned === 'takserver-badcert' ? 'streaming only, can re-enroll' : 'all TAK ports') + ')</span>' +
-                (/^[0-9a-fA-F:.]+$/.test(r.ip) ? ' <button class="btn-danger-sm" onclick="unbanTakIP(\'' + r.ip + '\')">Unban</button>' : '')
+                (/^[0-9a-fA-F:.]+$/.test(r.ip) ? ' <button class="btn-danger-sm" onclick="unbanTakIP('+f2bArg(r.ip)+')">Unban</button>' : '')
               : '';
             return '<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:12px;line-height:1.5;color:var(--text-secondary)">' + who + iss +
                    '<div style="font-family:JetBrains Mono,monospace;color:var(--text-dim)">' + _takEsc(r.ip || 'no recent address') + ' · ' + _takEsc(state) + ban + '</div></div>';
@@ -1385,8 +1389,8 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     var arrow = window._sshSortAsc ? ' ▲' : ' ▼';
     var rows = sorted.map(function(ip){
       return '<tr style="border-bottom:1px solid var(--border)">'+
-        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td>'+
-        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanSshIP(\''+ip+'\')">Unban</button></td></tr>';
+        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+f2bEsc(ip)+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanSshIP('+f2bArg(ip)+')">Unban</button></td></tr>';
     }).join('');
     c.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'+
       '<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleSshSort()">IP Address'+arrow+'</th>'+
@@ -1432,10 +1436,10 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     var attArrow = col==='attempts' ? (asc?' ▲':' ▼') : '';
     var rows = sorted.map(function(w){
       return '<tr style="border-bottom:1px solid var(--border)">'+
-        '<td style="font-family:monospace;padding:5px 8px;color:var(--text-primary);font-size:12px">'+w.ip+'</td>'+
-        '<td style="padding:5px 8px;color:var(--yellow);font-family:monospace;font-size:12px">'+w.attempts+'</td>'+
-        '<td style="padding:5px 8px;color:var(--text-dim);font-family:monospace;font-size:11px">'+w.last_seen+'</td>'+
-        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="manualBanSshIP(\''+w.ip+'\')">Ban Now</button></td></tr>';
+        '<td style="font-family:monospace;padding:5px 8px;color:var(--text-primary);font-size:12px">'+f2bEsc(w.ip)+'</td>'+
+        '<td style="padding:5px 8px;color:var(--yellow);font-family:monospace;font-size:12px">'+f2bEsc(w.attempts)+'</td>'+
+        '<td style="padding:5px 8px;color:var(--text-dim);font-family:monospace;font-size:11px">'+f2bEsc(w.last_seen)+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="manualBanSshIP('+f2bArg(w.ip)+')">Ban Now</button></td></tr>';
     }).join('');
     el.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'+
       '<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleSshWatchingSort(\'ip\')">IP Address'+ipArrow+'</th>'+
@@ -1583,8 +1587,8 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     var c = document.getElementById('mediamtx-ban-list-container'); if (!c) return;
     if (!ips.length) { c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>'; return; }
     var rows = ips.map(function(ip){
-      return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td>'+
-        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanMtxIP(\''+ip+'\')">Unban</button></td></tr>';
+      return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+f2bEsc(ip)+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanMtxIP('+f2bArg(ip)+')">Unban</button></td></tr>';
     }).join('');
     c.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
   };
@@ -1603,10 +1607,10 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     if (!list.length) { c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently being watched.</div>'; return; }
     var rows = list.map(function(w){
       return '<tr style="border-bottom:1px solid var(--border)">'+
-        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+w.ip+'</td>'+
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--yellow)">'+w.attempts+'</td>'+
-        '<td style="padding:5px 8px;font-size:11px;color:var(--text-dim)">'+w.last_seen+'</td>'+
-        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="banMtxIP(\''+w.ip+'\')">Ban Now</button></td></tr>';
+        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+f2bEsc(w.ip)+'</td>'+
+        '<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--yellow)">'+f2bEsc(w.attempts)+'</td>'+
+        '<td style="padding:5px 8px;font-size:11px;color:var(--text-dim)">'+f2bEsc(w.last_seen)+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="banMtxIP('+f2bArg(w.ip)+')">Ban Now</button></td></tr>';
     }).join('');
     c.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Attempts</th><th style="padding:4px 8px">Last Seen</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
   };
@@ -1762,8 +1766,8 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     var c = document.getElementById('takportal-ban-list-container'); if (!c) return;
     if (!ips.length) { c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently banned.</div>'; return; }
     var rows = ips.map(function(ip){
-      return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td>'+
-        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanTpjIP(\''+ip+'\')">Unban</button></td></tr>';
+      return '<tr style="border-bottom:1px solid var(--border)"><td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+f2bEsc(ip)+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanTpjIP('+f2bArg(ip)+')">Unban</button></td></tr>';
     }).join('');
     c.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
   };
@@ -1782,10 +1786,10 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     if (!list.length) { c.innerHTML='<div style="color:var(--text-dim);font-size:13px;font-family:monospace;padding:4px 0">No IPs currently being watched.</div>'; return; }
     var rows = list.map(function(w){
       return '<tr style="border-bottom:1px solid var(--border)">'+
-        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+w.ip+'</td>'+
-        '<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--yellow)">'+w.attempts+'</td>'+
-        '<td style="padding:5px 8px;font-size:11px;color:var(--text-dim)">'+w.last_seen+'</td>'+
-        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="banTpjIP(\''+w.ip+'\')">Ban Now</button></td></tr>';
+        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+f2bEsc(w.ip)+'</td>'+
+        '<td style="padding:5px 8px;text-align:right;font-size:12px;color:var(--yellow)">'+f2bEsc(w.attempts)+'</td>'+
+        '<td style="padding:5px 8px;font-size:11px;color:var(--text-dim)">'+f2bEsc(w.last_seen)+'</td>'+
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="banTpjIP('+f2bArg(w.ip)+')">Ban Now</button></td></tr>';
     }).join('');
     c.innerHTML = '<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em"><th style="padding:4px 8px;text-align:left">IP Address</th><th style="padding:4px 8px;text-align:right">Attempts</th><th style="padding:4px 8px">Last Seen</th><th style="padding:4px 8px;text-align:right">Action</th></tr></thead><tbody>'+rows+'</tbody></table>';
   };
@@ -1884,9 +1888,9 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
         ?'<span title="fail2ban lists this address, but the firewall has no rule for it, so it is not actually blocked. Unban to clear it." style="font-size:10px;color:var(--text-dim);background:rgba(148,163,184,0.1);padding:1px 5px;border-radius:3px;border:1px solid var(--border)">not in firewall</span>'
         :'<span style="font-size:10px;color:var(--red);background:rgba(239,68,68,0.1);padding:1px 5px;border-radius:3px;border:1px solid rgba(239,68,68,0.3)">all ports</span>';
       return '<tr style="border-bottom:1px solid var(--border)">'+
-        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+ip+'</td>'+
+        '<td style="padding:5px 8px;font-family:JetBrains Mono,monospace;font-size:12px;color:var(--text-primary)">'+f2bEsc(ip)+'</td>'+
         '<td style="padding:5px 8px;text-align:center">'+scope+'</td>'+
-        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanRecidiveIP(\''+ip+'\')">Unban</button></td></tr>';
+        '<td style="padding:5px 8px;text-align:right"><button class="btn-danger-sm" onclick="unbanRecidiveIP('+f2bArg(ip)+')">Unban</button></td></tr>';
     }).join('');
     c.innerHTML='<table style="width:100%;border-collapse:collapse"><thead><tr style="font-size:10px;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em">'+
       '<th style="padding:4px 8px;text-align:left;cursor:pointer;user-select:none" onclick="toggleRecidiveSort()">IP Address'+arrow+'</th>'+

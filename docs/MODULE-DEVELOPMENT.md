@@ -1064,4 +1064,4 @@ helper (section 9.2), the update path (section 12), the `app.py` hooks
 | The broker allow-list | `EXEC_ALLOW`, `EXEC_DENY`, `PATH_ALLOW` in `broker/takwerx_broker.py` |
 | Codebase map and the seams table | `ARCHITECTURE.md` |
 | Contribution rules, license header, CLA | `CONTRIBUTING.md`, `CLA.md` |
-| Ports already in use | `README.md`, "Ports" section |
+| Ports already in use | [PORTS.md](PORTS.md) |
