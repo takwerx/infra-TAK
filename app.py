@@ -115354,12 +115354,17 @@ def _trusted_java_exe(pid):
     Anything that fails is reported as UNKNOWN, never as a wrong JVM: a false red here
     would page someone about an outage that is not happening.
     """
+    # ops #1298: readlink only. os.path.realpath() did an lstat on /proc/<pid>/exe first, and
+    # on Rocky the confined console (takwerx_console_t) is not allowed `getattr` on another
+    # domain's lnk_file (it may `read` it). That was one SELinux denial per card refresh,
+    # about 150 an hour, each logged by setroubleshoot at priority err. The kernel already
+    # hands readlink() the resolved path, so realpath added nothing.
     try:
-        exe = os.path.realpath(f'/proc/{pid}/exe')
+        exe = os.readlink(f'/proc/{pid}/exe')
     except OSError:
-        return None
-    if not exe or not os.path.isfile(exe):
         return None      # unreadable /proc entry on a non-root console — unknown, not bad
+    if not exe or not os.path.isfile(exe):
+        return None
     if os.path.basename(exe) != 'java':
         # Measured on test6/test12 2026-09-10: TAK's launcher is a shell script, so the
         # obvious `pgrep -f takserver-api` resolves to /usr/bin/dash, not the JVM. Running
@@ -115418,7 +115423,7 @@ def _jvm_status_from_guarddog(api_pid):
     """The Guard Dog watcher's view of the running JVM, or None.
 
     The console runs as `takwerx` on every hardened box while TAK's JVMs run as `tak`, so
-    os.path.realpath('/proc/<pid>/exe') raises PermissionError here — measured on test12
+    reading the link of '/proc/<pid>/exe' raises PermissionError here — measured on test12
     during the v10.1.63 T&E, where the TAK Server card showed no JVM at all and the Guard Dog
     dot could never leave grey. Degrading to "unknown" was correct (a false red would be
     worse) but it made the whole thing invisible on most of the fleet.
