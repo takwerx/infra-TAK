@@ -2089,7 +2089,8 @@ def agency_admin_group_outcome(ctx, inst, ak_url, ak_headers, plog=None):
     # --- and its way in ----------------------------------------------------- #
     result = atlas_access.ensure(atlas_access.Api(ak_url, ak_headers),
                                  names['authentik_slug'], add=[group_name],
-                                 plog=log)
+                                 plog=log,
+                                 admin_group=global_admin_group(ak_url, ak_headers))
     if result['status'] == 'failed':
         return outcome('failed', 'Could not admit the agency admin group: %s'
                        % result['detail'])
@@ -5373,7 +5374,8 @@ def _reconcile_roster(ctx, inst, plog):
         except Exception as exc:
             plog('  ⚠ ATLAS version not read: %s' % str(exc)[:80])
         atlas_roster.admit(ctx, inst, dirpath, installed, running, plog,
-                           restarted=restarted, container_group=container_group)
+                           restarted=restarted, container_group=container_group,
+                           admin_group=_global_admin_group(ctx))
     except Exception as exc:
         plog('  ⚠ Could not check the standard admins\' access: %s' % str(exc)[:80])
 
@@ -6213,6 +6215,10 @@ def converge_access(ctx, ak_url, ak_headers, log):
         log('ATLAS access: could not read the deployments: %s' % str(exc)[:80])
         return out
     api = atlas_access.Api(ak_url, ak_headers)
+    # ⚠️ The superuser group as Authentik has it (ops #1289), asked once and
+    # only when a deployment's application is there: a box with no ATLAS makes
+    # no Authentik call here at all.
+    admin_group = None
     for inst in instances:
         names = atlas_instances.derive(inst)
         name = names['name']
@@ -6230,8 +6236,10 @@ def converge_access(ctx, ak_url, ak_headers, log):
                 out[name] = 'skipped'
                 continue
             add = [names['admin_group']] if names['slug'] else []
-            out[name] = atlas_access.ensure(api, app_slug, add=add,
-                                            plog=say)['status']
+            if admin_group is None:
+                admin_group = global_admin_group(ak_url, ak_headers)
+            out[name] = atlas_access.ensure(api, app_slug, add=add, plog=say,
+                                            admin_group=admin_group)['status']
         except Exception as exc:
             say('⚠ access policy not checked: %s' % str(exc)[:80])
             out[name] = 'failed'

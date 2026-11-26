@@ -267,7 +267,8 @@ def admitted(installed, running):
     return admits_role(installed) and admits_role(running)
 
 
-def ensure_access(api, n, installed, running, plog, blocker=None):
+def ensure_access(api, n, installed, running, plog, blocker=None,
+                  admin_group=None):
     """Put the standard group in, or take it out of, the application's access policy.
 
     ⚠️ **One expression policy, not a binding of its own** (`atlas_access`).
@@ -284,7 +285,8 @@ def ensure_access(api, n, installed, running, plog, blocker=None):
     """
     group = n['standard_group']
     if blocker is None and admitted(installed, running):
-        result = atlas_access.ensure(api, n['application'], add=[group], plog=plog)
+        result = atlas_access.ensure(api, n['application'], add=[group], plog=plog,
+                                     admin_group=admin_group)
         if result['status'] == 'failed':
             return '⚠', 'not admitted to ATLAS: %s' % result['detail']
         return '✓', 'admitted to ATLAS (%s)' % (installed,)
@@ -295,7 +297,8 @@ def ensure_access(api, n, installed, running, plog, blocker=None):
                % (running or 'no version', installed))
     if blocker is not None:
         why = blocker
-    if atlas_access.revoke(api, n['application'], group, plog=plog):
+    if atlas_access.revoke(api, n['application'], group, plog=plog,
+                            admin_group=admin_group):
         return '✓', 'taken out of ATLAS access: %s' % why
     return '·', 'not admitted to ATLAS: %s' % why
 
@@ -408,7 +411,7 @@ def _env_value(dirpath, key):
 
 
 def admit(ctx, inst, dirpath, installed, running, plog, restarted=True, opener=None,
-          container_group=None):
+          container_group=None, admin_group=None):
     """Let the standard group into ATLAS, or keep it out. Never raises.
 
     Called after `ensure` and after the `api` restart it asked for.
@@ -450,7 +453,8 @@ def admit(ctx, inst, dirpath, installed, running, plog, restarted=True, opener=N
             # older one still logs "predates the standard role".
             blocker = ('the running ATLAS does not have the group\'s name '
                        '(restart ATLAS, then run Update)')
-        mark, note = ensure_access(api, n, installed, running, plog, blocker=blocker)
+        mark, note = ensure_access(api, n, installed, running, plog, blocker=blocker,
+                                     admin_group=admin_group)
         plog('  %s "%s" %s' % (mark, n['standard_group'], note))
     except Exception as exc:
         plog('  ⚠ "%s" access not checked: %s' % (n['standard_group'], str(exc)[:120]))
