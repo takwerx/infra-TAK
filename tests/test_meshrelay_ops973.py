@@ -618,16 +618,16 @@ def test_an_empty_pin_fails_closed():
     assert M.pin_problem(empty) != ''
 
 
-def test_the_shipped_pin_is_ryans_public_v490_with_the_hashes_of_its_files():
+def test_the_shipped_pin_is_ryans_public_v491_with_the_hashes_of_its_files():
     """The values come from files downloaded from the public release and equal its
     SHA256SUMS (ops #973, Thu Nov 26, 2026). A drifted value would refuse every install."""
-    assert M.RELEASE['tag'] == 'v4.9.0'
+    assert M.RELEASE['tag'] == 'v4.9.1'
     assert M.RELEASE['assets']['amd64'] == (
-        'ptt-server-linux', '4fb1aea80a2b0f78cba1581da0c6b8528e94b817463d9872eecc1750f6fd53d0')
+        'ptt-server-linux', '739384e98d4af43661b25b39e7f4248319e04f4c8faee31b04043ebc001f6923')
     assert M.RELEASE['assets']['arm64'] == (
-        'ptt-server-linux-arm64', '227d223f3cd0d040e1cab5b7bad3904ec4f00cab3649f37346031a73fa737b54')
+        'ptt-server-linux-arm64', '39d5ba1841b002925e5cafaf10303170583a3b81373a3b3ab23f6035c1aaf557')
     assert M.RELEASE['web'] == (
-        'web.tar.gz', '947a9c35822a7ff316eccdc043627cfee3509161fb99b9156db2239850598539')
+        'web.tar.gz', '5383582cd29a3bba51201646ac1a59ab4dd692cf00f7a2a5a0e6c7fbc13f2298')
     assert M.pin_problem(arch='amd64') == '' and M.pin_problem(arch='arm64') == ''
 
 
