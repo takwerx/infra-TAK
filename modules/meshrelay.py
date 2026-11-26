@@ -73,15 +73,15 @@ REPO = 'RyanR3/MeshRelayServer'
 # pin only in a PR, with every value re-checked the same way. An empty or wrong value
 # makes the install refuse (pin_problem).
 RELEASE = {
-    'tag': 'v4.9.1',
+    'tag': 'v4.9.0',
     'assets': {
         # arch -> (file name in the release, sha256)
         'amd64': ('ptt-server-linux',
-                  '739384e98d4af43661b25b39e7f4248319e04f4c8faee31b04043ebc001f6923'),
+                  '4fb1aea80a2b0f78cba1581da0c6b8528e94b817463d9872eecc1750f6fd53d0'),
         'arm64': ('ptt-server-linux-arm64',
-                  '39d5ba1841b002925e5cafaf10303170583a3b81373a3b3ab23f6035c1aaf557'),
+                  '227d223f3cd0d040e1cab5b7bad3904ec4f00cab3649f37346031a73fa737b54'),
     },
-    'web': ('web.tar.gz', '5383582cd29a3bba51201646ac1a59ab4dd692cf00f7a2a5a0e6c7fbc13f2298'),
+    'web': ('web.tar.gz', '947a9c35822a7ff316eccdc043627cfee3509161fb99b9156db2239850598539'),
 }
 
 _SHA_RE = re.compile(r'^[0-9a-f]{64}$')
