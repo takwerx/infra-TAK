@@ -57,6 +57,8 @@ def env(tmp_path, monkeypatch):
     vis = tmp_path / 'stream_visibility.json'
     vis.write_text(json.dumps({'secret': 'private', 'live': 'private', 'cam/one': 'private'}))
     monkeypatch.setattr(ov, 'VISIBILITY_FILE', str(vis))
+    monkeypatch.setattr(ov, 'SHARE_LINKS_FILE', str(tmp_path / 'share_links.json'))
+    monkeypatch.setattr(ov, 'SHARE_LINKS_CAP_MARKER_FILE', str(tmp_path / 'share_links_capped.json'))
     monkeypatch.setattr(ov, 'AK_TOKEN', 'box-token')
     ak_groups = {'alice': ['vid_private'], 'bob': ['vid_public'], 'carol': [],
                  'akadmin': ['authentik Admins']}
@@ -162,3 +164,71 @@ def test_admin_can_still_make_a_link_that_never_ends(env):
     c, reached = env
     assert _gen(c, 'akadmin', 'secret', ttl=0).status_code == 200
     assert reached == ['generate']
+
+
+# ── Links made before the update that never end (ops #1272) ───────────────────
+
+def _overlay_in(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location('overlay_cap_under_test', REPO / 'mediamtx_ldap_overlay.py')
+    ov = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ov)
+    monkeypatch.setattr(ov, 'SHARE_LINKS_FILE', str(tmp_path / 'share_links.json'))
+    monkeypatch.setattr(ov, 'SHARE_LINKS_CAP_MARKER_FILE', str(tmp_path / 'share_links_capped.json'))
+    return ov
+
+
+def _old_links(tmp_path):
+    (tmp_path / 'share_links.json').write_text(json.dumps({
+        'oldA': {'stream': 'cam1', 'expires': None, 'ttl_label': 'Until revoked'},
+        'oldB': {'stream': 'cam2', 'ttl_label': 'Until revoked'},
+        'timed': {'stream': 'cam3', 'expires': 2000000000, 'ttl_label': '4 hours'},
+    }))
+
+
+def test_never_ending_links_end_24_hours_after_the_update(tmp_path, monkeypatch):
+    ov = _overlay_in(tmp_path, monkeypatch)
+    _old_links(tmp_path)
+    assert ov.cap_never_ending_share_links(now=1700000000) == 2
+    links = json.loads((tmp_path / 'share_links.json').read_text())
+    assert links['oldA']['expires'] == links['oldB']['expires'] == 1700000000 + 86400
+    assert links['timed']['expires'] == 2000000000
+    assert links['oldA']['stream'] == 'cam1'
+
+
+def test_cap_runs_once_so_a_later_admin_link_that_never_ends_is_kept(tmp_path, monkeypatch):
+    ov = _overlay_in(tmp_path, monkeypatch)
+    _old_links(tmp_path)
+    ov.cap_never_ending_share_links()
+    links = json.loads((tmp_path / 'share_links.json').read_text())
+    links['made-later'] = {'stream': 'cam1', 'expires': None}
+    (tmp_path / 'share_links.json').write_text(json.dumps(links))
+    assert ov.cap_never_ending_share_links() == 0
+    assert json.loads((tmp_path / 'share_links.json').read_text())['made-later']['expires'] is None
+
+
+def test_a_box_with_no_links_still_gets_the_marker(tmp_path, monkeypatch):
+    ov = _overlay_in(tmp_path, monkeypatch)
+    assert ov.cap_never_ending_share_links() == 0
+    assert (tmp_path / 'share_links_capped.json').exists()
+
+
+def test_an_unreadable_links_file_is_never_written_over(tmp_path, monkeypatch):
+    ov = _overlay_in(tmp_path, monkeypatch)
+    (tmp_path / 'share_links.json').write_text('{not json')
+    assert ov.cap_never_ending_share_links() is None
+    assert (tmp_path / 'share_links.json').read_text() == '{not json'
+    assert not (tmp_path / 'share_links_capped.json').exists()
+
+
+def test_the_overlay_does_the_cap_when_it_starts(tmp_path, monkeypatch):
+    """Applying the overlay (the editor start) caps the old links, so an infra-TAK box needs no new editor."""
+    cfg = tmp_path / 'mediamtx.yml'
+    cfg.write_text('authInternalUsers:\n- user: any\n  ips: [127.0.0.1]\n')
+    monkeypatch.setenv('MEDIAMTX_CONFIG', str(cfg))
+    ov = _overlay_in(tmp_path, monkeypatch)
+    _old_links(tmp_path)
+    app = flask.Flask('overlay-cap-start-test')
+    app.secret_key = 'test'
+    ov.apply_ldap_overlay(app)
+    links = json.loads((tmp_path / 'share_links.json').read_text())
+    assert links['oldA']['expires'] and links['oldB']['expires']
