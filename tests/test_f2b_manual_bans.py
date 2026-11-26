@@ -90,6 +90,7 @@ class Box:
             _f2b_is_available=lambda: True,
             _f2b_trusted_ignoreip=lambda extra='': self.trusted,
             _f2b_banaction=lambda: 'ufw',
+            _f2b_docker_twin=lambda primary: '',   # #736, its own test
             _f2b_loaded_jails=lambda: ['sshd', 'infratak-manual'] if self.jail_loaded else ['sshd'],
             _f2b_parse_status=self._parse,
             _f2b_manual_ensure_jail=lambda: '',
