@@ -324,3 +324,5 @@ def test_page_has_the_checkbox():
     assert 'Never ban Starlink addresses' in PAGE
     # the trade-off is said on the page
     assert 'nobody on Starlink can be banned' in PAGE
+    # an old download error is shown only while the setting is on (nothing downloads while off)
+    assert 'if (on && d.last_error)' in PAGE

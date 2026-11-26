@@ -1002,7 +1002,8 @@ function renderStarlink(d) {
       (d.v4 || 0) + ' IPv4, ' + (d.v6 || 0) + ' IPv6), updated ' + _starlinkWhen(d.fetched_at) + '.';
     info.appendChild(line);
   }
-  if (d.last_error) {
+  // While off nothing is downloaded, so an old failure would sit there for ever: show it only while on.
+  if (on && d.last_error) {
     var err = document.createElement('div');
     err.style.color = 'var(--red)';
     err.textContent = 'Last download failed (' + _starlinkWhen(d.last_attempt) + '): ' + d.last_error +
