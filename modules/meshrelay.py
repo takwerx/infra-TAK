@@ -70,13 +70,13 @@ REPO = 'RyanR3/MeshRelayServer'
 # private and has no tagged release yet (ops #973). Update these in a PR, with the SHA-256
 # of each file as built by Ryan's release job and checked by a second person.
 RELEASE = {
-    'tag': '',
+    'tag': 'v4.8.0',
     'assets': {
         # arch -> (file name in the release, sha256)
-        'amd64': ('ptt-server-linux', ''),
-        'arm64': ('ptt-server-linux-arm64', ''),
+        'amd64': ('v480-ptt-server-linux', 'd1720d2ed0a92b2ba8001518ba73a3fa1c0c33c2ecf21c1387020c4d8263c33f'),
+        'arm64': ('v480-ptt-server-linux-arm64', '1ac288fb324723d98bf5263408d6f6813059d7574d09e7cc51a40bd6e27cc1ec'),
     },
-    'web': ('web.tar.gz', ''),
+    'web': ('v480-web.tar.gz', 'fcea252016a0207e8ab58eea541a4ff5ed2b099bf289118b853c7c691a1fc992'),
 }
 
 _SHA_RE = re.compile(r'^[0-9a-f]{64}$')
