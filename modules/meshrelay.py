@@ -497,9 +497,14 @@ def expire_first_password(ctx, now=None):
     return True
 
 
-def capture_initial_password(ctx):
-    r = subprocess.run(ctx['_sudo_wrap'](['journalctl', '-u', UNIT, '--no-pager', '-o', 'cat', '-n', '400']),
-                       capture_output=True, text=True, timeout=30)
+def capture_initial_password(ctx, since=None):
+    """The first admin password, from the journal lines the service wrote since `since` (the start
+    of this Deploy's restart). Without `since`, a second Deploy after the 24-hour drop read the old
+    start-up lines again and showed the password a second time (ops #973)."""
+    argv = ['journalctl', '-u', UNIT, '--no-pager', '-o', 'cat', '-n', '400']
+    if since:
+        argv += ['--since', since]
+    r = subprocess.run(ctx['_sudo_wrap'](argv), capture_output=True, text=True, timeout=30)
     return parse_initial_password(r.stdout)
 
 
@@ -612,6 +617,7 @@ def deploy(ctx, job, params):
         ok, msg = ctx['_fw_deny'](WEB_PORT, 'tcp')
         if not ok:
             raise RuntimeError(f'could not close TCP {WEB_PORT}: {msg}')
+        restarted_at = _clock.strftime('%Y-%m-%d %H:%M:%S')
         _priv(ctx, ['systemctl', 'restart', UNIT])
         plog("📡 Step 6/7 — Health check")
         ok, why = False, ''
@@ -631,7 +637,7 @@ def deploy(ctx, job, params):
             # it made a Rollback after a second Deploy put the old files back but keep the new tag
             # in the record (found on a real box, ops #973).
             s['meshrelay']['previous'] = _prev
-        pw = capture_initial_password(ctx)
+        pw = capture_initial_password(ctx, since=restarted_at)
         if pw:
             # shown on the MeshRelay page for 24 hours (or until hidden), never logged
             s[FIRST_PW_KEY] = pw

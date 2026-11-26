@@ -896,8 +896,9 @@ PW_JOURNAL = ("server started\nINITIAL ADMIN PASSWORD (record this, it will not 
 
 def _deploy_with_password(box, monkeypatch, at):
     """Run Deploy with the journal showing a first admin password, at clock time `at`."""
-    monkeypatch.setattr(M, '_clock', types.SimpleNamespace(time=lambda: at))
-    monkeypatch.setattr(M, 'capture_initial_password', lambda ctx: M.parse_initial_password(PW_JOURNAL))
+    import time as _real_time
+    monkeypatch.setattr(M, '_clock', types.SimpleNamespace(time=lambda: at, strftime=_real_time.strftime))
+    monkeypatch.setattr(M, 'capture_initial_password', lambda ctx, since=None: M.parse_initial_password(PW_JOURNAL))
     job = _run_deploy(box)
     assert job['complete'] and not job['error'], box.logs
 
@@ -906,6 +907,28 @@ def test_deploy_stamps_the_first_admin_password_with_the_time_it_was_read(box, m
     _deploy_with_password(box, monkeypatch, 1000.0)
     assert box.settings[M.FIRST_PW_KEY] == 'Zx9fQ2mPaB'
     assert box.settings[M.FIRST_PW_AT_KEY] == 1000.0
+
+
+def test_the_password_is_read_only_from_journal_lines_written_since_this_deploys_restart(box, monkeypatch):
+    """After the 24-hour drop a second Deploy must not read the old start-up lines again and show the
+    password a second time: the journal read starts at this Deploy's own restart."""
+    seen = []
+
+    def fake_run(argv, **kw):
+        seen.append(list(argv))
+        return types.SimpleNamespace(stdout=PW_JOURNAL if '--since' not in argv else 'MeshRelay server listening\n',
+                                     returncode=0)
+    monkeypatch.setattr(M.subprocess, 'run', fake_run)
+    ctx = dict(box.ctx(), _sudo_wrap=lambda argv: list(argv))                     # let the real argv through
+    assert M.capture_initial_password(ctx) == 'Zx9fQ2mPaB'                        # the old way read every old line
+    assert M.capture_initial_password(ctx, since='2026-11-27 09:00:00') == ''
+    assert seen[-1][-2:] == ['--since', '2026-11-27 09:00:00']
+    seen.clear()
+    box.ctx = lambda ctx=ctx: ctx
+    _run_deploy(box)                                                              # a real Deploy asks for lines since its restart
+    asked = [a for a in seen if a[:3] == ['journalctl', '-u', M.UNIT]]
+    assert asked and '--since' in asked[0]
+    assert box.settings.get(M.FIRST_PW_KEY) is None, 'no password was written since the restart'
 
 
 def test_first_admin_password_is_dropped_after_24_hours_and_not_before(box, monkeypatch):
