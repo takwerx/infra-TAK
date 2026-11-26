@@ -447,7 +447,27 @@ gd_keytool() {
 # used only when it (its real target) and its docker-compose.yml are owned by root or
 # by the console account (takwerx: it writes every stack, and already has the broker),
 # the compose file is not a symlink, neither is world-writable, and group-writable only
-# for root's or that account's group. GD_STACK_OWNER exists for the tests.
+# for root's or that account's group.
+#
+# GH #739 / ops #1273: GD_STACK_OWNER is a SUPPORTED setting for a box whose stacks belong to
+# another admin account. Order: the GD_STACK_OWNER environment variable (a systemd drop-in
+# `Environment=GD_STACK_OWNER=name`), then the first line of /etc/takguard/stack_owner, then
+# takwerx. infra-TAK never writes the file, so an update leaves it alone. The file counts only
+# when it and its folder are root-owned, not a symlink and not writable by others: this
+# script runs as root, so anyone who could write that file could make root trust their folder.
+# The value must be an account name (letters, digits, _ . -) or a bare uid (tests).
+GD_STACK_OWNER_FILE="${GD_STACK_OWNER_FILE:-/etc/takguard/stack_owner}"
+GD_ROOT_UID="${GD_ROOT_UID:-0}"                 # the tests run as a plain user
+if [ -z "${GD_STACK_OWNER:-}" ] && [ -f "$GD_STACK_OWNER_FILE" ] && [ ! -L "$GD_STACK_OWNER_FILE" ] \
+   && [ -n "$(find "$GD_STACK_OWNER_FILE" "$(dirname "$GD_STACK_OWNER_FILE")" -maxdepth 0 \
+                 -uid "$GD_ROOT_UID" ! -perm -0002 ! -perm -0020 -print 2>/dev/null | sed -n '2p')" ]; then
+  IFS= read -r _gd_so < "$GD_STACK_OWNER_FILE" 2>/dev/null || true
+  case "$_gd_so" in
+    ''|[!A-Za-z0-9_]*|*[!A-Za-z0-9_.-]*) logger -t takguard-stack "ignoring $GD_STACK_OWNER_FILE: not an account name" 2>/dev/null ;;
+    *) GD_STACK_OWNER="$_gd_so" ;;
+  esac
+  unset _gd_so
+fi
 GD_STACK_OWNER="${GD_STACK_OWNER:-takwerx}"
 
 # gd_trusted_path <path> -> 0 when the path passes the owner/mode rule above.
