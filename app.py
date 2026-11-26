@@ -108908,6 +108908,206 @@ def _tak_admin_marti_get(url, timeout=12):
     return _tak_admin_marti_req(url, timeout=timeout)
 
 
+# ── Federation group names (gh #755, ops #1304) ───────────────────────────────────────────
+# infra-TAK's CoreConfig sets groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)", so the TAK group a
+# user is in is the plain channel name ("Fire"), not the LDAP name ("cn=tak_Fire"). TAK Server's
+# own Federation Manager group search saves the LDAP name (GET /Marti/api/groups returns both
+# `cn` and `dn`; the picker keeps `dn`), so a federate set up with the search has inbound and
+# outbound groups no user is in: data flows one way, with the link CONNECTED and no error.
+# We find those names and swap them for the plain ones with the same Marti calls the Federation
+# Manager makes (federategroups, federategroupsmap, federategroupconfig).
+_FED_DN_GROUP_RE = re.compile(r'^cn=tak_(.*?)(?:,|$)')   # the same pattern CoreConfig uses
+_FED_BARE_PREFIX = 'tak_'
+_FED_FIX_LOCK = _threading.Lock()
+
+
+def _fed_q(s):
+    return urllib.parse.quote(str(s), safe='')
+
+
+def _fed_plain_group_name(name, live_names=None):
+    """The plain TAK group name for a federate group saved with the LDAP prefix, else None.
+
+    `cn=tak_X` can never match a user's group on infra-TAK, so it always maps to X. A bare
+    `tak_X` is only flagged when X is a real TAK group and `tak_X` is not (a channel really
+    called tak_X stays alone); with no live group list (live_names None) it is left alone."""
+    n = name if isinstance(name, str) else ''
+    m = _FED_DN_GROUP_RE.match(n)
+    if m:
+        return m.group(1) or None
+    if n.startswith(_FED_BARE_PREFIX) and live_names is not None:
+        plain = n[len(_FED_BARE_PREFIX):]
+        if plain and plain in live_names and n not in live_names:
+            return plain
+    return None
+
+
+def _fed_groups_plan(assoc, gmap, live_names=None):
+    """What to change for ONE federate. assoc is its list of {group, direction} (GET
+    /Marti/api/federategroups/<id>), gmap its group map (GET /Marti/api/federategroupsmap/<id>).
+    On a real TAK Server the map is {remoteGroup: [localGroup, ...]} (lists, although its OpenAPI
+    file says strings, verified on test12 Nov 26, 2026); a plain string is accepted too. Only the
+    LOCAL side is ever touched: the remote group names belong to the other server.
+    Returns {'groups': [{'group', 'plain', 'directions'}],
+             'maps': [{'remote', 'local', 'plain', 'plain_present'}],
+             'have': {group name: [directions already there]}}."""
+    by_group = {}
+    have = {}
+    for a in assoc or []:
+        if not isinstance(a, dict):
+            continue
+        g = a.get('group')
+        d = str(a.get('direction') or '').upper()
+        dirs = {'INBOUND', 'OUTBOUND'} if d == 'BOTH' else ({d} if d in ('INBOUND', 'OUTBOUND') else set())
+        if not isinstance(g, str) or not dirs:
+            continue
+        have.setdefault(g, set()).update(dirs)
+        plain = _fed_plain_group_name(g, live_names)
+        if plain:
+            by_group.setdefault(g, {'group': g, 'plain': plain, 'directions': set()})['directions'].update(dirs)
+    groups = [{'group': v['group'], 'plain': v['plain'], 'directions': sorted(v['directions'])}
+              for v in by_group.values()]
+    maps = []
+    for remote, locals_ in sorted((gmap or {}).items()):
+        vals = [x for x in (locals_ if isinstance(locals_, (list, tuple)) else [locals_]) if isinstance(x, str)]
+        for local in vals:
+            plain = _fed_plain_group_name(local, live_names)
+            if plain:
+                maps.append({'remote': remote, 'local': local, 'plain': plain, 'plain_present': plain in vals})
+    return {'groups': groups, 'maps': maps, 'have': {k: sorted(v) for k, v in have.items()}}
+
+
+def _fed_marti(path, method='GET', timeout=15, json_body=None):
+    return _tak_admin_marti_req('https://127.0.0.1:8443/Marti/api/' + path, timeout=timeout,
+                                method=method, json_body=json_body)
+
+
+def _fed_data(resp):
+    return resp.get('data') if isinstance(resp, dict) else resp
+
+
+def _fed_groups_scan():
+    """Read every federate's groups and group map and list the ones saved with the LDAP prefix.
+    Returns (result, error). result = {'federates': [{id, name, groups, maps, have}], 'count': n}
+    where only federates with something to fix are listed; error is a short string or None."""
+    live = _tak_channel_items()
+    live_names = ({((g.get('name') if isinstance(g, dict) else '') or '').strip() for g in live}
+                  if live is not None else None)
+    feds, err = _fed_marti('federates')
+    if feds is None:
+        return None, 'could not read federates from TAK Server (%s)' % err
+    feds = _fed_data(feds)
+    if not isinstance(feds, list):
+        return None, 'TAK Server returned an unexpected federate list'
+    out = []
+    for f in feds:
+        fid = f.get('id') if isinstance(f, dict) else None
+        if not fid:
+            continue
+        assoc, e1 = _fed_marti('federategroups/' + _fed_q(fid))
+        gmap, e2 = _fed_marti('federategroupsmap/' + _fed_q(fid))
+        if assoc is None or gmap is None:
+            return None, 'could not read the groups of federate %s (%s)' % (f.get('name') or fid, e1 or e2)
+        gm = _fed_data(gmap)
+        plan = _fed_groups_plan(_fed_data(assoc), gm if isinstance(gm, dict) else {}, live_names)
+        if plan['groups'] or plan['maps']:
+            plan.update({'id': fid, 'name': f.get('name') or fid})
+            out.append(plan)
+    return {'federates': out, 'count': sum(len(p['groups']) + len(p['maps']) for p in out)}, None
+
+
+def _fed_groups_apply(plans):
+    """Swap the prefixed names for the plain ones, for each federate in plans (from
+    _fed_groups_scan). The plain name is added FIRST and the prefixed one removed after, so a
+    federate never loses a group half way. Then persist with POST /Marti/api/federategroupconfig
+    (no TAK restart). Returns (changed, errors)."""
+    changed, errors = 0, []
+    for p in plans:
+        fid = _fed_q(p['id'])
+        for g in p['groups']:
+            need = set(g['directions'])
+            add = need - set(p.get('have', {}).get(g['plain'], []))
+            if add:
+                d = 'BOTH' if add == {'INBOUND', 'OUTBOUND'} else sorted(add)[0]
+                ok, e = _fed_marti('federategroups', method='POST', timeout=20,
+                                   json_body={'federateId': p['id'], 'group': g['plain'], 'direction': d})
+                if not ok:
+                    errors.append('%s: could not add group %s (%s)' % (p['name'], g['plain'], e))
+                    continue
+            for d in sorted(need):
+                r, e = _fed_marti('federategroups/%s?group=%s&direction=%s' % (fid, _fed_q(g['group']), d),
+                                  method='DELETE', timeout=20)
+                if r is None:
+                    errors.append('%s: could not remove group %s %s (%s)' % (p['name'], g['group'], d, e))
+                else:
+                    changed += 1
+        for m in p['maps']:
+            qs = 'federategroupsmap/%s?remoteGroup=%s&localGroup=' % (fid, _fed_q(m['remote']))
+            if not m.get('plain_present'):
+                r, e = _fed_marti(qs + _fed_q(m['plain']), method='POST', timeout=20)
+                if r is None:
+                    errors.append('%s: could not map %s to %s (%s)' % (p['name'], m['remote'], m['plain'], e))
+                    continue
+            r, e = _fed_marti(qs + _fed_q(m['local']), method='DELETE', timeout=20)
+            if r is None:
+                errors.append('%s: could not remove mapping %s to %s (%s)' % (p['name'], m['remote'], m['local'], e))
+            else:
+                changed += 1
+    if changed:
+        r, e = _fed_marti('federategroupconfig', method='POST', timeout=30)
+        if r is None:
+            errors.append('changes made but not saved to CoreConfig (%s)' % e)
+    return changed, errors
+
+
+def _fed_groups_unavailable():
+    """None when this box can check; otherwise the short reason it cannot."""
+    if not os.path.exists('/opt/tak/CoreConfig.xml'):
+        return 'TAK Server is not on this box'
+    if _tak_core_is_remote():
+        return 'TAK Server runs on another host'
+    return None
+
+
+@app.route('/api/takserver/federation-groups-check')
+@login_required
+def takserver_federation_groups_check():
+    """gh #755: federate groups saved as cn=tak_<channel> (read-only)."""
+    why = _fed_groups_unavailable()
+    if why:
+        return jsonify({'supported': False, 'reason': why, 'count': 0, 'federates': []})
+    res, err = _fed_groups_scan()
+    if res is None:
+        return jsonify({'supported': True, 'error': err, 'count': 0, 'federates': []})
+    for p in res['federates']:
+        p.pop('have', None)
+    return jsonify(dict(res, supported=True))
+
+
+@app.route('/api/takserver/federation-groups-fix', methods=['POST'])
+@login_required
+def takserver_federation_groups_fix():
+    """gh #755: replace federate group names saved as cn=tak_<channel> with the plain channel
+    name, live, no TAK restart. Re-reads afterwards and reports what is still wrong."""
+    why = _fed_groups_unavailable()
+    if why:
+        return jsonify({'success': False, 'error': why}), 400
+    if not _FED_FIX_LOCK.acquire(blocking=False):
+        return jsonify({'success': False, 'error': 'A fix is already running'}), 409
+    try:
+        res, err = _fed_groups_scan()
+        if res is None:
+            return jsonify({'success': False, 'error': err}), 502
+        changed, errors = _fed_groups_apply(res['federates'])
+        after, err2 = _fed_groups_scan()
+        remaining = after['count'] if after else None
+        ok = not errors and after is not None and remaining == 0
+        return jsonify({'success': ok, 'changed': changed, 'remaining': remaining,
+                        'errors': errors[:10] + ([err2] if err2 else [])}), (200 if ok else 500)
+    finally:
+        _FED_FIX_LOCK.release()
+
+
 # TAK's UserAuthenticationFile.xml uses this default namespace; every element tag
 # comes back from ElementTree namespaced ({ns}User, {ns}groupList).
 _TAK_UAF_NS = 'http://bbn.com/marti/xml/bindings'
