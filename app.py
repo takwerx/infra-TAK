@@ -21174,7 +21174,7 @@ def guarddog_page():
         {'id': 'takportal', 'name': 'TAK Portal', 'monitored': modules.get('takportal', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'takportal_ctr', 'interval': '1 min', 'desc': 'Checks TAK Portal container is running. Alert and auto-restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (GET /login on port 3100). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
-        {'id': 'meshrelay', 'name': 'MeshRelay', 'monitored': modules.get('meshrelay', {}).get('installed'), 'monitors': [{'name': 'Service / login / dashboard', 'id': 'meshrelay_http', 'interval': '1 min', 'desc': 'Checks the ptt-server service is running, the dashboard answers on its loopback port, and config.json still requires a login (auth_enabled true). Fails if anyone turns the login off.'}]},
+        {'id': 'meshrelay', 'name': 'MeshRelay', 'monitored': modules.get('meshrelay', {}).get('installed'), 'monitors': [{'name': 'Service / login / dashboard', 'id': 'meshrelay_http', 'interval': '1 min', 'desc': 'Checks the ptt-server service is running, the dashboard answers on its loopback port, and config.json still requires a login (auth_enabled true) and keeps the dashboard on 127.0.0.1 (web_bind). Fails if anyone turns the login off or opens the dashboard port to the outside.'}]},
         {'id': 'simulator', 'name': 'TAK Simulator', 'monitored': modules.get('simulator', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'simulator_ctr', 'interval': '1 min', 'desc': 'Checks the tak-simulator container is running (liveness only). A scenario that is not running is normal and never alerts.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': "Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops. Also repairs CloudTAK by itself when it was recreated without the infra-TAK settings (e.g. by a TAK Portal marketplace install), at most 3 times an hour; emails only if that repair does not work."}]},
@@ -29221,8 +29221,14 @@ def _monitor_health_check(monitor_id):
             except Exception:
                 return False
         if monitor_id == 'meshrelay_http':
-            # ops #973: running, dashboard up, and the login still required (auth_enabled true)
+            # ops #973: running, dashboard up, the login still required (auth_enabled true) and the
+            # dashboard bound to loopback (web_bind). Also drops a first admin password that is
+            # 24 hours old: this check runs every half minute, so it does not wait for a page view.
             try:
+                try:
+                    mod_registry.meshrelay.expire_first_password(mod_registry.get_ctx())
+                except Exception:
+                    pass
                 return bool(mod_registry.meshrelay.health(mod_registry.get_ctx())[0])
             except Exception:
                 return False
@@ -128973,17 +128979,22 @@ def meshrelay_page():
     from flask import abort
     if not mod_registry.MODULES.get('meshrelay'):
         abort(404)
+    mr = mod_registry.meshrelay
+    try:
+        mr.expire_first_password(mod_registry.get_ctx())      # the first admin password lives 24 hours
+    except Exception:
+        pass
     settings = load_settings()
     modules = detect_modules()
     state = modules.get('meshrelay', {})
-    mr = mod_registry.meshrelay
     host = _get_service_domain(settings, 'meshrelay')
     _job = mod_registry.job_state('meshrelay')
     return render_template('meshrelay.html', settings=settings, modules=modules, meshrelay=state,
                            mr_host=host, mr_url=(f'https://{_pub_hostport(host)}' if host else ''),
                            mr_version=(settings.get('meshrelay') or {}).get('tag', ''),
                            mr_pinned=mr.RELEASE['tag'], mr_pin_problem=mr.pin_problem(arch=_host_arch()),
-                           mr_ptt_port=mr.PTT_PORT, mr_first_password=settings.get('meshrelay_first_admin_password', ''),
+                           mr_ptt_port=mr.PTT_PORT, mr_first_password=settings.get(mr.FIRST_PW_KEY, ''),
+                           mr_notice=mr.NOTICE, mr_source=mr.NOTICE_SOURCE,
                            deploying=_job.get('running', False), version=VERSION)
 
 try:

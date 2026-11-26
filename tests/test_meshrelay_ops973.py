@@ -182,7 +182,8 @@ def test_config_problem_refuses_unsafe_configs(text, bad):
 
 def test_config_problem_passes_the_seed_and_a_missing_key():
     assert M.config_problem(M.seed_config_text()) == ''
-    assert M.config_problem('{"web_port": 8187}') == ''     # the app's own default is true
+    # a missing auth_enabled is the app's own default, which is true
+    assert M.config_problem('{"web_port": 8187, "web_bind": "127.0.0.1"}') == ''
 
 
 def test_health_fails_when_config_says_auth_off(monkeypatch):
@@ -216,7 +217,7 @@ def test_deploy_refuses_to_start_on_an_existing_config_with_auth_off(monkeypatch
 
 
 def test_deploy_never_overwrites_an_existing_good_config(monkeypatch, box):
-    box.files[M.CONFIG_PATH] = '{"auth_enabled": true, "web_port": 8187, "max_clients": 7}'
+    box.files[M.CONFIG_PATH] = '{"auth_enabled": true, "web_port": 8187, "web_bind": "127.0.0.1", "max_clients": 7}'
     _run_deploy(box)
     assert not [e for e in box.events if e[0] == 'WRITE' and e[1] == M.CONFIG_PATH]
 
@@ -533,6 +534,63 @@ def test_broker_keeps_user_ptt_out_of_every_other_unit():
 
 # ── condition 2: web port closed to the outside ───────────────────────────────────────
 
+# Security's change (ops #973, Thu Nov 26): the dashboard listens on 127.0.0.1 itself, so a box with no
+# active firewall (`_fw_deny` then answers "no firewall present" and succeeds) never has the port open.
+# Ryan's v4.9.1 reads web_bind, trust_proxy and managed from config.json (config.go, infratak.go).
+
+def test_seed_config_binds_the_dashboard_to_loopback_and_trusts_only_the_proxy():
+    import json
+    cfg = json.loads(M.seed_config_text())
+    assert cfg['web_bind'] == '127.0.0.1'
+    assert cfg['trust_proxy'] is True
+    assert cfg['managed'] == 'infratak'
+
+
+@pytest.mark.parametrize('bind_json', ['', '"web_bind": "",', '"web_bind": null,', '"web_bind": "0.0.0.0",',
+                                       '"web_bind": "::",', '"web_bind": "localhost",',
+                                       '"web_bind": "192.0.2.10",', '"web_bind": "127.0.0.2",',
+                                       '"web_bind": " 127.0.0.1",', '"web_bind": 127,'])
+def test_config_problem_refuses_a_dashboard_that_is_not_bound_to_loopback(bind_json):
+    text = '{"auth_enabled": true, "web_port": 8187, %s "trust_proxy": true}' % bind_json
+    assert 'web_bind' in M.config_problem(text)
+
+
+def test_health_fails_when_the_dashboard_is_not_bound_to_loopback(monkeypatch):
+    import json
+    monkeypatch.setattr(M, '_active', lambda ctx: True)
+    monkeypatch.setattr(M, 'web_up', lambda timeout=5: True)
+    cfg = json.loads(M.seed_config_text())
+    cfg['web_bind'] = '0.0.0.0'
+    ok, why = M.health({'_read_priv': lambda p: json.dumps(cfg)})
+    assert not ok and 'web_bind' in why
+    del cfg['web_bind']                                   # the app's default is every address
+    ok, why = M.health({'_read_priv': lambda p: json.dumps(cfg)})
+    assert not ok and 'web_bind' in why
+
+
+def test_deploy_refuses_to_start_on_a_config_that_would_open_the_dashboard_port(monkeypatch):
+    import json
+    web = _pin(monkeypatch)
+    monkeypatch.setattr(M, '_active', lambda ctx: True)
+    monkeypatch.setattr(M, 'web_up', lambda timeout=5: True)
+    cfg = json.loads(M.seed_config_text())
+    cfg['web_bind'] = ''
+    b = Box(web, config=json.dumps(cfg))
+    job = _run_deploy(b)
+    assert job['error'] and not job['complete']
+    assert not [e for e in b.cmds() if e[:2] == ['systemctl', 'restart']]
+
+
+def test_deploy_on_a_box_with_no_firewall_still_leaves_the_dashboard_on_loopback(box):
+    """_fw_deny succeeds when no firewall is active; the config must hold the port shut by itself."""
+    _run_deploy(box)
+    assert json.loads(box.files[M.CONFIG_PATH])['web_bind'] == '127.0.0.1'
+    # and the upstream Caddy proxies to is the same loopback address
+    lines = []
+    M.append_caddy_vhost(lines, 'mr.example.test', True, 'http://127.0.0.1:9000', 'x', lambda r: None, 'u')
+    assert f'reverse_proxy 127.0.0.1:{M.WEB_PORT}' in '\n'.join(lines)
+
+
 def test_deploy_opens_only_the_phone_port_and_closes_the_web_port(box):
     _run_deploy(box)
     assert ('allow', M.PTT_PORT, 'udp') in box.fw
@@ -830,6 +888,132 @@ def test_first_admin_password_is_read_from_the_journal_not_admin_admin():
          "2026/11/19 12:00:00   admin / Zx9fQ2mPaB\nnext line\n")
     assert M.parse_initial_password(j) == 'Zx9fQ2mPaB'
     assert M.parse_initial_password('nothing here') == ''
+
+
+PW_JOURNAL = ("server started\nINITIAL ADMIN PASSWORD (record this, it will not be shown again):\n"
+              "2026/11/26 12:00:00   admin / Zx9fQ2mPaB\n")
+
+
+def _deploy_with_password(box, monkeypatch, at):
+    """Run Deploy with the journal showing a first admin password, at clock time `at`."""
+    monkeypatch.setattr(M, '_clock', types.SimpleNamespace(time=lambda: at))
+    monkeypatch.setattr(M, 'capture_initial_password', lambda ctx: M.parse_initial_password(PW_JOURNAL))
+    job = _run_deploy(box)
+    assert job['complete'] and not job['error'], box.logs
+
+
+def test_deploy_stamps_the_first_admin_password_with_the_time_it_was_read(box, monkeypatch):
+    _deploy_with_password(box, monkeypatch, 1000.0)
+    assert box.settings[M.FIRST_PW_KEY] == 'Zx9fQ2mPaB'
+    assert box.settings[M.FIRST_PW_AT_KEY] == 1000.0
+
+
+def test_first_admin_password_is_dropped_after_24_hours_and_not_before(box, monkeypatch):
+    _deploy_with_password(box, monkeypatch, 1000.0)
+    ctx = box.ctx()
+    assert M.expire_first_password(ctx, now=1000.0 + 24 * 3600 - 1) is False
+    assert box.settings[M.FIRST_PW_KEY] == 'Zx9fQ2mPaB'
+    assert M.expire_first_password(ctx, now=1000.0 + 24 * 3600) is True
+    assert M.FIRST_PW_KEY not in box.settings and M.FIRST_PW_AT_KEY not in box.settings
+    assert ('meshrelay_first_password_dropped', 'older than 24 hours') in box.audits
+    assert M.expire_first_password(ctx, now=1000.0 + 99 * 3600) is False        # nothing left to drop
+
+
+def test_a_first_admin_password_with_no_time_stamp_is_dropped_not_kept(box):
+    box.settings[M.FIRST_PW_KEY] = 'left-over'
+    assert M.expire_first_password(box.ctx(), now=5.0) is True
+    assert M.FIRST_PW_KEY not in box.settings
+    box.settings.update({M.FIRST_PW_KEY: 'x', M.FIRST_PW_AT_KEY: 'garbage'})
+    assert M.expire_first_password(box.ctx(), now=5.0) is True
+    assert M.FIRST_PW_KEY not in box.settings
+
+
+def test_a_stamp_in_the_future_does_not_keep_the_password_for_ever(box):
+    box.settings.update({M.FIRST_PW_KEY: 'x', M.FIRST_PW_AT_KEY: 10_000_000.0})
+    assert M.expire_first_password(box.ctx(), now=5.0) is True      # clock went back: drop, do not keep
+
+
+def test_the_status_call_drops_an_old_first_admin_password(box, monkeypatch):
+    app, routes = _views(monkeypatch, box)
+    box.settings.update({M.FIRST_PW_KEY: 'x', M.FIRST_PW_AT_KEY: 1.0})        # 1970: far past 24 hours
+    monkeypatch.setattr(M, 'health', lambda ctx: (True, ''))
+    monkeypatch.setattr(M, 'detect', lambda ctx: {'installed': True, 'running': True})
+    with app.test_request_context('/api/meshrelay/status'):
+        routes['meshrelay_status']()
+    assert M.FIRST_PW_KEY not in box.settings and M.FIRST_PW_AT_KEY not in box.settings
+
+
+def test_hide_it_and_uninstall_drop_the_password_and_its_stamp(box, monkeypatch):
+    app, routes = _views(monkeypatch, box)
+    box.settings.update({M.FIRST_PW_KEY: 'x', M.FIRST_PW_AT_KEY: 9e12})
+    with app.test_request_context('/api/meshrelay/forget-password', method='POST'):
+        routes['meshrelay_forget_password']()
+    assert M.FIRST_PW_KEY not in box.settings and M.FIRST_PW_AT_KEY not in box.settings
+    box.settings.update({M.FIRST_PW_KEY: 'x', M.FIRST_PW_AT_KEY: 9e12})
+    M.uninstall(box.ctx(), {}, {})
+    assert M.FIRST_PW_KEY not in box.settings and M.FIRST_PW_AT_KEY not in box.settings
+
+
+def test_page_and_guard_dog_check_both_run_the_24_hour_drop():
+    page = APP[APP.index("def meshrelay_page():"):]
+    page = page[:page.index("\ntry:\n    import threading as _threading_sh")]
+    assert 'expire_first_password' in page
+    # the page reads the password only after the drop ran
+    assert page.index('expire_first_password') < page.index('load_settings()')
+    check = APP[APP.index("if monitor_id == 'meshrelay_http':"):]
+    check = check[:check.index("if monitor_id == 'simulator_ctr':")]
+    assert 'expire_first_password' in check and 'health(' in check
+
+
+def test_the_stamp_key_is_a_declared_setting(box, monkeypatch):
+    got = {}
+    monkeypatch.setattr(M, 'register_module', lambda d: got.update(d))
+    M.register(box.ctx())
+    assert M.FIRST_PW_KEY in got['settings_keys'] and M.FIRST_PW_AT_KEY in got['settings_keys']
+
+
+# ── AGPL-3.0 notice on the MeshRelay page (Security, ops #973, Nov 26) ────────────────────
+
+def _render_page(**ctx):
+    jinja2 = pytest.importorskip('jinja2')
+    page = (REPO / 'templates/meshrelay.html').read_text(encoding='utf-8')
+    env = jinja2.Environment(loader=jinja2.DictLoader({
+        'base.html': '{% block page_css %}{% endblock %}{% block content %}{% endblock %}',
+        'meshrelay.html': page}))
+    base = dict(mr_notice=M.NOTICE, mr_source=M.NOTICE_SOURCE, mr_ptt_port=5000, mr_pin_problem='',
+                mr_pinned='v4.9.1', mr_version='v4.9.1', mr_url='', mr_first_password='', deploying=False,
+                meshrelay={})
+    base.update(ctx)
+    return env.get_template('meshrelay.html').render(**base)
+
+
+def _text(html):
+    return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', '', html))
+
+
+@pytest.mark.parametrize('installed', [False, True])
+def test_the_page_names_ryan_the_licence_and_the_source_in_both_states(installed):
+    html = _render_page(meshrelay={'installed': installed, 'running': True})
+    assert ('MeshRelay server by R3 Systems, AGPL-3.0, source: github.com/RyanR3/MeshRelayServer'
+            in _text(html))
+    assert 'href="https://github.com/RyanR3/MeshRelayServer"' in html
+
+
+def test_the_page_route_passes_the_notice_to_the_template():
+    page = APP[APP.index("def meshrelay_page():"):]
+    page = page[:page.index("\ntry:\n    import threading as _threading_sh")]
+    assert 'mr_notice=mr.NOTICE' in page and 'mr_source=mr.NOTICE_SOURCE' in page
+
+
+def test_the_module_never_edits_the_downloaded_binary_or_web_files():
+    """AGPL: infra-TAK runs Ryan's release unchanged. No sed, patch, replace or write into the
+    program or its web files; they are copied from the checked download and nothing else."""
+    src = (REPO / 'modules/meshrelay.py').read_text(encoding='utf-8')
+    for bad in ("'sed'", "'patch'", "'perl'", "'truncate'", "'tee'"):
+        assert bad not in src
+    # the only files this module writes by content are the seed config and its own unit
+    targets = set(re.findall(r"_write_priv'\]\(([A-Z_]+)", src))
+    assert targets == {'CONFIG_PATH', 'UNIT_PATH'}
 
 
 def test_uninstall_removes_data_unless_asked_to_keep_it(box):

@@ -24,7 +24,7 @@ Back to the [README](../README.md).
 | CloudTAK Media | 9997 | HTTPS | Video control — CloudTAK puts this port on every media URL; Caddy answers it (TLS, auth-gated). Blocked, videos opened from a map marker fail with "Failed to generate proxy stream" |
 | TAK Video Restreamer *(when deployed)* | 8555 | RTSPS | TLS-wrapped RTSP (its RTSP and SRT use MediaMTX's 8554 and 8890) |
 | TAK Video Restreamer *(when deployed)* | 1935 | RTMP | RTMP publishers |
-| MeshRelay *(when deployed)* | 5000 | UDP | Push-to-talk phones (the dashboard is Caddy-only, behind Authentik; its own web port 8187 stays closed) |
+| MeshRelay *(when deployed)* | 5000 | UDP | Push-to-talk phones (the dashboard is Caddy-only, behind Authentik; its own web port 8187 listens on 127.0.0.1 only and stays closed in the firewall) |
 | ATLAS MDM *(when deployed)* | 8449 | TLS | Enrolled tablets' device channel (mutual TLS) — the provisioning QR points here |
 | EUD Remote Assist *(when deployed)* | 8448 | HTTPS | Device API — the enrolment QR points here |
 | CoTURN — EUD Remote Assist *(when deployed)* | 3479 / 50000–50050 | TCP+UDP / UDP | TURN control / relayed media |

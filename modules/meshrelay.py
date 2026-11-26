@@ -10,11 +10,12 @@ Security conditions (Security lead, ops #973, Thu Nov 19 2026), each with a test
 tests/test_meshrelay_ops973.py:
   1. config.json is seeded with auth_enabled true before the first start; the health
      check fails the deploy if it ever reads false. config.json.example is never copied.
-  2. The dashboard port is loopback-only behind Caddy: a firewall deny rule here, proved by
-     a check from a second machine in the box test (a probe of the box's own address goes over
-     loopback and would say "open"; so Deploy cannot prove it from the box). The app has no
-     bind option yet, so it listens on every address and the firewall rule is the only guard:
-     with no active firewall the port is open and only the app's own login remains.
+  2. The dashboard port is loopback-only behind Caddy. The first guard is the app's own
+     `web_bind` 127.0.0.1 in config.json (Ryan's v4.9.1 reads it), so the port is not
+     reachable from outside even with no firewall; the health check fails when it is anything
+     else. The second guard is a firewall deny rule. Proved by a check from a second machine
+     in the box test (a probe of the box's own address goes over loopback and would say
+     "open"; so Deploy cannot prove it from the box).
   3. Authentik forward_auth covers the dashboard host. The phones use UDP 5000 only (the
      web router has no route they call), so nothing the phones need sits behind it. They
      never touch Caddy, so their brute-force protection is a fail2ban jail on the app's own
@@ -39,6 +40,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import time as _clock          # a second name, so a test that fakes `time.sleep` leaves the clock alone
 import urllib.error
 import urllib.request
 
@@ -64,7 +66,24 @@ PTT_PORT = 5000                           # UDP, public: the phones connect here
 # Not Ryan's default 8080: Guard Dog's health agent and Fed Hub already use 8080 on a
 # console box. Loopback behind Caddy; closed to the outside by a firewall rule.
 WEB_PORT = 8187
+# The dashboard listens on loopback only (`web_bind`), so with the firewall off or missing the port
+# is still not reachable from outside and nobody skips Authentik (Security, ops #973, Nov 26).
+# `trust_proxy` makes the app read the real client address and https from Caddy (only from
+# loopback); `managed` tells the app that infra-TAK installs and updates it, so it never
+# replaces its own binary. All three are read from config.json by Ryan's v4.9.1
+# (config.go, infratak.go, web.go).
+WEB_BIND = '127.0.0.1'
+MANAGED = 'infratak'
 REPO = 'RyanR3/MeshRelayServer'
+# AGPL-3.0 notice on the MeshRelay page (Security, ops #973, Nov 26). We never patch his binary or
+# web files: infra-TAK downloads the release, checks its SHA-256 and runs it unchanged.
+NOTICE = 'MeshRelay server by R3 Systems, AGPL-3.0, source: '
+NOTICE_SOURCE = 'github.com/RyanR3/MeshRelayServer'
+# The first admin password is shown on the MeshRelay page, not kept: it is dropped from the
+# console's settings 24 hours after it was read from the journal (Security, ops #973, Nov 26).
+FIRST_PW_KEY = 'meshrelay_first_admin_password'
+FIRST_PW_AT_KEY = 'meshrelay_first_admin_password_at'
+FIRST_PW_TTL = 24 * 3600
 
 # The pinned release: Ryan's public v4.9.1 (RyanR3/MeshRelayServer, AGPL-3.0, published
 # Wed Nov 25, 2026, 11:18 PM PT; annotated tag commit bd7ba369f0cbe99d0a450f8a9ae81f0440613ec4).
@@ -118,6 +137,9 @@ def seed_config_text():
     cfg = {
         'ptt_port': PTT_PORT,
         'web_port': WEB_PORT,
+        'web_bind': WEB_BIND,
+        'trust_proxy': True,
+        'managed': MANAGED,
         'max_clients': 1000,
         'max_channels': 100,
         'log_level': 'INFO',
@@ -149,6 +171,12 @@ def config_problem(text):
         return 'web_port is not a number'
     if web_port != WEB_PORT:
         return f'web_port is not {WEB_PORT}: the firewall rule and Caddy point at {WEB_PORT}'
+    # Security condition 2: the dashboard listens on loopback only. A missing or empty value
+    # means "every address" to the app, so unlike auth_enabled the default is NOT safe.
+    bind = cfg.get('web_bind')
+    if bind != WEB_BIND:
+        return (f'web_bind is {bind!r}, not {WEB_BIND!r}: the dashboard would listen on every '
+                'address and be reachable without Authentik')
     return ''
 
 
@@ -437,6 +465,38 @@ def parse_initial_password(journal_text):
     return m.group(1) if m else ''
 
 
+def first_password_expired(settings, now=None):
+    """True when the stored first admin password is older than 24 hours. A password with no
+    time stamp cannot be aged, so it counts as expired (it is dropped, never kept)."""
+    if not (settings or {}).get(FIRST_PW_KEY):
+        return False
+    try:
+        at = float(settings.get(FIRST_PW_AT_KEY))
+    except (TypeError, ValueError):
+        return True
+    now = _clock.time() if now is None else now
+    return not (0 <= now - at < FIRST_PW_TTL)
+
+
+def drop_first_password(settings):
+    """Remove the first admin password and its time stamp from a settings dict."""
+    settings.pop(FIRST_PW_KEY, None)
+    settings.pop(FIRST_PW_AT_KEY, None)
+
+
+def expire_first_password(ctx, now=None):
+    """Drop the first admin password from the console's settings once it is 24 hours old.
+    True when it dropped one. Called by the MeshRelay page, its status call and the Guard Dog
+    check that runs every half minute, so the password does not outlive its day."""
+    s = ctx['load_settings']()
+    if not first_password_expired(s, now):
+        return False
+    drop_first_password(s)
+    ctx['save_settings'](s)
+    _audit(ctx, 'meshrelay_first_password_dropped', 'older than 24 hours')
+    return True
+
+
 def capture_initial_password(ctx):
     r = subprocess.run(ctx['_sudo_wrap'](['journalctl', '-u', UNIT, '--no-pager', '-o', 'cat', '-n', '400']),
                        capture_output=True, text=True, timeout=30)
@@ -573,7 +633,9 @@ def deploy(ctx, job, params):
             s['meshrelay']['previous'] = _prev
         pw = capture_initial_password(ctx)
         if pw:
-            s['meshrelay_first_admin_password'] = pw      # shown once on the MeshRelay page, never logged
+            # shown on the MeshRelay page for 24 hours (or until hidden), never logged
+            s[FIRST_PW_KEY] = pw
+            s[FIRST_PW_AT_KEY] = _clock.time()
         ctx['save_settings'](s)
         plog("📡 Step 7/7 — Dashboard behind Caddy and Authentik")
         fqdn = (s.get('fqdn') or '').strip()
@@ -719,7 +781,7 @@ def uninstall(ctx, job, params):
         steps.append('Data removed (users, recordings, TAK connection keys)')
     s = ctx['load_settings']()
     s.pop('meshrelay', None)
-    s.pop('meshrelay_first_admin_password', None)
+    drop_first_password(s)
     ctx['save_settings'](s)
     ctx['generate_caddyfile'](s)        # the vhost goes: the module no longer detects as installed
     ctx['_caddy_reload']()
@@ -765,11 +827,12 @@ def register(ctx):
 
     def forget_password_view():
         s = ctx['load_settings']()
-        s.pop('meshrelay_first_admin_password', None)
+        drop_first_password(s)
         ctx['save_settings'](s)
         return jsonify({'success': True})
 
     def status_view():
+        expire_first_password(ctx)
         ok, why = health(ctx) if detect(ctx)['installed'] else (False, 'not installed')
         return jsonify({'healthy': ok, 'problem': why, 'version': installed_version(ctx),
                         'pinned': RELEASE['tag'], 'pin_problem': pin_problem(arch=ctx['_host_arch']())})
@@ -802,7 +865,7 @@ def register(ctx):
              'endpoint': 'meshrelay_status', 'view': status_view},
         ],
         'requires_modules': ['authentik'],    # the dashboard is published only behind Authentik
-        'ports': [f'{PTT_PORT}/udp'],   # the web port is loopback + Caddy only (firewall deny rule)
+        'ports': [f'{PTT_PORT}/udp'],   # the web port listens on 127.0.0.1 only (web_bind) + firewall deny rule
         'service_units': [UNIT],
-        'settings_keys': ['meshrelay', 'meshrelay_github_token', 'meshrelay_first_admin_password'],
+        'settings_keys': ['meshrelay', 'meshrelay_github_token', FIRST_PW_KEY, FIRST_PW_AT_KEY],
     })

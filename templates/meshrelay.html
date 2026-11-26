@@ -63,7 +63,7 @@
 {% if mr_first_password %}
 <div class="card">
   <div class="card-title">First admin password</div>
-  <div class="warn-box">Shown here until you hide it. Sign in to the dashboard as <b>admin</b>. MeshRelay makes you change it at first login.</div>
+  <div class="warn-box">Shown here for 24 hours after the install, or until you hide it. Then the console forgets it. Sign in to the dashboard as <b>admin</b>. MeshRelay makes you change it at first login.</div>
   <div class="url-box">{{ mr_first_password }}</div>
   <div class="row"><button class="btn btn-secondary" onclick="forgetPw()">Hide it</button></div>
 </div>
@@ -77,6 +77,8 @@
   <button class="btn btn-danger" onclick="doUninstall()">Uninstall MeshRelay</button>
 </div>
 {% endif %}
+
+<p id="meshrelayNotice" style="font-size:11px;color:var(--text-dim);line-height:1.6;margin-top:8px">{{ mr_notice }}<a href="https://{{ mr_source }}" rel="noopener" target="_blank" style="color:var(--text-dim);text-decoration:underline">{{ mr_source }}</a></p>
 
 <script>
 const J = {'Content-Type':'application/json'};
