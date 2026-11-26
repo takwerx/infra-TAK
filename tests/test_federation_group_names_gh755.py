@@ -325,3 +325,18 @@ def test_federation_card_shows_the_check_and_the_fix():
     # names reach the page as text, never as HTML
     seg = js[js.index('function loadFedGroupsCheck'):js.index('function fixFedGroups')]
     assert 'innerHTML' not in seg and 'li.textContent' in seg
+
+
+def test_card_keeps_a_green_fixed_message_after_the_fix():
+    """Lead asked for a look at the card after the Fix: the warning must not just vanish."""
+    html = (ROOT / 'templates' / 'takserver.html').read_text(encoding='utf-8')
+    js = (ROOT / 'static' / 'takserver.js').read_text(encoding='utf-8')
+    assert 'id="fed-groups-title"' in html and 'id="fed-groups-why"' in html
+    assert 'function fedGroupsView(fixed)' in js and 'Federation group names fixed' in js
+    # after a fix the check runs again; a clean answer shows the fixed state, a dirty one shows the warning again
+    seg = js[js.index('function loadFedGroupsCheck'):js.index('function fixFedGroups')]
+    assert 'afterFix===true' in seg and 'fedGroupsView(true)' in seg and 'fedGroupsView(false)' in seg
+    fix = js[js.index('function fixFedGroups'):js.index("if(document.getElementById('federation-body'))")]
+    assert 'loadFedGroupsCheck(true)' in fix
+    # the first load (no fix pressed) still hides the box when nothing needs fixing
+    assert "box.style.display='none'" in seg

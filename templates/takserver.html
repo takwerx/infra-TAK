@@ -680,8 +680,8 @@ window.takDbRefreshStart=function(){
 </div>
 </div>
 <div id="fed-groups-box" style="display:none;margin-bottom:20px;padding:16px;background:rgba(234,179,8,0.08);border:1px solid var(--yellow, #eab308);border-radius:10px">
-<div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--yellow, #eab308);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:8px">Federation group names need fixing</div>
-<p style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:8px">These federate groups use the LDAP name (<code>cn=tak_&hellip;</code>). No user is in a group with that name, so data flows one way only, even though the link shows connected. This happens when groups are added with the group search in TAK Server's Federation Manager. Fix swaps each one for the plain channel name. TAK Server does not restart.</p>
+<div id="fed-groups-title" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--yellow, #eab308);text-transform:uppercase;letter-spacing:1px;font-weight:600;margin-bottom:8px">Federation group names need fixing</div>
+<p id="fed-groups-why" style="font-size:12px;color:var(--text-secondary);line-height:1.5;margin-bottom:8px">These federate groups use the LDAP name (<code>cn=tak_&hellip;</code>). No user is in a group with that name, so data flows one way only, even though the link shows connected. This happens when groups are added with the group search in TAK Server's Federation Manager. Fix swaps each one for the plain channel name. TAK Server does not restart.</p>
 <ul id="fed-groups-list" style="font-size:12px;color:var(--text-secondary);line-height:1.6;margin:0 0 10px 18px;padding:0"></ul>
 <div style="display:flex;align-items:center;gap:10px">
 <button type="button" id="fed-groups-btn" onclick="fixFedGroups()" style="padding:8px 18px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">Fix group names</button>
