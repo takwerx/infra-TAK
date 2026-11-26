@@ -249,6 +249,7 @@ def jail_ns(tmp_path):
         '_f2b_trusted_ignoreip': lambda extra='': ('127.0.0.1/8 ::1 ' + extra).strip(),
         '_f2b_operator_extra': lambda stored: ' '.join(t for t in stored.split() if t not in ('127.0.0.1/8', '::1')),
         '_f2b_is_available': lambda: True,
+        '_f2b_docker_twin': lambda primary: '',   # #736, its own test
         '_makedirs_priv': lambda p, exist_ok=True: None,
         '_write_priv': lambda p, c: files.__setitem__(p, c),
         '_f2b_read_text': lambda p: files.get(p),
