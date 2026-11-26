@@ -23275,6 +23275,215 @@ def _f2b_fleet_ignore_cidrs():
         raw = ''
     return [c.strip() for c in raw.replace(',', ' ').split() if c.strip()]
 
+
+# ── Never ban Starlink (infra-TAK #736, ops #1269) ──────────────────────────────────
+# Starlink puts many customers behind one shared public address (carrier-grade NAT).
+# One fail2ban ban on that address cuts off every drone, laptop and phone behind it,
+# and a recidive escalation makes that 7 days on every port. Operators who field
+# Starlink terminals can turn this on (OFF by default): the ranges Starlink publishes
+# in its RFC 8805 geofeed are added to every jail's ignoreip. The trade-off is stated
+# on the page: an attacker who is also on Starlink can then never be banned on this box.
+#
+# The feed is ~14k rows (/24 v4, /38+ v6); merged it is ~400 ranges (~7 KB), a size
+# fail2ban's ignoreip handles as a plain list (0.11.2 and 1.1.0 both walk it linearly;
+# neither supports `ignoreip = file:`). Refreshed daily by _f2b_starlink_loop. The last
+# good list is kept on disk, so a failed download never empties the list.
+#
+# The feed is outside data that decides who may never be banned, so it is checked
+# before use: HTTPS with normal certificate checks, a size cap, and the WHOLE download
+# is refused if any row is wider than Starlink has ever published (a /16 v4 or /32 v6
+# floor; the real feed's widest rows are /24 and /38) or the merged total is out of
+# range. A tampered or broken feed therefore leaves the last good list in place rather
+# than whitelisting the internet.
+_F2B_STARLINK_FEED_URL = 'https://geoip.starlinkisp.net/feed.csv'
+_F2B_STARLINK_STATE_NAME = 'fail2ban-starlink.json'
+_F2B_STARLINK_REFRESH_S = 86400            # daily
+_F2B_STARLINK_RETRY_S = 3600               # the loop wakes hourly; a failed refresh retries then
+_F2B_STARLINK_MAX_BYTES = 8 * 1024 * 1024  # real feed ~0.5 MB
+_F2B_STARLINK_MIN_ROWS = 100               # real feed ~14k rows
+_F2B_STARLINK_MIN_PREFIX = {4: 16, 6: 32}  # refuse anything wider than this
+_F2B_STARLINK_MAX_RANGES = 2000            # merged; real feed ~400
+_F2B_STARLINK_MAX_V4_ADDRS = 1 << 24       # merged v4 total; real feed ~0.9M
+_F2B_STARLINK_RETIRED_MAX = 5000
+_f2b_starlink_lock = threading.Lock()
+
+
+def _f2b_starlink_state_path():
+    return os.path.join(CONFIG_DIR, _F2B_STARLINK_STATE_NAME)
+
+
+def _f2b_starlink_load():
+    """The cached list and its bookkeeping, {} when never downloaded. Never raises."""
+    try:
+        with open(_f2b_starlink_state_path()) as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except Exception:
+        return {}
+
+
+def _f2b_starlink_save(st):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix='.f2b-starlink-', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(st, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _f2b_starlink_state_path())
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def _f2b_starlink_enabled():
+    try:
+        return bool(load_settings().get('fail2ban_never_ban_starlink'))
+    except Exception:
+        return False
+
+
+def _f2b_starlink_cidrs():
+    """The Starlink ranges to put in ignoreip: the cached list when the setting is on,
+    [] otherwise. Only valid networks are returned, whatever the file holds."""
+    if not _f2b_starlink_enabled():
+        return []
+    out = []
+    for c in _f2b_starlink_load().get('cidrs') or []:
+        try:
+            out.append(str(ipaddress.ip_network(str(c))))
+        except ValueError:
+            continue
+    return out
+
+
+def _f2b_starlink_known():
+    """Every Starlink range this box has ever put in a jail (current list plus ranges a
+    later feed dropped), on or off. Used to strip them from a jail's stored ignoreip, so
+    turning the setting off, or Starlink retiring a range, really removes them instead
+    of leaving them behind as if an operator had typed them."""
+    st = _f2b_starlink_load()
+    return set(str(c) for c in (st.get('cidrs') or []) + (st.get('retired') or []))
+
+
+def _f2b_starlink_parse(text):
+    """Parse Starlink's RFC 8805 geofeed (`prefix,country,region,city,`) into merged
+    ranges. Returns (cidrs, rows). Raises ValueError with a plain reason when the feed
+    must not be used (see the block comment above for why the checks are strict)."""
+    nets = {4: [], 6: []}
+    rows = bad = 0
+    for line in str(text or '').splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        rows += 1
+        prefix = line.split(',', 1)[0].strip()
+        try:
+            net = ipaddress.ip_network(prefix, strict=False)
+        except ValueError:
+            bad += 1
+            continue
+        if net.prefixlen < _F2B_STARLINK_MIN_PREFIX[net.version]:
+            raise ValueError(f'feed lists {net}, wider than any Starlink range; not used')
+        if not net.is_global:
+            bad += 1          # private / reserved space has no business in this list
+            continue
+        nets[net.version].append(net)
+    if rows < _F2B_STARLINK_MIN_ROWS:
+        raise ValueError(f'feed has only {rows} rows; expected thousands')
+    if bad > rows // 100:
+        raise ValueError(f'{bad} of {rows} feed rows are not usable public ranges')
+    v4 = list(ipaddress.collapse_addresses(nets[4]))
+    v6 = list(ipaddress.collapse_addresses(nets[6]))
+    if len(v4) + len(v6) > _F2B_STARLINK_MAX_RANGES:
+        raise ValueError(f'feed merges to {len(v4) + len(v6)} ranges; too many')
+    if sum(n.num_addresses for n in v4) > _F2B_STARLINK_MAX_V4_ADDRS:
+        raise ValueError('feed covers more IPv4 space than Starlink holds')
+    if not v4 and not v6:
+        raise ValueError('feed has no usable ranges')
+    return [str(n) for n in v4 + v6], rows
+
+
+def _f2b_starlink_fetch():
+    """Download and check the feed. Returns (cidrs, rows); raises on any failure."""
+    req = urllib.request.Request(_F2B_STARLINK_FEED_URL,
+                                 headers={'User-Agent': 'infra-TAK fail2ban'})
+    with urllib.request.urlopen(req, timeout=30,
+                                context=ssl.create_default_context()) as r:
+        body = r.read(_F2B_STARLINK_MAX_BYTES + 1)
+    if len(body) > _F2B_STARLINK_MAX_BYTES:
+        raise ValueError('feed is larger than expected; not used')
+    return _f2b_starlink_parse(body.decode('utf-8', 'replace'))
+
+
+def _f2b_starlink_refresh(force=False, plog=None):
+    """Download the list when the setting is on and the cached copy is a day old (or
+    always with force). On success the new list is stored and, when it changed and the
+    setting is on, put into every jail. On failure the last good list stays in use and
+    the error is recorded for the page. Returns (ok, detail)."""
+    _log = plog or (lambda m: print(f'fail2ban: {m}', flush=True))
+    with _f2b_starlink_lock:
+        st = _f2b_starlink_load()
+        now = time.time()
+        if not force:
+            if not _f2b_starlink_enabled():
+                return False, 'off'
+            if now - float(st.get('fetched_at') or 0) < _F2B_STARLINK_REFRESH_S:
+                return True, 'fresh'
+        st['last_attempt'] = int(now)
+        try:
+            cidrs, rows = _f2b_starlink_fetch()
+        except Exception as e:
+            st['last_error'] = str(e)[:200]
+            try:
+                _f2b_starlink_save(st)
+            except Exception:
+                pass
+            _log(f'Starlink list download failed, keeping the last good list '
+                 f'({len(st.get("cidrs") or [])} ranges): {st["last_error"]}')
+            return False, st['last_error']
+        old = list(st.get('cidrs') or [])
+        changed = set(old) != set(cidrs)
+        retired = (set(st.get('retired') or []) | set(old)) - set(cidrs)
+        st.update({'cidrs': cidrs, 'rows': rows, 'fetched_at': int(now),
+                   'source': _F2B_STARLINK_FEED_URL, 'last_error': '',
+                   'retired': sorted(retired)[:_F2B_STARLINK_RETIRED_MAX]})
+        _f2b_starlink_save(st)
+    if changed:
+        _log(f'Starlink list updated: {len(cidrs)} ranges (was {len(old)}).')
+        if _f2b_starlink_enabled():
+            _f2b_selfheal_trusted_ignoreip(_log, force=True)
+    return True, f'{len(cidrs)} ranges'
+
+
+def _f2b_starlink_status():
+    st = _f2b_starlink_load()
+    cidrs = st.get('cidrs') or []
+    return {'enabled': _f2b_starlink_enabled(), 'ranges': len(cidrs),
+            'v4': sum(1 for c in cidrs if ':' not in str(c)),
+            'v6': sum(1 for c in cidrs if ':' in str(c)),
+            'rows': st.get('rows') or 0, 'fetched_at': st.get('fetched_at') or 0,
+            'last_attempt': st.get('last_attempt') or 0,
+            'last_error': st.get('last_error') or '', 'source': _F2B_STARLINK_FEED_URL}
+
+
+def _f2b_starlink_loop():
+    time.sleep(300)       # after the startup migrations and the broker are settled
+    while True:
+        try:
+            _f2b_starlink_refresh()
+        except Exception as e:
+            try:
+                print(f'fail2ban: Starlink refresh error (non-fatal): {e}', flush=True)
+            except Exception:
+                pass
+        time.sleep(_F2B_STARLINK_RETRY_S)
+
+
 def _f2b_trusted_ignoreip(extra=''):
     """Build the full ignoreip whitelist for ANY infra-TAK jail, fleet-uniform:
     localhost + the box's attached private subnet(s) + our own container bridges +
@@ -23288,6 +23497,7 @@ def _f2b_trusted_ignoreip(extra=''):
     candidates += _f2b_container_subnets()     # never ban our own services
     candidates += _f2b_own_addresses()         # never ban ourselves
     candidates += _f2b_fleet_ignore_cidrs()
+    candidates += _f2b_starlink_cidrs()        # only when the operator turned it on
     candidates += str(extra or '').replace(',', ' ').split()
     for c in candidates:
         c = c.strip()
@@ -23374,7 +23584,18 @@ def _f2b_operator_extra(stored):
     fleet.update(_f2b_container_subnets())
     fleet.update(_f2b_own_addresses())
     fleet.update(_f2b_fleet_ignore_cidrs())
+    fleet.update(_f2b_starlink_known())       # on or off: never kept as an operator entry
     return ' '.join(t for t in str(stored or '').split() if t not in fleet)
+
+
+def _f2b_hide_starlink(ignoreip):
+    """A jail's stored ignoreip without the Starlink ranges, for the per-jail whitelist
+    field on the page (~400 ranges would bury what the operator typed). Every writer
+    puts them back through _f2b_trusted_ignoreip while the setting is on."""
+    known = _f2b_starlink_known()
+    if not known:
+        return ignoreip
+    return ' '.join(t for t in str(ignoreip or '').split() if t not in known)
 
 def _f2b_read_jail_config():
     """Read current thresholds and ignoreip from the infratak-authentik jail config file."""
@@ -23391,7 +23612,7 @@ def _f2b_read_jail_config():
                         try: cfg[key] = int(line.split('=')[1].strip())
                         except Exception: pass
                 if line.startswith('ignoreip'):
-                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
+                    cfg['ignoreip'] = _f2b_hide_starlink(line.split('=', 1)[1].strip())
     except Exception:
         pass
     return cfg
@@ -25266,7 +25487,7 @@ def _f2b_selfheal_portal_caddy_log(plog=None):
         return changed
 
 
-def _f2b_selfheal_trusted_ignoreip(plog=None):
+def _f2b_selfheal_trusted_ignoreip(plog=None, force=False):
     """Add the never-bannable subnets to every infra-TAK jail's ignoreip, and release
     anything already banned inside one.
 
@@ -25280,13 +25501,20 @@ def _f2b_selfheal_trusted_ignoreip(plog=None):
 
     Boxes deployed before each fix carry an ignoreip missing those subnets. Console-path
     delivery: this runs at startup so a normal update fixes it with no SSH. Idempotent;
-    no-op when there is nothing to trust or nothing to change."""
+    no-op when there is nothing to trust or nothing to change.
+
+    The Starlink never-ban list (_f2b_starlink_refresh, the Starlink toggle) uses this
+    too, with force=True: it must also run when the list was just turned OFF and there
+    is nothing else to trust, so the ranges come out of every jail. While the setting is
+    on, a Starlink address banned before it was turned on is released here as well."""
     _log = plog or (lambda m: None)
     if not _f2b_is_available():
         return False
+    starlink = _f2b_starlink_cidrs()
     tun = _f2b_mgmt_tunnel_subnets() + _f2b_container_subnets() + _f2b_own_addresses()
-    if not tun:
+    if not tun and not starlink and not force:
         return False                      # no tunnel and no containers — nothing to trust
+    tun = tun + starlink
     jaild = '/etc/fail2ban/jail.d'
     if not os.path.isdir(jaild):
         return False
@@ -25356,16 +25584,20 @@ def _f2b_selfheal_trusted_ignoreip(plog=None):
     if not changed and not unbanned:
         return False
     if changed:
-        _log('fail2ban: trusted subnets ' + ', '.join(tun) +
-             ' added to ignoreip in ' + ', '.join(changed) +
-             ' — the management tunnel and our own containers can no longer be banned.')
+        _shown = [c for c in tun if c not in set(starlink)]
+        if starlink:
+            _shown.append(f'{len(starlink)} Starlink ranges')
+        _log('fail2ban: ignoreip updated in ' + ', '.join(changed) +
+             ' (trusted: ' + (', '.join(_shown) or 'only localhost and this box\'s network') +
+             ') — the management tunnel and our own containers can no longer be banned.')
         try:
             subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=60)
         except Exception:
             pass
     if unbanned:
         _log('fail2ban: released ' + ', '.join(unbanned) +
-             ' — a management-tunnel or container address was banned, which blocks EVERY port from it.')
+             ' — a management-tunnel, container or (when on) Starlink address was banned,'
+             ' which blocks it from this box.')
     return True
 
 
@@ -25470,7 +25702,7 @@ def _f2b_read_tak_jail_config():
                         try: cfg[key] = int(line.split('=')[1].strip())
                         except Exception: pass
                 if line.startswith('ignoreip'):
-                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
+                    cfg['ignoreip'] = _f2b_hide_starlink(line.split('=', 1)[1].strip())
     except Exception:
         pass
     return cfg
@@ -25900,7 +26132,8 @@ def fail2ban_tak_refused_api():
     # Addresses that can never be banned, said as such: the jail whitelist, and this box's
     # own containers (Node-RED's flows talk to 8089 too).
     nets = []
-    for tok in (_f2b_read_tak_jail_config().get('ignoreip') or '').split():
+    for tok in ((_f2b_read_tak_jail_config().get('ignoreip') or '').split()
+                + _f2b_starlink_cidrs()):
         try:
             nets.append(ipaddress.ip_network(tok, strict=False))
         except ValueError:
@@ -25954,7 +26187,7 @@ def _f2b_read_ssh_jail_config():
                         try: cfg[key] = int(line.split('=')[1].strip())
                         except Exception: pass
                 if line.startswith('ignoreip'):
-                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
+                    cfg['ignoreip'] = _f2b_hide_starlink(line.split('=', 1)[1].strip())
     except Exception:
         pass
     return cfg
@@ -26446,6 +26679,11 @@ def _f2b_ignoreip_explained():
         'and locks you out of a box you may not be able to reach any other way')
     add('Added by you', _f2b_fleet_ignore_cidrs(),
         "from 'fail2ban_ignore_cidrs' in settings")
+    _sl = _f2b_starlink_cidrs()
+    add('Starlink', _sl,
+        'you turned on "Never ban Starlink addresses": many Starlink users share one address')
+    if _sl and groups and groups[-1]['label'] == 'Starlink':
+        groups[-1]['summary'] = f'{len(_sl)} Starlink ranges'
 
     client = _f2b_console_client_ip()
     covered, matched = None, ''
@@ -26632,7 +26870,7 @@ def _f2b_read_mediamtx_jail_config():
                         try: cfg[key] = int(line.split('=')[1].strip())
                         except Exception: pass
                 if line.startswith('ignoreip'):
-                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
+                    cfg['ignoreip'] = _f2b_hide_starlink(line.split('=', 1)[1].strip())
     except Exception:
         pass
     return cfg
@@ -27184,7 +27422,7 @@ def _f2b_read_portal_jail_config():
                         try: cfg[key] = int(line.split('=')[1].strip())
                         except Exception: pass
                 if line.startswith('ignoreip'):
-                    cfg['ignoreip'] = line.split('=', 1)[1].strip()
+                    cfg['ignoreip'] = _f2b_hide_starlink(line.split('=', 1)[1].strip())
     except Exception:
         pass
     return cfg
@@ -27440,6 +27678,45 @@ def fail2ban_trusted_cidrs_api():
         pass
     return jsonify({'ok': True, 'cidrs': cleaned, 'rewritten': rewritten,
                     'effective': _f2b_trusted_ignoreip()})
+
+
+@app.route('/api/fail2ban/starlink', methods=['GET', 'POST'])
+@login_required
+def fail2ban_starlink_api():
+    """'Never ban Starlink addresses' (infra-TAK #736). GET: the setting and the cached
+    list's state. POST {enabled: bool}: turning it on downloads the list first and is
+    refused when no good list can be had; turning it off removes the ranges from every
+    jail. Either way every jail is rewritten and fail2ban reloaded."""
+    if request.method == 'GET':
+        return jsonify(dict(_f2b_starlink_status(), ok=True))
+    if not _f2b_is_available():
+        return jsonify({'ok': False, 'error': 'fail2ban not installed'}), 400
+    data = request.get_json(silent=True) or {}
+    want = data.get('enabled')
+    if not isinstance(want, bool):
+        return jsonify({'ok': False, 'error': 'enabled must be true or false'}), 400
+    warning = ''
+    if want:
+        ok, detail = _f2b_starlink_refresh(force=True)
+        if not ok:
+            if not _f2b_starlink_load().get('cidrs'):
+                return jsonify(dict(_f2b_starlink_status(), ok=False,
+                                    error='Could not download the Starlink address list: '
+                                          + detail)), 502
+            warning = ('Could not download a fresh Starlink list (' + detail +
+                       '); using the last good one. It retries every hour.')
+    s = load_settings()
+    s['fail2ban_never_ban_starlink'] = want
+    save_settings(s)
+    print(f"fail2ban: 'Never ban Starlink addresses' turned {'on' if want else 'off'} "
+          f"from the console ({_f2b_console_client_ip() or 'unknown address'})", flush=True)
+    audit('fail2ban:starlink', 'on' if want else 'off')
+    try:
+        _f2b_selfheal_trusted_ignoreip(lambda m: print(m, flush=True), force=True)
+    except Exception as e:
+        return jsonify(dict(_f2b_starlink_status(), ok=False,
+                            error='Saved, but the jails could not be updated: ' + str(e)[:200])), 500
+    return jsonify(dict(_f2b_starlink_status(), ok=True, warning=warning))
 
 def _f2b_read_recidive_config():
     cfg = {'maxretry': 3, 'findtime': 86400}
@@ -128291,6 +128568,13 @@ try:
     _threading_mtxgrant.Thread(target=_mediamtx_grant_watch, daemon=True, name='mediamtx-grant-watch').start()
 except Exception as _e:
     print(f"[startup] failed to start mediamtx grant watch (non-fatal): {_e}", flush=True)
+
+# infra-TAK #736: daily refresh of the Starlink never-ban list. Does nothing (no
+# download) unless the operator turned "Never ban Starlink addresses" on.
+try:
+    threading.Thread(target=_f2b_starlink_loop, daemon=True, name='f2b-starlink-refresh').start()
+except Exception as _e:
+    print(f"[startup] failed to start Starlink list refresh (non-fatal): {_e}", flush=True)
 
 # v10.1.4 WS6: warm the exposure-audit cache once in the background so the Console
 # header badge's first fetch after a restart hits a warm cache instead of racing the
