@@ -66,6 +66,7 @@ class World:
         self.stubborn = set()  # projects whose `stop` does nothing
         self.fail_up_from = set()
         self.compose_up_log = []
+        self.started_proxy = False
 
     # ---- building a box ----
     def deployment(self, slug, project, pg='bind', up=True, files=True):
@@ -80,7 +81,8 @@ class World:
         self.names[slug] = project
         for kind in ('api', 'db', 'renewal'):
             self.containers['%s-%s-1' % (project, kind)] = {
-                'project': project, 'workdir': str(d), 'running': up}
+                'project': project, 'workdir': str(d), 'running': up,
+                'service': kind}
         vol = '%s_pgdata' % project
         self.volumes[vol] = str(d / 'store' / 'pgdata') if pg == 'bind' else (
             '' if pg == 'managed' else pg)
@@ -96,9 +98,11 @@ class World:
             return 0, '\n'.join('%s\t%s' % pw for pw in seen)
         if sub[0] == 'ps':
             project = [a for a in sub if a.startswith('label=')][0].split('=', 2)[2]
-            pick = [n for n, c in sorted(self.containers.items())
+            pick = [(n, c) for n, c in sorted(self.containers.items())
                     if c['project'] == project and (c['running'] or '-a' in sub)]
-            return 0, '\n'.join(pick)
+            if 'compose.service' in sub[-1]:
+                return 0, '\n'.join(c['service'] for _, c in pick)
+            return 0, '\n'.join(n for n, _ in pick)
         if sub[0] == 'inspect':
             c = self.containers[sub[-1]]
             lines = ['volume %s_pgdata' % c['project'], 'bind ']
@@ -138,8 +142,14 @@ class World:
             for n in mine:
                 if not self.containers[n]['running']:
                     del self.containers[n]
-        elif action == 'up -d':
-            self.compose_up_log.append(where)
+        elif action.startswith('up -d'):
+            self.compose_up_log.append((where, action))
+            wanted = action.split()[2:] or ['api', 'db', 'renewal', 'proxy']
+            # ⚠️ ATLAS's compose also defines `proxy` (nginx on port 80). It must
+            # never be started: Caddy owns 80, and where it is free it would
+            # open a second public listener.
+            if 'proxy' in wanted:
+                self.started_proxy = True
             vol = '%s_pgdata' % project
             device = self.volumes.get(vol)
             self.volumes.setdefault(vol, '')
@@ -147,10 +157,10 @@ class World:
             # needs the working directory to exist.
             db_ok = (not device) or os.path.isdir(device)
             ok = os.path.isdir(where) and db_ok and where not in self.fail_up_from
-            for kind in ('api', 'db', 'renewal'):
+            for kind in [w for w in wanted if w != 'proxy']:
                 n = '%s-%s-1' % (project, kind)
                 self.containers[n] = {'project': project, 'workdir': where,
-                                      'running': ok}
+                                      'running': ok, 'service': kind}
         return R()
 
     # ---- the broker's mv / test / chown, on the real temp tree ----
@@ -226,9 +236,12 @@ def test_the_database_is_not_started_before_the_volume_points_at_it(world):
              if c[0] in ('compose', 'volume rm', 'volume create')]
     assert kinds == [('compose', 'stop'), ('compose', 'rm -f'),
                      ('volume rm', 'takmdm_pgdata'),
-                     ('volume create', 'takmdm_pgdata'), ('compose', 'up -d')]
-    assert ('compose', 'up -d', str(world.home / 'atlas' / 'default')) in world.calls
-    assert not any(c[:3] == ('compose', 'up -d', str(d)) for c in world.calls)
+                     ('volume create', 'takmdm_pgdata'),
+                     ('compose', 'up -d api db renewal')]
+    assert ('compose', 'up -d api db renewal',
+            str(world.home / 'atlas' / 'default')) in world.calls
+    assert not any(c[0] == 'compose' and c[1].startswith('up') and c[2] == str(d)
+                   for c in world.calls)
 
 
 def test_stop_is_used_never_down(world):
@@ -238,6 +251,21 @@ def test_stop_is_used_never_down(world):
     run(world)
 
     assert not any(c[0] == 'compose' and 'down' in c[1] for c in world.calls)
+
+
+def test_only_the_services_that_were_up_are_started_never_the_nginx_proxy(world):
+    """⚠️ **Found on nuc (ops #1266).** A bare `compose up -d` also starts ATLAS's
+    own `proxy` (nginx on port 80). It failed there only because Caddy held the
+    port; on a box where 80 is free it would open a second public listener.
+    The module has always started `up -d api`; the re-home starts what ran."""
+    world.deployment('default', 'takmdm')
+    world.deployment('corona', 'takmdm-corona')
+
+    run(world)
+
+    assert world.started_proxy is False
+    assert world.compose_up_log
+    assert all(cmd == 'up -d api db renewal' for _, cmd in world.compose_up_log)
 
 
 def test_a_docker_managed_database_volume_is_left_alone(world):
@@ -386,7 +414,7 @@ def test_a_stopped_deployment_is_moved_and_stays_stopped(world):
     out = run(world)
 
     assert list(out.values())[0].startswith('moved')
-    assert not any(c[:2] == ('compose', 'up -d') for c in world.calls)
+    assert not any(c[0] == 'compose' and c[1].startswith('up') for c in world.calls)
     assert world.volumes['takmdm_pgdata'] == str(
         world.home / 'atlas' / 'default' / 'store' / 'pgdata')
 

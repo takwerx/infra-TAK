@@ -3064,6 +3064,24 @@ def _running_containers(project):
     return {n.strip() for n in (out or '').splitlines() if n.strip()} if rc == 0 else set()
 
 
+def _running_services(project):
+    """Compose service names of the containers that are up.
+
+    ⚠️ **Why the move starts these by name and never a bare `up -d`.** ATLAS's
+    compose file also defines its own nginx (`proxy`), which publishes port 80.
+    The module has always started `up -d api` and left it out, because Caddy
+    owns 80 and 443. A bare `up -d` after a move would start it: it fails to
+    bind where Caddy holds the port, and where the port is free it opens a
+    second public listener that nobody asked for. Measured on nuc, ops #1266.
+    """
+    rc, out = _run_root(['docker', 'ps', '--filter',
+                         'label=com.docker.compose.project=%s' % project,
+                         '--format',
+                         '{{.Label "com.docker.compose.service"}}'])
+    names = {n.strip() for n in (out or '').splitlines() if n.strip()} if rc == 0 else set()
+    return sorted(n for n in names if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', n))
+
+
 def _anonymous_volumes(project):
     """Anonymous volumes held by a project's containers (a 64-hex name).
 
@@ -3208,6 +3226,10 @@ def _rehome_unit(ctx, project, src, dst, log, wait_healthy, sleep):
     rebind = bool(device)
 
     was_up = _running_containers(project)
+    services = _running_services(project)
+    # Only the services that were up, so `proxy` (nginx on port 80) stays off;
+    # `init` is pulled in by `depends_on` as it is for a deploy.
+    up_cmd = 'up -d ' + (' '.join(services) if services else 'api')
     log('%s: re-homing %s -> %s (%s)' % (
         project, src, dst,
         'database volume is re-pointed' if rebind else 'database volume is Docker-managed'))
@@ -3217,12 +3239,12 @@ def _rehome_unit(ctx, project, src, dst, log, wait_healthy, sleep):
         if rebind:
             _bind_pg_volume(bind_dir, log, volume=volume)
         if was_up:
-            compose(where, 'up -d')
+            compose(where, up_cmd)
 
     # 1) Stop (keeps containers and volumes).
     compose(src, 'stop')
     if _running_containers(project):
-        compose(src, 'up -d')
+        compose(src, up_cmd)
         return 'left alone: the stack would not stop (nothing was moved)'
 
     # 2) A bind volume cannot be re-pointed while a container still names it.
@@ -3230,7 +3252,7 @@ def _rehome_unit(ctx, project, src, dst, log, wait_healthy, sleep):
         compose(src, 'rm -f')
         rc, out = _run_root(['docker', 'volume', 'rm', volume])
         if rc != 0:
-            compose(src, 'up -d')
+            compose(src, up_cmd)
             return 'left alone: could not release %s (%s)' % (volume, out.strip()[:100])
 
     # 3) Move, hand over what root made, relabel.
@@ -3270,7 +3292,7 @@ def _rehome_unit(ctx, project, src, dst, log, wait_healthy, sleep):
 
     # 5) Up from the new home, and prove it: everything that was up is up.
     if was_up:
-        compose(dst, 'up -d')
+        compose(dst, up_cmd)
         for _ in range(max(1, int(wait_healthy // 3))):
             if was_up <= _running_containers(project):
                 break
