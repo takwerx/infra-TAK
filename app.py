@@ -1750,7 +1750,12 @@ MEDIAMTX_VETTED_RELEASE = "1.21.4"      # ops #817: 1.21.3 → 1.21.4 (RTSP-over
 # them. An install older than a step below is updated to that step first; the next Update
 # takes it the rest of the way (_ak_upgrade_hop). Each entry is the last vetted patch of a
 # family. Add the outgoing family's last vetted patch here whenever a new family is promoted.
-AUTHENTIK_UPGRADE_STEPS = ("2026.5.7",)
+# A box on an older family waits on this step until its second Update press, so the step must
+# be at or above that family's security floor (tests/test_authentik_2026_8_promotion.py,
+# AUTHENTIK_SECURITY_FLOOR). Raise it in the same PR that raises the floor.
+# ops #1290: 2026.5.7 -> 2026.5.9 (same-minor security release for the 2026.5 line, no database
+# migration between the two; upstream compare 2026.5.7...2026.5.9 shows no migrations file).
+AUTHENTIK_UPGRADE_STEPS = ("2026.5.9",)
 AUTHENTIK_DEV_RELEASE    = "2026.8.7"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 # CloudTAK version target. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
@@ -71650,7 +71655,8 @@ def authentik_control():
         import re as _re
         _inst = (_get_authentik_version_info().get('version') or '').strip()
         # v10.2.25: the next safe hop from what is running — a box on 2026.2.x goes to
-        # 2026.5.7 first, because 2026.8 will not start on a database that skipped 2026.5.
+        # the 2026.5 step (AUTHENTIK_UPGRADE_STEPS) first, because 2026.8 will not start on a
+        # database that skipped 2026.5.
         latest = _get_authentik_target_release(settings, installed=_inst)
         if not _ak_tag_is_sane(latest):
             return jsonify({'error': f'Refusing to update: target release '
