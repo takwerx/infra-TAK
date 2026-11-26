@@ -558,8 +558,14 @@ def deploy(ctx, job, params):
         if not ok:
             raise RuntimeError(f'health check failed: {why}')
         s = ctx['load_settings']()
+        _prev = (s.get('meshrelay') or {}).get('previous')
         s['meshrelay'] = {'tag': RELEASE['tag'], 'arch': arch,
                           'sha256': RELEASE['assets'][arch][1]}
+        if _prev:
+            # Deploy leaves the backup folder alone, so the backup still holds `previous`. Dropping
+            # it made a Rollback after a second Deploy put the old files back but keep the new tag
+            # in the record (found on a real box, ops #973).
+            s['meshrelay']['previous'] = _prev
         pw = capture_initial_password(ctx)
         if pw:
             s['meshrelay_first_admin_password'] = pw      # shown once on the MeshRelay page, never logged

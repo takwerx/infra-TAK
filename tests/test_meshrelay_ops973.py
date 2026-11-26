@@ -240,6 +240,21 @@ def test_rollback_leaves_no_stale_checksum_or_previous_in_the_record(box, monkey
     assert box.settings['meshrelay'] == {'tag': 'v4.5.0', 'arch': 'amd64'}
 
 
+def test_rollback_after_a_second_deploy_still_records_the_version_the_backup_holds(box, monkeypatch):
+    """Found on a real box (ops #973, v4.8.0 run): Update 4.5.0 to 4.6.0, then Deploy again on the
+    same pin (to arm the phone-login jail), then Rollback. The binary went back to 4.5.0 but the
+    record still said 4.6.0, because Deploy wrote a fresh record without `previous`. The page then
+    showed the wrong version and Update said 'already on the pinned version'."""
+    box.files[M.CONFIG_PATH] = M.seed_config_text()
+    box.settings['meshrelay'] = {'tag': 'v4.6.0', 'arch': 'amd64', 'sha256': 'a' * 64, 'previous': 'v4.5.0'}
+    monkeypatch.setattr(M, '_have_backup', lambda: True)
+    monkeypatch.setattr(M, '_have_web_backup', lambda: False)
+    _run_deploy(box)                       # second Deploy on the same pinned tag; the backup folder is untouched
+    assert box.settings['meshrelay']['tag'] == 'v4.6.0'
+    M.rollback(box.ctx(), plog=box.logs.append)
+    assert box.settings['meshrelay']['tag'] == 'v4.5.0'
+
+
 def test_update_and_rollback_never_touch_config(box, monkeypatch):
     box.files[M.CONFIG_PATH] = M.seed_config_text()
     box.settings['meshrelay'] = {'tag': 'v4.5.0'}
