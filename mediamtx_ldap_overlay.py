@@ -73,8 +73,49 @@ TRUSTED_PROXIES = frozenset(
 VID_GROUPS = ('vid_private', 'vid_public')
 ADMIN_GROUPS = frozenset({'authentik Admins'})
 VIEWER_GROUPS = frozenset({'vid_private', 'vid_public'})
+# The longest a link made by a viewer lasts (seconds). Admins may make links that never end.
+SHARE_LINK_VIEWER_MAX_SECONDS = 86400
+# Links made before this update that never end end 24 hours after the first start on it. Same
+# files and same rule as the editor's own cap (mediamtx-installer), so whichever starts first
+# does it and the other finds the marker.
+SHARE_LINK_LEGACY_CAP_SECONDS = 86400
 
 VISIBILITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stream_visibility.json')
+SHARE_LINKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'share_links.json')
+SHARE_LINKS_CAP_MARKER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'share_links_capped.json')
+
+
+def cap_never_ending_share_links(now=None):
+    """Once per box: give every share link that never ends an end time 24 hours from now.
+    A link an admin makes later that never ends is kept, because the marker says this ran.
+    Returns how many were capped, or None when it could not run (nothing is changed)."""
+    if os.path.exists(SHARE_LINKS_CAP_MARKER_FILE):
+        return 0
+    now = time.time() if now is None else now
+    links = {}
+    if os.path.exists(SHARE_LINKS_FILE):
+        try:
+            with open(SHARE_LINKS_FILE, 'r') as f:
+                links = json.load(f)
+        except (ValueError, IOError):
+            return None  # unreadable: never write over it, try again at the next start
+        if not isinstance(links, dict):
+            return None
+    capped = 0
+    for info in links.values():
+        if isinstance(info, dict) and not info.get('expires'):
+            info['expires'] = now + SHARE_LINK_LEGACY_CAP_SECONDS
+            info['ttl_label'] = '24 hours (set by the update)'
+            capped += 1
+    try:
+        if capped:
+            with open(SHARE_LINKS_FILE, 'w') as f:
+                json.dump(links, f, indent=2)
+        with open(SHARE_LINKS_CAP_MARKER_FILE, 'w') as f:
+            json.dump({'capped': capped, 'at': int(now)}, f)
+    except (IOError, OSError):
+        return None
+    return capped
 
 # Which groups a signed-in person is in (ops #1082).
 #
@@ -552,8 +593,12 @@ def _editor_tls_install(app):
 def apply_ldap_overlay(app):
     """Patch the Flask app for Authentik/LDAP mode."""
     _editor_tls_install(app)
+    try:
+        cap_never_ending_share_links()
+    except Exception:
+        pass  # never stop the editor from starting over this
 
-    VIEWER_ALLOWED = ('/viewer', '/api/viewer/streams', '/api/share-links', '/api/share-links/generate', '/api/theme/logo')
+    VIEWER_ALLOWED =('/viewer', '/api/viewer/streams', '/api/share-links/generate', '/api/theme/logo')
     VIEWER_PREFIXES = ('/watch/', '/hls-proxy/', '/shared/', '/shared-hls/')
 
     _untrusted_seen = set()
@@ -638,6 +683,36 @@ def apply_ldap_overlay(app):
             p = request.path
             if p not in VIEWER_ALLOWED and not p.startswith('/static') and not any(p.startswith(px) for px in VIEWER_PREFIXES):
                 return redirect('/viewer')
+
+    # ── Share links made by viewers ─────────────────────────────────────
+    # A viewer makes a link only for a stream they may watch themselves, and the
+    # link ends within a day. Only an admin lists links or makes one that never ends.
+
+    @app.before_request
+    def _viewer_share_link_policy():
+        if session.get('role') != 'viewer':
+            return
+        if request.path == '/api/share-links':
+            return jsonify({'error': 'Only an administrator can list share links'}), 403
+        if request.path != '/api/share-links/generate' or request.method != 'POST':
+            return
+        groups = set(session.get('ldap_groups') or [])
+        if not (groups & VIEWER_GROUPS):
+            return jsonify({'error': 'No video access. Contact your administrator.'}), 403
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'error': 'Stream name required'}), 400
+        stream = str(data.get('stream') or '').strip()
+        if not _valid_path(stream):
+            return jsonify({'error': 'Invalid stream name'}), 400
+        # Same lookup as /hls-proxy/: a private parent path makes the stream private.
+        names = {stream, stream.rsplit('/', 1)[0]} if '/' in stream else {stream}
+        vis = _load_visibility()
+        if any(vis.get(n, 'public') == 'private' for n in names) and 'vid_private' not in groups:
+            return jsonify({'error': 'You do not have access to this stream'}), 403
+        ttl = data.get('ttl')
+        if isinstance(ttl, bool) or not isinstance(ttl, int) or not (1 <= ttl <= SHARE_LINK_VIEWER_MAX_SECONDS):
+            return jsonify({'error': 'A link you make lasts at most 24 hours'}), 400
 
     # ── HLS helpers ─────────────────────────────────────────────────────
 
