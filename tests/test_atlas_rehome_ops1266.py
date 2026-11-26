@@ -67,6 +67,7 @@ class World:
         self.fail_up_from = set()
         self.compose_up_log = []
         self.started_proxy = False
+        self.wrong_project = []
 
     # ---- building a box ----
     def deployment(self, slug, project, pg='bind', up=True, files=True):
@@ -132,6 +133,15 @@ class World:
     # ---- docker compose, as `_broker_compose` runs it ----
     def compose(self, where, action, timeout=300):
         project = self.names[os.path.basename(where)]
+        # ⚠️ Like the real compose file, which names its project `takmdm`: without
+        # `-p` it addresses the plain deployment whatever the directory is. Found
+        # on test6, where an agency was "stopped" in the wrong project (ops #1266).
+        prefix = '-p %s ' % project
+        if not action.startswith(prefix):
+            self.wrong_project.append((where, action))
+            project = 'takmdm'
+        else:
+            action = action[len(prefix):]
         self.calls.append(('compose', action, where))
         mine = [n for n, c in self.containers.items() if c['project'] == project]
         if action == 'stop':
@@ -509,3 +519,26 @@ def test_app_hands_the_module_its_path_rewrite_and_runs_the_rehome():
     # After the registry, which is what gives the ctx its meaning.
     assert (APP.index('mod_registry.init_registry(app, _MODULE_CTX')
             < APP.index('mod_registry.atlas.rehome_root_era(_MODULE_CTX)'))
+
+
+def test_every_compose_call_names_its_project(world):
+    """⚠️ **The test6 finding.** The compose file is named `takmdm`, so an agency
+    addressed by directory alone is the plain deployment's project: `stop` did
+    nothing to it and the move was refused."""
+    world.deployment('default', 'takmdm')
+    world.deployment('corona', 'takmdm-corona')
+
+    out = run(world)
+
+    assert world.wrong_project == []
+    assert all(v.startswith('moved') for v in out.values())
+    assert all(c['running'] for c in world.containers.values())
+
+
+def test_a_project_name_that_is_not_a_plain_token_is_ignored(world):
+    world.deployment('default', 'takmdm')
+    world.containers['x-api-1'] = {'project': 'bad name; rm', 'service': 'api',
+                                   'workdir': str(world.root / 'evil'),
+                                   'running': True}
+
+    assert [p for p, _ in atlas.root_era_units()] == ['takmdm']

@@ -3050,7 +3050,8 @@ def root_era_units():
     for line in (out or '').splitlines():
         project, _, workdir = line.partition('\t')
         project, workdir = project.strip(), workdir.strip()
-        if project and workdir and (project, workdir) not in seen:
+        if (project and workdir and (project, workdir) not in seen
+                and re.fullmatch(r'[a-z0-9][a-z0-9_-]*', project)):
             seen.add((project, workdir))
             if _ROOT_ERA_UNIT.match(workdir):
                 units.append((project, workdir))
@@ -3200,7 +3201,16 @@ def rehome_root_era(ctx, log=None, wait_healthy=90, sleep=time.sleep):
 
 
 def _rehome_unit(ctx, project, src, dst, log, wait_healthy, sleep):
-    sudo, compose = ctx['_sudo_wrap'], ctx['_broker_compose']
+    sudo = ctx['_sudo_wrap']
+
+    def compose(where, action, timeout=300):
+        # ⚠️ **`-p <project>` on every call (found on test6, ops #1266).** ATLAS's
+        # compose file names its project `takmdm`, so a bare `--project-directory`
+        # addresses the plain deployment whatever directory it is given. An
+        # agency (`takmdm-corona`) was "stopped" in the wrong project, still
+        # running, and the move refused. `_compose` passes `-p` the same way.
+        return ctx['_broker_compose'](where, '-p %s %s' % (project, action),
+                                      timeout=timeout)
 
     def priv(argv, timeout=300):
         return subprocess.run(sudo(argv), capture_output=True, text=True,
