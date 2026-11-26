@@ -214,6 +214,15 @@ def test_selinux_off_is_a_no_op(tmp_path):
     assert not any('semodule' in c for c in run.calls)
 
 
+def test_ubuntu_has_no_selinux_tools_and_nothing_happens(tmp_path):
+    """No getenforce on Ubuntu: the check must return before it runs any command."""
+    ns, _, run = _env(tmp_path, stamp='1.0')
+    ns['shutil'] = types.SimpleNamespace(which=lambda n: None)
+    assert ns['_selinux_helper_module_pending']() is None
+    assert ns['_startup_selinux_helper_module_nudge']() is False
+    assert run.calls == []
+
+
 def _join_watchers():
     for t in threading.enumerate():
         if t.name == 'selinux-helper-module-nudge':
