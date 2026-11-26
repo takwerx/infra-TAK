@@ -31,6 +31,14 @@ Official: [Ubuntu Pro client](https://documentation.ubuntu.com/pro-client/), [ap
 - The apt codename comes from `/etc/os-release`, not `lsb_release`. A minimal 24.04 image can lack `lsb_release`, and an empty codename writes `apt -pgdg main`, which apt rejects for every source. 👁 observed, v10.3.0.
 - To model apt behaviour without a Pro token or a new VM, use a fresh `ubuntu` container and write the pin file by hand.
 
+## ufw and fail2ban (Ubuntu firewall bans)
+
+Official: [ufw(8)](https://manpages.ubuntu.com/manpages/jammy/man8/ufw.8.html), [fail2ban action.d/ufw.conf](https://github.com/fail2ban/fail2ban/blob/1.0.2/config/action.d/ufw.conf)
+
+- **`ufw insert 1 reject from <IPv6>` always fails; `ufw prepend reject from <IPv6>` works.** ufw 0.36.1 (Ubuntu 22.04) and 0.36.2 (24.04) answer `ERROR: Invalid position '1'` for an IPv6 source at position 1, even with no other rule. The same command with an IPv4 source works. The stock fail2ban 1.0.2 ufw action already uses `add = prepend`; the stock 0.11.2 action (Ubuntu 22.04) still uses `insert <insertpos>`. So no IPv6 ban in an all-ports ufw jail became a firewall rule until `infratak-ufw` switched to `ufw prepend` (ops #1275). `ufw delete reject from <IPv6> to any` removes the rule; deleting one that is not there returns 0. ✅ verified 2026-11-25, Ubuntu 22.04 (ufw 0.36.1, fail2ban 0.11.2) and 24.04 (ufw 0.36.2, fail2ban 1.0.2) containers, and aws-arm (Ubuntu 22.04 ARM64, ufw 0.36.1, fail2ban 0.11.2).
+- **fail2ban reads an action file only when it starts.** A reload leaves current bans on the action they were made with, so a changed action file reaches a box only after a stop and start. The console does that under the ufw lock (`_startup_f2b_ufw_lock_switch`). On aws-arm the first console start on the new code restarted fail2ban once; the second console start did not. ✅ verified 2026-11-25, aws-arm (ops #1275).
+- In the numbered `ufw status`, a `(v6)` rule is numbered after all IPv4 rules, so a freshly prepended IPv6 ban shows at a high number (36 of 37 on aws-arm). It is still first among the IPv6 rules. 👁 observed 2026-11-25, aws-arm.
+
 ## PGDG (PostgreSQL package repositories)
 
 Official: [apt](https://wiki.postgresql.org/wiki/Apt), [yum/dnf](https://www.postgresql.org/download/linux/redhat/)
