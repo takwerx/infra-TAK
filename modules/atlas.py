@@ -2145,6 +2145,80 @@ def agency_group_problem(settings, inst):
             'deployment\'s application.' % (group, why))
 
 
+#: Written above `TAKMDM_ADMIN_GROUP`: the groups infra-TAK put there itself, so
+#: the next update can tell them from groups the operator added (issue #14).
+_MANAGED_ADMIN_MARK = '# infra-TAK manages these admin groups: '
+
+
+def merged_admin_groups(current, managed, previously_managed=(), never=()):
+    """The admin groups to write: the managed ones first, then the operator's.
+
+    `current` is what the line holds now. A name from it stays unless infra-TAK
+    put it there before (`previously_managed`) or it may never be an admin
+    group (`never`). Pure, so the rule is tested without a `.env`.
+
+    ⚠️ **`previously_managed` is what makes a rename safe.** When Authentik's
+    superuser group is renamed, the old name is still on the line. Kept as if
+    the operator had added it, a name that no longer means "administrator"
+    would admit whoever is later put in a group of that name.
+    """
+    out = list(managed)
+    drop = set(previously_managed) | set(never)
+    for name in current:
+        if name and name not in out and name not in drop:
+            out.append(name)
+    return out
+
+
+def _last_env_value(body, key):
+    """The value of the last `KEY=` line (the one docker compose uses), or ''."""
+    value = ''
+    for line in body.splitlines():
+        if line.startswith(key + '='):
+            value = line[len(key) + 1:]
+    return value.strip().strip('"').strip("'")
+
+
+def _last_marked(body, mark):
+    value = ''
+    for line in body.splitlines():
+        if line.startswith(mark):
+            value = line[len(mark):]
+    return value
+
+
+def _admin_group_names(value):
+    return [n.strip() for n in (value or '').split(',') if n.strip()]
+
+
+def _previously_managed_admin_groups(body, inst):
+    """The names infra-TAK wrote before: the recorded ones, plus the defaults.
+
+    A `.env` from before the record existed holds only what infra-TAK wrote or
+    what the operator wrote, and the default names are the former.
+    """
+    names = set(_admin_group_names(_last_marked(body, _MANAGED_ADMIN_MARK)))
+    names.add(ADMIN_GROUP)
+    derived = atlas_instances.derive(inst)
+    if derived['slug']:
+        names.add(derived['admin_group'])
+    return names
+
+
+def _never_admin_groups(body, inst):
+    """Groups that must not be on the admin line, whoever put them there.
+
+    ⚠️ The renewal group locked every administrator out once (ops #510): only
+    its service account is in it. A standard-admin group on the admin line
+    makes its members full administrators, which ATLAS warns about.
+    """
+    names = {atlas_renewal.GROUP_NAME, atlas_roster.names(inst)['standard_group']}
+    standard = _last_env_value(body, atlas_roster.ENV_GROUP)
+    if standard:
+        names.add(standard)
+    return names
+
+
 def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
     """Turn on ATLAS's own two admin checks, once it is safe to.
 
@@ -2177,23 +2251,41 @@ def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
     # the agency's administrators with a 403 *after* Authentik had let them
     # through — the confusing half of a lockout, where the proxy says yes and
     # the application says no.
-    wanted = ','.join(admin_groups_for(inst, global_group))
-    if 'TAKMDM_ADMIN_GROUP=' + wanted not in body:
+    #
+    # ⚠️ **Merged, not replaced (ATLAS issue #14).** This used to write exactly
+    # the managed groups, so a group the operator had added (`ATLAS-Admins`)
+    # was dropped on every update — while `atlas_access` kept that group in
+    # the Authentik policy. Authentik let those administrators in and ATLAS
+    # refused them: the same lockout as above, made by an update.
+    managed = admin_groups_for(inst, global_group)
+    current = _admin_group_names(_last_env_value(body, 'TAKMDM_ADMIN_GROUP'))
+    wanted_names = merged_admin_groups(
+        current, managed,
+        previously_managed=_previously_managed_admin_groups(body, inst),
+        never=_never_admin_groups(body, inst))
+    wanted = ','.join(wanted_names)
+    lines_now = [l for l in body.splitlines() if l.startswith('TAKMDM_ADMIN_GROUP=')]
+    if current != wanted_names or len(lines_now) != 1:
         lines = [l for l in body.splitlines()
-                 if not l.startswith('TAKMDM_ADMIN_GROUP=')]
-        lines.append('')
-        lines.append('# SEC_AUDIT (ATLAS) H-1. The Authentik application binding is the')
-        lines.append('# first gate; this makes ATLAS check as well, so the binding being')
-        lines.append('# removed is a lockout rather than a silent promotion of everyone.')
-        lines.append('#')
-        lines.append('# Any one of these is sufficient (ATLAS >= 1.49.0). The agency\'s own')
-        lines.append('# administrators and the global ones are alternatives, never the')
-        lines.append('# same person.')
+                 if not l.startswith('TAKMDM_ADMIN_GROUP=')
+                 and not l.startswith(_MANAGED_ADMIN_MARK)]
+        if not any(l.startswith('# SEC_AUDIT (ATLAS) H-1.') for l in lines):
+            lines.append('')
+            lines.append('# SEC_AUDIT (ATLAS) H-1. The Authentik application binding is the')
+            lines.append('# first gate; this makes ATLAS check as well, so the binding being')
+            lines.append('# removed is a lockout rather than a silent promotion of everyone.')
+            lines.append('#')
+            lines.append('# Any one of these is sufficient (ATLAS >= 1.49.0). The agency\'s own')
+            lines.append('# administrators and the global ones are alternatives, never the')
+            lines.append('# same person. Groups you add to this line are kept on update.')
+        lines.append(_MANAGED_ADMIN_MARK + ','.join(managed))
         lines.append('TAKMDM_ADMIN_GROUP=' + wanted)
         body = '\n'.join(lines) + '\n'
         changed = True
-        plog('✓ ATLAS will require membership of %s'
-             % ' or '.join('"%s"' % n for n in admin_groups_for(inst, global_group)))
+        kept = [n for n in wanted_names if n not in managed]
+        plog('✓ ATLAS will require membership of %s%s'
+             % (' or '.join('"%s"' % n for n in wanted_names),
+                (' (kept your %s)' % ', '.join('"%s"' % n for n in kept)) if kept else ''))
 
     # --- S-1: prove the identity headers came through Caddy -----------------
     if 'TAKMDM_PROXY_AUTH_SECRET=' not in body:
