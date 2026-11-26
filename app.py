@@ -30266,6 +30266,10 @@ KNOWN_SECURITY_RELEASES = (
     # drops a distrusted root the container still trusted in 2026.8.4.
     {'component': 'authentik', 'fixed_in': '2026.8.5',
      'reason': 'a certificate bundle that still trusted a distrusted root (eMudhra)'},
+    # ops #1276: 2026.8.7 is a security release. Kept here as well as in Authentik's own
+    # advisory list, so the mail still says it is a security update when GitHub cannot be read.
+    {'component': 'authentik', 'fixed_in': '2026.8.7',
+     'reason': 'Authentik security flaws'},
     # ops #1253: CloudTAK plugins from TAK Portal's Marketplace use component `plugin:<id>`
     # (the Marketplace id). Add a plugin's security release here only once it is public.
     # Dispatcher 1.8.1 (public Nov 25, 2026; its release notes say "Security update").
