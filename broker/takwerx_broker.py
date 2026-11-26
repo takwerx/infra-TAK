@@ -930,7 +930,9 @@ _AK_FORWARDER_SCRIPT = ('docker logs -f authentik-server-1 2>&1 | grep --line-bu
                         '-F invalid_login >> /var/log/authentik/auth.log')
 _CONTAINER_RE = r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}'
 _STAGGER_STEP_RES = (
-    re.compile(rf'docker stop( {_CONTAINER_RE})+ 2>/dev/null; true'),
+    # GH #756: `timeout N` bounds a stop dockerd never answers (coreutils timeout, PATH as
+    # every other step here). The bare form stays for units written before.
+    re.compile(rf'(timeout [0-9]{{1,4}} )?docker stop( {_CONTAINER_RE})+ 2>/dev/null; true'),
     re.compile(r'echo "(Starting [A-Za-z ]{1,40}\.\.\.|All containers started)"'),
     re.compile(rf'docker start( {_CONTAINER_RE})+'),
     re.compile(r'sleep [0-9]{1,3}'),

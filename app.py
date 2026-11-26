@@ -1750,7 +1750,12 @@ MEDIAMTX_VETTED_RELEASE = "1.21.4"      # ops #817: 1.21.3 → 1.21.4 (RTSP-over
 # them. An install older than a step below is updated to that step first; the next Update
 # takes it the rest of the way (_ak_upgrade_hop). Each entry is the last vetted patch of a
 # family. Add the outgoing family's last vetted patch here whenever a new family is promoted.
-AUTHENTIK_UPGRADE_STEPS = ("2026.5.7",)
+# A box on an older family waits on this step until its second Update press, so the step must
+# be at or above that family's security floor (tests/test_authentik_2026_8_promotion.py,
+# AUTHENTIK_SECURITY_FLOOR). Raise it in the same PR that raises the floor.
+# ops #1290: 2026.5.7 -> 2026.5.9 (same-minor security release for the 2026.5 line, no database
+# migration between the two; upstream compare 2026.5.7...2026.5.9 shows no migrations file).
+AUTHENTIK_UPGRADE_STEPS = ("2026.5.9",)
 AUTHENTIK_DEV_RELEASE    = "2026.8.7"   # OFFLINE FALLBACK ONLY — dev channel tracks upstream-latest live (_get_authentik_target_release); this value is used only when the GitHub lookup is unreachable. Bump it to the current latest when convenient, but it no longer gates what dev installs.
 # CloudTAK version target. v13.45 split the server into hub (stateful) / api (stateless) modes —
 # a breaking change for plugin server routes, which now live in api/stateless/routes/ with the
@@ -23292,6 +23297,56 @@ def _f2b_fleet_ignore_cidrs():
         raw = ''
     return [c.strip() for c in raw.replace(',', ' ').split() if c.strip()]
 
+# How many removed trusted addresses we remember (oldest forgotten first).
+_F2B_RETIRED_MAX = 200
+
+def _f2b_retired_cidrs():
+    """Addresses the operator once had on the trusted list and then removed (settings
+    'fail2ban_ignore_retired'). Needed because a jail file does not say where an entry
+    came from: once a CIDR leaves 'fail2ban_ignore_cidrs' it looks exactly like an entry
+    the operator typed into that one jail, and every writer would put it back
+    (ops #1286). _f2b_operator_extra drops these."""
+    try:
+        raw = load_settings().get('fail2ban_ignore_retired', '') or ''
+    except Exception:
+        raw = ''
+    return [c.strip() for c in str(raw).replace(',', ' ').split() if c.strip()]
+
+def _f2b_set_fleet_cidrs(s_cfg, cidrs):
+    """The ONE place that changes the trusted list in `s_cfg` (the settings dict; the
+    caller saves it). Anything the new list no longer holds is remembered as retired, and
+    anything it holds again stops being retired."""
+    old = [c.strip() for c in str(s_cfg.get('fail2ban_ignore_cidrs', '') or '').replace(',', ' ').split() if c.strip()]
+    new = []
+    for c in cidrs:
+        c = str(c).strip()
+        if c and c not in new:
+            new.append(c)
+    retired = [c.strip() for c in str(s_cfg.get('fail2ban_ignore_retired', '') or '').replace(',', ' ').split()
+               if c.strip() and c.strip() not in new]
+    for c in old:
+        if c not in new and c not in retired:
+            retired.append(c)
+    s_cfg['fail2ban_ignore_cidrs'] = ' '.join(new)
+    s_cfg['fail2ban_ignore_retired'] = ' '.join(retired[-_F2B_RETIRED_MAX:])
+    return new
+
+def _f2b_unretire(ignoreip_text):
+    """An operator who types an address into one jail's own whitelist and presses Save
+    means it: stop treating it as a removed trusted address. Never raises."""
+    try:
+        typed = set(str(ignoreip_text or '').replace(',', ' ').split())
+        if not typed:
+            return
+        s_cfg = load_settings()
+        retired = [c for c in str(s_cfg.get('fail2ban_ignore_retired', '') or '').split() if c]
+        keep = [c for c in retired if c not in typed]
+        if len(keep) != len(retired):
+            s_cfg['fail2ban_ignore_retired'] = ' '.join(keep)
+            save_settings(s_cfg)
+    except Exception:
+        pass
+
 def _f2b_trusted_ignoreip(extra=''):
     """Build the full ignoreip whitelist for ANY infra-TAK jail, fleet-uniform:
     localhost + the box's attached private subnet(s) + our own container bridges +
@@ -23369,7 +23424,7 @@ def _f2b_seed_console_client_ignore(client_ip, why=''):
         existing = _f2b_fleet_ignore_cidrs()
         if ip not in existing:
             existing.append(ip)
-        s_cfg['fail2ban_ignore_cidrs'] = ' '.join(existing)
+        _f2b_set_fleet_cidrs(s_cfg, existing)
         s_cfg['fail2ban_ignore_seeded'] = True
         save_settings(s_cfg)
         print(f"fail2ban: seeded console client {ip} into the never-ban list "
@@ -23391,6 +23446,9 @@ def _f2b_operator_extra(stored):
     fleet.update(_f2b_container_subnets())
     fleet.update(_f2b_own_addresses())
     fleet.update(_f2b_fleet_ignore_cidrs())
+    # An address taken off the trusted list is no longer in the set above, so without this
+    # it would read as a per-jail entry and be written straight back (ops #1286).
+    fleet.update(_f2b_retired_cidrs())
     return ' '.join(t for t in str(stored or '').split() if t not in fleet)
 
 def _f2b_read_jail_config():
@@ -26076,7 +26134,8 @@ def fail2ban_authentik_toggle_api():
         return jsonify({'ok': True, 'enabled': False})
     # Enable: write jail config (preserving existing thresholds/ignoreip if present)
     cfg = _f2b_read_jail_config()
-    ignoreip = str(data.get('ignoreip', cfg.get('ignoreip', ''))).strip()
+    ignoreip = str(data.get('ignoreip', _f2b_operator_extra(cfg.get('ignoreip', '')))).strip()
+    _f2b_unretire(ignoreip)
     maxretry = int(data.get('maxretry', cfg.get('maxretry', 5)))
     findtime = int(data.get('findtime', cfg.get('findtime', 600)))
     bantime  = int(data.get('bantime',  cfg.get('bantime',  3600)))
@@ -26162,6 +26221,7 @@ def fail2ban_config_api():
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     ignoreip = str(data.get('ignoreip', '')).strip()
+    _f2b_unretire(ignoreip)
     try:
         _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip)
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
@@ -26286,6 +26346,7 @@ def fail2ban_tak_config_api():
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     ignoreip = str(data.get('ignoreip', '')).strip()
+    _f2b_unretire(ignoreip)
     try:
         _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip)
         # Ensure the fail2ban daemon is running before reloading jails
@@ -26544,6 +26605,7 @@ def fail2ban_ssh_config_api():
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     ignoreip = str(data.get('ignoreip', '')).strip()
+    _f2b_unretire(ignoreip)
     try:
         _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip)
         # Ensure the fail2ban daemon is running before reloading
@@ -27091,8 +27153,9 @@ def fail2ban_mediamtx_config_api():
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     try:
-        _f2b_write_mediamtx_jail(maxretry, findtime, bantime,
-                                 str(data.get('ignoreip', '') or '').strip())
+        _mtx_ignoreip = str(data.get('ignoreip', '') or '').strip()
+        _f2b_unretire(_mtx_ignoreip)
+        _f2b_write_mediamtx_jail(maxretry, findtime, bantime, _mtx_ignoreip)
         _svc = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                               capture_output=True, text=True)
         if _svc.stdout.strip() != 'active':
@@ -27197,7 +27260,9 @@ TAKPORTAL_F2B_LOG = '/var/log/tak-portal/lookup.log'
 # v10.1.11 — what the jail ACTUALLY reads. The native log above was never written
 # (see generate_caddyfile()'s TAK Portal block), so the jail is fed from Caddy's
 # access log for the Portal host instead. Caddy owns /var/log/caddy and rolls this
-# file itself (10MiB x5), so it needs no logrotate rule of ours.
+# file itself (10MiB x5), so it needs no logrotate rule of ours. On RHEL that roll
+# needs the httpd_t rule in selinux/takwerx_console.te (1.1, ops #1299): without it
+# the roll was denied at 10 MiB and the log stopped growing for good.
 TAKPORTAL_CADDY_LOG = '/var/log/caddy/takportal-access.log'
 # Blunter signal than the original per-result contract (HTTP status can't tell a
 # fat-fingered domain from a scripted probe), so the threshold is raised: a human
@@ -27382,6 +27447,7 @@ def fail2ban_takportal_config_api():
         findtime = max(10, min(86400,   int(data.get('findtime', 600))))
         bantime  = max(60, min(2592000, int(data.get('bantime',  3600))))
         ignoreip = str(data.get('ignoreip', '')).strip()
+        _f2b_unretire(ignoreip)
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     try:
@@ -27551,7 +27617,7 @@ def fail2ban_trusted_cidrs_api():
         if c not in cleaned:
             cleaned.append(c)
     s = load_settings()
-    s['fail2ban_ignore_cidrs'] = ' '.join(cleaned)
+    _f2b_set_fleet_cidrs(s, cleaned)
     save_settings(s)
     rewritten = _f2b_rewrite_all_jails()
     try:
@@ -27683,7 +27749,7 @@ def fail2ban_add_my_ip_api():
                         'cidrs': cidrs, 'effective': _f2b_trusted_ignoreip()})
     cidrs.append(ip)
     s_cfg = load_settings()
-    s_cfg['fail2ban_ignore_cidrs'] = ' '.join(cidrs)
+    _f2b_set_fleet_cidrs(s_cfg, cidrs)
     # An explicit click counts as the seed — do not let an automatic seed add a second,
     # different address later (e.g. one visit from another network).
     s_cfg['fail2ban_ignore_seeded'] = True
@@ -46168,6 +46234,54 @@ def _install_le_cert_on_8446_at_deploy(host, log_step):
     return ok
 
 
+# ops #1295: on Rocky 9 the Caddy step failed in 2 seconds with only "Caddy install failed" in the
+# log, and every later module then said "not tried". The @caddy/caddy COPR answers badly for a
+# moment now and then (the same install passed minutes later), and the old code ran the COPR
+# step with no check, never retried, and never printed what dnf said. Now each try shows dnf's
+# own words and the step is tried again after a pause.
+CADDY_DNF_TRIES = 4
+CADDY_DNF_DELAY = 15     # seconds between tries
+
+
+def _caddy_dnf_install(plog, tries=None, delay=None):
+    """Install Caddy from the @caddy/caddy COPR on a dnf box. Returns True when it installed.
+
+    `dnf copr enable` is checked, because a failed enable makes `dnf install caddy` say only
+    "No match for argument". A failed try logs the last 300 characters of dnf's output (the
+    apt branch does the same) and is tried again after `delay` seconds, `tries` tries in all.
+    A timeout counts as a failed try and never raises. The copr plugin line keeps its old
+    meaning: it logs a failure and goes on, as the plugin is often there already."""
+    tries = CADDY_DNF_TRIES if tries is None else tries
+    delay = CADDY_DNF_DELAY if delay is None else delay
+
+    def _step(argv, limit):
+        try:
+            r = subprocess.run(_sudo_wrap(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, timeout=limit)
+            return r.returncode, (r.stdout or '').strip()
+        except subprocess.TimeoutExpired:
+            return 124, f'timed out after {limit} seconds'
+        except OSError as e:
+            return 127, str(e)
+
+    rc, out = _step(['dnf', 'install', '-y', 'dnf-command(copr)'], 120)
+    if rc != 0:
+        plog(f"  ⚠ dnf copr plugin did not install (going on): {out[-300:] or 'no output'}")
+    for n in range(1, tries + 1):
+        label = 'dnf copr enable @caddy/caddy'
+        rc, out = _step(['dnf', 'copr', 'enable', '-y', '@caddy/caddy'], 120)
+        if rc == 0:
+            label = 'the caddy package install'
+            rc, out = _step(['dnf', 'install', '-y', 'caddy'], 300)
+        if rc == 0:
+            return True
+        plog(f"  ✗ {label} failed (try {n} of {tries}): {out[-300:] or 'no output'}")
+        if n < tries:
+            plog(f"  Trying again in {delay} seconds...")
+            time.sleep(delay)
+    return False
+
+
 def run_caddy_deploy(domain):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -46231,13 +46345,21 @@ def run_caddy_deploy(domain):
                 return
         else:
             plog("  Installing Caddy via dnf...")
-            subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'dnf-command(copr)']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
-            subprocess.run(_sudo_wrap(['dnf', 'copr', 'enable', '-y', '@caddy/caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
-            r = subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
-            if r.returncode != 0:
-                plog(f"✗ Caddy install failed")
-                caddy_deploy_status.update({'running': False, 'error': True})
-                return
+            if not _caddy_dnf_install(plog):
+                # ops #1295. The static build alone has no `caddy` user and no caddy.service
+                # (the rpm scriptlets make those), so it is only a way forward when something of
+                # the package is already here: a working caddy, or an rpm whose payload is missing
+                # (the check below installs the binary then).
+                _have_bin = subprocess.run('caddy version', shell=True, capture_output=True).returncode == 0
+                _have_rpm = subprocess.run(['rpm', '-q', 'caddy'], capture_output=True).returncode == 0
+                if _have_bin or _have_rpm:
+                    plog("  ⚠ dnf could not install Caddy; going on with the Caddy already on this server.")
+                else:
+                    plog("✗ Caddy install failed: dnf could not install Caddy from the @caddy/caddy "
+                         "repository after several tries (reason above). The repository may be down "
+                         "or slow. Wait a few minutes, then run the Caddy deploy again.")
+                    caddy_deploy_status.update({'running': False, 'error': True})
+                    return
 
         # Verify install (if binary missing e.g. after uninstall, reinstall restores it)
         r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
@@ -50050,6 +50172,41 @@ def _takportal_build_env():
     return {**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(_TAKPORTAL_BUILD_TIMEOUT)}
 
 
+# GH #756: seconds a healthy dockerd takes to answer `docker inspect` for one container.
+_TAKPORTAL_INSPECT_TIMEOUT = 15
+_TAKPORTAL_DOCKER_STUCK_MSG = (
+    'Docker is stuck on the TAK Portal container {name}: it does not answer "docker inspect" '
+    'within {secs} seconds, so an update would wait on it until the build times out. Nothing was '
+    'changed. Restart Docker on this server (sudo systemctl restart docker), then press Update again.')
+
+
+def _takportal_docker_stuck(timeout=_TAKPORTAL_INSPECT_TIMEOUT):
+    """GH #756: the name of a TAK Portal container dockerd no longer answers for, or ''.
+
+    A field box after a Docker restart: `docker ps` listed tak-portal as Up, but
+    `docker inspect tak-portal` hung for ever (dockerd still held a lock on a container
+    whose processes were gone). `compose up --build` then built the new image and blocked
+    stopping the old container until the 900 s build timeout, and the console said only
+    "Build timed out". Ask dockerd about each container first, with a short timeout. Any
+    other failure (no Docker, no containers, a refused call) is not a hang: ''.
+    An empty list (dockerd did not answer `docker ps` either, or no project) still asks
+    about 'tak-portal' by name: an absent one answers at once, a frozen dockerd does not."""
+    try:
+        try:
+            _cs = _takportal_project_containers(all_states=True)
+        except Exception:
+            _cs = []
+        for c in (_cs or [{'id': 'tak-portal', 'name': 'tak-portal'}]):
+            try:
+                subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Status}}', c['id']]),
+                               capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return c.get('name') or c['id']
+    except Exception:
+        pass
+    return ''
+
+
 @_records_module_update(  # v10.2.8 W10 — on the job since ops #72 (the route now answers 202 at once)
     'takportal', from_fn=lambda: (_get_takportal_version_info().get('version') or ''))
 def _takportal_run_update(portal_dir):
@@ -50065,6 +50222,14 @@ def _takportal_run_update(portal_dir):
     # "Updated" ([[takportal-update-silent-pull-failure]]). Both are fixed here:
     # the channel comes from TAK Portal's own BETA_MODE, and a git failure is a
     # hard 500 with the git error in it.
+    #
+    # GH #756: first make sure dockerd still answers for the portal's containers. A stuck
+    # one turns the build below into a silent 900 s wait; say what is wrong, change nothing.
+    _stuck = _takportal_docker_stuck()
+    if _stuck:
+        _msg = _TAKPORTAL_DOCKER_STUCK_MSG.format(name=_stuck, secs=_TAKPORTAL_INSPECT_TIMEOUT)
+        print(f'[takportal] update: {_msg}', flush=True)
+        return {'success': False, 'error': _msg}, 500
     _mod_result_step('takportal', 'Step 1/2: fetching the release')
     gitr = _takportal_update_git(portal_dir)
     # ops #380: the record said "2.0.25 -> ?" because only a success ever filled in the target.
@@ -66129,25 +66294,55 @@ def _update_boot_stagger_service():
         all_containers = []
         for _, containers, _ in BOOT_ORDER:
             all_containers.extend(c for c in containers if c in existing)
-        stop_cmd = f'docker stop {" ".join(all_containers)} 2>/dev/null; true'
         steps.append('echo "All containers started"')
-        exec_cmd = ' && \\\n  '.join(steps)
-        unit = (
-            '[Unit]\n'
-            'Description=Stagger Docker container startup on boot\n'
-            'After=docker.service\n'
-            'Requires=docker.service\n\n'
-            '[Service]\n'
-            'Type=oneshot\n'
-            'RemainAfterExit=yes\n'
-            f"ExecStart=/bin/bash -c '\\\n  {stop_cmd} && \\\n  {exec_cmd}'\n\n"
-            '[Install]\n'
-            'WantedBy=multi-user.target\n'
-        )
-        _write_priv('/etc/systemd/system/docker-stagger.service', unit)
+        try:
+            _write_priv('/etc/systemd/system/docker-stagger.service',
+                        _boot_stagger_unit_text(all_containers, steps))
+        except BrokerError:
+            # A broker from before GH #756 refuses the `timeout` on the stop step. Keep the
+            # rest of the fix (Wants=, the start timeout) until the broker is updated.
+            _write_priv('/etc/systemd/system/docker-stagger.service',
+                        _boot_stagger_unit_text(all_containers, steps, stop_timeout=0))
         _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', 'docker-stagger']], 'and', timeout=10)
     except Exception:
         pass
+
+
+# GH #756: bounds for docker-stagger. A Type=oneshot unit has no start timeout by default, so
+# one `docker stop` that dockerd never answers held the whole sequence (and every TAK Portal
+# start, recreate and update behind it) for 1 h 47 min on a field box.
+_BOOT_STAGGER_STOP_TIMEOUT = 120      # the client-side limit on the one `docker stop` of them all
+_BOOT_STAGGER_START_TIMEOUT = 900     # the whole unit; systemd marks it failed past this
+
+
+def _boot_stagger_unit_text(all_containers, steps, stop_timeout=_BOOT_STAGGER_STOP_TIMEOUT):
+    """The docker-stagger.service text. Pure; the broker's unit check reads the same shape.
+
+    GH #756: `Wants=docker.service`, never `Requires=`. With Requires=, systemd restarts this
+    unit whenever docker.service restarts (systemd.unit(5): "If one of the other units is
+    explicitly stopped (or restarted), this unit will be stopped (or restarted) too"
+    https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#Requires=).
+    So a Docker restart in the middle of a console update (a docker-ce package update, a
+    daemon.json change) stopped Authentik and TAK Portal again, racing the console's own
+    TAK Portal restart. The sequencer is for boot; after a plain Docker restart the
+    containers' own restart policy brings them back. After=docker.service keeps the order."""
+    stop_cmd = f'docker stop {" ".join(all_containers)} 2>/dev/null; true'
+    if stop_timeout:
+        stop_cmd = f'timeout {int(stop_timeout)} {stop_cmd}'
+    exec_cmd = ' && \\\n  '.join(steps)
+    return (
+        '[Unit]\n'
+        'Description=Stagger Docker container startup on boot\n'
+        'After=docker.service\n'
+        'Wants=docker.service\n\n'
+        '[Service]\n'
+        'Type=oneshot\n'
+        'RemainAfterExit=yes\n'
+        f'TimeoutStartSec={_BOOT_STAGGER_START_TIMEOUT}\n'
+        f"ExecStart=/bin/bash -c '\\\n  {stop_cmd} && \\\n  {exec_cmd}'\n\n"
+        '[Install]\n'
+        'WantedBy=multi-user.target\n'
+    )
 
 
 def _ensure_docker_log_limits(log_fn=None):
@@ -71933,7 +72128,8 @@ def authentik_control():
         import re as _re
         _inst = (_get_authentik_version_info().get('version') or '').strip()
         # v10.2.25: the next safe hop from what is running — a box on 2026.2.x goes to
-        # 2026.5.7 first, because 2026.8 will not start on a database that skipped 2026.5.
+        # the 2026.5 step (AUTHENTIK_UPGRADE_STEPS) first, because 2026.8 will not start on a
+        # database that skipped 2026.5.
         latest = _get_authentik_target_release(settings, installed=_inst)
         if not _ak_tag_is_sane(latest):
             return jsonify({'error': f'Refusing to update: target release '
@@ -92990,9 +93186,11 @@ _ak_group_names_state = {'at': 0.0, 'result': None, 'logged': set()}
 
 
 def _ak_group_name_findings(names):
-    """Which of `names` can be read as other groups. A name is listed when it holds "|"
-    (the header's own separator), or when a part of it between "|", ";" or "," is the
-    name of ANOTHER group (compared without case and outer spaces, as such readers do).
+    """Which of `names` hold a separator ("|", ";" or ","). ops #1294: every such name is
+    listed, because TAK Portal 2.0.42 refuses the three in NEW group names but does not
+    clean old ones and still splits the groups header on them. `reads_as` lists the
+    ANOTHER groups a part of the name equals (compared without case and outer spaces, as
+    such readers do): a non-empty list is the dangerous case (the red wording).
     Returns [{'name': ..., 'reads_as': [other group names]}], sorted by name."""
     names = [n for n in names if isinstance(n, str) and n]
     by_key = {}
@@ -93012,8 +93210,7 @@ def _ak_group_name_findings(names):
             key = part.strip().lower()
             if key and key != own and key in by_key and by_key[key] not in reads_as:
                 reads_as.append(by_key[key])
-        if '|' in n or reads_as:
-            out.append({'name': n, 'reads_as': reads_as})
+        out.append({'name': n, 'reads_as': reads_as})
     return out
 
 
@@ -93050,11 +93247,12 @@ def _ak_group_names_scan(force=False, max_age=AK_GROUP_NAME_SCAN_SECONDS):
         _ak_group_names_state['logged'].update(f['name'] for f in fresh)
     for f in fresh:
         detail = ('%r can be read as %s' % (f['name'], ', '.join(repr(x) for x in f['reads_as']))
-                  if f['reads_as'] else '%r holds the separator "|"' % f['name'])
+                  if f['reads_as'] else '%r holds a separator ("|", ";" or ",")' % f['name'])
         print('[authentik] \u26a0 GROUP NAME WARNING: the Authentik group %s by an app that '
-              'splits the group list. If you did not make this group on purpose, look at who '
-              'made it and who is in it (Authentik Admin, Directory, Groups), then rename or '
-              'delete it.' % detail, flush=True)
+              'splits the group list. Step: Authentik Admin, Directory, Groups, rename %r '
+              'without those characters (check who made it and who is in it first). '
+              'infra-TAK does not rename it: a rename can drop access.'
+              % (detail, f['name']), flush=True)
         try:
             audit('authentik:group-name-separator', detail, force=True)
         except Exception:
@@ -109066,6 +109264,206 @@ def _tak_admin_marti_get(url, timeout=12):
     return _tak_admin_marti_req(url, timeout=timeout)
 
 
+# ── Federation group names (gh #755, ops #1304) ───────────────────────────────────────────
+# infra-TAK's CoreConfig sets groupNameExtractorRegex="cn=tak_(.*?)(?:,|$)", so the TAK group a
+# user is in is the plain channel name ("Fire"), not the LDAP name ("cn=tak_Fire"). TAK Server's
+# own Federation Manager group search saves the LDAP name (GET /Marti/api/groups returns both
+# `cn` and `dn`; the picker keeps `dn`), so a federate set up with the search has inbound and
+# outbound groups no user is in: data flows one way, with the link CONNECTED and no error.
+# We find those names and swap them for the plain ones with the same Marti calls the Federation
+# Manager makes (federategroups, federategroupsmap, federategroupconfig).
+_FED_DN_GROUP_RE = re.compile(r'^cn=tak_(.*?)(?:,|$)')   # the same pattern CoreConfig uses
+_FED_BARE_PREFIX = 'tak_'
+_FED_FIX_LOCK = _threading.Lock()
+
+
+def _fed_q(s):
+    return urllib.parse.quote(str(s), safe='')
+
+
+def _fed_plain_group_name(name, live_names=None):
+    """The plain TAK group name for a federate group saved with the LDAP prefix, else None.
+
+    `cn=tak_X` can never match a user's group on infra-TAK, so it always maps to X. A bare
+    `tak_X` is only flagged when X is a real TAK group and `tak_X` is not (a channel really
+    called tak_X stays alone); with no live group list (live_names None) it is left alone."""
+    n = name if isinstance(name, str) else ''
+    m = _FED_DN_GROUP_RE.match(n)
+    if m:
+        return m.group(1) or None
+    if n.startswith(_FED_BARE_PREFIX) and live_names is not None:
+        plain = n[len(_FED_BARE_PREFIX):]
+        if plain and plain in live_names and n not in live_names:
+            return plain
+    return None
+
+
+def _fed_groups_plan(assoc, gmap, live_names=None):
+    """What to change for ONE federate. assoc is its list of {group, direction} (GET
+    /Marti/api/federategroups/<id>), gmap its group map (GET /Marti/api/federategroupsmap/<id>).
+    On a real TAK Server the map is {remoteGroup: [localGroup, ...]} (lists, although its OpenAPI
+    file says strings, verified on test12 Nov 26, 2026); a plain string is accepted too. Only the
+    LOCAL side is ever touched: the remote group names belong to the other server.
+    Returns {'groups': [{'group', 'plain', 'directions'}],
+             'maps': [{'remote', 'local', 'plain', 'plain_present'}],
+             'have': {group name: [directions already there]}}."""
+    by_group = {}
+    have = {}
+    for a in assoc or []:
+        if not isinstance(a, dict):
+            continue
+        g = a.get('group')
+        d = str(a.get('direction') or '').upper()
+        dirs = {'INBOUND', 'OUTBOUND'} if d == 'BOTH' else ({d} if d in ('INBOUND', 'OUTBOUND') else set())
+        if not isinstance(g, str) or not dirs:
+            continue
+        have.setdefault(g, set()).update(dirs)
+        plain = _fed_plain_group_name(g, live_names)
+        if plain:
+            by_group.setdefault(g, {'group': g, 'plain': plain, 'directions': set()})['directions'].update(dirs)
+    groups = [{'group': v['group'], 'plain': v['plain'], 'directions': sorted(v['directions'])}
+              for v in by_group.values()]
+    maps = []
+    for remote, locals_ in sorted((gmap or {}).items()):
+        vals = [x for x in (locals_ if isinstance(locals_, (list, tuple)) else [locals_]) if isinstance(x, str)]
+        for local in vals:
+            plain = _fed_plain_group_name(local, live_names)
+            if plain:
+                maps.append({'remote': remote, 'local': local, 'plain': plain, 'plain_present': plain in vals})
+    return {'groups': groups, 'maps': maps, 'have': {k: sorted(v) for k, v in have.items()}}
+
+
+def _fed_marti(path, method='GET', timeout=15, json_body=None):
+    return _tak_admin_marti_req('https://127.0.0.1:8443/Marti/api/' + path, timeout=timeout,
+                                method=method, json_body=json_body)
+
+
+def _fed_data(resp):
+    return resp.get('data') if isinstance(resp, dict) else resp
+
+
+def _fed_groups_scan():
+    """Read every federate's groups and group map and list the ones saved with the LDAP prefix.
+    Returns (result, error). result = {'federates': [{id, name, groups, maps, have}], 'count': n}
+    where only federates with something to fix are listed; error is a short string or None."""
+    live = _tak_channel_items()
+    live_names = ({((g.get('name') if isinstance(g, dict) else '') or '').strip() for g in live}
+                  if live is not None else None)
+    feds, err = _fed_marti('federates')
+    if feds is None:
+        return None, 'could not read federates from TAK Server (%s)' % err
+    feds = _fed_data(feds)
+    if not isinstance(feds, list):
+        return None, 'TAK Server returned an unexpected federate list'
+    out = []
+    for f in feds:
+        fid = f.get('id') if isinstance(f, dict) else None
+        if not fid:
+            continue
+        assoc, e1 = _fed_marti('federategroups/' + _fed_q(fid))
+        gmap, e2 = _fed_marti('federategroupsmap/' + _fed_q(fid))
+        if assoc is None or gmap is None:
+            return None, 'could not read the groups of federate %s (%s)' % (f.get('name') or fid, e1 or e2)
+        gm = _fed_data(gmap)
+        plan = _fed_groups_plan(_fed_data(assoc), gm if isinstance(gm, dict) else {}, live_names)
+        if plan['groups'] or plan['maps']:
+            plan.update({'id': fid, 'name': f.get('name') or fid})
+            out.append(plan)
+    return {'federates': out, 'count': sum(len(p['groups']) + len(p['maps']) for p in out)}, None
+
+
+def _fed_groups_apply(plans):
+    """Swap the prefixed names for the plain ones, for each federate in plans (from
+    _fed_groups_scan). The plain name is added FIRST and the prefixed one removed after, so a
+    federate never loses a group half way. Then persist with POST /Marti/api/federategroupconfig
+    (no TAK restart). Returns (changed, errors)."""
+    changed, errors = 0, []
+    for p in plans:
+        fid = _fed_q(p['id'])
+        for g in p['groups']:
+            need = set(g['directions'])
+            add = need - set(p.get('have', {}).get(g['plain'], []))
+            if add:
+                d = 'BOTH' if add == {'INBOUND', 'OUTBOUND'} else sorted(add)[0]
+                ok, e = _fed_marti('federategroups', method='POST', timeout=20,
+                                   json_body={'federateId': p['id'], 'group': g['plain'], 'direction': d})
+                if not ok:
+                    errors.append('%s: could not add group %s (%s)' % (p['name'], g['plain'], e))
+                    continue
+            for d in sorted(need):
+                r, e = _fed_marti('federategroups/%s?group=%s&direction=%s' % (fid, _fed_q(g['group']), d),
+                                  method='DELETE', timeout=20)
+                if r is None:
+                    errors.append('%s: could not remove group %s %s (%s)' % (p['name'], g['group'], d, e))
+                else:
+                    changed += 1
+        for m in p['maps']:
+            qs = 'federategroupsmap/%s?remoteGroup=%s&localGroup=' % (fid, _fed_q(m['remote']))
+            if not m.get('plain_present'):
+                r, e = _fed_marti(qs + _fed_q(m['plain']), method='POST', timeout=20)
+                if r is None:
+                    errors.append('%s: could not map %s to %s (%s)' % (p['name'], m['remote'], m['plain'], e))
+                    continue
+            r, e = _fed_marti(qs + _fed_q(m['local']), method='DELETE', timeout=20)
+            if r is None:
+                errors.append('%s: could not remove mapping %s to %s (%s)' % (p['name'], m['remote'], m['local'], e))
+            else:
+                changed += 1
+    if changed:
+        r, e = _fed_marti('federategroupconfig', method='POST', timeout=30)
+        if r is None:
+            errors.append('changes made but not saved to CoreConfig (%s)' % e)
+    return changed, errors
+
+
+def _fed_groups_unavailable():
+    """None when this box can check; otherwise the short reason it cannot."""
+    if not os.path.exists('/opt/tak/CoreConfig.xml'):
+        return 'TAK Server is not on this box'
+    if _tak_core_is_remote():
+        return 'TAK Server runs on another host'
+    return None
+
+
+@app.route('/api/takserver/federation-groups-check')
+@login_required
+def takserver_federation_groups_check():
+    """gh #755: federate groups saved as cn=tak_<channel> (read-only)."""
+    why = _fed_groups_unavailable()
+    if why:
+        return jsonify({'supported': False, 'reason': why, 'count': 0, 'federates': []})
+    res, err = _fed_groups_scan()
+    if res is None:
+        return jsonify({'supported': True, 'error': err, 'count': 0, 'federates': []})
+    for p in res['federates']:
+        p.pop('have', None)
+    return jsonify(dict(res, supported=True))
+
+
+@app.route('/api/takserver/federation-groups-fix', methods=['POST'])
+@login_required
+def takserver_federation_groups_fix():
+    """gh #755: replace federate group names saved as cn=tak_<channel> with the plain channel
+    name, live, no TAK restart. Re-reads afterwards and reports what is still wrong."""
+    why = _fed_groups_unavailable()
+    if why:
+        return jsonify({'success': False, 'error': why}), 400
+    if not _FED_FIX_LOCK.acquire(blocking=False):
+        return jsonify({'success': False, 'error': 'A fix is already running'}), 409
+    try:
+        res, err = _fed_groups_scan()
+        if res is None:
+            return jsonify({'success': False, 'error': err}), 502
+        changed, errors = _fed_groups_apply(res['federates'])
+        after, err2 = _fed_groups_scan()
+        remaining = after['count'] if after else None
+        ok = not errors and after is not None and remaining == 0
+        return jsonify({'success': ok, 'changed': changed, 'remaining': remaining,
+                        'errors': errors[:10] + ([err2] if err2 else [])}), (200 if ok else 500)
+    finally:
+        _FED_FIX_LOCK.release()
+
+
 # TAK's UserAuthenticationFile.xml uses this default namespace; every element tag
 # comes back from ElementTree namespaced ({ns}User, {ns}groupList).
 _TAK_UAF_NS = 'http://bbn.com/marti/xml/bindings'
@@ -115645,12 +116043,17 @@ def _trusted_java_exe(pid):
     Anything that fails is reported as UNKNOWN, never as a wrong JVM: a false red here
     would page someone about an outage that is not happening.
     """
+    # ops #1298: readlink only. os.path.realpath() did an lstat on /proc/<pid>/exe first, and
+    # on Rocky the confined console (takwerx_console_t) is not allowed `getattr` on another
+    # domain's lnk_file (it may `read` it). That was one SELinux denial per card refresh,
+    # about 150 an hour, each logged by setroubleshoot at priority err. The kernel already
+    # hands readlink() the resolved path, so realpath added nothing.
     try:
-        exe = os.path.realpath(f'/proc/{pid}/exe')
+        exe = os.readlink(f'/proc/{pid}/exe')
     except OSError:
-        return None
-    if not exe or not os.path.isfile(exe):
         return None      # unreadable /proc entry on a non-root console — unknown, not bad
+    if not exe or not os.path.isfile(exe):
+        return None
     if os.path.basename(exe) != 'java':
         # Measured on test6/test12 2026-09-10: TAK's launcher is a shell script, so the
         # obvious `pgrep -f takserver-api` resolves to /usr/bin/dash, not the JVM. Running
@@ -115709,7 +116112,7 @@ def _jvm_status_from_guarddog(api_pid):
     """The Guard Dog watcher's view of the running JVM, or None.
 
     The console runs as `takwerx` on every hardened box while TAK's JVMs run as `tak`, so
-    os.path.realpath('/proc/<pid>/exe') raises PermissionError here — measured on test12
+    reading the link of '/proc/<pid>/exe' raises PermissionError here — measured on test12
     during the v10.1.63 T&E, where the TAK Server card showed no JVM at all and the Guard Dog
     dot could never leave grey. Degrading to "unknown" was correct (a false red would be
     worse) but it made the whole thing invisible on most of the fleet.
@@ -122164,7 +122567,8 @@ def _fail2ban_add_guarddog_hook(plog):
 
     # ── Step 3: Rewrite jail config to include both ufw + infratak-guarddog ───
     cfg = _f2b_read_jail_config()
-    _f2b_write_jail_config(cfg['maxretry'], cfg['findtime'], cfg['bantime'], cfg.get('ignoreip', ''))
+    _f2b_write_jail_config(cfg['maxretry'], cfg['findtime'], cfg['bantime'],
+                            _f2b_operator_extra(cfg.get('ignoreip', '')))
     plog("fail2ban guarddog hook: updated jail config with infratak-guarddog action")
 
     # ── Step 4: Reload fail2ban ───────────────────────────────────────────────
@@ -126183,6 +126587,16 @@ def _post_update_auto_deploy():
             except Exception as _ak_rep_err:
                 print(f"Post-update: authentik reputation policy error (non-fatal): {_ak_rep_err}")
 
+            # GH #756: only a deploy, an uninstall or the TAK Portal step rewrote the boot
+            # sequencer, so a box without a running TAK Portal kept `Requires=docker.service`
+            # (re-run on every Docker restart) and no timeout. Converge every box that has one.
+            try:
+                if os.path.exists('/etc/systemd/system/docker-stagger.service'):
+                    _update_boot_stagger_service()
+                    print("Post-update: boot sequencer (docker-stagger) converged", flush=True)
+            except Exception as _bs_err:
+                print(f"Post-update: boot sequencer converge error (non-fatal): {_bs_err}", flush=True)
+
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
                 if not guarddog_deploy_status.get('running'):
@@ -128266,6 +128680,88 @@ try:
     _startup_selinux_policy_canary()
 except Exception as _e:
     print(f"[startup] selinux policy canary skipped (non-fatal): {_e}", flush=True)
+
+
+def _selinux_helper_module_pending(name='takwerx_console'):
+    """ops #1299: (want, have) when the installed SELinux module `name` is behind the
+    shipped .te, else None. Refresh-only like the broker: a box that never had the
+    module, a box with SELinux off and a box that is already current all give None."""
+    te = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'selinux', name + '.te')
+    if not (shutil.which('getenforce') and os.path.isfile(te)):
+        return None
+    try:
+        mode = (subprocess.run(['getenforce'], capture_output=True, text=True,
+                               timeout=10).stdout or '').strip()
+    except Exception:
+        return None
+    if mode == 'Disabled':
+        return None
+    import re as _re
+    try:
+        with open(te) as f:
+            m = _re.match(r'^module\s+%s\s+([0-9.]+)' % _re.escape(name), f.readline())
+        want = m.group(1) if m else ''
+    except OSError:
+        want = ''
+    if not want:
+        return None
+    try:
+        listed = subprocess.run(_sudo_wrap(['semodule', '-l']), capture_output=True,
+                                text=True, timeout=60).stdout or ''
+    except Exception:
+        return None
+    if name not in {ln.strip().split()[0] for ln in listed.splitlines() if ln.strip()}:
+        return None
+    try:
+        with open(f'/etc/selinux/.takwerx-{name}.ver') as f:
+            have = f.read().strip()
+    except OSError:
+        have = ''
+    return None if have == want else (want, have)
+
+
+def _startup_selinux_helper_module_nudge(wait=120, step=5):
+    """ops #1299: make sure the small `takwerx_console` module (1.1 adds the rule that
+    lets Caddy roll its own access log) reaches an EXISTING box, root installs included.
+
+    The canary above watches only takwerx_console_confined, which a root install does
+    not have, and a release that leaves the broker source alone restarts no broker, so
+    nothing would run the broker's refresh. The refresh itself
+    (_selinux_policy_converge) already covers both modules in one pass. So: when the
+    module is installed and its stamp is behind the shipped .te, give a refresh that is
+    already in flight `wait` seconds to land, then ask for ONE broker restart. It runs
+    in a thread because no migration depends on this module, so it must never hold the
+    boot. A no-op when the stamp matches, which is every boot after the first.
+    Returns True when a watcher thread was started."""
+    pending = _selinux_helper_module_pending()
+    if not pending:
+        return False
+    want, have = pending
+
+    def _watch():
+        import time as _tm
+        for _ in range(max(1, wait // step)):
+            _tm.sleep(step)
+            if not _selinux_helper_module_pending():
+                print(f"[selinux-canary] ✓ takwerx_console refreshed to {want}", flush=True)
+                return
+        print(f"[selinux-canary] takwerx_console stamp {have or 'absent'} != shipped {want} — "
+              f"restarting takwerx-broker to run its policy refresh", flush=True)
+        try:
+            subprocess.run(_sudo_wrap(['systemctl', '--no-block', 'restart', 'takwerx-broker']),
+                           capture_output=True, text=True, timeout=20)
+        except Exception as e:
+            print(f"[selinux-canary] broker restart request failed (non-fatal): {e}", flush=True)
+
+    import threading as _th
+    _th.Thread(target=_watch, daemon=True, name='selinux-helper-module-nudge').start()
+    return True
+
+
+try:
+    _startup_selinux_helper_module_nudge()
+except Exception as _e:
+    print(f"[startup] selinux helper module check skipped (non-fatal): {_e}", flush=True)
 
 _startup_migrations()
 _post_update_auto_deploy()

@@ -143,12 +143,19 @@ def _outcome(status, detail=''):
     return {'status': status, 'detail': detail}
 
 
-def ensure(api, app_slug, add=(), remove=(), plog=None):
+def ensure(api, app_slug, add=(), remove=(), plog=None, admin_group=None):
     """Make the application's one access policy admit global admins plus `add`.
 
     The policy keeps whatever groups it already holds (so the agency's admin
     group and a later standard group are each added by their own caller without
     undoing the other), minus `remove`. The global administrators are always in.
+
+    ⚠️ **`admin_group` is the superuser group as Authentik has it now** (ops
+    #1289), from `atlas.global_admin_group`. `authentik Admins` is only the
+    default name: an operator who renamed the group was locked out of ATLAS,
+    because this policy kept naming the old one. None means the default name.
+    The old default name is dropped from the policy once that group is gone, so
+    a group made later under that name does not inherit ATLAS administration.
 
     Returns ``{'status', 'detail'}``: ``present`` (nothing changed), ``created``
     (something was written) or ``failed`` (``detail`` says what). Never raises.
@@ -177,7 +184,17 @@ def ensure(api, app_slug, add=(), remove=(), plog=None):
             log('  ⚠ ' + detail)
             return _outcome('failed', detail)
         current = parse_groups(pol.get('expression')) if pol else []
-        wanted = [ADMIN_GROUP]
+        admin_group = admin_group or ADMIN_GROUP
+        if (admin_group != ADMIN_GROUP and ADMIN_GROUP in current
+                and ADMIN_GROUP not in add
+                and _find(api, 'core/groups/', 'name', ADMIN_GROUP) is None):
+            # The default-named group no longer exists (it was renamed): its
+            # name in the policy admits nobody now, and would admit whoever
+            # makes a group with that name later.
+            current = [g for g in current if g != ADMIN_GROUP]
+            log('  ✓ The old group name "%s" is no longer in the access policy '
+                '(Authentik has no such group)' % ADMIN_GROUP)
+        wanted = [admin_group]
         for group in list(current) + list(add):
             if group not in wanted and group not in remove:
                 wanted.append(group)
@@ -229,7 +246,7 @@ def ensure(api, app_slug, add=(), remove=(), plog=None):
             bindings = again
             log('  ✓ Access policy bound to this deployment')
 
-        if _supersede(api, bindings, wanted, log):
+        if _supersede(api, bindings, wanted, log, admin_group):
             changed = True
         return _outcome('created' if changed else 'present')
     except Exception as exc:
@@ -238,7 +255,7 @@ def ensure(api, app_slug, add=(), remove=(), plog=None):
         return _outcome('failed', detail)
 
 
-def _supersede(api, bindings, groups, log):
+def _supersede(api, bindings, groups, log, admin_group=ADMIN_GROUP):
     """Remove the bindings our policy now covers. True when any was removed.
 
     Only an enabled, not-negated "Allow authentik Admins" binding, and only an
@@ -247,7 +264,7 @@ def _supersede(api, bindings, groups, log):
     """
     pks = set()
     for group in groups:
-        if group == ADMIN_GROUP:
+        if group == admin_group:
             continue
         row = _find(api, 'core/groups/', 'name', group)
         if row and row.get('pk'):
@@ -269,7 +286,7 @@ def _supersede(api, bindings, groups, log):
     return removed
 
 
-def revoke(api, app_slug, group, plog=None):
+def revoke(api, app_slug, group, plog=None, admin_group=None):
     """Take `group` out of this application's way in. True when anything changed.
 
     ⚠️ Two places can hold it: our policy (one name in the "or") and a direct
@@ -289,7 +306,8 @@ def revoke(api, app_slug, group, plog=None):
     changed = False
     pol = _find(api, 'policies/expression/', 'name', policy_name(app_slug))
     if pol is not None and group in parse_groups(pol.get('expression')):
-        result = ensure(api, app_slug, remove=[group], plog=plog)
+        result = ensure(api, app_slug, remove=[group], plog=plog,
+                        admin_group=admin_group)
         if result['status'] == 'failed':
             raise RuntimeError(result['detail'])
         changed = True
