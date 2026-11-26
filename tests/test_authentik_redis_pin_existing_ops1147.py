@@ -65,6 +65,7 @@ def _load(legacy=None):
         'AUTHENTIK_REDIS_IMAGE': _const('AUTHENTIK_REDIS_IMAGE'),
         '_DOCKER_SOCKET_PATHS': _const('_DOCKER_SOCKET_PATHS'),
         '_ensure_authentik_compose_patches_legacy': legacy or (lambda *a, **k: pytest.fail('legacy patcher reached')),
+        '_authentik_redis_seen_version': lambda image: '',   # ops #1306: no newer redis on this box
     }
     exec(compile('\n\n'.join(parts), 'app.py', 'exec'), ns)
     return ns
@@ -235,7 +236,8 @@ def _legacy_ns():
             parts.append(ast.get_source_segment(APP, node))
     ns = {'os': __import__('os'), 're': re, '_authentik_pg_command_for_ram': lambda ram: (PG_CMD, 'test-tier'),
           '_local_ram_mb': lambda: 16000, 'AUTHENTIK_REDIS_IMAGE': _const('AUTHENTIK_REDIS_IMAGE'),
-          '_DOCKER_SOCKET_PATHS': _const('_DOCKER_SOCKET_PATHS')}
+          '_DOCKER_SOCKET_PATHS': _const('_DOCKER_SOCKET_PATHS'),
+          '_authentik_redis_seen_version': lambda image: ''}
     exec(compile('\n\n'.join(parts), 'app.py', 'exec'), ns)
     return ns
 
