@@ -68019,6 +68019,14 @@ def _heal_netbird_pinned_image(plog=None):
             return False  # already on this channel's target — healthy, no-op
         _pin_kind = 'dev' if _srv_img == NETBIRD_SERVER_DEV_IMAGE and NETBIRD_SERVER_DEV_IMAGE != NETBIRD_SERVER_IMAGE else 'vetted'
         _log(f"  netbird: compose off the {_pin_kind} pin — restoring {_srv_img} + recreating")
+        # ops #1307: this heal goes DOWN on purpose (it pulls a box off a bad newer image, and
+        # 0.83.2 -> 0.82.1 on a migrated store was drilled, ops #1088). When it does, say so once
+        # in plain words, so nobody reads a version going back as a fault.
+        _cur_srv = re.search(r'netbirdio/netbird-server:[^\s\'"]+', txt)
+        if _cur_srv and _image_ahead_of_pin(_cur_srv.group(0), _srv_img):
+            _log(f"  netbird: moved NetBird down from {_cur_srv.group(0).rsplit(':', 1)[-1]} to "
+                 f"{_srv_img.rsplit(':', 1)[-1]}: this box ran a newer version than the tested "
+                 f"one for its update channel, so it goes back to the tested one")
         _netbird_sync_compose_image_tags(nb_dir)
         subprocess.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
                        capture_output=True, text=True, cwd=nb_dir, timeout=600)

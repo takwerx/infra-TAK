@@ -54,7 +54,7 @@ _WANT = {
     '_IMAGE_EXACT_TAG_RE', '_image_ref_parts', '_image_exact_version', '_image_ahead_of_pin',
     '_docker_env_version', '_webodm_pin_images', '_webodm_strip_olefile', 'WEBODM_OLEFILE_STRIP',
     'WEBODM_VERSION', 'WEBODM_IMAGES', 'NODERED_IMAGE', '_NODERED_IMAGE_LINE_RE',
-    '_nodered_remote_image_cmd',
+    '_nodered_remote_image_cmd', '_heal_netbird_pinned_image', '_netbird_sync_compose_image_tags',
 }
 
 
@@ -436,3 +436,44 @@ def test_netbird_heal_still_moves_a_newer_image_down_to_the_pin(tmp_path):
     assert ns['_netbird_sync_compose_image_tags'](str(tmp_path)) is True
     txt = compose.read_text()
     assert 'netbird-server:0.82.1' in txt and 'dashboard:v2.96.0' in txt
+
+
+def _run_netbird_heal(tmp_path, monkeypatch, image, dashboard='netbirdio/dashboard:v2.98.0'):
+    nb = tmp_path / 'netbird'
+    nb.mkdir()
+    (nb / 'docker-compose.yml').write_text(
+        f'services:\n  netbird-server:\n    image: {image}\n  dashboard:\n    image: {dashboard}\n')
+    monkeypatch.setenv('HOME', str(tmp_path))
+    ran, log = [], []
+    ns = _ns(_get_netbird_target_images=lambda *a: ('netbirdio/netbird-server:0.82.1', 'netbirdio/dashboard:v2.96.0'),
+             NETBIRD_SERVER_IMAGE='netbirdio/netbird-server:0.82.1',
+             NETBIRD_SERVER_DEV_IMAGE='netbirdio/netbird-server:0.83.2',
+             _write_priv=lambda p, c: pytest.fail('plain write expected'),
+             _read_priv=lambda p: pytest.fail('plain read expected'),
+             subprocess=types.SimpleNamespace(run=lambda cmd, **kw: ran.append(cmd) or types.SimpleNamespace(
+                 returncode=0, stdout='', stderr='')))
+    result = ns['_heal_netbird_pinned_image'](log.append)
+    return result, log, ran, (nb / 'docker-compose.yml').read_text()
+
+
+def test_netbird_heal_says_so_once_in_plain_words_when_it_moves_a_newer_image_down(tmp_path, monkeypatch):
+    """Lead's addition (ops #1307): the heal goes down on purpose, and logs one plain line when it does."""
+    result, log, ran, compose = _run_netbird_heal(tmp_path, monkeypatch, 'netbirdio/netbird-server:0.83.2')
+    assert result is True
+    assert 'netbird-server:0.82.1' in compose and 'dashboard:v2.96.0' in compose
+    assert ['docker', 'compose', 'up', '-d'] in ran
+    down = [line for line in log if 'moved NetBird down from 0.83.2 to 0.82.1' in line]
+    assert len(down) == 1, log
+    assert 'tested' in down[0] and 'update channel' in down[0]
+
+
+def test_netbird_heal_does_not_say_it_went_down_when_it_moves_an_older_image_up(tmp_path, monkeypatch):
+    result, log, ran, compose = _run_netbird_heal(tmp_path, monkeypatch, 'netbirdio/netbird-server:0.80.0')
+    assert result is True and 'netbird-server:0.82.1' in compose
+    assert not any('moved NetBird down' in line for line in log), log
+
+
+def test_netbird_heal_on_the_pin_does_nothing(tmp_path, monkeypatch):
+    result, log, ran, compose = _run_netbird_heal(
+        tmp_path, monkeypatch, 'netbirdio/netbird-server:0.82.1', dashboard='netbirdio/dashboard:v2.96.0')
+    assert result is False and ran == [] and log == []
