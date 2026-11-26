@@ -46015,6 +46015,54 @@ def _install_le_cert_on_8446_at_deploy(host, log_step):
     return ok
 
 
+# ops #1295: on Rocky 9 the Caddy step failed in 2 seconds with only "Caddy install failed" in the
+# log, and every later module then said "not tried". The @caddy/caddy COPR answers badly for a
+# moment now and then (the same install passed minutes later), and the old code ran the COPR
+# step with no check, never retried, and never printed what dnf said. Now each try shows dnf's
+# own words and the step is tried again after a pause.
+CADDY_DNF_TRIES = 4
+CADDY_DNF_DELAY = 15     # seconds between tries
+
+
+def _caddy_dnf_install(plog, tries=None, delay=None):
+    """Install Caddy from the @caddy/caddy COPR on a dnf box. Returns True when it installed.
+
+    `dnf copr enable` is checked, because a failed enable makes `dnf install caddy` say only
+    "No match for argument". A failed try logs the last 300 characters of dnf's output (the
+    apt branch does the same) and is tried again after `delay` seconds, `tries` tries in all.
+    A timeout counts as a failed try and never raises. The copr plugin line keeps its old
+    meaning: it logs a failure and goes on, as the plugin is often there already."""
+    tries = CADDY_DNF_TRIES if tries is None else tries
+    delay = CADDY_DNF_DELAY if delay is None else delay
+
+    def _step(argv, limit):
+        try:
+            r = subprocess.run(_sudo_wrap(argv), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               text=True, timeout=limit)
+            return r.returncode, (r.stdout or '').strip()
+        except subprocess.TimeoutExpired:
+            return 124, f'timed out after {limit} seconds'
+        except OSError as e:
+            return 127, str(e)
+
+    rc, out = _step(['dnf', 'install', '-y', 'dnf-command(copr)'], 120)
+    if rc != 0:
+        plog(f"  ⚠ dnf copr plugin did not install (going on): {out[-300:] or 'no output'}")
+    for n in range(1, tries + 1):
+        label = 'dnf copr enable @caddy/caddy'
+        rc, out = _step(['dnf', 'copr', 'enable', '-y', '@caddy/caddy'], 120)
+        if rc == 0:
+            label = 'the caddy package install'
+            rc, out = _step(['dnf', 'install', '-y', 'caddy'], 300)
+        if rc == 0:
+            return True
+        plog(f"  ✗ {label} failed (try {n} of {tries}): {out[-300:] or 'no output'}")
+        if n < tries:
+            plog(f"  Trying again in {delay} seconds...")
+            time.sleep(delay)
+    return False
+
+
 def run_caddy_deploy(domain):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -46078,13 +46126,21 @@ def run_caddy_deploy(domain):
                 return
         else:
             plog("  Installing Caddy via dnf...")
-            subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'dnf-command(copr)']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
-            subprocess.run(_sudo_wrap(['dnf', 'copr', 'enable', '-y', '@caddy/caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=60)
-            r = subprocess.run(_sudo_wrap(['dnf', 'install', '-y', 'caddy']), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
-            if r.returncode != 0:
-                plog(f"✗ Caddy install failed")
-                caddy_deploy_status.update({'running': False, 'error': True})
-                return
+            if not _caddy_dnf_install(plog):
+                # ops #1295. The static build alone has no `caddy` user and no caddy.service
+                # (the rpm scriptlets make those), so it is only a way forward when something of
+                # the package is already here: a working caddy, or an rpm whose payload is missing
+                # (the check below installs the binary then).
+                _have_bin = subprocess.run('caddy version', shell=True, capture_output=True).returncode == 0
+                _have_rpm = subprocess.run(['rpm', '-q', 'caddy'], capture_output=True).returncode == 0
+                if _have_bin or _have_rpm:
+                    plog("  ⚠ dnf could not install Caddy; going on with the Caddy already on this server.")
+                else:
+                    plog("✗ Caddy install failed: dnf could not install Caddy from the @caddy/caddy "
+                         "repository after several tries (reason above). The repository may be down "
+                         "or slow. Wait a few minutes, then run the Caddy deploy again.")
+                    caddy_deploy_status.update({'running': False, 'error': True})
+                    return
 
         # Verify install (if binary missing e.g. after uninstall, reinstall restores it)
         r = subprocess.run('which caddy', shell=True, capture_output=True, text=True)
