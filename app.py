@@ -27077,7 +27077,9 @@ TAKPORTAL_F2B_LOG = '/var/log/tak-portal/lookup.log'
 # v10.1.11 — what the jail ACTUALLY reads. The native log above was never written
 # (see generate_caddyfile()'s TAK Portal block), so the jail is fed from Caddy's
 # access log for the Portal host instead. Caddy owns /var/log/caddy and rolls this
-# file itself (10MiB x5), so it needs no logrotate rule of ours.
+# file itself (10MiB x5), so it needs no logrotate rule of ours. On RHEL that roll
+# needs the httpd_t rule in selinux/takwerx_console.te (1.1, ops #1299): without it
+# the roll was denied at 10 MiB and the log stopped growing for good.
 TAKPORTAL_CADDY_LOG = '/var/log/caddy/takportal-access.log'
 # Blunter signal than the original per-result contract (HTTP status can't tell a
 # fat-fingered domain from a scripted probe), so the threshold is raised: a human
@@ -127975,6 +127977,88 @@ try:
     _startup_selinux_policy_canary()
 except Exception as _e:
     print(f"[startup] selinux policy canary skipped (non-fatal): {_e}", flush=True)
+
+
+def _selinux_helper_module_pending(name='takwerx_console'):
+    """ops #1299: (want, have) when the installed SELinux module `name` is behind the
+    shipped .te, else None. Refresh-only like the broker: a box that never had the
+    module, a box with SELinux off and a box that is already current all give None."""
+    te = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'selinux', name + '.te')
+    if not (shutil.which('getenforce') and os.path.isfile(te)):
+        return None
+    try:
+        mode = (subprocess.run(['getenforce'], capture_output=True, text=True,
+                               timeout=10).stdout or '').strip()
+    except Exception:
+        return None
+    if mode == 'Disabled':
+        return None
+    import re as _re
+    try:
+        with open(te) as f:
+            m = _re.match(r'^module\s+%s\s+([0-9.]+)' % _re.escape(name), f.readline())
+        want = m.group(1) if m else ''
+    except OSError:
+        want = ''
+    if not want:
+        return None
+    try:
+        listed = subprocess.run(_sudo_wrap(['semodule', '-l']), capture_output=True,
+                                text=True, timeout=60).stdout or ''
+    except Exception:
+        return None
+    if name not in {ln.strip().split()[0] for ln in listed.splitlines() if ln.strip()}:
+        return None
+    try:
+        with open(f'/etc/selinux/.takwerx-{name}.ver') as f:
+            have = f.read().strip()
+    except OSError:
+        have = ''
+    return None if have == want else (want, have)
+
+
+def _startup_selinux_helper_module_nudge(wait=120, step=5):
+    """ops #1299: make sure the small `takwerx_console` module (1.1 adds the rule that
+    lets Caddy roll its own access log) reaches an EXISTING box, root installs included.
+
+    The canary above watches only takwerx_console_confined, which a root install does
+    not have, and a release that leaves the broker source alone restarts no broker, so
+    nothing would run the broker's refresh. The refresh itself
+    (_selinux_policy_converge) already covers both modules in one pass. So: when the
+    module is installed and its stamp is behind the shipped .te, give a refresh that is
+    already in flight `wait` seconds to land, then ask for ONE broker restart. It runs
+    in a thread because no migration depends on this module, so it must never hold the
+    boot. A no-op when the stamp matches, which is every boot after the first.
+    Returns True when a watcher thread was started."""
+    pending = _selinux_helper_module_pending()
+    if not pending:
+        return False
+    want, have = pending
+
+    def _watch():
+        import time as _tm
+        for _ in range(max(1, wait // step)):
+            _tm.sleep(step)
+            if not _selinux_helper_module_pending():
+                print(f"[selinux-canary] ✓ takwerx_console refreshed to {want}", flush=True)
+                return
+        print(f"[selinux-canary] takwerx_console stamp {have or 'absent'} != shipped {want} — "
+              f"restarting takwerx-broker to run its policy refresh", flush=True)
+        try:
+            subprocess.run(_sudo_wrap(['systemctl', '--no-block', 'restart', 'takwerx-broker']),
+                           capture_output=True, text=True, timeout=20)
+        except Exception as e:
+            print(f"[selinux-canary] broker restart request failed (non-fatal): {e}", flush=True)
+
+    import threading as _th
+    _th.Thread(target=_watch, daemon=True, name='selinux-helper-module-nudge').start()
+    return True
+
+
+try:
+    _startup_selinux_helper_module_nudge()
+except Exception as _e:
+    print(f"[startup] selinux helper module check skipped (non-fatal): {_e}", flush=True)
 
 _startup_migrations()
 _post_update_auto_deploy()
