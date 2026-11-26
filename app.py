@@ -49972,9 +49972,15 @@ def _takportal_docker_stuck(timeout=_TAKPORTAL_INSPECT_TIMEOUT):
     whose processes were gone). `compose up --build` then built the new image and blocked
     stopping the old container until the 900 s build timeout, and the console said only
     "Build timed out". Ask dockerd about each container first, with a short timeout. Any
-    other failure (no Docker, no containers, a refused call) is not a hang: ''."""
+    other failure (no Docker, no containers, a refused call) is not a hang: ''.
+    An empty list (dockerd did not answer `docker ps` either, or no project) still asks
+    about 'tak-portal' by name: an absent one answers at once, a frozen dockerd does not."""
     try:
-        for c in _takportal_project_containers(all_states=True):
+        try:
+            _cs = _takportal_project_containers(all_states=True)
+        except Exception:
+            _cs = []
+        for c in (_cs or [{'id': 'tak-portal', 'name': 'tak-portal'}]):
             try:
                 subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Status}}', c['id']]),
                                capture_output=True, text=True, timeout=timeout)

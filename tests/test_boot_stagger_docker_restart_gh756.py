@@ -228,6 +228,16 @@ def test_a_healthy_or_unreadable_docker_is_not_called_stuck():
     assert ns['_takportal_docker_stuck']() == ''
     ns['_takportal_project_containers'] = lambda all_states=True: (_ for _ in ()).throw(OSError('no docker'))
     assert ns['_takportal_docker_stuck']() == ''
+    ns['subprocess'].run = lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError('docker'))
+    assert ns['_takportal_docker_stuck']() == ''
+
+
+def test_a_frozen_dockerd_with_no_container_list_is_still_caught():
+    """dockerd answers neither `docker ps` (list comes back empty) nor `docker inspect`."""
+    ns, calls = _stuck_ns(hang=('tak-portal',))
+    ns['_takportal_project_containers'] = lambda all_states=True: []
+    assert ns['_takportal_docker_stuck']() == 'tak-portal'
+    assert calls[-1][-1] == 'tak-portal'
 
 
 def test_the_update_stops_before_it_changes_anything():
