@@ -275,4 +275,6 @@ def test_a_git_failure_reapplies_the_loopback_port_patch_and_builds_nothing():
     calls = []
     body, code = _job(dict(GITR, ok=False, error='Could not fetch release 2.0.15 from GitHub: x.'), '2.0.14', calls)('/p')
     assert code == 500 and body['error'].startswith('Could not fetch release')
+    # GH #756: the read-only `docker inspect` check before the git step is not a build.
+    calls = [c for c in calls if not (isinstance(c, list) and c[:2] == ['docker', 'inspect'])]
     assert calls == ['patch_ports']

@@ -50017,6 +50017,41 @@ def _takportal_build_env():
     return {**os.environ, 'TAKWERX_BROKER_TIMEOUT': str(_TAKPORTAL_BUILD_TIMEOUT)}
 
 
+# GH #756: seconds a healthy dockerd takes to answer `docker inspect` for one container.
+_TAKPORTAL_INSPECT_TIMEOUT = 15
+_TAKPORTAL_DOCKER_STUCK_MSG = (
+    'Docker is stuck on the TAK Portal container {name}: it does not answer "docker inspect" '
+    'within {secs} seconds, so an update would wait on it until the build times out. Nothing was '
+    'changed. Restart Docker on this server (sudo systemctl restart docker), then press Update again.')
+
+
+def _takportal_docker_stuck(timeout=_TAKPORTAL_INSPECT_TIMEOUT):
+    """GH #756: the name of a TAK Portal container dockerd no longer answers for, or ''.
+
+    A field box after a Docker restart: `docker ps` listed tak-portal as Up, but
+    `docker inspect tak-portal` hung for ever (dockerd still held a lock on a container
+    whose processes were gone). `compose up --build` then built the new image and blocked
+    stopping the old container until the 900 s build timeout, and the console said only
+    "Build timed out". Ask dockerd about each container first, with a short timeout. Any
+    other failure (no Docker, no containers, a refused call) is not a hang: ''.
+    An empty list (dockerd did not answer `docker ps` either, or no project) still asks
+    about 'tak-portal' by name: an absent one answers at once, a frozen dockerd does not."""
+    try:
+        try:
+            _cs = _takportal_project_containers(all_states=True)
+        except Exception:
+            _cs = []
+        for c in (_cs or [{'id': 'tak-portal', 'name': 'tak-portal'}]):
+            try:
+                subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', '{{.State.Status}}', c['id']]),
+                               capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return c.get('name') or c['id']
+    except Exception:
+        pass
+    return ''
+
+
 @_records_module_update(  # v10.2.8 W10 — on the job since ops #72 (the route now answers 202 at once)
     'takportal', from_fn=lambda: (_get_takportal_version_info().get('version') or ''))
 def _takportal_run_update(portal_dir):
@@ -50032,6 +50067,14 @@ def _takportal_run_update(portal_dir):
     # "Updated" ([[takportal-update-silent-pull-failure]]). Both are fixed here:
     # the channel comes from TAK Portal's own BETA_MODE, and a git failure is a
     # hard 500 with the git error in it.
+    #
+    # GH #756: first make sure dockerd still answers for the portal's containers. A stuck
+    # one turns the build below into a silent 900 s wait; say what is wrong, change nothing.
+    _stuck = _takportal_docker_stuck()
+    if _stuck:
+        _msg = _TAKPORTAL_DOCKER_STUCK_MSG.format(name=_stuck, secs=_TAKPORTAL_INSPECT_TIMEOUT)
+        print(f'[takportal] update: {_msg}', flush=True)
+        return {'success': False, 'error': _msg}, 500
     _mod_result_step('takportal', 'Step 1/2: fetching the release')
     gitr = _takportal_update_git(portal_dir)
     # ops #380: the record said "2.0.25 -> ?" because only a success ever filled in the target.
@@ -66096,25 +66139,55 @@ def _update_boot_stagger_service():
         all_containers = []
         for _, containers, _ in BOOT_ORDER:
             all_containers.extend(c for c in containers if c in existing)
-        stop_cmd = f'docker stop {" ".join(all_containers)} 2>/dev/null; true'
         steps.append('echo "All containers started"')
-        exec_cmd = ' && \\\n  '.join(steps)
-        unit = (
-            '[Unit]\n'
-            'Description=Stagger Docker container startup on boot\n'
-            'After=docker.service\n'
-            'Requires=docker.service\n\n'
-            '[Service]\n'
-            'Type=oneshot\n'
-            'RemainAfterExit=yes\n'
-            f"ExecStart=/bin/bash -c '\\\n  {stop_cmd} && \\\n  {exec_cmd}'\n\n"
-            '[Install]\n'
-            'WantedBy=multi-user.target\n'
-        )
-        _write_priv('/etc/systemd/system/docker-stagger.service', unit)
+        try:
+            _write_priv('/etc/systemd/system/docker-stagger.service',
+                        _boot_stagger_unit_text(all_containers, steps))
+        except BrokerError:
+            # A broker from before GH #756 refuses the `timeout` on the stop step. Keep the
+            # rest of the fix (Wants=, the start timeout) until the broker is updated.
+            _write_priv('/etc/systemd/system/docker-stagger.service',
+                        _boot_stagger_unit_text(all_containers, steps, stop_timeout=0))
         _run_priv_chain([['systemctl', 'daemon-reload'], ['systemctl', 'enable', 'docker-stagger']], 'and', timeout=10)
     except Exception:
         pass
+
+
+# GH #756: bounds for docker-stagger. A Type=oneshot unit has no start timeout by default, so
+# one `docker stop` that dockerd never answers held the whole sequence (and every TAK Portal
+# start, recreate and update behind it) for 1 h 47 min on a field box.
+_BOOT_STAGGER_STOP_TIMEOUT = 120      # the client-side limit on the one `docker stop` of them all
+_BOOT_STAGGER_START_TIMEOUT = 900     # the whole unit; systemd marks it failed past this
+
+
+def _boot_stagger_unit_text(all_containers, steps, stop_timeout=_BOOT_STAGGER_STOP_TIMEOUT):
+    """The docker-stagger.service text. Pure; the broker's unit check reads the same shape.
+
+    GH #756: `Wants=docker.service`, never `Requires=`. With Requires=, systemd restarts this
+    unit whenever docker.service restarts (systemd.unit(5): "If one of the other units is
+    explicitly stopped (or restarted), this unit will be stopped (or restarted) too"
+    https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#Requires=).
+    So a Docker restart in the middle of a console update (a docker-ce package update, a
+    daemon.json change) stopped Authentik and TAK Portal again, racing the console's own
+    TAK Portal restart. The sequencer is for boot; after a plain Docker restart the
+    containers' own restart policy brings them back. After=docker.service keeps the order."""
+    stop_cmd = f'docker stop {" ".join(all_containers)} 2>/dev/null; true'
+    if stop_timeout:
+        stop_cmd = f'timeout {int(stop_timeout)} {stop_cmd}'
+    exec_cmd = ' && \\\n  '.join(steps)
+    return (
+        '[Unit]\n'
+        'Description=Stagger Docker container startup on boot\n'
+        'After=docker.service\n'
+        'Wants=docker.service\n\n'
+        '[Service]\n'
+        'Type=oneshot\n'
+        'RemainAfterExit=yes\n'
+        f'TimeoutStartSec={_BOOT_STAGGER_START_TIMEOUT}\n'
+        f"ExecStart=/bin/bash -c '\\\n  {stop_cmd} && \\\n  {exec_cmd}'\n\n"
+        '[Install]\n'
+        'WantedBy=multi-user.target\n'
+    )
 
 
 def _ensure_docker_log_limits(log_fn=None):
@@ -126222,6 +126295,16 @@ def _post_update_auto_deploy():
                     _authentik_setup_reputation_policy(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _ak_rep_err:
                 print(f"Post-update: authentik reputation policy error (non-fatal): {_ak_rep_err}")
+
+            # GH #756: only a deploy, an uninstall or the TAK Portal step rewrote the boot
+            # sequencer, so a box without a running TAK Portal kept `Requires=docker.service`
+            # (re-run on every Docker restart) and no timeout. Converge every box that has one.
+            try:
+                if os.path.exists('/etc/systemd/system/docker-stagger.service'):
+                    _update_boot_stagger_service()
+                    print("Post-update: boot sequencer (docker-stagger) converged", flush=True)
+            except Exception as _bs_err:
+                print(f"Post-update: boot sequencer converge error (non-fatal): {_bs_err}", flush=True)
 
             # Re-deploy Guard Dog (updated scripts + timers)
             if os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
