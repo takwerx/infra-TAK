@@ -23275,6 +23275,56 @@ def _f2b_fleet_ignore_cidrs():
         raw = ''
     return [c.strip() for c in raw.replace(',', ' ').split() if c.strip()]
 
+# How many removed trusted addresses we remember (oldest forgotten first).
+_F2B_RETIRED_MAX = 200
+
+def _f2b_retired_cidrs():
+    """Addresses the operator once had on the trusted list and then removed (settings
+    'fail2ban_ignore_retired'). Needed because a jail file does not say where an entry
+    came from: once a CIDR leaves 'fail2ban_ignore_cidrs' it looks exactly like an entry
+    the operator typed into that one jail, and every writer would put it back
+    (ops #1286). _f2b_operator_extra drops these."""
+    try:
+        raw = load_settings().get('fail2ban_ignore_retired', '') or ''
+    except Exception:
+        raw = ''
+    return [c.strip() for c in str(raw).replace(',', ' ').split() if c.strip()]
+
+def _f2b_set_fleet_cidrs(s_cfg, cidrs):
+    """The ONE place that changes the trusted list in `s_cfg` (the settings dict; the
+    caller saves it). Anything the new list no longer holds is remembered as retired, and
+    anything it holds again stops being retired."""
+    old = [c.strip() for c in str(s_cfg.get('fail2ban_ignore_cidrs', '') or '').replace(',', ' ').split() if c.strip()]
+    new = []
+    for c in cidrs:
+        c = str(c).strip()
+        if c and c not in new:
+            new.append(c)
+    retired = [c.strip() for c in str(s_cfg.get('fail2ban_ignore_retired', '') or '').replace(',', ' ').split()
+               if c.strip() and c.strip() not in new]
+    for c in old:
+        if c not in new and c not in retired:
+            retired.append(c)
+    s_cfg['fail2ban_ignore_cidrs'] = ' '.join(new)
+    s_cfg['fail2ban_ignore_retired'] = ' '.join(retired[-_F2B_RETIRED_MAX:])
+    return new
+
+def _f2b_unretire(ignoreip_text):
+    """An operator who types an address into one jail's own whitelist and presses Save
+    means it: stop treating it as a removed trusted address. Never raises."""
+    try:
+        typed = set(str(ignoreip_text or '').replace(',', ' ').split())
+        if not typed:
+            return
+        s_cfg = load_settings()
+        retired = [c for c in str(s_cfg.get('fail2ban_ignore_retired', '') or '').split() if c]
+        keep = [c for c in retired if c not in typed]
+        if len(keep) != len(retired):
+            s_cfg['fail2ban_ignore_retired'] = ' '.join(keep)
+            save_settings(s_cfg)
+    except Exception:
+        pass
+
 def _f2b_trusted_ignoreip(extra=''):
     """Build the full ignoreip whitelist for ANY infra-TAK jail, fleet-uniform:
     localhost + the box's attached private subnet(s) + our own container bridges +
@@ -23352,7 +23402,7 @@ def _f2b_seed_console_client_ignore(client_ip, why=''):
         existing = _f2b_fleet_ignore_cidrs()
         if ip not in existing:
             existing.append(ip)
-        s_cfg['fail2ban_ignore_cidrs'] = ' '.join(existing)
+        _f2b_set_fleet_cidrs(s_cfg, existing)
         s_cfg['fail2ban_ignore_seeded'] = True
         save_settings(s_cfg)
         print(f"fail2ban: seeded console client {ip} into the never-ban list "
@@ -23374,6 +23424,9 @@ def _f2b_operator_extra(stored):
     fleet.update(_f2b_container_subnets())
     fleet.update(_f2b_own_addresses())
     fleet.update(_f2b_fleet_ignore_cidrs())
+    # An address taken off the trusted list is no longer in the set above, so without this
+    # it would read as a per-jail entry and be written straight back (ops #1286).
+    fleet.update(_f2b_retired_cidrs())
     return ' '.join(t for t in str(stored or '').split() if t not in fleet)
 
 def _f2b_read_jail_config():
@@ -26045,7 +26098,8 @@ def fail2ban_authentik_toggle_api():
         return jsonify({'ok': True, 'enabled': False})
     # Enable: write jail config (preserving existing thresholds/ignoreip if present)
     cfg = _f2b_read_jail_config()
-    ignoreip = str(data.get('ignoreip', cfg.get('ignoreip', ''))).strip()
+    ignoreip = str(data.get('ignoreip', _f2b_operator_extra(cfg.get('ignoreip', '')))).strip()
+    _f2b_unretire(ignoreip)
     maxretry = int(data.get('maxretry', cfg.get('maxretry', 5)))
     findtime = int(data.get('findtime', cfg.get('findtime', 600)))
     bantime  = int(data.get('bantime',  cfg.get('bantime',  3600)))
@@ -26131,6 +26185,7 @@ def fail2ban_config_api():
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     ignoreip = str(data.get('ignoreip', '')).strip()
+    _f2b_unretire(ignoreip)
     try:
         _f2b_write_jail_config(maxretry, findtime, bantime, ignoreip)
         subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, timeout=15)
@@ -26255,6 +26310,7 @@ def fail2ban_tak_config_api():
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     ignoreip = str(data.get('ignoreip', '')).strip()
+    _f2b_unretire(ignoreip)
     try:
         _f2b_write_tak_jail_config(maxretry, findtime, bantime, ignoreip)
         # Ensure the fail2ban daemon is running before reloading jails
@@ -26513,6 +26569,7 @@ def fail2ban_ssh_config_api():
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     ignoreip = str(data.get('ignoreip', '')).strip()
+    _f2b_unretire(ignoreip)
     try:
         _f2b_write_ssh_jail_config(maxretry, findtime, bantime, ignoreip)
         # Ensure the fail2ban daemon is running before reloading
@@ -26971,8 +27028,9 @@ def fail2ban_mediamtx_config_api():
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     try:
-        _f2b_write_mediamtx_jail(maxretry, findtime, bantime,
-                                 str(data.get('ignoreip', '') or '').strip())
+        _mtx_ignoreip = str(data.get('ignoreip', '') or '').strip()
+        _f2b_unretire(_mtx_ignoreip)
+        _f2b_write_mediamtx_jail(maxretry, findtime, bantime, _mtx_ignoreip)
         _svc = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                               capture_output=True, text=True)
         if _svc.stdout.strip() != 'active':
@@ -27262,6 +27320,7 @@ def fail2ban_takportal_config_api():
         findtime = max(10, min(86400,   int(data.get('findtime', 600))))
         bantime  = max(60, min(2592000, int(data.get('bantime',  3600))))
         ignoreip = str(data.get('ignoreip', '')).strip()
+        _f2b_unretire(ignoreip)
     except (ValueError, TypeError) as e:
         return jsonify({'ok': False, 'error': f'Invalid value: {e}'}), 400
     try:
@@ -27431,7 +27490,7 @@ def fail2ban_trusted_cidrs_api():
         if c not in cleaned:
             cleaned.append(c)
     s = load_settings()
-    s['fail2ban_ignore_cidrs'] = ' '.join(cleaned)
+    _f2b_set_fleet_cidrs(s, cleaned)
     save_settings(s)
     rewritten = _f2b_rewrite_all_jails()
     try:
@@ -27563,7 +27622,7 @@ def fail2ban_add_my_ip_api():
                         'cidrs': cidrs, 'effective': _f2b_trusted_ignoreip()})
     cidrs.append(ip)
     s_cfg = load_settings()
-    s_cfg['fail2ban_ignore_cidrs'] = ' '.join(cidrs)
+    _f2b_set_fleet_cidrs(s_cfg, cidrs)
     # An explicit click counts as the seed — do not let an automatic seed add a second,
     # different address later (e.g. one visit from another network).
     s_cfg['fail2ban_ignore_seeded'] = True
@@ -121869,7 +121928,8 @@ def _fail2ban_add_guarddog_hook(plog):
 
     # ── Step 3: Rewrite jail config to include both ufw + infratak-guarddog ───
     cfg = _f2b_read_jail_config()
-    _f2b_write_jail_config(cfg['maxretry'], cfg['findtime'], cfg['bantime'], cfg.get('ignoreip', ''))
+    _f2b_write_jail_config(cfg['maxretry'], cfg['findtime'], cfg['bantime'],
+                            _f2b_operator_extra(cfg.get('ignoreip', '')))
     plog("fail2ban guarddog hook: updated jail config with infratak-guarddog action")
 
     # ── Step 4: Reload fail2ban ───────────────────────────────────────────────
