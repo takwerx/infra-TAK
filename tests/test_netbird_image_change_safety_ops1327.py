@@ -585,3 +585,11 @@ def test_a_redeploy_with_a_failed_pull_stops_before_touching_anything(tmp_path, 
     assert r['written'] == []
     assert (nb / 'docker-compose.yml').read_text() == _compose()
     assert fake.running is True
+
+
+def test_uninstall_forgets_the_owed_finalize(tmp_path):
+    """The account goes with the data on Uninstall, so a stale netbird_finalize_pending must not
+    survive into the next install (the source is read: the route runs a thread)."""
+    tree = ast.parse(APP)
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'netbird_uninstall_api')
+    assert "netbird_finalize_pending" in ast.get_source_segment(APP, fn)

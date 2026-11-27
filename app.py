@@ -17067,6 +17067,7 @@ def netbird_uninstall_api():
             if 'netbird_pat' in settings:
                 del settings['netbird_pat']
             settings.pop('netbird_admin_email', None)
+            settings.pop('netbird_finalize_pending', None)  # ops #1327: the account is gone with the data
             save_settings(settings)
             # Regenerate caddyfile and reload
             generate_caddyfile(settings)
