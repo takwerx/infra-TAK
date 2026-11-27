@@ -82,11 +82,12 @@ def _family(v):
 
 
 def test_pins_promoted_to_2026_8_7():
-    # ops #1276: same-minor SECURITY patch (8.6 -> 8.7), no migration named in the notes, so no new upgrade step.
+    # ops #1276: same-minor SECURITY patch (8.6 -> 8.7), no migration named in the notes.
+    # ops #1290: the 2026.5 upgrade step moved with it, 5.7 -> 5.9 (also a same-minor patch, no migration).
     ns = _ns()
     assert ns['AUTHENTIK_VETTED_RELEASE'] == '2026.8.7'
     assert ns['AUTHENTIK_DEV_RELEASE'] == '2026.8.7'
-    assert ns['AUTHENTIK_UPGRADE_STEPS'] == ('2026.5.7',)
+    assert ns['AUTHENTIK_UPGRADE_STEPS'] == ('2026.5.9',)
 
 
 @pytest.mark.parametrize('installed', ['2026.8.6', '2026.8.5', '2026.8.4', '2026.8.1', '2026.5.7'])
@@ -96,9 +97,9 @@ def test_update_reaches_2026_8_7_in_one_press(installed):
 
 
 @pytest.mark.parametrize('installed,expected', [
-    ('2026.2.7', '2026.5.7'),     # one family behind upstream's floor → step first
-    ('2026.2.0', '2026.5.7'),
-    ('2025.10.3', '2026.5.7'),
+    ('2026.2.7', '2026.5.9'),     # one family behind upstream's floor → step first
+    ('2026.2.0', '2026.5.9'),
+    ('2025.10.3', '2026.5.9'),
     ('2026.5.6', '2026.8.4'),     # the previous family: straight through, as upstream allows
     ('2026.5.7', '2026.8.4'),
     ('2026.8.1', '2026.8.4'),     # same family
@@ -113,7 +114,8 @@ def test_upgrade_hop(installed, expected):
 def test_hop_never_overshoots_a_target_inside_the_step_family():
     hop = _ns()['_ak_upgrade_hop']
     assert hop('2026.2.7', '2026.5.7') == '2026.5.7'
-    assert hop('2026.2.7', '2026.5.8') == '2026.5.8'
+    assert hop('2026.2.7', '2026.5.9') == '2026.5.9'
+    assert hop('2026.2.7', '2026.5.12') == '2026.5.12'
 
 
 @pytest.mark.parametrize('start', ['2025.10.3', '2026.2.0', '2026.2.7', '2026.5.6', '2026.8.1'])
@@ -135,11 +137,11 @@ def test_every_hop_chain_satisfies_upstream_skip_guard(start):
 def test_target_release_main_and_dev_channels():
     main = _ns({'update_channel': 'main'})['_get_authentik_target_release']
     assert main() == '2026.8.7'                           # fresh install: the pin itself
-    assert main(installed='2026.2.7') == '2026.5.7'
+    assert main(installed='2026.2.7') == '2026.5.9'
     assert main(installed='2026.5.7') == '2026.8.7'
     dev = _ns({'update_channel': 'dev'}, latest='2026.8.7')['_get_authentik_target_release']
     assert dev() == '2026.8.7'                            # dev tracks upstream latest, not the pin
-    assert dev(installed='2026.2.7') == '2026.5.7'
+    assert dev(installed='2026.2.7') == '2026.5.9'
     offline = _ns({'update_channel': 'dev'}, latest=None)['_get_authentik_target_release']
     assert offline() == '2026.8.7'
 
@@ -174,6 +176,37 @@ def test_the_guard_catches_the_stale_pin():
 def test_main_channel_offers_nothing_below_the_floor(installed):
     main = _ns({'update_channel': 'main'})['_get_authentik_target_release']
     assert _ver(main(installed=installed)) >= AUTHENTIK_SECURITY_FLOOR[(2026, 8)]
+
+
+def test_every_upgrade_step_is_at_or_above_the_security_floor():
+    """ops #1290: a box on 2026.2.x or older stops at the step first and stays there until its
+    second Update press, so the step must itself be patched, not just the final pin."""
+    steps = _ns()['AUTHENTIK_UPGRADE_STEPS']
+    assert steps
+    for step in steps:
+        floor = AUTHENTIK_SECURITY_FLOOR.get(_family(step))
+        assert floor, f'step {step}: family has no security floor entry, add one'
+        assert _ver(step) >= floor, f'upgrade step {step} is below the security floor {floor}'
+
+
+def test_the_step_guard_catches_the_stale_step():
+    # The red half of the proof: 2026.5.7 (the old step) is below the 2026.5 floor, 2026.5.9 is not.
+    floor = AUTHENTIK_SECURITY_FLOOR[(2026, 5)]
+    assert _ver('2026.5.7') < floor <= _ver('2026.5.9')
+
+
+@pytest.mark.parametrize('start', ['2025.10.3', '2026.2.0', '2026.2.7', '2026.5.6', '2026.5.7', '2026.8.1'])
+def test_no_update_press_lands_below_the_security_floor(start):
+    """Walk Update presses from `start` to the pin: every release a customer is parked on,
+    even for one press, must be at or above its family's floor."""
+    ns = _ns({'update_channel': 'main'})
+    cur, presses = start, 0
+    while cur != ns['AUTHENTIK_VETTED_RELEASE']:
+        cur = ns['_get_authentik_target_release'](installed=cur)
+        floor = AUTHENTIK_SECURITY_FLOOR.get(_family(cur))
+        assert floor and _ver(cur) >= floor, f'from {start}, a press lands on {cur}, below the floor'
+        presses += 1
+        assert presses <= 3
 
 
 def test_steps_are_ascending_and_below_the_pin():

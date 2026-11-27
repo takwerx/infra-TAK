@@ -4,6 +4,42 @@ All notable changes to infra-TAK, newest first. Each entry opens with a plain-la
 
 Back to the [README](README.md).
 
+## v10.4.9-alpha — 2026-11-27 — Authentik Redis restart-loop fix, Guard Dog update emails that try again, ATLAS admin fixes, Federation group names
+
+**Headline: Fixes the Authentik Redis restart loop that 10.4.8 caused on some servers. A server already in the loop repairs itself when it updates. Guard Dog update emails now arrive even when GitHub or the mail relay fails for a moment. Fixes for ATLAS admins, fail2ban, Federation and Rocky. Update from the Console page, Update Now.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.9-alpha))
+
+**Authentik.**
+- 10.4.8 moved Authentik's Redis to an older version on servers where a newer one had already saved its data. That Redis could not read the data and restarted every minute. Now a newer Redis is never moved back. A server already in the loop is repaired when it updates: the unreadable data file is moved aside, not deleted.
+- A server two Authentik versions behind now steps through 2026.5.9 on its way to 2026.8.7.
+- The Authentik page lists every group name that holds `|`, `;` or `,` and says how to rename it.
+
+**Security.**
+- Video (MediaMTX): security update.
+
+**Guard Dog.**
+- When GitHub or the mail relay cannot be reached, Guard Dog tries the update email again in an hour, not six. A server is not emailed twice for the same release.
+- When only the API part of TAK Server stops on Ubuntu, Guard Dog restarts only that part. Devices stay connected.
+
+**ATLAS.**
+- An ATLAS update keeps admin groups you added. Before, those admins were locked out after an update.
+- After you rename Authentik's admin group, its members can still open ATLAS.
+
+**fail2ban.**
+- An address you remove from Trusted networks now leaves every jail.
+
+**TAK Server.**
+- The Federation card finds groups saved as `cn=tak_<channel>` (data flowed only one way) and a **Fix group names** button repairs them.
+
+**Boot and Docker.**
+- A restart of Docker no longer restarts Authentik, TAK Portal and CloudTAK, and the boot sequence can no longer hang. TAK Portal Update says when Docker is stuck.
+
+**Rocky and RHEL.**
+- Caddy install tries again when the package source is slow, and says what went wrong.
+- Caddy can roll the TAK Portal access log again, so the TAK Portal fail2ban jail sees new sign-ins.
+- The console no longer fills the system log with SELinux warnings.
+
+**Upgrading:** use **Update Now** on the Console page. Do not roll back to 10.4.8: the Redis loop comes back. If you rolled back, update again.
+
 ## v10.4.8-alpha — 2026-11-26 — Authentik security update, fail2ban bans that block every port and send their email, safer CloudTAK updates, Email Relay with no login
 
 **Headline: Authentik moves to 2026.8.7, a security release. fail2ban bans now block IPv6 addresses and the ports Docker publishes, and their ban emails arrive. A CloudTAK update no longer leaves the map down when a plugin does not fit the new CloudTAK. Update from the Console page, Update Now, then press Update on the Authentik page.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.8-alpha))

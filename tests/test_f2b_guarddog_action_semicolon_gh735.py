@@ -162,6 +162,9 @@ def _hook(box):
           '_makedirs_priv': lambda *a, **k: None,
           '_f2b_read_jail_config': lambda: {'maxretry': 5, 'findtime': 600, 'bantime': 3600},
           '_f2b_write_jail_config': lambda *a, **k: None,
+          # The hook strips the fleet tokens from the stored ignoreip (ops #1286); this test
+          # only checks the action file and the reload, so pass the entries through.
+          '_f2b_operator_extra': lambda stored: stored,
           '_sudo_wrap': lambda c: c,
           'subprocess': types.SimpleNamespace(run=box.run)}
     exec(_func('_fail2ban_add_guarddog_hook'), ns)

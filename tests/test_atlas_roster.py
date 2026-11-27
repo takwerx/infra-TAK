@@ -789,7 +789,7 @@ def test_reconcile_restarts_api_before_it_admits(monkeypatch, tmp_path, env_chan
     seen = {}
 
     def admit(ctx, inst, dirpath, installed, running, plog, restarted=True,
-              container_group=None):
+              container_group=None, admin_group=None):
         order.append('admit')
         seen.update(installed=installed, running=running, restarted=restarted,
                     container_group=container_group)

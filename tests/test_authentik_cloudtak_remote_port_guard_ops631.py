@@ -57,7 +57,8 @@ def _ns(module_run=None, server_ip=None):
               'remote': {'host': ((s.get(k) or {}).get('remote') or {}).get('host', '')}},
           '_local_ram_mb': lambda: 8192,
           '_authentik_pg_command_for_ram': lambda mb: ('postgres -c max_connections=200', 'standard'),
-          '_yaml_duplicate_keys': lambda raw, y: []}
+          '_yaml_duplicate_keys': lambda raw, y: [],
+          '_authentik_redis_seen_version': lambda image: ''}   # ops #1306: no newer redis on this box
     for node in TREE.body:
         if isinstance(node, ast.FunctionDef) and node.name in _FUNCS:
             exec(ast.get_source_segment(APP, node), ns)
