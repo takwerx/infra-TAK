@@ -485,11 +485,24 @@ def _copy_presets(plog):
 
 
 def _video_base(ctx, settings):
-    """rtsp://<host>:8554 when MediaMTX or TAK Video Restreamer is installed, else ''."""
+    """rtsp://<stream host>:8554 when MediaMTX or TAK Video Restreamer is installed, else ''.
+
+    The host is the media server's own name (stream.<fqdn>, or the operator's custom name),
+    the same name the MediaMTX editor hands out. Not the bare fqdn (ops #1424): CloudTAK's media
+    server pulls an RTSP link itself, and only the stream.<fqdn> name is pinned to this box
+    (ops #560, _cloudtak_stream_host_pin). Pulled through the bare fqdn, the request leaves the
+    box and comes back from the wrong address (MediaMTX answers 401) or never comes back (home
+    network, no NAT hairpin). A box with no domain keeps its address."""
     modules = ctx['detect_modules'](fresh=True)
-    if not (modules.get('mediamtx', {}).get('installed') or modules.get('tak_video_restreamer', {}).get('installed')):
+    key = ('mediamtx' if modules.get('mediamtx', {}).get('installed')
+           else 'tak_video_restreamer' if modules.get('tak_video_restreamer', {}).get('installed')
+           else '')
+    if not key:
         return ''
-    host = (settings.get('fqdn') or '').strip() or (settings.get('server_ip') or '').strip()
+    host = ''
+    if (settings.get('fqdn') or '').strip():
+        host = (ctx['_get_service_domain'](settings, key) or '').strip()
+    host = host or (settings.get('server_ip') or '').strip()
     return f'rtsp://{host}:8554' if host else ''
 
 
