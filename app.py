@@ -72295,9 +72295,18 @@ def authentik_control():
                                          f'Nothing was changed. Promote the vetted release instead of '
                                          f'downgrading a live IdP.'}), 409
             # v10.2.8 W10b: remember the tag this host is pinned to now, so a failure can restore it.
-            _rp_ok, _rp_out = _ssh_probe(remote, f"cd {ak_dir} && grep -oE 'AUTHENTIK_TAG:-[^}}]+' docker-compose.yml | head -1 | cut -d- -f2", timeout=10)
+            # ops #1359: strip only the `AUTHENTIK_TAG:-` prefix. `cut -d- -f2` split on EVERY dash, so a
+            # pin such as 2026.11.0-rc2 or 2026.8.7-distroless came back as 2026.11.0 / 2026.8.7 and
+            # the restore wrote a different tag than the host had.
+            _rp_ok, _rp_out = _ssh_probe(remote, f"cd {ak_dir} && grep -oE 'AUTHENTIK_TAG:-[^}}]+' docker-compose.yml | head -1 | sed 's/^AUTHENTIK_TAG:-//'", timeout=10)
             _remote_prev = (_rp_out or '').strip().splitlines()[0].strip() if _rp_ok and (_rp_out or '').strip() else ''
-            if not _ak_tag_is_sane(_remote_prev):
+            # The old `_ak_tag_is_sane` (digits and dots only) refused a pin with a suffix, so the restore
+            # would do nothing. Allow YYYY.M[.P] plus an optional `-suffix` of letters, digits, dots and
+            # dashes. No slash, ampersand, quote, space or newline passes, so the value is safe inside the
+            # `sed 's/.../.../'` below. `latest`, `2026` and a `v` prefix stay refused (not restored).
+            # Inline on purpose: a new module-level name would have to be added to every test that cuts
+            # `authentik_control` out of app.py by name.
+            if not re.fullmatch(r'\d{4}(?:\.\d{1,3}){1,3}(?:-[0-9A-Za-z][0-9A-Za-z.\-]{0,40})?', _remote_prev):
                 _remote_prev = ''
 
             def _remote_restore_pin():
