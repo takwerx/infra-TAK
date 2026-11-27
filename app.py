@@ -1146,18 +1146,225 @@ def _read_priv(path):
 
 
 def _open_secret_w(path):
-    """open(path, 'w') for a file that holds secrets (module .env files).
+    """Write a file that holds secrets (module .env files): atomic, 0600, all or nothing.
 
     ops #632: a plain open() creates the file at the umask default (0644), and the
     startup converge only tightened it to 600 at the NEXT console start — until then
     every local user (tak, postgres) could read the Authentik/CloudTAK passwords.
-    Create it 0600, and tighten an existing one BEFORE the new content goes in."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+
+    ops #1332: the old body opened with O_TRUNC, so a full disk or a dead process
+    mid-write left ~/authentik/.env empty or cut short. That file holds PG_PASS and
+    AUTHENTIK_SECRET_KEY, and a Deploy over the old database volume then minted new
+    ones. Now `with _open_secret_w(p) as f: f.write(...)` collects the text in memory;
+    only a clean exit from the `with` writes it, to a 0600 temp file in the SAME folder
+    that is fsynced and renamed over the old one. An error inside the `with`, a full
+    disk, or a crash leaves the old file exactly as it was. A full disk raises an
+    OSError with a plain message (errno ENOSPC), never a half-written file.
+    Fallback: if the folder will not let us make or rename a file (a read-only folder,
+    a root-owned folder, an SELinux rename denial), the text is written over the file
+    in place (no O_TRUNC; truncate to length only after the write succeeded)."""
+    import contextlib, errno, io
+
+    @contextlib.contextmanager
+    def _writer():
+        buf = io.StringIO()
+        yield buf                       # an exception in the with-body skips everything below
+        data = buf.getvalue().encode('utf-8')
+        real = os.path.realpath(path)
+        folder = os.path.dirname(real) or '.'
+        try:
+            st = os.stat(real)
+        except OSError:
+            st = None
+
+        def _full(exc):
+            return OSError(errno.ENOSPC, f'Disk is full: could not save {real}. '
+                                         f'The old file was left unchanged. Free some disk space and retry.')
+
+        def _in_place():
+            print(f"secret write: could not rename a new file over {real} (folder or SELinux refused); "
+                  f"writing it in place instead", flush=True)
+            fd = os.open(real, os.O_WRONLY | os.O_CREAT, 0o600)    # no O_TRUNC
+            try:
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    pass
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.ftruncate(fd, len(data))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+        tmp = None
+        try:
+            try:
+                fd, tmp = _tempfile_mkstemp(folder, real)
+            except (PermissionError, FileNotFoundError):
+                _in_place()
+                return
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    pass
+                if st is not None and os.getuid() == 0:
+                    try:
+                        os.fchown(fd, st.st_uid, st.st_gid)     # keep the owner a root console found
+                    except OSError:
+                        pass
+            finally:
+                os.close(fd)
+            try:
+                os.replace(tmp, real)
+            except PermissionError:
+                os.unlink(tmp)
+                tmp = None
+                _in_place()
+                return
+            tmp = None
+            try:
+                dfd = os.open(folder, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
+        except OSError as e:
+            if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                raise _full(e) from e
+            raise
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def _tempfile_mkstemp(folder, real):
+        import tempfile
+        return tempfile.mkstemp(prefix='.' + os.path.basename(real) + '.', suffix='.tmp', dir=folder)
+
+    return _writer()
+
+
+def _authentik_env_sane(text):
+    """ops #1332: does this .env text still hold the two secrets Authentik cannot lose?
+
+    PG_PASS (the database password; Postgres keeps the old one inside its volume) and
+    AUTHENTIK_SECRET_KEY (signs sessions and encrypts stored secrets). An empty or cut-short
+    file has neither. Both must have a value."""
+    seen = {}
+    for ln in (text or '').splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith('#') or '=' not in ln:
+            continue
+        k, v = ln.split('=', 1)
+        seen[k.strip()] = v.strip().strip('"').strip("'")
+    has_pass = bool(seen.get('PG_PASS') or seen.get('AUTHENTIK_POSTGRESQL__PASSWORD'))
+    return has_pass and bool(seen.get('AUTHENTIK_SECRET_KEY'))
+
+
+def _authentik_env_newest_good_backup(env_path):
+    """Newest `<env>.bak*` next to env_path that is still sane, as (path, text); else (None, None)."""
+    folder = os.path.dirname(env_path) or '.'
+    prefix = os.path.basename(env_path) + '.bak'
     try:
-        os.fchmod(fd, 0o600)
+        names = [n for n in os.listdir(folder) if n.startswith(prefix)]
     except OSError:
-        pass                    # not ours (pre-flip root-owned) — the converge heals it
-    return os.fdopen(fd, 'w')
+        return (None, None)
+    found = []
+    for n in names:
+        fp = os.path.join(folder, n)
+        try:
+            found.append((os.stat(fp).st_mtime, fp))
+        except OSError:
+            continue
+    for _mt, fp in sorted(found, reverse=True):
+        try:
+            with open(fp) as f:
+                text = f.read()
+        except OSError:
+            continue
+        if _authentik_env_sane(text):
+            return (fp, text)
+    return (None, None)
+
+
+def _authentik_env_restore_from_backup(env_path, plog):
+    """ops #1332: put the newest good backup back as .env. True when .env is sane afterwards.
+
+    PG_PASS and AUTHENTIK_SECRET_KEY are made once and never change, so any backup that holds
+    them holds the right ones. Later tuning lines come back by themselves: every writer that
+    adds them is idempotent and runs at the next console start. A damaged file that still has
+    bytes is kept beside it as `.env.damaged.<time>` (0600)."""
+    bak, text = _authentik_env_newest_good_backup(env_path)
+    if not bak:
+        return False
+    try:
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                damaged = f.read()
+            if damaged.strip():
+                with _open_secret_w(f"{env_path}.damaged.{int(time.time())}") as f:
+                    f.write(damaged)
+        with _open_secret_w(env_path) as f:
+            f.write(text)
+    except Exception as e:
+        plog(f"  authentik .env: could not restore from {os.path.basename(bak)}: {e}")
+        return False
+    plog(f"  ⚠ authentik .env was missing or damaged: restored from {os.path.basename(bak)} "
+         f"(the database password and secret key are the original ones)")
+    return True
+
+
+def _authentik_db_volume_exists():
+    """ops #1332: True / False when Docker says whether the Authentik Postgres volume exists
+    (compose project 'authentik' for ~/authentik, volume 'database'); None when Docker cannot say."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'volume', 'ls', '-q', '--filter', 'name=authentik_database']),
+                           capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return 'authentik_database' in (r.stdout or '').split()
+
+
+def _authentik_env_guard_before_mint(env_path, plog):
+    """ops #1332: never make new database and secret-key values over an existing database.
+
+    Postgres keeps the password it was first started with, inside its volume. A new PG_PASS in
+    a fresh .env locks Authentik out of its own database, and a new AUTHENTIK_SECRET_KEY breaks
+    every stored secret. Returns 'ok' when it is safe to carry on (a .env that is fine, or no
+    database volume to protect), 'restored' when .env came back from a backup, or 'refuse'."""
+    text = ''
+    if os.path.exists(env_path):
+        try:
+            with open(env_path) as f:
+                text = f.read()
+        except OSError:
+            text = ''
+        if _authentik_env_sane(text):
+            return 'ok'
+    if _authentik_db_volume_exists() is not True:
+        return 'ok'
+    if _authentik_env_restore_from_backup(env_path, plog):
+        return 'restored'
+    plog("\u2717 Stopped: this box still holds the database of an earlier Authentik install "
+         "(Docker volume authentik_database), but ~/authentik/.env is missing or damaged and no good backup was found.")
+    plog("  Deploying now would make new passwords, and Authentik could no longer open its own database.")
+    plog("  To keep the old data: put your old .env file back in ~/authentik, then Deploy again.")
+    plog("  To start over with an empty Authentik (this deletes the old users and settings): "
+         "run  docker volume rm authentik_database  and Deploy again.")
+    return 'refuse'
 
 
 def _read_own_or_priv(path):
@@ -76179,7 +76386,7 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
 
         import time as _t
         backup_path = f'{env_path}.bak.gunicorn-timeout.{int(_t.time())}'
-        with open(backup_path, 'w') as _f:
+        with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
 
         new_line = f'GUNICORN_CMD_ARGS=--timeout={int(value)}\n'
@@ -76303,7 +76510,7 @@ def _ensure_authentik_pg_persistent_connections(plog, max_age=10, health_checks=
 
         import time as _t
         backup_path = f'{env_path}.bak.pg-persistent-conn.{int(_t.time())}'
-        with open(backup_path, 'w') as _f:
+        with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
 
         appended = []
@@ -76418,7 +76625,7 @@ def _patch_authentik_conn_max_age_60_to_10(plog=None):
 
         import time as _t
         backup_path = f'{ak_env}.bak.conn-max-age-60to10.{int(_t.time())}'
-        with open(backup_path, 'w') as _f:
+        with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
 
         new_text = env_text.replace(
@@ -76528,7 +76735,7 @@ def _patch_authentik_web_max_requests_to_1000(plog=None):
 
         import time as _t
         backup_path = f'{ak_env}.bak.max-requests-1000.{int(_t.time())}'
-        with open(backup_path, 'w') as _f:
+        with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
 
         new_text = env_text
@@ -76691,7 +76898,7 @@ def _patch_authentik_max_requests_snap_to_baseline_if_pgbouncer(plog=None):
 
         _new_jitter = max(5, _baseline // 20)
         _backup = f'{ak_env}.bak.snap-to-baseline.{_now}'
-        with open(_backup, 'w') as _f:
+        with _open_secret_w(_backup) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(_env_text)
 
         _new_text = re.sub(
@@ -78154,6 +78361,16 @@ def _authentik_apply_official_tunings(plog):
         plog(f"  authentik tunings: read error: {e}")
         return False
 
+    # ops #1332: never build on a .env that lost its secrets (an empty or cut-short file).
+    if not _authentik_env_sane(content):
+        if _authentik_env_restore_from_backup(env_path, plog):
+            with open(env_path) as f:
+                content = f.read()
+        else:
+            plog("  \u2717 authentik tunings: ~/authentik/.env has no PG_PASS or AUTHENTIK_SECRET_KEY and no good "
+                 "backup was found — changed nothing. Put the old .env back, then restart the console.")
+            return False
+
     lines = content.splitlines()
     actions = []
 
@@ -78232,6 +78449,9 @@ def _authentik_apply_official_tunings(plog):
         return False
 
     try:
+        _bak = f"{env_path}.bak.tunings.{int(time.time())}"      # ops #1332: this writer kept no backup
+        with _open_secret_w(_bak) as f:
+            f.write(content)
         with _open_secret_w(env_path) as f:
             f.write(new_content)
         plog("  authentik tunings: .env updated:")
@@ -84418,7 +84638,7 @@ def _authentik_max_requests_autotune_apply(plog, new_max, new_jitter, reason):
             return False
 
         _backup = f"{ak_env}.bak.autotune.{_now}"
-        with open(_backup, 'w') as _f:
+        with _open_secret_w(_backup) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(_txt)
 
         _new_txt = re.sub(
@@ -86231,6 +86451,16 @@ def _authentik_fix_trusted_proxy_cidrs(plog):
         plog(f"  trusted proxy CIDRs: read error: {e}")
         return False
 
+    # ops #1332: never build on a .env that lost its secrets (an empty or cut-short file).
+    if not _authentik_env_sane(content):
+        if _authentik_env_restore_from_backup(env_path, plog):
+            with open(env_path) as f:
+                content = f.read()
+        else:
+            plog("  \u2717 trusted proxy CIDRs: ~/authentik/.env has no PG_PASS or AUTHENTIK_SECRET_KEY and no good "
+                 "backup was found — changed nothing. Put the old .env back, then restart the console.")
+            return False
+
     key = 'AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS'
     value = AK_TRUSTED_PROXY_CIDRS
 
@@ -86251,6 +86481,8 @@ def _authentik_fix_trusted_proxy_cidrs(plog):
 
     new_content = content.rstrip('\n') + f'\n{key}={value}\n'
     try:
+        with _open_secret_w(f"{env_path}.bak.trusted-proxy.{int(time.time())}") as f:   # ops #1332: no backup before
+            f.write(content)
         with _open_secret_w(env_path) as f:
             f.write(new_content)
         plog(f"  trusted proxy CIDRs: appended {key}={value}")
@@ -87412,6 +87644,8 @@ def run_authentik_deploy(reconfigure=False):
                     env_lines = f.readlines()
                 has_cookie_domain = any(line.strip().startswith('AUTHENTIK_COOKIE_DOMAIN=') for line in env_lines)
                 if not has_cookie_domain:
+                    with _open_secret_w(f"{env_path}.bak.cookie-domain.{int(time.time())}") as f:   # ops #1332
+                        f.write(''.join(env_lines))
                     with _open_secret_w(env_path) as f:
                         for line in env_lines:
                             f.write(line)
@@ -87627,6 +87861,11 @@ def run_authentik_deploy(reconfigure=False):
             plog("")
             plog("\u2501\u2501\u2501 Step 3/10: Generating Configuration \u2501\u2501\u2501")
             ldap_svc_pass = None
+            # ops #1332: a missing or damaged .env over an existing database volume must not
+            # make new passwords (Postgres keeps the old one inside the volume).
+            if _authentik_env_guard_before_mint(env_path, plog) == 'refuse':
+                authentik_deploy_status.update({'running': False, 'error': True})
+                return
             if not os.path.exists(env_path):
                 pg_pass = subprocess.run('openssl rand -base64 36 | tr -d "\\n"', shell=True, capture_output=True, text=True).stdout.strip()[:90]
                 secret_key = subprocess.run('openssl rand -hex 32', shell=True, capture_output=True, text=True).stdout.strip()
@@ -88345,9 +88584,12 @@ entries:
                         import secrets as _ldap_secrets
                         ldap_svc_password = _ldap_secrets.token_urlsafe(24)
                         try:
-                            with open(env_path, 'a') as _env_f:
+                            with open(env_path) as _env_r:      # ops #1332: whole-file atomic write, not a bare append
+                                _env_now = _env_r.read()
+                            with _open_secret_w(env_path) as _env_f:
                                 _env_f.write(
-                                    '\n# Auto-generated by infra-TAK v0.9.12 (was previously a shared hardcoded fallback).\n'
+                                    _env_now + ('' if _env_now.endswith('\n') or not _env_now else '\n')
+                                    + '\n# Auto-generated by infra-TAK v0.9.12 (was previously a shared hardcoded fallback).\n'
                                     f'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD={ldap_svc_password}\n'
                                 )
                             plog("  ⚠ AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD was missing — generated and saved a new value to ~/authentik/.env")
