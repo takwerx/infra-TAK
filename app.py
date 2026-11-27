@@ -12126,9 +12126,36 @@ def support_diagnostics_email():
     return jsonify({'success': True, 'message': f'Sent to {to}'})
 
 
+def _release_version_tuple(v):
+    """(10, 4, 9) from '10.4.9-alpha', 'v10.4.9' ...; None when it is not a plain version."""
+    try:
+        return tuple(int(p) for p in str(v or '').strip().lstrip('v').replace('-alpha', '').replace('-beta', '').split('.'))
+    except ValueError:
+        return None
+
+
+def _console_ahead_of_main_message(latest, running=None):
+    """ops #1330: '' unless the console runs a NEWER version than the newest main release
+    `latest`. A dev box switched to the main channel then says "Up to date" while it holds code
+    main does not have, and the parts pinned per channel (NetBird, Authentik) follow main's older
+    values. Plain words, shown on the console page. Never raises."""
+    cur = _release_version_tuple(VERSION if running is None else running)
+    new = _release_version_tuple(latest)
+    if not cur or not new or cur <= new:
+        return ''
+    return (f'This server runs {VERSION}, which is newer than the newest main release '
+            f'({str(latest).strip().lstrip("v")}). Main has older versions of some parts, such as '
+            'NetBird and Authentik, and staying on main can move those parts back to them. '
+            'Switch to the dev channel to stay on this code.')
+
+
 def _update_check_response(data):
     """Return JSON response with no-cache headers so FQDN/proxy path never serves stale update badge."""
     from flask import make_response
+    if isinstance(data, dict) and data.get('channel') == 'main' and not data.get('check_failed'):
+        _ahead = _console_ahead_of_main_message(data.get('latest'))
+        if _ahead:
+            data = {**data, 'ahead_of_channel': True, 'ahead_message': _ahead}
     r = make_response(jsonify(data))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     r.headers['Pragma'] = 'no-cache'
@@ -12844,19 +12871,25 @@ def _update_plain_git_error(err):
     return err
 
 
-def _update_rollback_snapshot(prev, running_version, head_tag, now_utc):
+def _update_rollback_snapshot(prev, running_version, head_tag, now_utc, head_sha=''):
     """The `console_rollback` record to save at the start of an Update Now click.
 
     ops #1329: if an earlier click already recorded this RUNNING version and it is still the
     version running, keep that record. Click one moves HEAD; when the restart never comes,
-    click two used to read the NEW tag from HEAD and make it the rollback target."""
+    click two used to read the NEW tag from HEAD and make it the rollback target.
+    ops #1330: the record also holds the commit (`sha`) and a `label`; the tag is set only when
+    HEAD is exactly on one. The `v{version}` guess stays only when git could say neither."""
     prev = prev if isinstance(prev, dict) else {}
-    if prev.get('available') and prev.get('tag') and prev.get('version') == running_version:
+    if (prev.get('available') and (prev.get('tag') or prev.get('sha'))
+            and prev.get('version') == running_version):
         return prev
+    tag = head_tag or ('' if head_sha else f'v{running_version}')
     return {
         'available': True,
         'version': running_version,
-        'tag': head_tag or f'v{running_version}',
+        'tag': tag,
+        'sha': head_sha,
+        'label': tag or f'{running_version} ({head_sha[:7]})',
         'snapshot_at': now_utc,
     }
 
@@ -13134,21 +13167,13 @@ def update_apply():
 
     # v0.9.3: Record current version for one-step rollback before updating
     try:
-        _pre_update_version = VERSION
         _s = load_settings()
-        # Determine the current git tag so rollback can fetch it
-        _cur_tag_r = subprocess.run(
-            ['git', f'--git-dir={os.path.join(console_dir, ".git")}',
-             f'--work-tree={console_dir}', 'describe', '--tags', '--exact-match'],
-            capture_output=True, text=True, timeout=10
-        )
-        _cur_tag = (_cur_tag_r.stdout or '').strip() if _cur_tag_r.returncode == 0 else f'v{VERSION}'
         # ops #1329 (item 4): after an interrupted click (HEAD moved, restart never came) HEAD
-        # names the NEW tag; a second click used to record that as the rollback target. Keep
-        # the record the first click made for the version that is actually running.
-        _s['console_rollback'] = _update_rollback_snapshot(
-            _s.get('console_rollback'), VERSION, _cur_tag,
-            datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))
+        # names the NEW tag; a second click used to record that as the rollback target. The
+        # helper keeps the record the first click made for the version that is running.
+        # ops #1330: it also stores the commit, and a tag only when HEAD is exactly on one.
+        _s['console_rollback'] = _console_rollback_snapshot(
+            console_dir, VERSION, _s.get('console_rollback'))
         save_settings(_s)
     except Exception:
         pass
@@ -13766,6 +13791,229 @@ def console_migrate_nonroot_status_api():
     return jsonify({'state': state, 'nonroot': nonroot, 'detail': detail})
 
 
+# ops #1330: the Rollback never changes anything until it knows the release it goes back to is on
+# this box, checks out FIRST, and only then runs the module steps that older release needs. Before,
+# three module steps (MediaMTX editor passwords to plain text, ATLAS identity headers, the
+# MediaMTX remote HLS port) ran before the checkout and the `git fetch` answer was thrown away: a
+# checkout that failed (no network and no local tag, a tag that never existed) left the console
+# on the new version with those three changes applied.
+_ROLLBACK_REPO_URL = 'https://github.com/takwerx/infra-TAK.git'
+_ROLLBACK_REF_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+_ROLLBACK_SHA_RE = re.compile(r'[0-9a-f]{40}')
+
+# The pinned versions the older release puts back when it runs its own start-up checks after the
+# rollback (its code is not ours to change). Plain constants in app.py, read from the old release
+# with git and compared with this one. NetBird is listed for the update channel the box is on.
+_ROLLBACK_PIN_WATCH = (
+    ('NetBird server', 'NETBIRD_SERVER_IMAGE', 'main'),
+    ('NetBird dashboard', 'NETBIRD_DASHBOARD_IMAGE', 'main'),
+    ('NetBird server', 'NETBIRD_SERVER_DEV_IMAGE', 'dev'),
+    ('NetBird dashboard', 'NETBIRD_DASHBOARD_DEV_IMAGE', 'dev'),
+    ('Authentik redis', 'AUTHENTIK_REDIS_IMAGE', ''),
+    ('Authentik connection pool', '_AUTHENTIK_PGBOUNCER_IMAGE', ''),
+    ('Node-RED', 'NODERED_IMAGE', ''),
+    ('WebODM', 'WEBODM_VERSION', ''),
+    ('CloudTAK media server', 'MEDIA_INFRA_IMAGE', ''),
+    ('CloudTAK database', 'POSTGIS_IMAGE', ''),
+    ('TURN server', 'COTURN_IMAGE', ''),
+    ('MediaMTX web editor', 'MEDIAMTX_EDITOR_REF', ''),
+)
+
+
+def _console_rollback_snapshot(console_dir, version, prev=None):
+    """The record Update Now keeps for the Rollback button, taken before the update moves HEAD.
+    The tag is set only when HEAD is exactly on one. It used to fall back to `v{version}`, which
+    on a dev box (an untagged commit, with the same version string as the next release) is a tag
+    that does not exist yet or sits on another commit. The commit is recorded too, so the
+    Rollback goes to what really ran (ops #1330). `prev` is the record already saved: a second
+    click after an interrupted update keeps it (ops #1329, see _update_rollback_snapshot).
+    Raises when git cannot be run."""
+    def _git_out(*args):
+        r = subprocess.run(
+            ['git', f'--git-dir={os.path.join(console_dir, ".git")}', f'--work-tree={console_dir}'] + list(args),
+            capture_output=True, text=True, timeout=10)
+        return (r.stdout or '').strip() if r.returncode == 0 else ''
+    tag = _git_out('describe', '--tags', '--exact-match')
+    sha = _git_out('rev-parse', 'HEAD').lower()
+    if not _ROLLBACK_SHA_RE.fullmatch(sha):
+        sha = ''
+    return _update_rollback_snapshot(
+        prev, version, tag, datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), head_sha=sha)
+
+
+def _rollback_git(console_dir, args, timeout=30):
+    return subprocess.run(
+        ['git', '-c', f'safe.directory={console_dir}'] + list(args),
+        cwd=console_dir, capture_output=True, text=True, timeout=timeout,
+        env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+
+
+def _rollback_resolve_target(console_dir, tag, sha):
+    """The commit a Rollback goes back to, made sure to be on this box. Returns (commit, error);
+    error is '' when it is. Changes nothing but the local tag list (the fetch)."""
+    why = ''
+    if tag:
+        try:
+            f = _rollback_git(console_dir, ['fetch', _ROLLBACK_REPO_URL,
+                                            f'refs/tags/{tag}:refs/tags/{tag}'], timeout=60)
+            if f.returncode != 0:
+                why = ((f.stderr or f.stdout or '').strip().splitlines() or ['git fetch failed'])[-1][:160]
+        except Exception as e:
+            why = str(e)[:160]
+    have_tag = ''
+    if tag:
+        try:
+            r = _rollback_git(console_dir, ['rev-parse', '-q', '--verify', f'refs/tags/{tag}^{{commit}}'], timeout=15)
+            out = (r.stdout or '').strip().lower()
+            have_tag = out if r.returncode == 0 and _ROLLBACK_SHA_RE.fullmatch(out) else ''
+        except Exception:
+            have_tag = ''
+    have_sha = ''
+    if sha:
+        try:
+            r = _rollback_git(console_dir, ['cat-file', '-e', f'{sha}^{{commit}}'], timeout=15)
+            have_sha = sha if r.returncode == 0 else ''
+        except Exception:
+            have_sha = ''
+    # What really ran wins over a tag that moved.
+    if have_sha:
+        if have_tag and have_tag != have_sha:
+            print(f'Rollback: tag {tag} now points to {have_tag[:7]}, not to the {have_sha[:7]} that ran: '
+                  'going back to the one that ran', flush=True)
+        return have_sha, ''
+    if have_tag:
+        return have_tag, ''
+    name = tag or (sha[:7] if sha else 'the previous version')
+    return '', (f'Could not get {name} onto this server' + (f' ({why})' if why else '') + '.')
+
+
+def _rollback_current_ref(console_dir):
+    """Where the console checkout is now, in a form `git checkout` takes back: the branch name,
+    else the commit. '' when git cannot say."""
+    try:
+        b = _rollback_git(console_dir, ['symbolic-ref', '-q', '--short', 'HEAD'], timeout=15)
+        name = (b.stdout or '').strip()
+        if b.returncode == 0 and _ROLLBACK_REF_RE.fullmatch(name):
+            return name
+        h = _rollback_git(console_dir, ['rev-parse', 'HEAD'], timeout=15)
+        c = (h.stdout or '').strip().lower()
+        return c if h.returncode == 0 and _ROLLBACK_SHA_RE.fullmatch(c) else ''
+    except Exception:
+        return ''
+
+
+def _console_release_const(console_dir, ref, name):
+    """The plain string constant `name` as release `ref` holds it in app.py ('' when it has none
+    or git cannot read it). Read from git's copy, never from the checkout."""
+    if not _ROLLBACK_REF_RE.fullmatch(str(ref or '')) or not re.fullmatch(r'[A-Z_][A-Z0-9_]*', str(name or '')):
+        return ''
+    try:
+        r = _rollback_git(console_dir, ['grep', '-h', '-E', rf'^{name}[[:space:]]*=', ref, '--', 'app.py'])
+    except Exception:
+        return ''
+    m = re.search(rf'''^{name}\s*=\s*["']([^"']+)["']''', r.stdout or '', re.M)
+    return m.group(1) if m else ''
+
+
+def _rollback_pin_short(v):
+    v = str(v or '')
+    return v.rsplit(':', 1)[-1] if ':' in v else v
+
+
+def _rollback_pin_changes(console_dir, ref, channel, current):
+    """[(name, this version, older release)] for every watched pin the older release `ref` sets
+    to something else. `current` maps constant name to the value this console holds."""
+    out = []
+    for label, const, only_channel in _ROLLBACK_PIN_WATCH:
+        if only_channel and only_channel != channel:
+            continue
+        now = str(current.get(const) or '')
+        then = _console_release_const(console_dir, ref, const)
+        if now and then and now != then:
+            out.append((label, _rollback_pin_short(now), _rollback_pin_short(then)))
+    return out
+
+
+def _rollback_redis_hazard(console_dir, ref, label, compose_image, seen_version):
+    """Plain words when the older release `ref` would break this box's Authentik redis, else ''.
+    ops #1306 / #1330: before 10.4.9 a floating redis tag (alpine, latest, 8) was pinned back to
+    the pin with no look at the version it really ran. The older release does that again after the
+    rollback, and a redis that ran something newer cannot read the dump it saved ("Can't handle
+    RDB format version"): redis crash-loops and Authentik sign-in stops. The older code cannot be
+    changed, so say it first. `compose_image`: the redis `image:` of ~/authentik/docker-compose.yml
+    ('' when there is none); `seen_version`: REDIS_VERSION of the running container ('' unknown)."""
+    if _console_release_app_has(console_dir, ref, 'def _authentik_redis_seen_version(') is not False:
+        return ''              # that release looks at the version first (True), or git cannot say (None)
+    m = re.fullmatch(r'(?:docker\.io/)?(?:library/)?redis(?::([\w.-]+))?', str(compose_image or '').strip().strip('\'"'))
+    if not m:
+        return ''
+    tag = m.group(1) or 'latest'
+    if not (tag in ('alpine', 'latest') or re.fullmatch(r'\d+(?:\.\d+)?(?:-alpine)?', tag)):
+        return ''              # an exact version or another image: the older release leaves it alone
+    sv = re.match(r'(\d+)\.(\d+)\.(\d+)', str(seen_version or ''))
+    pin = re.match(r'.*?(\d+)\.(\d+)\.(\d+)', AUTHENTIK_REDIS_IMAGE.rsplit(':', 1)[-1])
+    if not sv or not pin or tuple(int(x) for x in sv.groups()) <= tuple(int(x) for x in pin.groups()):
+        return ''
+    return (f'Authentik redis on this server runs {".".join(sv.groups())} on the floating tag "{tag}". '
+            f'{label} sets a floating redis back to {AUTHENTIK_REDIS_IMAGE.rsplit(":", 1)[-1]}, which '
+            f'cannot read what {".".join(sv.groups())} saved, so redis would stop and Authentik '
+            'sign-in would fail until you press Update Now again.')
+
+
+def _rollback_redis_hazard_here(console_dir, ref, label):
+    """_rollback_redis_hazard with this box's own answers. Never raises: no answer, no warning."""
+    try:
+        compose = os.path.expanduser('~/authentik/docker-compose.yml')
+        if not os.path.exists(compose):
+            return ''
+        with open(compose, encoding='utf-8') as f:
+            im = re.search(r'(?m)^\s*image:\s*[\'"]?([^\s\'"#]*redis[^\s\'"#]*)', f.read())
+        if not im:
+            return ''
+        seen = _authentik_redis_seen_version(im.group(1))
+        return _rollback_redis_hazard(console_dir, ref, label, im.group(1), seen or '')
+    except Exception:
+        return ''
+
+
+def _rollback_pin_message(label, changes, hazards=()):
+    """Plain words for the operator: what the older release puts back by itself, and what it
+    would break on this server."""
+    out = []
+    if changes:
+        lines = '; '.join(f'{n} {then} (this version {now})' for n, now, then in changes)
+        out.append(f'{label} runs its own start-up checks and may set these back to the versions it was '
+                   f'tested with: {lines}. If this server already runs a newer one of them, check it after '
+                   'the rollback.')
+    out.extend(h for h in hazards if h)
+    return ' '.join(out)
+
+
+@app.route('/api/console/rollback/preview')
+@login_required
+def console_rollback_preview_api():
+    """What the Rollback button would do, in plain words, before it is pressed (ops #1330).
+    Reads only. Never fails the page: a problem comes back as an empty list."""
+    console_dir = os.path.dirname(os.path.abspath(__file__))
+    rb = (load_settings().get('console_rollback') or {})
+    if not rb.get('available'):
+        return jsonify({'ok': True, 'available': False, 'changes': [], 'message': ''})
+    tag = str(rb.get('tag') or '').strip()
+    sha = str(rb.get('sha') or '').strip().lower()
+    ref = sha if _ROLLBACK_SHA_RE.fullmatch(sha) else tag
+    label = rb.get('label') or tag or sha[:7] or 'the previous version'
+    channel = (load_settings().get('update_channel') or 'main').strip().lower()
+    try:
+        changes = _rollback_pin_changes(console_dir, ref, channel, globals())
+    except Exception:
+        changes = []
+    hazards = [h for h in (_rollback_redis_hazard_here(console_dir, ref, label),) if h]
+    return jsonify({'ok': True, 'available': True, 'label': label,
+                    'changes': [{'name': n, 'now': a, 'then': b} for n, a, b in changes],
+                    'hazards': hazards,
+                    'message': _rollback_pin_message(label, changes, hazards)})
+
+
 @app.route('/api/console/rollback', methods=['POST'])
 @login_required
 def console_rollback_api():
@@ -13785,32 +14033,51 @@ def console_rollback_api():
     rb = s.get('console_rollback') or {}
     if not rb.get('available'):
         return jsonify({'ok': False, 'error': 'No rollback available (no snapshot recorded before last update)'}), 400
-    prev_tag = rb.get('tag', '').strip()
-    if not prev_tag:
+    prev_tag = str(rb.get('tag') or '').strip()
+    prev_sha = str(rb.get('sha') or '').strip().lower()
+    if prev_sha and not _ROLLBACK_SHA_RE.fullmatch(prev_sha):
+        prev_sha = ''
+    if prev_tag and not _ROLLBACK_REF_RE.fullmatch(prev_tag):
+        prev_tag = ''           # a stored value that looks like a git option never reaches git
+    if not prev_tag and not prev_sha:
         return jsonify({'ok': False, 'error': 'Rollback tag not recorded'}), 400
+    label = prev_tag or str(rb.get('label') or '') or prev_sha[:7]
     try:
-        git_cfg = ['git', '-c', f'safe.directory={console_dir}']
-        # Fetch the tag from origin
-        fetch_r = subprocess.run(
-            git_cfg + ['fetch', 'https://github.com/takwerx/infra-TAK.git',
-                       f'refs/tags/{prev_tag}:refs/tags/{prev_tag}'],
-            cwd=console_dir, capture_output=True, text=True, timeout=60,
-            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
-        )
-        # ops #917: a release that pins a web editor older than password hashing (2.1.15) would,
+        # ops #1330: 1. Make sure the release is here. Nothing on this box changes if it is not.
+        target, why = _rollback_resolve_target(console_dir, prev_tag, prev_sha)
+        if not target:
+            return jsonify({'ok': False, 'error': why + ' Nothing was changed.'}), 500
+        # What the older release will need (read from git, before anything moves).
+        orig_ref = _rollback_current_ref(console_dir)
+        redis_hazard = _rollback_redis_hazard_here(console_dir, target, f'Version {label}')
+        # 2. Check out FIRST. If this fails nothing else has been touched.
+        checkout_r = _rollback_git(console_dir, ['checkout', '--force', target])
+        if checkout_r.returncode != 0:
+            err = (checkout_r.stderr or '').strip() or 'git checkout failed'
+            return jsonify({'ok': False, 'error': err}), 500
+        # 3. ops #917: a release that pins a web editor older than password hashing (2.1.15) would,
         # on its "Patch web editor", put back an editor that cannot read hashed passwords. Give
-        # the accounts plain-text passwords first (the editor's own rollback does the same).
-        # Done before the checkout so a failure here leaves the console as it was.
+        # the accounts plain-text passwords first (the editor's own rollback does the same). When
+        # that cannot be done the rollback stops and the checkout is put back.
         editor_reset = {'state': 'none', 'count': 0}
-        if _mediamtx_editor_ref_lacks_hashing(_console_release_editor_ref(console_dir, prev_tag)):
+        if _mediamtx_editor_ref_lacks_hashing(_console_release_editor_ref(console_dir, target)):
             editor_reset = _mediamtx_editor_unhash_for_rollback(s)
             if editor_reset['state'] == 'fail':
+                back = None
+                if orig_ref:
+                    back = _rollback_git(console_dir, ['checkout', '--force', orig_ref])
+                if back is not None and back.returncode == 0:
+                    return jsonify({'ok': False, 'error': (
+                        'Rollback stopped: the MediaMTX web editor passwords could not be changed '
+                        'for the older version. Nothing was changed.')}), 500
                 return jsonify({'ok': False, 'error': (
                     'Rollback stopped: the MediaMTX web editor passwords could not be changed '
-                    'for the older version. Nothing was changed.')}), 500
+                    'for the older version, and the console files could not be put back. Press '
+                    'Rollback again, or restart the console, to finish going back to '
+                    f'{label}.')}), 500
         # ops #1151: an older release cannot keep ATLAS on Authentik's signed token (its
         # Caddyfile does not pass the token and its Authentik reconfigure takes the signing
-        # key off). Put such a deployment back on the identity headers first, or it refuses
+        # key off). Put such a deployment back on the identity headers, or it refuses
         # every administrator after the rollback. A failure here does not stop the rollback.
         atlas_reset = {}
         try:
@@ -13819,31 +14086,32 @@ def console_rollback_api():
                 atlas_reset = _atlas_rb(
                     mod_registry.get_ctx(),
                     lambda m: print(f'Rollback: ATLAS {m}', flush=True),
-                    _console_release_has_file(console_dir, prev_tag,
+                    _console_release_has_file(console_dir, target,
                                               'modules/atlas_signed_identity.py')) or {}
         except Exception as _arb:
             print(f'Rollback: ATLAS sign-in step error (non-fatal): {str(_arb)[:160]}', flush=True)
         # ops #1149: a release without the closed HLS port on a remote MediaMTX box gets the
-        # port back (bind and firewall rule) before the checkout. A failure does not stop the
-        # rollback.
+        # port back (bind and firewall rule). A failure does not stop the rollback.
         hls_port_reset = 'none'
         try:
-            hls_port_reset = _mediamtx_remote_hls_port_before_rollback(s, console_dir, prev_tag)
+            hls_port_reset = _mediamtx_remote_hls_port_before_rollback(s, console_dir, target)
         except Exception as _hpr:
             print(f'Rollback: MediaMTX HLS port step error (non-fatal): {str(_hpr)[:160]}', flush=True)
-        checkout_r = subprocess.run(
-            git_cfg + ['checkout', '--force', prev_tag],
-            cwd=console_dir, capture_output=True, text=True, timeout=30,
-            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
-        )
-        if checkout_r.returncode != 0:
-            err = (checkout_r.stderr or '').strip() or 'git checkout failed'
-            return jsonify({'ok': False, 'error': err}), 500
-        # Clear rollback availability (one rollback per update)
+        # Clear rollback availability (one rollback per update). Settings are read again: the
+        # steps above can take minutes.
+        s = load_settings()
         s['console_rollback'] = {'available': False}
         save_settings(s)
+        try:
+            pin_note = _rollback_pin_message(
+                f'Version {label}',
+                _rollback_pin_changes(console_dir, target,
+                                      (s.get('update_channel') or 'main').strip().lower(), globals()),
+                [redis_hazard])
+        except Exception:
+            pin_note = ''
         _detached_console_restart()
-        message = f'Rolled back to {prev_tag}. Console is restarting.'
+        message = f'Rolled back to {label}. Console is restarting.'
         if editor_reset['state'] == 'reset':
             message += (' The MediaMTX web editor in that version cannot read the new password '
                         'format, so its accounts got new passwords. The admin password is on '
@@ -13856,8 +14124,10 @@ def console_rollback_api():
         if 'failed' in atlas_reset.values():
             message += (' ATLAS could not be set back to the sign-in of that version. If the '
                         'ATLAS console refuses administrators, press Update Now again.')
+        if pin_note:
+            message += ' ' + pin_note
         return jsonify({
-            'ok': True, 'tag': prev_tag,
+            'ok': True, 'tag': label,
             'message': message,
             'editor_passwords_reset': editor_reset['count'],
         })
@@ -17628,17 +17898,49 @@ def netbird_control_api():
         # or the briefly-shipped :latest that broke auth), so rewrite the compose to the vetted
         # pin BEFORE pull — Update always converges the box onto the tested image, never chases
         # upstream latest. (Bumping the pin in a release is what actually moves NetBird forward.)
-        _netbird_sync_compose_image_tags(nb_dir)
-        pull = _sp.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
-                       capture_output=True, text=True, cwd=nb_dir, timeout=600)
-        if pull.returncode != 0:
-            err = (pull.stderr or pull.stdout or 'docker compose pull failed').strip()[:400]
-            return jsonify({'success': False, 'error': err}), 500
+        #
+        # ops #1327: the order is (1) pull the pinned images by name, (2) back up data/, (3) only then
+        # rewrite the compose and recreate. A failed pull stops here with the compose and the
+        # running container untouched. Update no longer runs _netbird_finalize_account_store: it
+        # reset the operator's "users need approval" setting on every Update. It runs only while
+        # this install still owes it (netbird_finalize_pending, set when a deploy created the owner).
+        _s = load_settings()
+        _srv_img, _dash_img = _get_netbird_target_images(_s)
+        _compose_path = os.path.join(nb_dir, 'docker-compose.yml')
+        try:
+            with open(_compose_path) as _f:
+                _old_txt = _f.read()
+        except Exception:
+            _old_txt = _read_priv(_compose_path)
+        _backup = None
+        _same = _netbird_compose_on_target(_old_txt, _srv_img, _dash_img)
+        if not _same:
+            _ok, _backup, _msg = _netbird_prepare_image_change(nb_dir, _old_txt, _srv_img, _dash_img, lambda _m: None)
+            if not _ok:
+                return jsonify({'success': False, 'error': f'NetBird was not changed: {_msg}'[:400]}), 500
+        _wrote = _netbird_sync_compose_image_tags(nb_dir)
+        if not _same and not _wrote:
+            # the backup stopped the server; start it as it was and say so
+            _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), capture_output=True, text=True,
+                    cwd=nb_dir, timeout=180)
+            return jsonify({'success': False, 'error': 'NetBird was not changed: could not rewrite '
+                            'docker-compose.yml'}), 500
+        if _same:
+            pull = _sp.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=600)
+            if pull.returncode != 0:
+                err = (pull.stderr or pull.stdout or 'docker compose pull failed').strip()[:400]
+                return jsonify({'success': False, 'error': err}), 500
         try:
             _netbird_recreate_containers(nb_dir, lambda _m: None)
-            _netbird_finalize_account_store()
+            if _s.get('netbird_finalize_pending') and _netbird_finalize_account_store():
+                _s.pop('netbird_finalize_pending', None)
+                save_settings(_s)
         except Exception as ex:
-            return jsonify({'success': False, 'error': str(ex)[:300]}), 500
+            if not _same:
+                _netbird_revert_compose(nb_dir, _old_txt, lambda _m: None)
+            _hint = f' (data backup: {os.path.basename(_backup)})' if _backup else ''
+            return jsonify({'success': False, 'error': (str(ex)[:300] + _hint)}), 500
         time.sleep(2)
         r_status = _sp.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server']),
                              capture_output=True, text=True)
@@ -17723,6 +18025,7 @@ def netbird_uninstall_api():
             if 'netbird_pat' in settings:
                 del settings['netbird_pat']
             settings.pop('netbird_admin_email', None)
+            settings.pop('netbird_finalize_pending', None)  # ops #1327: the account is gone with the data
             save_settings(settings)
             # Regenerate caddyfile and reload
             generate_caddyfile(settings)
@@ -26820,6 +27123,21 @@ def fail2ban_status_api():
         return jsonify({'available': False, 'error': str(e)[:200]})
 
 
+@app.route('/api/fail2ban/ban-summary', methods=['GET', 'POST'])
+@login_required
+def fail2ban_ban_summary_api():
+    """ops #1395: the opt-in daily ban summary mail. Default OFF. Routine bans are never
+    mailed one by one; this is the only ban mail an owner can ask for. The ban notifier
+    (infratak-f2b-notify) reads settings.f2b_daily_summary on every ban."""
+    s = load_settings()
+    if request.method == 'POST':
+        data = request.get_json(force=True, silent=True) or {}
+        s['f2b_daily_summary'] = bool(data.get('enabled', False))
+        save_settings(s)
+    return jsonify({'ok': True, 'enabled': bool(s.get('f2b_daily_summary', False)),
+                    'alert_email_set': bool((s.get('guarddog_alert_email') or '').strip())})
+
+
 @app.route('/api/fail2ban/authentik/config', methods=['POST'])
 @login_required
 def fail2ban_authentik_toggle_api():
@@ -29144,6 +29462,9 @@ def fail2ban_uninstall_api():
             '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf',
             '/etc/systemd/system/authentik-log-forwarder.service',
             '/usr/local/sbin/infratak-f2b-notify',
+            '/var/lib/fail2ban/infratak-f2b-notify-state.json',
+            '/var/lib/fail2ban/infratak-f2b-notify-state.json.lock',
+            '/var/lib/fail2ban/infratak-f2b-notify-state.json.tmp',
         ]:
             subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True)  # v10.0.5 non-root
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
@@ -69493,21 +69814,51 @@ def _netbird_mgmt_request(path, method='GET', data=None, token=None, base='http:
     return _req.urlopen(req, timeout=timeout, context=ctx)
 
 
+def _netbird_compose_image_tags(txt):
+    """The image tags a NetBird compose names: {'server': [...], 'dashboard': [...]}. One entry per
+    `image:` line; a line with no tag gives None (Docker reads that as :latest). Parsed as whole
+    tokens, so `0.82.1` is never found inside `0.82.10` (ops #1327)."""
+    import re as _re
+    out = {'server': [], 'dashboard': []}
+    for key, name in (('server', 'netbirdio/netbird-server'), ('dashboard', 'netbirdio/dashboard')):
+        pat = _re.compile(r'^[ \t]*image:[ \t]*["\']?' + _re.escape(name)
+                          + r'(?::([^\s"\'#]+))?(?![\w./:-])', _re.M)
+        out[key] = [m.group(1) for m in pat.finditer(txt or '')]
+    return out
+
+
+def _netbird_compose_on_target(txt, srv_img, dash_img):
+    """True when EVERY netbird-server and dashboard image line in the compose names exactly the
+    tag of the target images, and each is named at least once. An exact tag compare: a text match
+    found 0.82.1 inside 0.82.10, and a tag-less line counted as the pin (ops #1327)."""
+    tags = _netbird_compose_image_tags(txt)
+    want_srv = srv_img.rsplit(':', 1)[-1]
+    want_dash = dash_img.rsplit(':', 1)[-1]
+    return (bool(tags['server']) and all(t == want_srv for t in tags['server'])
+            and bool(tags['dashboard']) and all(t == want_dash for t in tags['dashboard']))
+
+
 def _netbird_sync_compose_image_tags(nb_dir):
-    """Rewrite the NetBird compose's image: tags to the current NETBIRD_SERVER_IMAGE /
-    NETBIRD_DASHBOARD_IMAGE constants (the vetted PIN). A box may carry a different tag on disk —
-    an older pin, or the broken :latest a box was briefly moved to — so pin the compose before
-    any `docker compose pull` so it fetches exactly the vetted image. Idempotent; best-effort."""
+    """Rewrite the NetBird compose's image: tags to the current target images (the PIN for this
+    box's update channel). A box may carry a different tag on disk — an older pin, the broken
+    :latest a box was briefly moved to, a tag-less line — so pin the compose before the container
+    is recreated. Idempotent; best-effort. Callers pull the images FIRST (ops #1327): this rewrite
+    never runs ahead of a pull."""
     import re as _re
     compose = os.path.join(nb_dir, 'docker-compose.yml')
     try:
         with open(compose) as f:
             txt = f.read()
     except Exception:
-        return False
+        try:
+            txt = _read_priv(compose)
+        except Exception:
+            return False
     _srv_img, _dash_img = _get_netbird_target_images()
-    new = _re.sub(r'(image:\s*)netbirdio/netbird-server:\S+', rf'\1{_srv_img}', txt)
-    new = _re.sub(r'(image:\s*)netbirdio/dashboard:\S+', rf'\1{_dash_img}', new)
+    new = _re.sub(r'(?m)^([ \t]*image:[ \t]*["\']?)netbirdio/netbird-server(?::[^\s"\'#]+)?(?![\w./:-])',
+                  lambda m: m.group(1) + _srv_img, txt)
+    new = _re.sub(r'(?m)^([ \t]*image:[ \t]*["\']?)netbirdio/dashboard(?::[^\s"\'#]+)?(?![\w./:-])',
+                  lambda m: m.group(1) + _dash_img, new)
     if new == txt:
         return False  # already current — nothing to do
     try:
@@ -69521,6 +69872,179 @@ def _netbird_sync_compose_image_tags(nb_dir):
             return True
         except Exception:
             return False
+
+
+def _netbird_pull_images(images, plog):
+    """Pull each image BY NAME and report (ok, message). A failed pull is not fatal when the image
+    is already on this box (an offline box, a registry blip): the compose will name exactly that
+    image. A failed pull of an image that is NOT on the box stops the caller before it touches
+    the compose or the container (ops #1327: the heal used to rewrite the compose first, so a
+    failed pull left the new tag named over the old container)."""
+    for img in images:
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'pull', img]),
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode == 0:
+                continue
+            err = (r.stderr or r.stdout or 'docker pull failed').strip()[:200]
+        except Exception as e:
+            err = str(e)[:200]
+        try:
+            have = subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', img]),
+                                  capture_output=True, text=True, timeout=30)
+            on_disk = have.returncode == 0
+        except Exception:
+            on_disk = False
+        if on_disk:
+            plog(f'  ⚠ netbird: could not pull {img} ({err}); using the copy already on this box')
+            continue
+        return False, f'could not pull {img}: {err}'
+    return True, ''
+
+
+def _netbird_data_fingerprint(root):
+    """(relative path, size, mtime_ns) of every file under root — what a stopped store looks like."""
+    out = []
+    for dp, _dn, fns in os.walk(root):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            out.append((os.path.relpath(p, root), st.st_size, st.st_mtime_ns))
+    return sorted(out)
+
+
+def _netbird_backup_data(nb_dir, from_label, plog):
+    """Copy ~/netbird/data (store.db, idp.db, the rest) to ~/netbird/data.bak-<from_label> BEFORE a
+    NetBird image change (ops #1327). NetBird 0.83 migrates the store and upstream names no way
+    back, so this copy is the only way to undo it.
+
+    The server is stopped for the copy so the files are consistent (a live SQLite copy can be torn).
+    The caller recreates it right after with the new image. Returns (ok, backup_path_or_None, msg).
+    On ANY failure the server is started again and nothing has changed: no backup, no image change.
+    An identical earlier backup is reused (a heal that retries every boot adds no copies); the 5
+    newest backups are kept."""
+    import shutil as _sh
+    import sqlite3 as _sq
+    import re as _re
+    from datetime import datetime as _dt
+    data = os.path.join(nb_dir, 'data')
+    try:
+        has_data = os.path.isdir(data) and bool(os.listdir(data))
+    except OSError:
+        has_data = False
+    if not has_data:
+        return True, None, 'no NetBird data to back up'
+
+    def _start_again():
+        try:
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'start', 'netbird-server']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=120)
+        except Exception:
+            pass
+
+    label = _re.sub(r'[^0-9A-Za-z._-]', '_', (from_label or '').strip()) or 'unknown'
+    try:
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'stop', 'netbird-server']),
+                       capture_output=True, text=True, cwd=nb_dir, timeout=120)
+        st = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server']),
+                            capture_output=True, text=True, timeout=30)
+        if st.returncode == 0 and st.stdout.strip() == 'true':
+            return False, None, 'could not stop netbird-server for a consistent copy'
+    except Exception as e:
+        _start_again()
+        return False, None, f'could not stop netbird-server: {str(e)[:120]}'
+
+    dest = None
+    try:
+        fp = _netbird_data_fingerprint(data)
+        for name in sorted(os.listdir(nb_dir)):
+            old = os.path.join(nb_dir, name)
+            if name.startswith('data.bak-') and os.path.isdir(old) and _netbird_data_fingerprint(old) == fp:
+                plog(f'  ✓ netbird: data already backed up in {name}')
+                return True, old, 'already backed up'
+        need = sum(sz for _p, sz, _m in fp)
+        free = _sh.disk_usage(nb_dir).free
+        if free < int(need * 1.1) + 50 * 1024 * 1024:
+            _start_again()
+            return False, None, (f'not enough free disk for a backup of the NetBird data '
+                                 f'({need // (1024 * 1024)} MB needed, {free // (1024 * 1024)} MB free)')
+        dest = os.path.join(nb_dir, f'data.bak-{label}')
+        if os.path.exists(dest):
+            dest += '-' + _dt.utcnow().strftime('%Y%m%d-%H%M%S')
+        try:
+            _sh.copytree(data, dest, symlinks=True, copy_function=_sh.copy2)
+        except Exception:
+            # root-owned files the console cannot read: copy as root through the broker.
+            _sh.rmtree(dest, ignore_errors=True)
+            r = subprocess.run(_sudo_wrap(['cp', '-a', data, dest]),
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout or 'cp failed').strip()[:160])
+        try:
+            os.chmod(dest, 0o700)
+            os.utime(dest, None)  # copytree gave it the source folder's time; "newest" must mean newest
+        except OSError:
+            pass
+        if _netbird_data_fingerprint(dest) != fp:
+            raise RuntimeError('the copy does not match the data')
+        db = os.path.join(dest, 'store.db')
+        if os.path.isfile(db):
+            conn = _sq.connect(f'file:{db}?mode=ro&immutable=1', uri=True, timeout=5)
+            try:
+                conn.execute('SELECT count(*) FROM sqlite_master').fetchone()
+            finally:
+                conn.close()
+    except Exception as e:
+        if dest:
+            _sh.rmtree(dest, ignore_errors=True)
+        _start_again()
+        return False, None, f'backup of the NetBird data failed: {str(e)[:160]}'
+
+    try:
+        baks = sorted((os.path.join(nb_dir, n) for n in os.listdir(nb_dir) if n.startswith('data.bak-')),
+                      key=lambda p: os.path.getmtime(p), reverse=True)
+        for old in baks[5:]:
+            if old != dest:
+                _sh.rmtree(old, ignore_errors=True)
+    except OSError:
+        pass
+    plog(f'  ✓ netbird: backed up data/ to {os.path.basename(dest)} ({need // (1024 * 1024)} MB). '
+         f'To go back: stop netbird-server, copy it over data/, put the old image tags in docker-compose.yml, up -d')
+    return True, dest, 'backed up'
+
+
+def _netbird_prepare_image_change(nb_dir, compose_txt, srv_img, dash_img, plog):
+    """Everything that must succeed BEFORE the compose names a new NetBird image (ops #1327):
+    pull both images by name, then back up the data. Returns (ok, backup_path_or_None, msg). When
+    ok is False nothing has changed and netbird-server is running as before."""
+    ok, msg = _netbird_pull_images([srv_img, dash_img], plog)
+    if not ok:
+        return False, None, msg
+    cur = (_netbird_compose_image_tags(compose_txt)['server'] or [None])[0]
+    return _netbird_backup_data(nb_dir, cur or 'untagged', plog)
+
+
+def _netbird_revert_compose(nb_dir, old_txt, plog):
+    """The new image would not start: put the previous compose text back and bring the old
+    container up again, so the box keeps running (the backup is untouched either way)."""
+    compose = os.path.join(nb_dir, 'docker-compose.yml')
+    try:
+        try:
+            with open(compose, 'w') as f:
+                f.write(old_txt)
+        except Exception:
+            _write_priv(compose, old_txt)
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=180)
+        plog('  netbird: put the previous compose back' + ('' if r.returncode == 0
+             else f' — start failed: {(r.stderr or r.stdout or "").strip()[:160]}'))
+        return r.returncode == 0
+    except Exception as e:
+        plog(f'  ⚠ netbird: could not put the previous compose back: {str(e)[:120]}')
+        return False
 
 
 def _netbird_store_key_needed(server_image):
@@ -69746,8 +70270,9 @@ def _heal_netbird_pinned_image(plog=None):
     """v10.0.9: roll a NetBird box back onto the vetted pin if its compose carries a different
     image tag — e.g. the briefly-shipped :latest that jumped server 0.72.3→"24.04" / dashboard
     v2.39→v2.90 and broke auth fleet-wide (401 'token invalid'). Detects drift from the on-disk
-    compose tag, rewrites to the pin, pulls, and recreates so the box self-heals on the next
-    console boot. Idempotent: a box already on the pin is a no-op (no pull, no restart).
+    compose tag (an exact tag compare, ops #1327), pulls the pin, backs up the data, rewrites the
+    compose to the pin and recreates, so the box self-heals on the next console boot. Idempotent:
+    a box already on the pin is a no-op (no pull, no stop, no backup, no restart).
     Best-effort; never raises. (Recovery proven manually on test6/8/12 2026-07-06 — 0.72.3 starts
     clean against the newer-migrated store.db and the 401s stop.)"""
     _log = plog or (lambda m: print(m, flush=True))
@@ -69769,10 +70294,19 @@ def _heal_netbird_pinned_image(plog=None):
             except Exception:
                 return False
         _srv_img, _dash_img = _get_netbird_target_images()
-        if _srv_img in txt and _dash_img in txt:
+        if _netbird_compose_on_target(txt, _srv_img, _dash_img):
             return False  # already on this channel's target — healthy, no-op
         _pin_kind = 'dev' if _srv_img == NETBIRD_SERVER_DEV_IMAGE and NETBIRD_SERVER_DEV_IMAGE != NETBIRD_SERVER_IMAGE else 'vetted'
         _log(f"  netbird: compose off the {_pin_kind} pin — restoring {_srv_img} + recreating")
+        # ops #1327: pull FIRST and back the data up, THEN rewrite the compose. Before, the compose
+        # was rewritten before the pull and the pull was not checked, so a failed pull left the new
+        # tag named over the old container (the next `up -d` swapped the image silently), and a
+        # move to 0.83 migrated the store with no copy of the old one.
+        _ok, _bak, _msg = _netbird_prepare_image_change(nb_dir, txt, _srv_img, _dash_img, _log)
+        if not _ok:
+            _log(f"  ⚠ netbird: image NOT changed ({_msg}); NetBird keeps running as it was. "
+                 "The next console start tries again.")
+            return False
         # ops #1307: this heal goes DOWN on purpose (it pulls a box off a bad newer image, and
         # 0.83.2 -> 0.82.1 on a migrated store was drilled, ops #1088). When it does, say so once
         # in plain words, so nobody reads a version going back as a fault.
@@ -69781,18 +70315,28 @@ def _heal_netbird_pinned_image(plog=None):
             _log(f"  netbird: moved NetBird down from {_cur_srv.group(0).rsplit(':', 1)[-1]} to "
                  f"{_srv_img.rsplit(':', 1)[-1]}: this box ran a newer version than the tested "
                  f"one for its update channel, so it goes back to the tested one")
-        _netbird_sync_compose_image_tags(nb_dir)
-        subprocess.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
-                       capture_output=True, text=True, cwd=nb_dir, timeout=600)
+        _wrote = _netbird_sync_compose_image_tags(nb_dir)
+        if not _wrote:
+            _log("  ⚠ netbird: could not rewrite docker-compose.yml; starting NetBird as it was")
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']),
                            capture_output=True, text=True, cwd=nb_dir, timeout=180)
-        if r.returncode == 0:
+        if r.returncode == 0 and _wrote:
             _log(f"  ✓ netbird: restored to {_pin_kind} pin + recreated")
             return True
-        _log(f"  ⚠ netbird: pin restore recreate failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+        if r.returncode != 0:
+            _log(f"  ⚠ netbird: pin restore recreate failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+            if _wrote:
+                _netbird_revert_compose(nb_dir, txt, _log)
+            if _bak:
+                _log(f"  netbird: data backup kept in {os.path.basename(_bak)}")
         return False
     except Exception as e:
         _log(f"  netbird: pin-restore heal error (non-fatal): {e}")
+        try:  # the backup stops the server for its copy: never leave it stopped
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'start', 'netbird-server']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=120)
+        except Exception:
+            pass
         return False
 
 
@@ -69978,12 +70522,17 @@ def _netbird_complete_setup(settings, plog):
         resp = _netbird_mgmt_request('/api/setup', method='POST', data=body, timeout=30)
         result = json.loads(resp.read().decode())
         pat = result.get('personal_access_token') or ''
+        # ops #1327: THIS deploy created the account, so the onboarding / approval gates it starts
+        # with are ours to clear (once). A redeploy or Update of an existing account never sets
+        # this, so it never touches an approval setting the operator chose.
+        settings['netbird_finalize_pending'] = True
         if pat:
             settings['netbird_pat'] = pat
             settings['netbird_admin_email'] = email
             save_settings(settings)
             plog(f'  ✓ Setup complete — PAT saved (user={email})')
             return pat
+        save_settings(settings)
         plog(f'  ⚠ Setup returned 200 without PAT (keys: {list(result.keys())})')
         return None
     except urllib.error.HTTPError as e:
@@ -70387,8 +70936,28 @@ def _run_netbird_deploy(settings):
         # /api/setup then created the owner WITHOUT a PAT or an account, Authentik was never
         # registered, and the deploy still reported success. The flag only matters while
         # setup is required, and Step 5 rewrites the compose without it.
-        _nb_target_srv, _ = _get_netbird_target_images()
+        _nb_target_srv, _nb_target_dash = _get_netbird_target_images()
         nb_store_key = _ensure_netbird_store_key_setting(settings) if _netbird_store_key_needed(_nb_target_srv) else None
+        # ops #1327: a redeploy over an existing NetBird that changes the image (or finds a store
+        # with no compose) pulls the new images and backs up data/ BEFORE the compose is rewritten.
+        _old_compose = os.path.join(nb_dir, 'docker-compose.yml')
+        _old_txt = None
+        if os.path.isfile(_old_compose):
+            try:
+                with open(_old_compose) as _f:
+                    _old_txt = _f.read()
+            except Exception:
+                try:
+                    _old_txt = _read_priv(_old_compose)
+                except Exception:
+                    _old_txt = None
+        _store_exists = os.path.isfile(os.path.join(nb_dir, 'data', 'store.db'))
+        if (_old_txt is not None and not _netbird_compose_on_target(_old_txt, _nb_target_srv, _nb_target_dash)) \
+                or (_old_txt is None and _store_exists):
+            _ok, _bak, _msg = _netbird_prepare_image_change(nb_dir, _old_txt or '', _nb_target_srv,
+                                                            _nb_target_dash, plog)
+            if not _ok:
+                raise RuntimeError(f'NetBird image not changed: {_msg}. The running NetBird was left as it was.')
         _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=True, store_key=nb_store_key)
         plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{_pub_hostport(netbird_domain)}/oauth2)')
 
@@ -70396,6 +70965,8 @@ def _run_netbird_deploy(settings):
         _sp.run(_sudo_wrap(['docker', 'compose', 'pull']), capture_output=True, text=True, cwd=nb_dir)
         r = _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), capture_output=True, text=True, cwd=nb_dir)
         if r.returncode != 0:
+            if _old_txt:
+                _netbird_revert_compose(nb_dir, _old_txt, plog)
             raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
         # netbird-server reads the host CA bundle through a single-file bind mount, and
         # update-ca-certificates swaps that file, so a container started before a CA was installed
@@ -70446,7 +71017,15 @@ def _run_netbird_deploy(settings):
 
         plog('  Recreating containers to apply config...')
         _netbird_recreate_containers(nb_dir, plog)
-        _netbird_finalize_account_store(plog)
+        # ops #1327: clear the onboarding / approval gates only when this install still owes it
+        # (a deploy created the owner and the clear has not happened yet). A redeploy of a working
+        # account left "users need approval" alone.
+        if settings.get('netbird_finalize_pending'):
+            if _netbird_finalize_account_store(plog):
+                settings.pop('netbird_finalize_pending', None)
+                save_settings(settings)
+        else:
+            plog('  ✓ Account approval settings left as they are')
         plog('✓ Click Authentik on the NetBird login page to sign in')
 
         plog('')
@@ -124760,15 +125339,33 @@ def _fail2ban_install_and_configure(plog):
 # The ban notifier fail2ban runs as root. Module level so the startup converge can bring
 # an existing box's copy up to date: the hook below writes it once and never again.
 _F2B_NOTIFY_SCRIPT = r'''#!/usr/bin/env python3
-"""infratak-f2b-notify: email alert when fail2ban bans an IP (Authentik / TAK Server jails).
+"""infratak-f2b-notify: runs after every fail2ban ban (ops #1395).
 Called by fail2ban action: infratak-f2b-notify <ip> [jail]
 Reads guarddog_alert_email + email_relay from infra-TAK settings.json.
 Sends via localhost:25 (same Postfix relay Guard Dog uses). Exits cleanly
 if email is not configured so fail2ban does not treat it as an error.
+
+A public box is probed by bots all day, so a ban is NOT a reason to email (10.4.7 to
+10.4.9 mailed every one: about 25 mails in 6 hours on test6). The ban is still logged
+by the action (dashboard line) and fail2ban. This script mails only when a person is
+needed:
+  - a TAK Server jail ban where the device showed a client certificate (a real device
+    is locked out), or
+  - an SSH jail ban after failed passwords for a real local account (not root, not a
+    system account).
+A name or address is mailed once a day, and a box is mailed at most 3 times a day, so
+even a real attack cannot flood the inbox. Everything else is routine: no email.
+Optional (default off, settings f2b_daily_summary): one summary mail a day.
 """
-import sys, os, re, json, smtplib, subprocess
+import sys, os, re, json, smtplib, subprocess, ipaddress, pwd, time
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
+
+STATE_PATH = '/var/lib/fail2ban/infratak-f2b-notify-state.json'
+F2B_LOG = '/var/log/fail2ban.log'
+PERSON_DAY_CAP = 3
+PERSON_COOLDOWN = 86400
+SUMMARY_EVERY = 86400
 
 
 def _find_settings():
@@ -124845,16 +125442,9 @@ def _duration_label(seconds):
     return f'{max(1, seconds // 60)} min'
 
 
-def _tak_reason(ip, jail='takserver'):
-    badcert = jail == 'takserver-badcert'
-    bantime = 600 if badcert else 3600
-    try:
-        with open(TAK_BADCERT_JAIL if badcert else TAK_JAIL) as f:
-            m = re.search(r'^bantime\s*=\s*(\d+)', f.read(), re.M)
-        if m:
-            bantime = int(m.group(1))
-    except Exception:
-        pass
+def _tak_scan(ip):
+    """(kind, certificate subject) for one address, read from the TAK log. The subject is
+    '' when the device never showed a client certificate (a scanner)."""
     kinds, subject = {}, ''
     try:
         with open(TAK_LOG, 'rb') as f:
@@ -124871,7 +125461,20 @@ def _tak_reason(ip, jail='takserver'):
                     subject = s.group(1).strip()[:200]
     except Exception:
         pass
-    kind = max(kinds, key=kinds.get) if kinds else 'other'
+    return (max(kinds, key=kinds.get) if kinds else 'other'), subject
+
+
+def _tak_reason(ip, jail='takserver'):
+    badcert = jail == 'takserver-badcert'
+    bantime = 600 if badcert else 3600
+    try:
+        with open(TAK_BADCERT_JAIL if badcert else TAK_JAIL) as f:
+            m = re.search(r'^bantime\s*=\s*(\d+)', f.read(), re.M)
+        if m:
+            bantime = int(m.group(1))
+    except Exception:
+        pass
+    kind, subject = _tak_scan(ip)
     if badcert:
         return (_tak_explain(ip, kind, subject, _duration_label(bantime), jail) +
                 "\n\nOnly TAK streaming is blocked (8089, 8443, federation). Enrollment (8446), "
@@ -124881,9 +125484,229 @@ def _tak_reason(ip, jail='takserver'):
             "from that address.")
 
 
+def _tail_text(path, nbytes):
+    """Last nbytes of a log file as text, '' when it cannot be read."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - nbytes))
+            return f.read().decode('utf-8', 'replace')
+    except Exception:
+        return ''
+
+
+def _resolve_jail(ip, hint):
+    """Which jail made this ban. The shared Guard Dog action passes 'authentik' for every
+    jail (sshd, console, takportal, mediamtx, clientfeed...), so the name is read from
+    fail2ban's own log: it writes `[jail] Ban IP` BEFORE it runs the actions. The TAK
+    actions name their jail correctly and are trusted as given."""
+    if hint in ('takserver', 'takserver-badcert'):
+        return hint
+    found = None
+    pat = re.compile(r'\[([^\]\s]+)\] Ban ' + re.escape(ip) + r'\s*$')
+    for line in _tail_text(F2B_LOG, 256 * 1024).splitlines():
+        m = pat.search(line)
+        if m:
+            found = m.group(1)
+    return found or hint
+
+
+def _clean(text, limit=60):
+    """Attacker-controlled text (certificate names) kept to plain characters, so it can
+    sit in a mail subject."""
+    return re.sub(r'[^A-Za-z0-9 ._@=,-]', '', text or '')[:limit].strip()
+
+
+def _cert_name(subject):
+    m = re.search(r'CN=([^,;]+)', subject or '')
+    return _clean(m.group(1) if m else subject)
+
+
+_SSH_FAIL_RE = re.compile(
+    r'Failed (?:password|keyboard-interactive/pam|publickey) for (?!invalid user )(\S+) '
+    r'from (\S+) port')
+
+
+def _ssh_log_text():
+    for p in ('/var/log/auth.log', '/var/log/secure'):
+        if os.path.exists(p):
+            return _tail_text(p, 4 * 1024 * 1024)
+    try:   # no auth file (journal only)
+        r = subprocess.run(['journalctl', '-t', 'sshd', '--since', '2 hours ago',
+                            '--no-pager', '-o', 'cat'],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout
+    except Exception:
+        return ''
+
+
+def _is_real_account(name, console_uid):
+    """A human account on this box: exists, not root, has a login shell, and is a normal
+    user (uid 1000 up) or the console's own user. Bots guess root, admin, postgres,
+    oracle and the like; those are not real accounts here and stay routine."""
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,32}', name or ''):
+        return False
+    try:
+        pw = pwd.getpwnam(name)
+    except KeyError:
+        return False
+    if pw.pw_uid == 0 or pw.pw_name == 'root':
+        return False
+    if pw.pw_shell.endswith(('nologin', 'false')) or not pw.pw_shell:
+        return False
+    return 1000 <= pw.pw_uid < 60000 or pw.pw_uid == console_uid
+
+
+def _ssh_real_user(ip, console_uid):
+    for line in _ssh_log_text().splitlines():
+        m = _SSH_FAIL_RE.search(line)
+        if m and m.group(2) == ip and _is_real_account(m.group(1), console_uid):
+            return m.group(1)
+    return ''
+
+
+def _person_needed(ip, jail, console_uid):
+    """(key, subject line, text) when this ban needs a person, else None (routine)."""
+    j = jail.lower()
+    if j in ('takserver', 'takserver-badcert'):
+        kind, subject = _tak_scan(ip)
+        if subject:
+            name = _cert_name(subject)
+            return ('tak:' + name, f'a TAK device ({name}) is blocked',
+                    'A device that showed a TAK certificate was blocked. A real user may '
+                    'be locked out.\n\n' + _tak_reason(ip, j))
+    if j == 'sshd':
+        user = _ssh_real_user(ip, console_uid)
+        if user:
+            return ('ssh:' + user, f'SSH password failures on account {user}',
+                    f'{ip} failed SSH passwords for the real account "{user}" on this '
+                    f'server, so it is blocked.\n\nBots guess names like root and admin. '
+                    f'This was a real account here. It may be someone mistyping, or '
+                    f'someone trying to get in.')
+    return None
+
+
+def _locked_state(fn):
+    """Run fn(state) with the state file locked; returns (result, ok). Several copies of
+    this script run at once in a burst, so the read-change-write must be one step."""
+    import fcntl
+    lock = None
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        lock = open(STATE_PATH + '.lock', 'a')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(STATE_PATH) as f:
+                st = json.load(f)
+            if not isinstance(st, dict):
+                st = {}
+        except Exception:
+            st = {}
+        result = fn(st)
+        tmp = STATE_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(st, f)
+        os.replace(tmp, STATE_PATH)
+        return result, True
+    except Exception as e:
+        print(f"infratak-f2b-notify: state file unusable: {e}", file=sys.stderr)
+        return None, False
+    finally:
+        if lock:
+            lock.close()
+
+
+def _person_gate(st, key, now):
+    """'send', 'repeat' (this name was mailed in the last day) or 'cap' (3 mails today)."""
+    sent = [t for t in st.get('person_sent', []) if now - t < 86400]
+    seen = {k: t for k, t in st.get('person_seen', {}).items() if now - t < PERSON_COOLDOWN}
+    verdict = 'send'
+    if key in seen:
+        verdict = 'repeat'
+    elif len(sent) >= PERSON_DAY_CAP:
+        verdict = 'cap'
+    else:
+        sent.append(now)
+        seen[key] = now
+    st['person_sent'], st['person_seen'] = sent, seen
+    return verdict
+
+
+def _person_undo(st, key, now):
+    """The mail did not go out: give the slot back so the next ban can try again."""
+    if isinstance(st.get('person_seen'), dict):
+        st['person_seen'].pop(key, None)
+    if st.get('person_sent'):
+        st['person_sent'].pop()
+
+
+def _summary_gate(st, now):
+    """True once per 24 hours (and records it)."""
+    if now - float(st.get('summary_at', 0) or 0) < SUMMARY_EVERY:
+        return False
+    st['summary_at'] = now
+    return True
+
+
+def _recent_bans(now, window=86400):
+    """[(jail, ip)] for bans in the last day, from fail2ban's own log."""
+    pat = re.compile(r'^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ .*\[([^\]\s]+)\] Ban (\S+)\s*$')
+    out = []
+    for line in _tail_text(F2B_LOG, 8 * 1024 * 1024).splitlines():
+        m = pat.match(line)
+        if not m:
+            continue
+        try:
+            t = time.mktime(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S'))
+        except Exception:
+            continue
+        if 0 <= now - t <= window:
+            out.append((m.group(2), m.group(3)))
+    return out
+
+
+def _summary_text(server_id, bans):
+    by_jail, by_ip = {}, {}
+    for jail, ip in bans:
+        by_jail[jail] = by_jail.get(jail, 0) + 1
+        by_ip[ip] = by_ip.get(ip, 0) + 1
+    jails = ', '.join(f'{j} {n}' for j, n in sorted(by_jail.items(), key=lambda x: -x[1]))
+    top = '\n'.join(f'  {ip}  ({n} bans)' for ip, n in
+                    sorted(by_ip.items(), key=lambda x: -x[1])[:5])
+    return (f'fail2ban summary for {server_id}, last 24 hours:\n\n'
+            f'  Bans:     {len(bans)} from {len(by_ip)} addresses\n'
+            f'  By jail:  {jails}\n\n'
+            f'Top sources:\n{top}\n\n'
+            f'Routine bans are not mailed one by one. See the Fail2ban page in your '
+            f'infra-TAK console for the full list. You turned this summary on there.\n')
+
+
+def _send(settings, recipients, subject, body):
+    relay = settings.get('email_relay', {})
+    from_addr = relay.get('from_addr', 'noreply@localhost')
+    from_name = relay.get('from_name', 'Guard Dog')
+    msg = MIMEText(body, 'plain', 'utf-8')
+    msg['From'] = f'{from_name} <{from_addr}>'
+    msg['To'] = ', '.join(recipients)
+    msg['Subject'] = subject
+    try:
+        with smtplib.SMTP('localhost', 25, timeout=15) as smtp:
+            smtp.sendmail(from_addr, recipients, msg.as_string())
+        print(f"infratak-f2b-notify: alert sent to {msg['To']}", file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"infratak-f2b-notify: email failed: {e}", file=sys.stderr)
+        return False
+
+
 def main():
     ip   = sys.argv[1] if len(sys.argv) > 1 else 'unknown'
-    jail = sys.argv[2] if len(sys.argv) > 2 else 'authentik'
+    hint = sys.argv[2] if len(sys.argv) > 2 else 'authentik'
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        print("infratak-f2b-notify: no valid address given — no email sent", file=sys.stderr)
+        sys.exit(0)
     settings_path = _find_settings()
     if not settings_path:
         print("infratak-f2b-notify: settings.json not found — no email sent",
@@ -124925,51 +125748,58 @@ def main():
                   file=sys.stderr)
             sys.exit(0)
 
-    relay     = settings.get('email_relay', {})
-    from_addr = relay.get('from_addr', 'noreply@localhost')
-    from_name = relay.get('from_name', 'Guard Dog')
     server_id = (settings.get('server_nickname') or
                  settings.get('fqdn') or
                  settings.get('server_ip', 'infra-TAK'))
+    # guarddog_alert_email may hold several comma-joined addresses (v10.1.30).
+    recipients = [a for a in re.split(r'[,;\s]+', to_addr) if a]
+    now = time.time()
+    jail = _resolve_jail(ip, hint)
+
+    # Opt-in daily summary (default off). It rides on the next ban after 24 hours, so no
+    # timer is needed: a box that has no bans has nothing to report.
+    if settings.get('f2b_daily_summary'):
+        due, ok = _locked_state(lambda st: _summary_gate(st, now))
+        bans = _recent_bans(now) if (ok and due) else []
+        if bans:
+            if not _send(settings, recipients,
+                         f'[{server_id}] fail2ban: {len(bans)} ban' + ('' if len(bans) == 1 else 's') + ' in the last 24 hours',
+                         _summary_text(server_id, bans)):
+                _locked_state(lambda st: st.update(summary_at=0))
+
+    try:
+        console_uid = os.stat(settings_path).st_uid
+    except Exception:
+        console_uid = -1
+    need = _person_needed(ip, jail, console_uid)
+    if not need:
+        print(f"infratak-f2b-notify: routine ban of {ip} ({jail}) — no email sent",
+              file=sys.stderr)
+        sys.exit(0)
+    key, headline, detail = need
+    verdict, ok = _locked_state(lambda st: _person_gate(st, key, now))
+    if ok and verdict != 'send':
+        print(f"infratak-f2b-notify: {key} already mailed today or 3 mails sent today "
+              f"({verdict}) — no email sent", file=sys.stderr)
+        sys.exit(0)
+
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-
-    _reasons = {
-        'authentik':  'Too many failed Authentik login attempts',
-        'takserver':  'Too many failed TAK Server connection attempts (scanner or bad certificate)',
-        'takserver-badcert': 'A flood of TAK Server connections with a refused certificate',
-    }
-    reason     = _reasons.get(jail.lower(), f'Too many failed {jail} attempts')
     jail_label = {'authentik': 'Authentik', 'takserver': 'TAK Server',
-                  'takserver-badcert': 'TAK Server, refused certificate'}.get(jail.lower(), jail)
-    explain    = (_tak_reason(ip, jail.lower()) + '\n\n'
-                  if jail.lower() in ('takserver', 'takserver-badcert') else '')
-
-    subject = f'[{server_id}] fail2ban: Banned {ip} ({jail_label})'
+                  'takserver-badcert': 'TAK Server, refused certificate',
+                  'sshd': 'SSH'}.get(jail.lower(), _clean(jail))
     body = (
-        f'fail2ban has banned the following IP address:\n\n'
+        f'fail2ban blocked an address and this one needs a person to look at it:\n\n'
         f'  IP:     {ip}\n'
         f'  Jail:   {jail_label}\n'
         f'  Server: {server_id}\n'
-        f'  Time:   {ts}\n'
-        f'  Reason: {reason}\n\n'
-        f'{explain}'
+        f'  Time:   {ts}\n\n'
+        f'{detail}\n\n'
+        f'Routine bans (bots and scanners) are no longer emailed. They stay on the '
+        f'Fail2ban page and in the Guard Dog log.\n'
         f'To unban this IP, open your infra-TAK console → Fail2ban page.\n'
     )
-
-    # guarddog_alert_email may hold several comma-joined addresses (v10.1.30).
-    recipients = [a for a in re.split(r'[,;\s]+', to_addr) if a]
-
-    msg = MIMEText(body, 'plain', 'utf-8')
-    msg['From'] = f'{from_name} <{from_addr}>'
-    msg['To'] = ', '.join(recipients)
-    msg['Subject'] = subject
-
-    try:
-        with smtplib.SMTP('localhost', 25, timeout=15) as smtp:
-            smtp.sendmail(from_addr, recipients, msg.as_string())
-        print(f"infratak-f2b-notify: alert sent to {msg['To']}", file=sys.stderr)
-    except Exception as e:
-        print(f"infratak-f2b-notify: email failed: {e}", file=sys.stderr)
+    if not _send(settings, recipients, f'[{server_id}] fail2ban: {headline}', body) and ok:
+        _locked_state(lambda st: _person_undo(st, key, now))
 
 
 if __name__ == '__main__':
@@ -128735,6 +129565,48 @@ def _post_update_service_recovery_sweep(plog):
     }
 
 
+# ops #1330: the post-update run is stamped (`last_console_version` / `last_console_sha`) only
+# when it finished. It used to be stamped in a `finally`, so a run that raised (docker or the
+# broker not up yet after a reboot, a bug in one step) was marked done, and the next start took
+# the "same version" branch and never ran it again; only a killed process re-ran it. Now a raised
+# run is not stamped and runs again at the next console start. A bug that raises every time
+# would re-run a full post-update on every boot for ever, so after this many starts in a row for
+# the same version and commit the run is stamped anyway and the journal says why.
+_POST_UPDATE_MAX_FAILED_STARTS = 3
+
+
+def _post_update_finish_settings(s, ok, version, sha, error=''):
+    """Record how a post-update run ended in the settings dict `s` (changed in place; the caller
+    saves it). Returns (stamped, journal_message). `ok`: the run returned. Not ok: it raised."""
+    sha = sha or ''
+    if ok:
+        s['last_console_version'] = version
+        if sha:
+            s['last_console_sha'] = sha
+        s.pop('post_update_failed', None)
+        return True, f"last_console_version saved as {version} (sha {sha[:7] or 'n/a'})"
+    key = f"{version}@{sha or 'n/a'}"
+    prev = s.get('post_update_failed') if isinstance(s.get('post_update_failed'), dict) else {}
+    try:
+        count = (int(prev.get('count') or 0) + 1) if prev.get('key') == key else 1
+    except (TypeError, ValueError):
+        count = 1
+    s['post_update_failed'] = {
+        'key': key, 'count': count, 'error': str(error or '')[:300],
+        'at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+    }
+    if count >= _POST_UPDATE_MAX_FAILED_STARTS:
+        s['last_console_version'] = version
+        if sha:
+            s['last_console_sha'] = sha
+        return True, (f"post-update for {version} (sha {sha[:7] or 'n/a'}) failed {count} starts in a "
+                      f"row, last error: {str(error)[:200]}. Giving up: saved last_console_version "
+                      f"anyway, so it does not run again on every boot.")
+    return False, (f"post-update for {version} (sha {sha[:7] or 'n/a'}) did NOT finish ({str(error)[:200]}). "
+                   f"last_console_version is not saved, so it runs again at the next console start "
+                   f"(failed {count} of {_POST_UPDATE_MAX_FAILED_STARTS}).")
+
+
 def _post_update_auto_deploy():
     """After a console update, automatically re-deploy Guard Dog and reconfigure Authentik.
 
@@ -130764,6 +131636,8 @@ def _post_update_auto_deploy():
             print("Post-update: auto-deploy complete")
 
         def _run_post_update_guarded():
+            _pu_ok = False      # ops #1330: stamped as done only when the run returned
+            _pu_err = ''
             try:
                 _w = 0
                 while _stack_job_running() and _w < 3 * 3600:
@@ -130773,17 +131647,18 @@ def _post_update_auto_deploy():
                     _w += 10
                 _POST_UPDATE_ACTIVE['on'] = True
                 _run_post_update()
+                _pu_ok = True
             except Exception as _e:
+                _pu_err = str(_e) or type(_e).__name__
                 print(f"Post-update: migration thread error: {_e}", flush=True)
             finally:
                 _POST_UPDATE_ACTIVE['on'] = False
                 try:
                     s_done = load_settings()
-                    s_done['last_console_version'] = VERSION
-                    if cur_sha:
-                        s_done['last_console_sha'] = cur_sha
+                    _pu_stamped, _pu_msg = _post_update_finish_settings(
+                        s_done, _pu_ok, VERSION, cur_sha, _pu_err or 'the run did not finish')
                     save_settings(s_done)
-                    print(f"Post-update: last_console_version saved as {VERSION} (sha {cur_sha[:7] or 'n/a'})", flush=True)
+                    print(f"Post-update: {_pu_msg}", flush=True)
                 except Exception as _e:
                     print(f"Post-update: failed to save last_console_version: {_e}", flush=True)
                 try:

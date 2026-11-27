@@ -39,6 +39,7 @@ import ast
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 import textwrap
@@ -55,6 +56,8 @@ _WANT = {
     '_docker_env_version', '_webodm_pin_images', '_webodm_strip_olefile', 'WEBODM_OLEFILE_STRIP',
     'WEBODM_VERSION', 'WEBODM_IMAGES', 'NODERED_IMAGE', '_NODERED_IMAGE_LINE_RE',
     '_nodered_remote_image_cmd', '_heal_netbird_pinned_image', '_netbird_sync_compose_image_tags',
+    # ops #1327: the heal now compares tags exactly before it acts
+    '_netbird_compose_image_tags', '_netbird_compose_on_target',
 }
 
 
@@ -398,25 +401,37 @@ def test_webodm_startup_migration_still_moves_only_the_broker():
 
 
 def test_the_real_webodm_update_does_not_write_an_older_webapp_over_a_newer_one():
-    """Run _run_webodm_update itself, with the box stubbed out, on a compose that runs WebODM 4.1.0."""
-    node = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == '_run_webodm_update')
-    written, log = [], []
+    """Run _run_webodm_update itself, with the box stubbed out, on a compose that runs WebODM 4.1.0.
+
+    Since ops #1328 the update hands the compose to the shared _webodm_move_to_new_images, which
+    writes it through _webodm_put_file. This test loads that real helper too (not a stub of it), so
+    it still sees the exact bytes that would land on the box's docker-compose.yml."""
+    want = {'_run_webodm_update', '_webodm_move_to_new_images'}
+    nodes = [n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name in want]
+    assert {n.name for n in nodes} == want, 'app.py no longer has both functions this test runs'
+    const = {t.id: n for n in TREE.body if isinstance(n, ast.Assign) for t in n.targets
+             if isinstance(t, ast.Name) and t.id == 'WEBODM_PENDING_COMPOSE'}
+    written, log = {}, []
     compose = _compose(webapp='webodm/webodm_webapp:4.1.0', db='webodm/webodm_db:18',
                        broker='redis:8.10.3-alpine', nodeodm='webodm/nodeodx:2.4.0')
     status = {}
     ns = _ns(
-        _webodm_update_status=status, _webodm_dir=lambda: '/home/takwerx/webodm',
-        _read_priv=lambda p: compose, _write_priv=lambda p, c: written.append(c),
+        shlex=shlex, _webodm_update_status=status, _webodm_dir=lambda: '/home/takwerx/webodm',
+        _read_priv=lambda p: compose, _webodm_put_file=lambda cfg, path, content: written.__setitem__(path, content),
+        _webodm_run=lambda cfg, argv, timeout=0: types.SimpleNamespace(returncode=0, stdout='', stderr=''),
         _webodm_db_needs_upgrade=lambda d: False, _webodm_db_room_check=lambda plog: None,
-        _webodm_compose=lambda d, a, timeout=0: types.SimpleNamespace(returncode=0, stdout='', stderr=''),
+        _webodm_compose=lambda d, a, timeout=0, cfg=None: types.SimpleNamespace(returncode=0, stdout='', stderr=''),
         WEBODM_PULL_TIMEOUT_S=1, WEBODM_UPGRADE_WAIT_S=1, time=types.SimpleNamespace(sleep=lambda s: None))
-    exec(compile(ast.Module([node], []), 'app.py', 'exec'), ns)
+    for node in const.values():
+        exec(compile(ast.Module([node], []), 'app.py', 'exec'), ns)
+    exec(compile(ast.Module(nodes, []), 'app.py', 'exec'), ns)
     ns['_webodm_update_status'] = status
     ns['_run_webodm_update']()
-    final = written[-1] if written else compose
+    final = written.get('/home/takwerx/webodm/docker-compose.yml', compose)
     assert _images(final)['wo_webapp'] == 'webodm/webodm_webapp:4.1.0', status
     assert _images(final)['wo_worker'] == 'webodm/webodm_webapp:4.1.0'
     assert status.get('complete') is True, status
+    assert any('Kept wo_webapp on webodm/webodm_webapp:4.1.0' in line for line in status.get('log', [])), status
 
 
 # ---------------------------------------------------------------------------------------------
@@ -450,6 +465,10 @@ def _run_netbird_heal(tmp_path, monkeypatch, image, dashboard='netbirdio/dashboa
              NETBIRD_SERVER_DEV_IMAGE='netbirdio/netbird-server:0.83.2',
              _write_priv=lambda p, c: pytest.fail('plain write expected'),
              _read_priv=lambda p: pytest.fail('plain read expected'),
+             # ops #1327: pull + data backup before the compose is rewritten. Proven in
+             # test_netbird_image_change_safety_ops1327.py; here it only has to say yes.
+             _netbird_prepare_image_change=lambda *a, **k: (True, None, ''),
+             _netbird_revert_compose=lambda *a, **k: None,
              subprocess=types.SimpleNamespace(run=lambda cmd, **kw: ran.append(cmd) or types.SimpleNamespace(
                  returncode=0, stdout='', stderr='')))
     result = ns['_heal_netbird_pinned_image'](log.append)

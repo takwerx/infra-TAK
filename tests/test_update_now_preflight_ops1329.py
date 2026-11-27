@@ -48,13 +48,13 @@ OLD, NEW = 'v1.0.0-alpha', 'v1.0.1-alpha'
 _FUNCS = [
     'update_apply', '_git_fetch_retry', '_update_console_python', '_update_safe_extract',
     '_update_preflight_tree', '_update_clear_stale_git_locks', '_update_plain_git_error',
-    '_update_rollback_snapshot', '_post_update_in_progress', '_detached_console_restart',
+    '_update_rollback_snapshot', '_console_rollback_snapshot', '_post_update_in_progress', '_detached_console_restart',
     '_tag_version_tuple', '_main_commit_shas', '_select_latest_release_tag',
     '_fetch_latest_tag_name',
 ]
 _ASSIGNS = ['_UPDATE_PIP_TIMEOUT_S', '_UPDATE_RESTART_DELAY_S', '_UPDATE_RESTART_WAIT_S', '_UPDATE_REQ_CHECK_PY',
             '_UPDATE_TREE_CHECK_PY', '_UPDATE_TREE_CHECK_TIMEOUT_S', '_GIT_FETCH_TIMEOUTS_S', '_GIT_FETCH_PAUSE_S',
-            '_GIT_TRANSIENT_RE']
+            '_GIT_TRANSIENT_RE', '_ROLLBACK_SHA_RE']
 
 
 def _lift(names=None, assigns=None):
