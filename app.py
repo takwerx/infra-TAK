@@ -8223,6 +8223,24 @@ def _console_log_failed_login(where):
     audit('auth:login-failed', 'console password via %s' % where)
 
 
+def _console_log_login_ok():
+    """ops #1406: one line for a good console password login, in the same file as the failed
+    ones, so the Guard Dog watch can tell a login that worked right after failed guesses.
+    The fail2ban console jail matches only 'failed login', never this line. Never raises."""
+    try:
+        try:
+            ip = _client_ip()
+            ipaddress.ip_address(ip)
+        except Exception:
+            ip = (request.remote_addr or 'unknown').strip()
+        with open(CONSOLE_LOGIN_FAIL_LOG, 'a') as f:
+            f.write('%s console: login ok from %s\n'
+                    % (datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), ip))
+        os.chmod(CONSOLE_LOGIN_FAIL_LOG, 0o600)
+    except Exception:
+        pass
+
+
 def _note_password_length(password):
     """After a good password login: record whether the stored password meets the floor.
     Only a yes/no is kept (never the length). Drives the console's change-password
@@ -8276,6 +8294,7 @@ def login():
             session['last_activity'] = int(time.time())   # ops #815: login is activity
             _stamp_session_login()   # ops #634
             _stamp_notice_login(True)
+            _console_log_login_ok()   # ops #1406
             # W3: in Hardened posture, password login is the on-box break-glass path — audit it.
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
@@ -8328,6 +8347,7 @@ def index():
             session['last_activity'] = int(time.time())  # v10.1.40: see _apply_authentik_session
             _stamp_session_login()   # ops #634
             _stamp_notice_login(True)
+            _console_log_login_ok()   # ops #1406
             audit('auth:login-password', 'console password / break-glass')
             return redirect(_safe_next_path() or url_for('console_page'))
         _console_log_failed_login('/')   # ops #638
@@ -26820,6 +26840,141 @@ def fail2ban_status_api():
         return jsonify({'available': False, 'error': str(e)[:200]})
 
 
+# ops #1406: Authentik sign-ins for the Guard Dog "login worked after failed guesses" watch.
+# The watch (infratak-f2b-notify --watch) runs as root from a timer and must not hold the
+# Authentik admin token, so the console copies the few events it needs into a log file next
+# to console-auth.log: every failed sign-in from an outside address, and the good sign-ins
+# from those same addresses. Read-only calls to Authentik's events API, one round every 5
+# minutes, local Authentik only (a remote Authentik would cost an SSH call every round).
+AK_LOGIN_LOG = os.path.join(CONFIG_DIR, 'authentik-logins.log')
+AK_LOGIN_LOG_MAX = 1024 * 1024
+AK_LOGIN_POLL_S = 300
+AK_LOGIN_LOOKBACK_S = 1800
+AK_LOGIN_MAX_ADDRESSES = 10
+_AK_LOGIN_SEEN = set()
+_AK_LOGIN_SEEN_LOADED = False
+
+
+def _ak_login_clean(text):
+    return re.sub(r'[^A-Za-z0-9._@-]', '', str(text or ''))[:64]
+
+
+def _ak_login_outside(ip):
+    try:
+        a = ipaddress.ip_address(str(ip or '').strip())
+    except ValueError:
+        return False
+    return not (a.is_private or a.is_loopback or a.is_link_local or a.is_unspecified
+                or a.is_multicast)
+
+
+def _ak_login_events(base, token, query):
+    import urllib.request as _req
+    import urllib.parse as _up
+    r = _req.Request(f"{base}/api/v3/events/events/?{_up.urlencode(query)}",
+                     headers={'Authorization': f'Bearer {token}'})
+    with _req.urlopen(r, timeout=15) as resp:
+        return (json.loads(resp.read().decode()).get('results') or [])
+
+
+def _ak_login_load_seen():
+    global _AK_LOGIN_SEEN_LOADED
+    if _AK_LOGIN_SEEN_LOADED:
+        return
+    _AK_LOGIN_SEEN_LOADED = True
+    try:
+        with open(AK_LOGIN_LOG) as f:
+            for line in f.read().splitlines()[-2000:]:
+                m = re.search(r' pk=(\S+)$', line)
+                if m:
+                    _AK_LOGIN_SEEN.add(m.group(1))
+    except Exception:
+        pass
+
+
+def _ak_login_watch_once(now=None):
+    """Copy new Authentik sign-in events to AK_LOGIN_LOG. Returns the lines written. Never
+    raises: Authentik being down or slow is not a reason to bother anyone here."""
+    try:
+        import calendar
+        now = now or time.time()
+        if not os.path.isfile(os.path.expanduser('~/authentik/docker-compose.yml')):
+            return 0
+        settings = load_settings()
+        cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        if cfg.get('target_mode') == 'remote':
+            return 0
+        token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                 or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+        if not token:
+            return 0
+        base = _get_authentik_api_url(settings)
+        _ak_login_load_seen()
+
+        def _when(ev):
+            try:
+                return datetime.strptime((ev.get('created') or '')[:19], '%Y-%m-%dT%H:%M:%S')
+            except ValueError:
+                return None
+
+        def _recent(ev):
+            t = _when(ev)
+            return t is not None and 0 <= now - calendar.timegm(t.timetuple()) <= AK_LOGIN_LOOKBACK_S
+
+        lines, addresses = [], []
+
+        def _take(ev, kind):
+            pk = str(ev.get('pk') or '')
+            ip = str(ev.get('client_ip') or '').strip()
+            if not pk or pk in _AK_LOGIN_SEEN or not _recent(ev) or not _ak_login_outside(ip):
+                return
+            ctx = ev.get('context') if isinstance(ev.get('context'), dict) else {}
+            usr = ev.get('user') if isinstance(ev.get('user'), dict) else {}
+            who = _ak_login_clean(ctx.get('username') if kind == 'login_failed' else usr.get('username'))
+            lines.append((_when(ev), '%s authentik: %s from %s user=%s pk=%s\n'
+                          % (_when(ev).strftime('%Y-%m-%d %H:%M:%S'), kind, ip, who, pk), pk))
+            if ip not in addresses:
+                addresses.append(ip)
+
+        for ev in _ak_login_events(base, token, {'action': 'login_failed',
+                                                 'ordering': '-created', 'page_size': 100}):
+            _take(ev, 'login_failed')
+        for ip in addresses[:AK_LOGIN_MAX_ADDRESSES]:
+            for ev in _ak_login_events(base, token, {'action': 'login', 'client_ip': ip,
+                                                     'ordering': '-created', 'page_size': 20}):
+                _take(ev, 'login ok')
+        if not lines:
+            return 0
+        lines.sort(key=lambda x: x[0])
+        try:
+            if os.path.getsize(AK_LOGIN_LOG) > AK_LOGIN_LOG_MAX:
+                os.replace(AK_LOGIN_LOG, AK_LOGIN_LOG + '.1')
+        except OSError:
+            pass
+        with open(AK_LOGIN_LOG, 'a') as f:
+            for _t, text, pk in lines:
+                f.write(text)
+                _AK_LOGIN_SEEN.add(pk)
+        os.chmod(AK_LOGIN_LOG, 0o600)
+        return len(lines)
+    except Exception as e:
+        print(f"[f2b-watch] Authentik sign-in copy skipped: {str(e)[:120]}", flush=True)
+        return 0
+
+
+def _ak_login_watch_loop():
+    time.sleep(AK_LOGIN_POLL_S)
+    while True:
+        _ak_login_watch_once()
+        time.sleep(AK_LOGIN_POLL_S)
+
+
+try:
+    threading.Thread(target=_ak_login_watch_loop, daemon=True, name='ak-login-watch').start()
+except Exception:
+    pass
+
+
 @app.route('/api/fail2ban/ban-summary', methods=['GET', 'POST'])
 @login_required
 def fail2ban_ban_summary_api():
@@ -29129,6 +29284,7 @@ def fail2ban_uninstall_api():
         print(f"fail2ban uninstall: {msg}", flush=True)
     try:
         # Stop and disable services
+        subprocess.run(_sudo_wrap(['systemctl', 'disable', '--now', 'infratak-f2b-watch.timer']), capture_output=True)  # ops #1406
         subprocess.run(_sudo_wrap(['systemctl', 'stop', 'fail2ban']), capture_output=True)
         subprocess.run(_sudo_wrap(['systemctl', 'disable', 'fail2ban']), capture_output=True)
         subprocess.run(_sudo_wrap(['systemctl', 'stop', 'authentik-log-forwarder']), capture_output=True)
@@ -29158,6 +29314,8 @@ def fail2ban_uninstall_api():
             '/etc/fail2ban/action.d/infratak-guarddog.conf',
             '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf',
             '/etc/systemd/system/authentik-log-forwarder.service',
+            '/etc/systemd/system/infratak-f2b-watch.timer',
+            '/etc/systemd/system/infratak-f2b-watch.service',
             '/usr/local/sbin/infratak-f2b-notify',
             '/var/lib/fail2ban/infratak-f2b-notify-state.json',
             '/var/lib/fail2ban/infratak-f2b-notify-state.json.lock',
@@ -124806,6 +124964,18 @@ PERSON_DAY_CAP = 3
 PERSON_COOLDOWN = 86400
 SUMMARY_EVERY = 86400
 
+# ops #1406: `infratak-f2b-notify --watch` runs from a timer every 5 minutes.
+WATCH_FAIL_MIN = 3          # failed guesses from one address before a good login needs a person
+WATCH_WINDOW = 1800         # ...when they came within 30 minutes before it
+WATCH_RECENT = 1800         # a good login older than this is not news
+HEALTH_RUNS = 2             # runs in a row that must see fail2ban failing before anyone is mailed
+BOOT_GRACE = 600            # seconds after boot: fail2ban may still be starting
+ACTION_ERR_MIN = 2          # ban actions that errored in the last hour
+ACTION_ERR_WINDOW = 3600
+RETRY_AFTER = 3600          # a mail that could not be handed to the relay is tried again in 1 hour
+QUIET_MARKER = '/var/lib/takguard/quiet_window'
+JAIL_DIR = '/etc/fail2ban/jail.d'
+
 
 def _find_settings():
     """Locate settings.json by asking systemd for the console working dir."""
@@ -125138,32 +125308,26 @@ def _send(settings, recipients, subject, body):
         return False
 
 
-def main():
-    ip   = sys.argv[1] if len(sys.argv) > 1 else 'unknown'
-    hint = sys.argv[2] if len(sys.argv) > 2 else 'authentik'
-    try:
-        ipaddress.ip_address(ip)
-    except ValueError:
-        print("infratak-f2b-notify: no valid address given — no email sent", file=sys.stderr)
-        sys.exit(0)
+def _load_context():
+    """(settings_path, settings, recipients, server_id), or None when no mail can go out
+    (no settings, no recipient, or Guard Dog notifications paused). The reason is printed."""
     settings_path = _find_settings()
     if not settings_path:
         print("infratak-f2b-notify: settings.json not found — no email sent",
               file=sys.stderr)
-        sys.exit(0)
-
+        return None
     try:
         with open(settings_path) as f:
             settings = json.load(f)
     except Exception as e:
         print(f"infratak-f2b-notify: could not read settings: {e}", file=sys.stderr)
-        sys.exit(0)
+        return None
 
     to_addr = (settings.get('guarddog_alert_email') or '').strip()
     if not to_addr:
         print("infratak-f2b-notify: guarddog_alert_email not set — no email sent",
               file=sys.stderr)
-        sys.exit(0)
+        return None
 
     # Honour the Guard Dog notification pause. This script does its own SMTP rather
     # than going through the console, so the helper-level gate does not cover it —
@@ -125185,13 +125349,381 @@ def main():
         if _muted:
             print("infratak-f2b-notify: notifications paused — no email sent",
                   file=sys.stderr)
-            sys.exit(0)
+            return None
 
     server_id = (settings.get('server_nickname') or
                  settings.get('fqdn') or
                  settings.get('server_ip', 'infra-TAK'))
     # guarddog_alert_email may hold several comma-joined addresses (v10.1.30).
     recipients = [a for a in re.split(r'[,;\s]+', to_addr) if a]
+    return settings_path, settings, recipients, server_id
+
+
+# ── ops #1406: --watch (timer, every 5 minutes) ─────────────────────────────────────────
+# Two more "a person needs to look" mails, and nothing else:
+#   1. a login that worked right after failed guesses from the same address (SSH, console,
+#      Authentik), and
+#   2. fail2ban itself failing (service down, a jail not running, a ban action erroring).
+# Routine bans still send nothing. The same once-a-day-per-cause rule and the same
+# 3-a-day box cap as the ban mails (_person_gate) apply.
+
+_MONTHS = {m: i for i, m in enumerate(
+    ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'), 1)}
+_ISO_RE = re.compile(r'(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:[.,]\d+)?(Z|[+-]\d\d:?\d\d)?')
+_SYSLOG_RE = re.compile(r'([A-Z][a-z]{2}) +(\d{1,2}) (\d\d):(\d\d):(\d\d)')
+_SSH_WATCH_FAIL = re.compile(
+    r'Failed (?:password|keyboard-interactive/pam) for (?:invalid user )?(\S+) from (\S+) port')
+_SSH_WATCH_OK = re.compile(
+    r'Accepted (?:password|publickey|keyboard-interactive/pam|gssapi\S*) for (\S+) from (\S+) port')
+_CONSOLE_WATCH_RE = re.compile(r'console: (failed login|login ok) from (\S+)')
+_AUTHENTIK_WATCH_RE = re.compile(r'authentik: (login_failed|login ok) from (\S+)(?: user=(\S*))?')
+
+
+def _line_time(line, now, naive_utc=False):
+    """Epoch seconds of a log line, or None. Reads ISO stamps (with or without an offset)
+    and classic syslog stamps (no year: this year, or last year when that would be in the
+    future). A stamp with no offset is box-local time unless naive_utc says it is UTC."""
+    import calendar
+    m = _ISO_RE.match(line)
+    if m:
+        y, mo, d, h, mi, s = [int(x) for x in m.groups()[:6]]
+        tz = m.group(7)
+        try:
+            if tz is None and not naive_utc:
+                return time.mktime((y, mo, d, h, mi, s, 0, 0, -1))
+            t = calendar.timegm((y, mo, d, h, mi, s, 0, 0, 0))
+        except (ValueError, OverflowError):
+            return None
+        if tz and tz != 'Z':
+            sign = 1 if tz[0] == '+' else -1
+            digits = tz[1:].replace(':', '')
+            t -= sign * (int(digits[:2]) * 3600 + int(digits[2:4]) * 60)
+        return t
+    m = _SYSLOG_RE.match(line)
+    if m and m.group(1) in _MONTHS:
+        year = time.localtime(now).tm_year
+        try:
+            t = time.mktime((year, _MONTHS[m.group(1)], int(m.group(2)), int(m.group(3)),
+                             int(m.group(4)), int(m.group(5)), 0, 0, -1))
+        except (ValueError, OverflowError):
+            return None
+        if t > now + 86400:
+            t = time.mktime((year - 1, _MONTHS[m.group(1)], int(m.group(2)), int(m.group(3)),
+                             int(m.group(4)), int(m.group(5)), 0, 0, -1))
+        return t
+    return None
+
+
+def _ssh_watch_text():
+    for p in ('/var/log/auth.log', '/var/log/secure'):
+        if os.path.exists(p):
+            return _tail_text(p, 4 * 1024 * 1024)
+    try:   # no auth file (journal only)
+        r = subprocess.run(['journalctl', '-t', 'sshd', '--since', '2 hours ago',
+                            '--no-pager', '-o', 'short-iso'],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout
+    except Exception:
+        return ''
+
+
+def _watch_file_text(path):
+    """A log the console writes (live file, then the rolled .1 when the live one is small)."""
+    text = _tail_text(path, 1024 * 1024)
+    if len(text) < 64 * 1024:
+        text = _tail_text(path + '.1', 1024 * 1024) + text
+    return text
+
+
+def _login_events(now, config_dir):
+    """[(time, service, kind, address, account)] from the SSH log and the two console-side
+    logs. kind is 'fail' or 'ok'. SSH counts password failures only: a rejected public key
+    is how a client with several keys in its agent normally connects."""
+    out = []
+    for line in _ssh_watch_text().splitlines():
+        m = _SSH_WATCH_FAIL.search(line)
+        kind = 'fail'
+        if not m:
+            m = _SSH_WATCH_OK.search(line)
+            kind = 'ok'
+        if not m:
+            continue
+        t = _line_time(line, now)
+        if t is not None:
+            out.append((t, 'ssh', kind, m.group(2), m.group(1)))
+    for fname, rx, svc in (('console-auth.log', _CONSOLE_WATCH_RE, 'console'),
+                           ('authentik-logins.log', _AUTHENTIK_WATCH_RE, 'authentik')):
+        for line in _watch_file_text(os.path.join(config_dir, fname)).splitlines():
+            m = rx.search(line)
+            if not m:
+                continue
+            t = _line_time(line, now, naive_utc=True)
+            if t is None:
+                continue
+            kind = 'fail' if m.group(1) in ('failed login', 'login_failed') else 'ok'
+            who = (m.group(3) if svc == 'authentik' else '') or ''
+            out.append((t, svc, kind, m.group(2), who))
+    return out
+
+
+def _ignored_networks():
+    """Addresses fail2ban never bans (the operator's own, local subnets, containers): read
+    from the ignoreip lines of the jail files. A login from one of those is not news."""
+    nets = []
+    try:
+        names = sorted(os.listdir(JAIL_DIR))
+    except OSError:
+        names = []
+    paths = [os.path.join(JAIL_DIR, n) for n in names if n.endswith('.conf')]
+    paths.append('/etc/fail2ban/jail.local')
+    for p in paths:
+        try:
+            with open(p) as f:
+                text = f.read()
+        except OSError:
+            continue
+        for m in re.finditer(r'^\s*ignoreip\s*=\s*(.+)$', text, re.M):
+            for tok in re.split(r'[,\s]+', m.group(1).strip()):
+                try:
+                    nets.append(ipaddress.ip_network(tok, strict=False))
+                except ValueError:
+                    pass
+    return nets
+
+
+def _skip_address(ip, nets):
+    try:
+        a = ipaddress.ip_address(ip.split('%')[0])
+    except ValueError:
+        return True
+    if a.is_loopback or a.is_unspecified or a.is_link_local or a.is_multicast:
+        return True
+    return any(a in n for n in nets if n.version == a.version)
+
+
+def _logins_after_failures(events, now, nets):
+    """[(service, address, account, failures, time)] for each good login that came within
+    WATCH_RECENT seconds, after at least WATCH_FAIL_MIN failed guesses from the same
+    address on the same service in the WATCH_WINDOW seconds before it. A good login ends
+    the run of failures. Addresses fail2ban ignores never count."""
+    fails, found = {}, []
+    for t, svc, kind, ip, who in sorted(events, key=lambda e: e[0]):
+        key = (svc, ip)
+        if kind == 'fail':
+            fails.setdefault(key, []).append(t)
+            continue
+        recent = [x for x in fails.get(key, []) if 0 <= t - x <= WATCH_WINDOW]
+        if (len(recent) >= WATCH_FAIL_MIN and 0 <= now - t <= WATCH_RECENT
+                and not _skip_address(ip, nets)):
+            found.append((svc, ip, who, len(recent), t))
+        fails[key] = []
+    return found
+
+
+_SERVICE_LABEL = {'ssh': 'SSH', 'console': 'the infra-TAK console', 'authentik': 'Authentik'}
+
+
+def _login_mail(svc, ip, who, nfail, t):
+    label = _SERVICE_LABEL.get(svc, svc)
+    when = datetime.fromtimestamp(t, timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+    acct = _clean(who)
+    headline = f'a login to {label} worked after {nfail} failed guesses'
+    lines = [f'A login to {label} worked right after {nfail} failed guesses from the same address.',
+             '', f'  Address:  {ip}', f'  Service:  {label}']
+    if acct:
+        lines.append(f'  Account:  {acct}')
+    lines += [f'  Time:     {when}', '',
+              'If this was you or a colleague who mistyped a password, nothing more is needed. '
+              'To stop these mails for an address you use, add it under Trusted addresses on '
+              'the Fail2ban page of your infra-TAK console.', '',
+              'If you do not know this address, treat the account as taken: change its '
+              'password and check who is signed in to the server.']
+    return f'login:{svc}:{ip}', headline, '\n'.join(lines)
+
+
+def _quiet_window_open(now):
+    """True while a Guard Dog quiet window is open (planned work: Update Now, T&E)."""
+    try:
+        with open(QUIET_MARKER) as f:
+            parts = f.read().split()
+        return float(parts[1]) > now
+    except Exception:
+        return False
+
+
+def _run_text(cmd, timeout=15):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or '').strip()
+    except Exception:
+        return 1, ''
+
+
+def _expected_jails():
+    """Jails infra-TAK set up and left switched on (a parked or removed jail file is off)."""
+    jails = set()
+    try:
+        names = sorted(os.listdir(JAIL_DIR))
+    except OSError:
+        return jails
+    for n in names:
+        if not (n.startswith('infratak') and n.endswith('.conf')):
+            continue
+        try:
+            with open(os.path.join(JAIL_DIR, n)) as f:
+                text = f.read()
+        except OSError:
+            continue
+        for sect in re.split(r'^\s*\[', text, flags=re.M)[1:]:
+            name = sect.split(']', 1)[0].strip()
+            if name and name != 'DEFAULT' and re.search(r'^\s*enabled\s*=\s*(true|yes|1)\s*$',
+                                                         sect, re.M | re.I):
+                jails.add(name)
+    return jails
+
+
+def _uptime():
+    try:
+        with open('/proc/uptime') as f:
+            return float(f.read().split()[0])
+    except Exception:
+        return 1e9
+
+
+def _health_problems(now):
+    """{cause: (headline, text)} for what is wrong with fail2ban right now. Empty when it is
+    healthy, or when it is off on purpose (disabled, masked or not installed): nobody is
+    mailed for something the owner turned off."""
+    if _uptime() < BOOT_GRACE:
+        return {}
+    _rc, enabled = _run_text(['systemctl', 'is-enabled', 'fail2ban'])
+    if not enabled.startswith('enabled'):
+        return {}
+    problems = {}
+    _rc, active = _run_text(['systemctl', 'is-active', 'fail2ban'])
+    if active != 'active':
+        problems['f2b:service'] = (
+            'fail2ban is not running',
+            f'The fail2ban service is not running (state: {_clean(active) or "unknown"}). '
+            'Nothing is blocking guessed passwords or scanners right now.\n\n'
+            'Open the Fail2ban page of your infra-TAK console, or look at '
+            '"systemctl status fail2ban" on the server, to see why it stopped.')
+        return problems
+    rc, out = _run_text(['fail2ban-client', 'status'], timeout=20)
+    if rc != 0:
+        problems['f2b:service'] = (
+            'fail2ban is not answering',
+            'The fail2ban service says it is running, but it does not answer. '
+            'Bans may not be working.\n\nLook at "systemctl status fail2ban" and '
+            '/var/log/fail2ban.log on the server.')
+        return problems
+    m = re.search(r'Jail list:\s*(.*)$', out, re.M)
+    running = {j.strip() for j in re.split(r'[,\s]+', m.group(1)) if j.strip()} if m else set()
+    missing = sorted(_expected_jails() - running)
+    if missing:
+        names = ', '.join(_clean(j) for j in missing)
+        problems['f2b:jails'] = (
+            f'fail2ban jail not running: {names}',
+            f'These fail2ban jails are set up but not running: {names}.\n'
+            'They are not blocking anything. A jail stops when its log file is missing '
+            'or its settings have an error.\n\nThe last lines of /var/log/fail2ban.log '
+            'on the server say why.')
+    pat = re.compile(r'^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d).*ERROR\s+.*Failed to execute (?:ban|unban) '
+                     r"jail '([^']+)' action '([^']+)'")
+    errors = {}
+    for line in _tail_text(F2B_LOG, 2 * 1024 * 1024).splitlines():
+        em = pat.match(line)
+        if not em:
+            continue
+        t = _line_time(line, now)
+        if t is not None and 0 <= now - t <= ACTION_ERR_WINDOW:
+            errors[(em.group(2), em.group(3))] = errors.get((em.group(2), em.group(3)), 0) + 1
+    bad = sorted(k for k, n in errors.items() if n >= ACTION_ERR_MIN)
+    if bad:
+        what = ', '.join(f'{_clean(j)} / {_clean(a)}' for j, a in bad)
+        problems['f2b:action'] = (
+            f'fail2ban ban action failing: {what}',
+            f'fail2ban tried to ban an address and the ban action failed, at least '
+            f'{ACTION_ERR_MIN} times in the last hour ({what}).\n'
+            'The address was NOT blocked.\n\nThe ERROR lines in /var/log/fail2ban.log on '
+            'the server show the command that failed.')
+    return problems
+
+
+def _health_count(st, present):
+    """Count the runs in a row that saw each cause; returns the causes seen HEALTH_RUNS
+    times in a row. A cause that is gone for one run starts again from zero."""
+    old = st.get('health') if isinstance(st.get('health'), dict) else {}
+    new = {c: int(old.get(c, 0) or 0) + 1 for c in present}
+    st['health'] = new
+    return [c for c, n in new.items() if n >= HEALTH_RUNS]
+
+
+def watch():
+    """The timer entry point: look for the two cases above and mail at most what the
+    once-a-day and 3-a-day gates allow. Never raises."""
+    ctx = _load_context()
+    if not ctx:
+        return
+    settings_path, settings, recipients, server_id = ctx
+    now = time.time()
+    problems = {}
+    try:
+        problems = _health_problems(now)
+    except Exception as e:
+        print(f"infratak-f2b-notify: health check failed: {e}", file=sys.stderr)
+    due, ok = _locked_state(lambda st: _health_count(st, list(problems)))
+    items = []                                   # (key, headline, text); health first
+    for cause in (due or []):
+        headline, text = problems[cause]
+        items.append((cause, headline, text))
+    try:
+        nets = _ignored_networks()
+        events = _login_events(now, os.path.dirname(settings_path))
+        for svc, ip, who, nfail, t in _logins_after_failures(events, now, nets):
+            items.append(_login_mail(svc, ip, who, nfail, t))
+    except Exception as e:
+        print(f"infratak-f2b-notify: login check failed: {e}", file=sys.stderr)
+    if not items:
+        return
+    if _quiet_window_open(now):
+        print("infratak-f2b-notify: Guard Dog quiet window is open — no email sent "
+              "(looked again at the next run)", file=sys.stderr)
+        return
+    wait, _ok = _locked_state(lambda st: float(st.get('retry_after', 0) or 0))
+    if wait and wait > now:
+        print("infratak-f2b-notify: mail relay did not take the last message — waiting "
+              "before trying again", file=sys.stderr)
+        return
+    for key, headline, text in items:
+        verdict, ok = _locked_state(lambda st, k=key: _person_gate(st, k, now))
+        if not ok or verdict != 'send':
+            continue
+        body = (f'{text}\n\nServer: {server_id}\n'
+                f'Time:   {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}\n\n'
+                'Guard Dog sends this once a day for each cause, and at most 3 of these a day '
+                'for the server. Routine bans (bots and scanners) are not emailed.\n')
+        if not _send(settings, recipients, f'[{server_id}] {headline}', body):
+            _locked_state(lambda st, k=key: (_person_undo(st, k, now),
+                                             st.update(retry_after=time.time() + RETRY_AFTER)))
+            break
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '--watch':
+        watch()
+        sys.exit(0)
+    ip   = sys.argv[1] if len(sys.argv) > 1 else 'unknown'
+    hint = sys.argv[2] if len(sys.argv) > 2 else 'authentik'
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        print("infratak-f2b-notify: no valid address given — no email sent", file=sys.stderr)
+        sys.exit(0)
+    ctx = _load_context()
+    if not ctx:
+        sys.exit(0)
+    settings_path, settings, recipients, server_id = ctx
     now = time.time()
     jail = _resolve_jail(ip, hint)
 
@@ -125246,6 +125778,72 @@ if __name__ == '__main__':
 '''
 
 
+# ops #1406: the timer that runs `infratak-f2b-notify --watch` every 5 minutes. Plain strings so
+# tests can read them. The service names the script by absolute path, so a box rolled back to a
+# release whose script has no --watch just gets "no valid address" and exit 0 each run.
+_F2B_WATCH_SERVICE = (
+    "[Unit]\n"
+    "Description=infra-TAK fail2ban and login watch (mails only when a person is needed)\n\n"
+    "[Service]\n"
+    "Type=oneshot\n"
+    "ExecStart=/usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify --watch\n"
+)
+_F2B_WATCH_TIMER = (
+    "[Unit]\n"
+    "Description=Run the infra-TAK fail2ban and login watch every 5 minutes\n\n"
+    "[Timer]\n"
+    "OnBootSec=10min\n"
+    "OnUnitActiveSec=5min\n"
+    "AccuracySec=30s\n"
+    "Unit=infratak-f2b-watch.service\n\n"
+    "[Install]\n"
+    "WantedBy=timers.target\n"
+)
+_F2B_WATCH_UNITS = ('/etc/systemd/system/infratak-f2b-watch.service',
+                    '/etc/systemd/system/infratak-f2b-watch.timer')
+
+
+def _f2b_watch_ensure():
+    """Write the watch timer and start it. Safe to run on every start: a unit file is
+    rewritten only when it differs, and the timer is enabled only when it is not. Returns
+    True when something changed. Only boxes whose fail2ban hook is in place (the notifier
+    script exists) get it; a box without fail2ban gets nothing."""
+    if not os.path.exists('/usr/local/sbin/infratak-f2b-notify'):
+        return False
+    changed = False
+    for path, text in zip(_F2B_WATCH_UNITS, (_F2B_WATCH_SERVICE, _F2B_WATCH_TIMER)):
+        if _f2b_read_text(path) != text:
+            _write_priv(path, text)
+            changed = True
+    if changed:
+        subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True, timeout=30)
+    en = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', 'infratak-f2b-watch.timer']),
+                        capture_output=True, text=True, timeout=15)
+    if changed or not (en.stdout or '').strip().startswith('enabled'):
+        subprocess.run(_sudo_wrap(['systemctl', 'enable', '--now', 'infratak-f2b-watch.timer']),
+                       capture_output=True, timeout=30)
+        changed = True
+    return changed
+
+
+def _startup_converge_f2b_watch():
+    """ops #1406: every box that has the fail2ban hook gets the watch timer (and the newest
+    notifier script, which the banaction converge above has just written)."""
+    try:
+        cur = _f2b_read_text('/usr/local/sbin/infratak-f2b-notify')
+        if cur is not None and cur != _F2B_NOTIFY_SCRIPT:
+            _write_priv('/usr/local/sbin/infratak-f2b-notify', _F2B_NOTIFY_SCRIPT, perm=0o755)
+        if _f2b_watch_ensure():
+            print('Startup migration: ✓ fail2ban and login watch timer in place (mails only '
+                  'when a login worked after failed guesses, or fail2ban itself is failing)',
+                  flush=True)
+    except PermissionError:
+        pass
+    except Exception as _e:
+        print('Startup migration: fail2ban watch converge warning (non-fatal): %s' % _e,
+              flush=True)
+
+
 # gh #735 (v10.4.7-alpha): these three `actionban` values joined the dashboard log line and the
 # ban e-mail with ` ; `. fail2ban's config reader sets inline_comment_prefixes=';'
 # (fail2ban/client/configparserinc.py), so ` ;` starts a comment and everything after it was
@@ -125296,6 +125894,11 @@ def _fail2ban_add_guarddog_hook(plog):
     notify_path = '/usr/local/sbin/infratak-f2b-notify'
     _write_priv(notify_path, _F2B_NOTIFY_SCRIPT, perm=0o755)
     plog(f"fail2ban guarddog hook: wrote {notify_path}")
+    try:
+        if _f2b_watch_ensure():
+            plog("fail2ban guarddog hook: watch timer (login after failed guesses, fail2ban failing) started")
+    except Exception as _we:
+        plog(f"fail2ban guarddog hook: watch timer not started (non-fatal): {_we}")
 
     # ── Step 2: fail2ban action definition ────────────────────────────────────
     # %% in ini = literal % after ConfigParser interpolation → shell %
@@ -126922,6 +127525,8 @@ def _startup_migrations():
             _startup_converge_tak_banaction()
         except Exception as _f2b_e3e:
             print(f"Startup migration: takserver banaction converge error (non-fatal): {_f2b_e3e}", flush=True)
+        # ops #1406 — the watch timer; after the converge above has put the newest script on disk.
+        _startup_converge_f2b_watch()
         # v10.3.4 — refused-cert phones move to the takserver-badcert jail, which never
         # blocks enrollment (8446). Before recidive's exemption so both land in one start.
         try:
