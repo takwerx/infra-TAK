@@ -107,7 +107,7 @@ def test_started_at_parses_to_the_right_epoch():
 def test_database_container_creation_is_not_changed():
     # A tmpfs over /run/postgresql was tried and dropped: it covers one of the three locks, and
     # /tmp holds a file from TAK's image build (`buildarch`) that a tmpfs would hide.
-    runs = re.findall(r"--name \{TAK_DB_CONTAINER\}[^\n]*-d takserver_db", APP)
+    runs = re.findall(r"--name \{TAK_DB_CONTAINER\}[^\n]*-d (?:takserver_db|\{TAK_DB_IMAGE\})", APP)
     assert len(runs) == 2, runs          # deploy and update
     assert all('tmpfs' not in r for r in runs)
 

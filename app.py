@@ -3857,6 +3857,7 @@ def _tak_is_bundle_dir(path):
     return _tak_bundle_dockerfiles(path)[0] is not None
 
 TAK_DB_CONTAINER = 'takserver-db'    # db container name
+TAK_DB_IMAGE = 'takserver_db'        # db image tag (ops #1326)
 TAK_DOCKER_NET = 'takserver'         # docker network
 TAK_DB_VOLUME = 'takserver_pgsql'    # named volume for postgres data
 TAK_DOCKER_ROOT = os.path.join(os.path.expanduser('~'), 'tak-docker')  # unzip target
@@ -31695,7 +31696,7 @@ def _tak_messaging_starts():
     return int(s) if s.isdigit() else 0
 
 
-def _tak_db_refresh_backup(pgbin, pw, say, stamp):
+def _tak_db_refresh_backup(pgbin, pw, say, stamp, prefix='pre-dbrefresh'):
     """(path, '') of a backup of the `cot` database, or ('', why). Container installs have no
     PostgreSQL client on the host (the broker's pg_restore op answers "not found on trusted PATH": field
     test, ARM box, Nov 14), so the whole proof runs INSIDE the database container: `pg_dump -Fc`, then
@@ -31717,7 +31718,7 @@ def _tak_db_refresh_backup(pgbin, pw, say, stamp):
             or int(nums[0]) <= 0 or int(nums[1]) <= 0:
         return '', 'pg_restore could not read the dump back'
     toc, size = int(nums[0]), int(nums[1])
-    dest_dir = os.path.join(TAK_DOCKER_ROOT, 'snapshots', f'pre-dbrefresh-{stamp}')
+    dest_dir = os.path.join(TAK_DOCKER_ROOT, 'snapshots', f'{prefix}-{stamp}')
     dest = os.path.join(dest_dir, 'cot.pgdump')
     try:
         os.makedirs(dest_dir, mode=0o700, exist_ok=True)
@@ -101359,7 +101360,7 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
         #    it would have preserved is already gone, so its fresh init builds 5.8's schema.
         #    It writes the SAME status dict the Update panel polls, so it is told not to
         #    mark the job complete — the data has not moved yet.
-        run_takserver_upgrade_container(zip_path, mark_complete=False)
+        run_takserver_upgrade_container(zip_path, mark_complete=False, migration=True)
         if upgrade_status.get('error'):
             return fail('The container rebuild failed — see the output above.',
                         f'Your PostgreSQL 15 data is intact in volume {old_vol} and the export '
@@ -105371,7 +105372,264 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
 
 
-def run_takserver_upgrade_container(zip_path, mark_complete=True):
+# ==========================================================================
+# ops #1326 — the Docker TAK Server update checks everything BEFORE it touches anything
+# ==========================================================================
+# It used to `docker rm -f` both TAK containers first, unpack the zip next, delete the old
+# bundle folder before the build, and build last. A build that failed (registry unreachable,
+# disk full) left TAK down, the old folder gone with its snapshots and setenv.sh, and no way
+# to press Update again. A 5.7 zip on a 5.8 box built a PostgreSQL 15 image on a PostgreSQL 18
+# volume and started an empty database. Measured on a real 5.8 R105 ARM box, ops #1311/#1326.
+# Order now: read-only checks, backup outside the bundle, unpack, carry over, BUILD (TAK keeps
+# running), then stop + swap, then delete the old folder last, and only when the new TAK is up.
+
+_TAK_UPDATE_BACKUP_KEEP = 2
+_TAK_UPDATE_BACKUP_RE = re.compile(r'^pre-update-\d{8}-\d{6}$')
+_TAK_SETENV_HEAP_A = '# >>> infra-TAK managed heap >>>'
+_TAK_SETENV_HEAP_B = '# <<< infra-TAK managed heap <<<'
+
+
+def _tak_dockerfile_pg_major(text):
+    """PostgreSQL major a TAK database Dockerfile builds, or None. Pure.
+    5.7 and older: `FROM postgres:15.1`. 5.8 hardened (UBI + PGDG): `postgresql18-server`."""
+    t = text or ''
+    for pat in (r'^\s*FROM\s+(?:\S+/)?postgres:(\d+)', r'postgresql-?(\d+)-server',
+                r'/usr/pgsql-(\d+)/bin'):
+        m = re.search(pat, t, re.I | re.M)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _tak_zip_bundle_info(zip_path):
+    """Read-only look inside a takserver-docker zip. Returns {'top', 'app_df', 'db_df',
+    'hardened', 'pg_major'}. Raises ValueError (plain words) when it is not an official bundle."""
+    import zipfile
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except Exception:
+        raise ValueError('The uploaded file is not a readable zip.')
+    with zf:
+        names = zf.namelist()
+        tops = {n.split('/')[0] for n in names if n.strip('/')}
+        if len(tops) != 1:
+            raise ValueError('The zip does not hold one takserver-docker folder, so it is not an '
+                             'official takserver-docker zip.')
+        top = next(iter(tops))
+        for app_df, db_df in _TAK_DOCKERFILES:
+            if f'{top}/{app_df}' in names and f'{top}/{db_df}' in names:
+                text = zf.read(f'{top}/{db_df}')[:400000].decode('utf-8', 'replace')
+                return {'top': top, 'app_df': app_df, 'db_df': db_df,
+                        'hardened': 'hardened' in db_df.lower(),
+                        'pg_major': _tak_dockerfile_pg_major(text)}
+    raise ValueError('The zip has no TAK Server Dockerfiles, so it is not an official '
+                     'takserver-docker zip.')
+
+
+def _tak_db_volume_layout(volume=None):
+    """What the TAK database volume holds, read without changing it.
+    {'exists': False} when there is no such volume; {'exists': True, 'root': N|None,
+    'legacy': N|None} where `root` is the PostgreSQL major of a cluster at the volume root
+    (5.8 hardened layout) and `legacy` the major of a cluster at <volume>/<N>/data (5.7 layout);
+    None when the volume exists but could not be read."""
+    vol = volume or TAK_DB_VOLUME
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'volume', 'inspect', vol]),
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return {'exists': False, 'root': None, 'legacy': None}
+        script = ('r=none; [ -s /from/PG_VERSION ] && r=$(cat /from/PG_VERSION); l=none; '
+                  'for f in /from/*/data/PG_VERSION; do [ -s "$f" ] && l=$(cat "$f"); done; '
+                  'echo "ROOT=$r LEGACY=$l"')
+        r = subprocess.run(_sudo_wrap([
+            'docker', 'run', '--rm', '--user', '0', '-v', f'{vol}:/from',
+            '--entrypoint', 'sh', TAK_CONTAINER, '-c', script],),
+            capture_output=True, text=True, timeout=180)
+    except Exception:
+        return None
+    m = re.search(r'ROOT=(\S+)\s+LEGACY=(\S+)', r.stdout or '') if r.returncode == 0 else None
+    if not m:
+        return None
+
+    def major(s):
+        d = re.match(r'(\d+)', s)
+        return int(d.group(1)) if d else None
+    return {'exists': True, 'root': major(m.group(1)), 'legacy': major(m.group(2))}
+
+
+def _tak_volume_check(hardened, image_major, vol):
+    """(ok, plain-words refusal) — can an image of `image_major`, laid out for the hardened
+    (volume root) or legacy (<volume>/N/data) bundle, start on the database volume described
+    by `vol` without creating an empty or incompatible database? Pure."""
+    if vol is None:
+        return False, ('The database volume could not be read, so the update cannot check that '
+                       'the new version matches your data. Nothing was changed.')
+    if not vol.get('exists'):
+        return True, ''
+    here, other = (vol.get('root'), vol.get('legacy')) if hardened else \
+                  (vol.get('legacy'), vol.get('root'))
+    if here is None and other is None:
+        return True, ''                                   # empty volume: a fresh database
+    if here is None:
+        return False, ('Your database (PostgreSQL %d) is stored in a different layout than this '
+                       'zip uses. Starting it would create a new, EMPTY database and TAK Server '
+                       'would look empty. Nothing was changed. Upload the zip for the TAK Server '
+                       'version you run, or a newer one of the same major version.' % other)
+    if image_major is not None and image_major != here:
+        return False, ('This zip builds PostgreSQL %d but your data is PostgreSQL %d, and '
+                       'PostgreSQL will not start on data from another major version. Nothing '
+                       'was changed.%s' % (image_major, here,
+                                           ' A TAK Server 5.8 zip on a 5.7 server goes through '
+                                           'the 5.8 migration, not this button.'
+                                           if image_major > here else ''))
+    return True, ''
+
+
+def _tak_container_update_preflight(zip_path, old_ctx, ulog, check_volume=True):
+    """Everything the container update can know BEFORE it touches anything. Returns
+    (info, error): `error` is a plain-words refusal (nothing was changed) or ''."""
+    try:
+        info = _tak_zip_bundle_info(zip_path)
+    except ValueError as e:
+        return None, str(e)
+    if info['top'] == os.path.basename(old_ctx):
+        return None, ('This zip is the version that is already installed (%s). Nothing was '
+                      'changed. Upload a different takserver-docker zip.' % info['top'])
+    cur = _tak_release_key(os.path.basename(old_ctx))
+    new = _tak_release_key(os.path.basename(zip_path)) or _tak_release_key(info['top'])
+    if cur and new and new < cur:
+        if new[:2] < cur[:2]:
+            return None, ('This zip is TAK Server %d.%d, which is older than the %d.%d you run. '
+                          'The database does not go back with the package, so nothing was '
+                          'changed. Upload a %d.%d zip, or restore a snapshot from Snapshots & '
+                          'Recovery.' % (new[0], new[1], cur[0], cur[1], cur[0], cur[1]))
+        ulog('⚠ DOWNGRADE: %s is OLDER than the installed %s. Installing it on purpose; the '
+             'database is not changed by the image.'
+             % (_tak_fmt_release(new), _tak_fmt_release(cur)))
+    if check_volume:
+        vol = _tak_db_volume_layout()
+        ok, why = _tak_volume_check(info['hardened'], info['pg_major'], vol)
+        if not ok:
+            return None, why
+        ulog('  ✓ The zip matches the database volume (PostgreSQL %s).'
+             % (info['pg_major'] or 'version not stated'))
+    return info, ''
+
+
+def _tak_pre_update_backup(stamp, old_tak, ulog):
+    """Backup OUTSIDE the bundle before a container update. Returns (ok, folder).
+    The cot database is dumped and read back (only when the database container runs; a stopped
+    one has nothing to dump and its volume is not touched by the update), and the config files
+    are copied. Pruned to the newest _TAK_UPDATE_BACKUP_KEEP folders."""
+    root = os.path.join(TAK_DOCKER_ROOT, 'snapshots')
+    dest_dir = os.path.join(root, f'pre-update-{stamp}')
+    try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        os.chmod(dest_dir, 0o700)
+    except PermissionError:
+        _makedirs_priv(dest_dir, mode=0o700)
+    except Exception as e:
+        ulog(f'✗ Could not create the backup folder: {str(e)[:120]}')
+        return False, ''
+    for f in ('CoreConfig.xml', 'UserAuthenticationFile.xml', 'setenv.sh'):
+        src = os.path.join(old_tak, f)
+        if os.path.exists(src):
+            _pg_run(['cp', '-p', src, os.path.join(dest_dir, f)], timeout=60)
+            _pg_run(['chmod', '600', os.path.join(dest_dir, f)], timeout=30)
+    r = _pg_run(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_DB_CONTAINER], timeout=60)
+    if r.returncode != 0 or (r.stdout or '').strip() != 'true':
+        ulog('  ⚠ The database container is not running, so no database dump was made. '
+             'Config files were copied to %s. The database volume itself is not touched.' % dest_dir)
+        return True, dest_dir
+    pw = _tak58_db_password()
+    pgbin = None
+    for major in (TAK_PG_MAJOR, 15):
+        pgbin = _tak58_container_pgbin(TAK_DB_CONTAINER, major)
+        if pgbin:
+            break
+    if not pw or not pgbin:
+        ulog('✗ The database is running but could not be backed up (password or PostgreSQL '
+             'tools not found). Nothing was changed.')
+        return False, dest_dir
+    path, why = _tak_db_refresh_backup(pgbin, pw, ulog, stamp, prefix='pre-update')
+    if not path:
+        ulog('✗ The database backup failed (%s). Nothing was changed.' % why)
+        _pg_run(['rm', '-rf', dest_dir], timeout=120)     # an unfinished backup folder is not a backup
+        return False, dest_dir
+    try:
+        kept = sorted(d for d in os.listdir(root) if _TAK_UPDATE_BACKUP_RE.match(d))
+        for old in kept[:-_TAK_UPDATE_BACKUP_KEEP]:
+            _pg_run(['rm', '-rf', os.path.join(root, old)], timeout=120)
+    except Exception:
+        pass
+    ulog('  ✓ Backup saved in %s (database dump + config files)' % dest_dir)
+    return True, dest_dir
+
+
+def _tak_setenv_carry(old_tak, new_tak, backup_dir, ulog):
+    """Put infra-TAK's own blocks (heap, Java pin) from the old setenv.sh into the NEW bundle's
+    stock setenv.sh. Third-party file: never copy the whole old file over the new one. The old
+    file stays in the backup folder."""
+    try:
+        old = _read_priv(os.path.join(old_tak, 'setenv.sh'))
+    except Exception:
+        return
+    try:
+        new = _read_priv(os.path.join(new_tak, 'setenv.sh'))
+    except Exception:
+        new = None
+    if not old or new is None:
+        return
+    def block(a, b):
+        m = re.search(rf'{re.escape(a)}.*?{re.escape(b)}\n?', old, re.S)
+        return m.group(0) if m else ''
+    heap = block(_TAK_SETENV_HEAP_A, _TAK_SETENV_HEAP_B)
+    jvm = block(_TAK_SETENV_JVM_A, _TAK_SETENV_JVM_B)
+    out = new
+    for a, b in ((_TAK_SETENV_HEAP_A, _TAK_SETENV_HEAP_B), (_TAK_SETENV_JVM_A, _TAK_SETENV_JVM_B)):
+        out = re.sub(rf'{re.escape(a)}.*?{re.escape(b)}\n?', '', out, flags=re.S)
+    if jvm:
+        out = out + ('' if out.endswith('\n') else '\n') + jvm   # appended, as the pin writes it
+    if heap:
+        out = heap + out                                          # prepended, as set-heap writes it
+    if out != new:
+        try:
+            _write_priv(os.path.join(new_tak, 'setenv.sh'), out)
+            ulog('  ✓ Heap and Java settings carried into the new setenv.sh')
+        except Exception as e:
+            ulog(f'  ⚠ Could not carry the setenv.sh settings ({str(e)[:100]}). '
+                 f'Your old file is in {backup_dir or "the old bundle"}.')
+
+
+def _tak_carry_missing(old_dir, new_dir, ulog, label, move=False):
+    """Copy (or move) every entry of old_dir that new_dir does not already have. Never
+    replaces anything the new bundle ships. Returns True when nothing failed."""
+    if not os.path.isdir(old_dir):
+        return True
+    r = _pg_run(['ls', old_dir], timeout=30)
+    if r.returncode != 0:
+        ulog(f'  ⚠ Could not list {old_dir}')
+        return False
+    _pg_run(['mkdir', '-p', new_dir], timeout=30)
+    r2 = _pg_run(['ls', new_dir], timeout=30)
+    have = set((r2.stdout or '').split('\n')) if r2.returncode == 0 else set()
+    ok, n = True, 0
+    for name in (r.stdout or '').split('\n'):
+        if not name or name.startswith('-') or name in have:
+            continue
+        cmd = ['mv'] if move else ['cp', '-rp']
+        c = _pg_run(cmd + [os.path.join(old_dir, name), os.path.join(new_dir, name)], timeout=900)
+        if c.returncode != 0:
+            ulog(f'  ⚠ Could not carry {label}/{name}: {(c.stderr or c.stdout or "").strip()[:120]}')
+            ok = False
+        else:
+            n += 1
+    if n:
+        ulog(f'  ✓ {n} item(s) of {label} carried over')
+    return ok
+
+
+def run_takserver_upgrade_container(zip_path, mark_complete=True, migration=False):
     """v10.0.1 — DATA-PRESERVING container upgrade. Rebuilds the TAK Server image from the new
     takserver-docker-*.zip and recreates the containers while KEEPING the database (the
     TAK_DB_VOLUME named volume) and the existing CA/certs + CoreConfig + UserAuthenticationFile.
@@ -105381,10 +105639,17 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
     upgrade_log/upgrade_status (the Update panel). SACRED: the DB volume must never be removed
     on this path — that is the whole point of an upgrade vs a redeploy.
 
+    ops #1326 order: checks and a backup first (nothing changed), then unpack, carry over, build
+    (TAK keeps running), then stop and swap, and the old bundle folder is deleted LAST, only once
+    the new TAK is up. A failure before the swap leaves the old TAK running; a failure in the swap
+    puts the old images, link and containers back.
+
     mark_complete=False leaves upgrade_status 'running' at the end: the 5.8 container
     migration calls this as a STEP (rebuild) and has the data import still to do, and
     the Update panel stops polling — and reloads the page as "Update complete" — the
-    moment it sees running=False."""
+    moment it sees running=False. `migration=True` is that caller: it already exported the
+    database and removed the old containers and volume, so the volume check, the backup and
+    the swap rollback do not apply (the old PostgreSQL 15 data is in its own rollback volume)."""
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         upgrade_log.append(entry); print(entry, flush=True)
@@ -105396,6 +105661,11 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
             return r.returncode == 0
         except Exception as e:
             ulog(f"    ! {str(e)[:160]}"); return False
+    def dk(argv, timeout=120):
+        try:
+            return subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout).returncode == 0
+        except Exception:
+            return False
     def _fail(msg):
         ulog(f"✗ {msg}")
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
@@ -105406,36 +105676,50 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         ulog("=" * 50)
         old_tak = os.path.realpath('/opt/tak')        # current bundle's tak/ dir
         old_ctx = os.path.dirname(old_tak)            # current bundle dir (inside TAK_DOCKER_ROOT)
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        kept_msg = ('The database was not touched.' if migration
+                    else 'TAK Server was not stopped and still runs the old version.')
 
-        # 1) Stop+remove the OLD containers — NOT the volume (the DB stays in TAK_DB_VOLUME).
-        ulog("Step 1/6: Stopping current containers (database volume kept)...")
-        subprocess.run(_sudo_wrap(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER]), capture_output=True, timeout=90)
+        # 1) Read-only checks. Nothing is changed until these pass.
+        ulog("Step 1/7: Checking the zip against this server (nothing is changed yet)...")
+        info, err = _tak_container_update_preflight(zip_path, old_ctx, ulog, check_volume=not migration)
+        if err:
+            return _fail(err)
 
-        # 2) Extract the new bundle ALONGSIDE the old (no wipe — keeps the old certs reachable for
+        # 2) Backup outside the bundle (the 5.8 migration made its own export).
+        backup_dir = ''
+        if not migration:
+            ulog("Step 2/7: Saving a backup outside the bundle folder...")
+            _ok, backup_dir = _tak_pre_update_backup(stamp, old_tak, ulog)
+            if not _ok:
+                return _fail("The backup failed, so the update stopped before changing anything. "
+                             + kept_msg)
+
+        # 3) Extract the new bundle ALONGSIDE the old (no wipe — keeps the old certs reachable for
         #    an in-place broker copy; both dirs are inside the allowlisted ~/tak-docker root).
-        ulog("Step 2/6: Unpacking new bundle...")
+        ulog("Step 3/7: Unpacking new bundle...")
+        new_ctx = os.path.join(TAK_DOCKER_ROOT, info['top'])
+        new_tak = os.path.join(new_ctx, 'tak')
+
+        def _drop_new(why):
+            """Failure BEFORE the swap: remove the half-prepared new folder, old TAK is untouched."""
+            if os.path.realpath('/opt/tak') != os.path.realpath(new_tak):
+                subprocess.run(_sudo_wrap(['rm', '-rf', new_ctx]), capture_output=True, timeout=120)
+            return _fail(f"{why} {kept_msg} The old bundle folder was not changed.")
         try:
             import zipfile
             with zipfile.ZipFile(zip_path) as zf:
                 _safe_extract_zip(zf, TAK_DOCKER_ROOT, apply_modes=True)
         except Exception as e:
-            return _fail(f"Failed to extract the new bundle: {str(e)[:160]}")
+            return _drop_new(f"Failed to extract the new bundle: {str(e)[:160]}.")
         _tak_bundle_repair_exec_bits(TAK_DOCKER_ROOT, ulog)
-        entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
-                   if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()
-                   and _tak_is_bundle_dir(os.path.join(TAK_DOCKER_ROOT, d))
-                   and os.path.join(TAK_DOCKER_ROOT, d) != old_ctx]
-        entries.sort(key=lambda d: os.path.getmtime(os.path.join(TAK_DOCKER_ROOT, d)), reverse=True)
-        if not entries:
-            return _fail("No NEW takserver-docker bundle found (same version as installed, or not an official zip). "
-                         "Upload a different takserver-docker-*.zip. The old install is untouched.")
-        new_ctx = os.path.join(TAK_DOCKER_ROOT, entries[0])
-        new_tak = os.path.join(new_ctx, 'tak')
-        ulog(f"✓ New bundle: {entries[0]}")
+        if not _tak_is_bundle_dir(new_ctx):
+            return _drop_new("No takserver-docker bundle found after unpacking (not an official zip).")
+        ulog(f"✓ New bundle: {info['top']}")
 
-        # 3) Carry the PRESERVED certs / CoreConfig / UserAuth over old -> new (in place, broker),
-        #    re-point /opt/tak, then drop the old bundle dir.
-        ulog("Step 3/6: Carrying over certs + CoreConfig (preserved)...")
+        # 4) Carry the PRESERVED certs / CoreConfig / UserAuthenticationFile over old -> new (in
+        #    place, broker). Copies only: the old folder is not changed or deleted here.
+        ulog("Step 4/7: Carrying over certs, CoreConfig, settings and plugins (preserved)...")
         subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=30)
         subprocess.run(_sudo_wrap(['mkdir', '-p', os.path.join(new_tak, 'certs')]), capture_output=True, timeout=10)
         subprocess.run(_sudo_wrap(['cp', '-rp', os.path.join(old_tak, 'certs', 'files'), os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=120)
@@ -105443,18 +105727,19 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
             subprocess.run(_sudo_wrap(['cp', '-p', os.path.join(old_tak, f), os.path.join(new_tak, f)]), capture_output=True, timeout=30)
         _carry_cert_metadata(old_tak, new_tak, ulog)
         if not os.path.exists(os.path.join(new_tak, 'certs', 'files', 'takserver.jks')):
-            return _fail("Certs did not carry over (takserver.jks missing in new bundle) — aborting before swap. Old install untouched.")
-        subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
-        rc(f'ln -sfn {shlex.quote(new_tak)} /opt/tak', timeout=15)
-        if old_ctx and old_ctx != new_ctx:
-            subprocess.run(_sudo_wrap(['rm', '-rf', old_ctx]), capture_output=True, timeout=60)
-        ulog("✓ certs + CoreConfig carried over; /opt/tak re-pointed")
+            return _drop_new("Certs did not carry over (takserver.jks missing in new bundle).")
+        _tak_setenv_carry(old_tak, new_tak, backup_dir, ulog)
+        _tak_carry_missing(os.path.join(old_tak, 'lib'), os.path.join(new_tak, 'lib'), ulog, 'plugin jars')
+        _tak_carry_missing(os.path.join(old_tak, 'conf', 'plugins'),
+                           os.path.join(new_tak, 'conf', 'plugins'), ulog, 'plugin settings')
+        ulog("✓ certs + CoreConfig carried over (old folder untouched)")
 
-        # 4) Build the new-version images.
-        ulog("Step 4/6: Building new TAK Server images (minutes on arm64)...")
+        # 5) Build the new-version images under TEMPORARY tags. TAK keeps running. Tags `takserver`
+        #    and `takserver_db` still name the OLD images; they move only after both builds work.
+        ulog("Step 5/7: Building new TAK Server images (minutes on arm64; TAK Server keeps running)...")
         _app_df, _db_df = _tak_bundle_dockerfiles(new_ctx)
         if not _app_df:
-            return _fail('No TAK Dockerfiles under %s/docker - is this an official takserver-docker zip?' % new_ctx)
+            return _drop_new('No TAK Dockerfiles under %s/docker - is this an official takserver-docker zip?' % new_ctx)
         # Both, and in this order: the resolver picks WHICH Dockerfile (5.8 hardened renamed
         # them — GH #66), the patcher fixes the stock one's EOL bullseye sources (GH #69). The
         # patcher targets Dockerfile.takserver-db by name and returns False when it is absent,
@@ -105464,39 +105749,85 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         _patch_tak_hardened_java_pin(new_ctx, _app_df, ulog)   # ops #963 — pinned Temurin build never moves
         _patch_tak_db_pgdg_releasever(new_ctx, _db_df, ulog)   # ops #686 — PGDG lags new RHEL minors
         _patch_tak_dockerfile_cacerts(new_ctx, _app_df, ulog)   # ops #200 — JDK's own CA roots
-        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
-            return _fail("DB image build failed.")
-        if not rc(f'cd {shlex.quote(new_ctx)} && docker build --pull -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
-            return _fail("TAK Server image build failed.")
+        db_new, app_new = f'{TAK_DB_IMAGE}:build-{stamp}', f'{TAK_CONTAINER}:build-{stamp}'
+        db_old, app_old = f'{TAK_DB_IMAGE}:pre-update-{stamp}', f'{TAK_CONTAINER}:pre-update-{stamp}'
+        # Keep the OLD images reachable by a tag of their own, so a swap that fails can put them back.
+        had_db, had_app = dk(['docker', 'tag', TAK_DB_IMAGE, db_old]), dk(['docker', 'tag', TAK_CONTAINER, app_old])
+        def _drop_tags(*tags):
+            for t in tags:
+                dk(['docker', 'image', 'rm', t], 120)
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {db_new} -f {shlex.quote(_db_df)} . 2>&1'):
+            _drop_tags(db_new, db_old, app_old)
+            return _drop_new("DB image build failed.")
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build --pull -t {app_new} -f {shlex.quote(_app_df)} . 2>&1'):
+            _drop_tags(db_new, app_new, db_old, app_old)
+            return _drop_new("TAK Server image build failed.")
         ulog("✓ Images built")
+
+        # 6) Stop and swap. Downtime starts here.
+        ulog("Step 6/7: Stopping the old containers and starting the new ones (DB volume reused)...")
+        def _start_stack(ctx, tak_dir):
+            """Create + start both containers on the SAME volume + network. True when every
+            docker command worked. NO `docker volume rm`."""
+            ok = rc(f'docker network inspect {TAK_DOCKER_NET} >/dev/null 2>&1 || docker network create {TAK_DOCKER_NET}', timeout=30)
+            ok &= rc(f'docker run {_tak_db_volume_mount(ctx)} '
+                     f'-v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
+                     f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d {TAK_DB_IMAGE}', timeout=120)
+            time.sleep(8)
+            # CREATE (not run -d) so the Authentik LDAP network is attached BEFORE the JVM starts.
+            # If TAK boots without the LDAP net reachable, it loads its group cache EMPTY -> every user
+            # resolves to "not a member of any group" -> "no channels", needing a manual restart+resync.
+            # create -> connect the LDAP net -> start guarantees LDAP (ldap://authentik-ldap-1:3389) is
+            # resolvable from the first boot, so groups load and webadmin/EUD channels work hands-off.
+            ok &= rc(f'docker create -v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always '
+                     f'-p 8089:8089 -p 8443:8443 -p 8446:8446 --network {TAK_DOCKER_NET} '
+                     f'--name {TAK_CONTAINER} {TAK_CONTAINER}', timeout=60)
+            _aknet, _aklname = _ensure_tak_on_authentik_network()  # connect LDAP net to the created (not-yet-started) container
+            if _aknet:
+                ulog(f"✓ Joined Authentik network ({_aknet}) before start — LDAP/groups reachable from boot")
+            ok &= rc(f'docker start {TAK_CONTAINER}', timeout=90)
+            return ok
+        subprocess.run(_sudo_wrap(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER]), capture_output=True, timeout=90)
+        subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
+        rc(f'ln -sfn {shlex.quote(new_tak)} /opt/tak', timeout=15)
+        dk(['docker', 'tag', db_new, TAK_DB_IMAGE]); dk(['docker', 'tag', app_new, TAK_CONTAINER])
         # The hardened 5.8 images run as tak:0 / postgres:0, not root, and the tree they
         # mount was written by the console user (and the certs carried over from the old
         # bundle keep their old ownership). Same fix as the deploy path, same reason —
         # a no-op on the pre-hardened images, which run as root inside the container.
         _container_own_tree(new_tak, ulog)
+        if not _start_stack(new_ctx, new_tak):
+            if migration:
+                return _fail("The new containers did not start. The database was not touched; see the output above.")
+            ulog("✗ The new containers did not start. Putting the old version back...")
+            dk(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER], 90)
+            subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
+            rc(f'ln -sfn {shlex.quote(old_tak)} /opt/tak', timeout=15)
+            if had_db: dk(['docker', 'tag', db_old, TAK_DB_IMAGE])
+            if had_app: dk(['docker', 'tag', app_old, TAK_CONTAINER])
+            _back = False
+            for _try in (1, 2):          # a port the failed start held can need a moment to free up
+                if not (had_db and had_app):
+                    break
+                if _try == 2:
+                    ulog("  Trying the old version once more in 30 seconds...")
+                    time.sleep(30)
+                    dk(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER], 90)
+                if _start_stack(old_ctx, old_tak):
+                    _back = True
+                    break
+            if _back:
+                subprocess.run(_sudo_wrap(['rm', '-rf', new_ctx]), capture_output=True, timeout=120)
+                _drop_tags(db_new, app_new, db_old, app_old)
+                return _fail("The new version did not start, so the old version is running again. "
+                             "Nothing was lost. The backup is in %s." % (backup_dir or 'the old bundle'))
+            return _fail("The new version did not start and the old one could not be restarted "
+                         "automatically. The database volume %s is untouched. Old images: %s and %s. "
+                         "Old bundle folder: %s. Backup: %s."
+                         % (TAK_DB_VOLUME, db_old, app_old, old_ctx, backup_dir or 'none'))
 
-        # 5) Recreate the containers on the SAME volume + network. NO `docker volume rm`.
-        ulog("Step 5/6: Recreating containers (DB volume reused)...")
-        rc(f'docker network inspect {TAK_DOCKER_NET} >/dev/null 2>&1 || docker network create {TAK_DOCKER_NET}', timeout=30)
-        rc(f'docker run {_tak_db_volume_mount(new_ctx)} '
-           f'-v {shlex.quote(new_tak)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
-           f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d takserver_db', timeout=120)
-        time.sleep(8)
-        # CREATE (not run -d) so the Authentik LDAP network is attached BEFORE the JVM starts.
-        # If TAK boots without the LDAP net reachable, it loads its group cache EMPTY -> every user
-        # resolves to "not a member of any group" -> "no channels", needing a manual restart+resync.
-        # create -> connect the LDAP net -> start guarantees LDAP (ldap://authentik-ldap-1:3389) is
-        # resolvable from the first boot, so groups load and webadmin/EUD channels work hands-off.
-        rc(f'docker create -v {shlex.quote(new_tak)}:/opt/tak:z --restart=always '
-           f'-p 8089:8089 -p 8443:8443 -p 8446:8446 --network {TAK_DOCKER_NET} '
-           f'--name {TAK_CONTAINER} {TAK_CONTAINER}', timeout=60)
-        _aknet, _aklname = _ensure_tak_on_authentik_network()  # connect LDAP net to the created (not-yet-started) container
-        if _aknet:
-            ulog(f"✓ Joined Authentik network ({_aknet}) before start — LDAP/groups reachable from boot")
-        rc(f'docker start {TAK_CONTAINER}', timeout=90)
-
-        # 6) Wait for messaging (TAK runs its schema migrations here against the preserved DB).
-        ulog("Step 6/6: Waiting for messaging microservice (schema migration; up to 10 min)...")
+        # 7) Wait for messaging (TAK runs its schema migrations here against the preserved DB).
+        ulog("Step 7/7: Waiting for messaging microservice (schema migration; up to 10 min)...")
         _up = False
         for waited in range(0, 600, 10):
             time.sleep(10)
@@ -105506,8 +105837,28 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
             if waited and waited % 60 == 0:
                 upgrade_log.append(f"  ⏳ {waited//60} min …")
         if not _up:
-            ulog("⚠ Did not see messaging start within 10 min — check `docker logs takserver`. DB + certs were preserved (no data loss).")
+            ulog("⚠ Did not see messaging start within 10 min — check `docker logs takserver`. DB + certs were preserved (no data loss). "
+                 f"The old bundle folder was KEPT at {old_ctx}.")
         _tak_repair_container_healthchecks(ulog)
+        # The new TAK is up: only now move the files that live only in the old bundle (snapshots,
+        # previous logs) and delete the old folder. Anything that fails to move keeps the folder.
+        if _up and old_ctx and old_ctx != new_ctx:
+            ulog("Moving snapshots and previous logs into the new bundle, then removing the old folder...")
+            _mv_ok = _tak_carry_missing(os.path.join(old_tak, 'snapshots'),
+                                        os.path.join(new_tak, 'snapshots'), ulog, 'snapshots', move=True)
+            _logs_old = os.path.join(old_tak, 'logs')
+            if os.path.isdir(_logs_old):
+                _prev = os.path.join(new_tak, 'logs', f'before-update-{stamp}')
+                _mv_ok &= dk(['mkdir', '-p', os.path.join(new_tak, 'logs')], 30) and \
+                          dk(['mv', _logs_old, _prev], 300)
+            if _mv_ok:
+                subprocess.run(_sudo_wrap(['rm', '-rf', old_ctx]), capture_output=True, timeout=300)
+                _drop_tags(db_new, app_new, db_old, app_old)
+                ulog("✓ old bundle folder removed; /opt/tak points to the new bundle")
+            else:
+                ulog(f"⚠ Some files could not be moved, so the old folder was KEPT at {old_ctx}.")
+        else:
+            _drop_tags(db_new, app_new)
         # Re-sync the TAK Portal to the recreated TAK JVM — the rotation does this (Step 7) and
         # it's exactly what 'patches the Portal back to working' on native. The upgrade recreated
         # the containers, so the Portal must refresh its client cert + CA and reconnect, or

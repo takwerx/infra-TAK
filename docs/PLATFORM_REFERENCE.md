@@ -60,6 +60,15 @@ Each entry says where the fact comes from. `✅ verified <date> on <box>` means 
 - ✅ verified 2026-11-26 on nuc: with a file other than `dump.rdb` in `/data`, the image's entrypoint logs `Unknown file ... found in data dir. Permissions will not be modified.` Redis starts normally.
 - So infra-TAK never pins a floating Redis tag to a version older than the one the box ran (ops #1306, infra-TAK #759).
 
+## TAK Server Docker bundle: database volume layout and the update order (ops #1326)
+
+**Source (official):** the TAK Server docker bundle itself: `docker/Dockerfile.hardened-takserver-db` (5.8: `postgresql18-server`, `VOLUME /var/lib/postgresql/data`, `ENV PGDATA=/var/lib/postgresql/data`) and the older `docker/Dockerfile.takserver-db` (`FROM postgres:15.1`, cluster under `/var/lib/postgresql/<N>/data`).
+
+- ✅ verified 2026-11-26 on fresh-install ubuntu-22.04-arm64 (TAK Server 5.8 R104 and R105 hardened bundles, non-root console): the `takserver_pgsql` volume holds `PG_VERSION` (value 18) at the volume ROOT, read with `docker run --rm --user 0 -v takserver_pgsql:/from --entrypoint sh takserver -c 'cat /from/PG_VERSION'` through the console's broker. A 5.7-era image mounts the volume one level higher and looks for `<volume>/15/data`, so it finds nothing in that volume and starts an EMPTY cluster. The update reads the volume in the layout of the NEW zip and refuses when the data is not there.
+- ✅ verified 2026-11-26 on the same box: the new images build while the old containers keep running; `docker tag` of the old image under a spare tag and a retag back put the old version in place again after a failed start (failed on purpose by holding host port 8446).
+- ✅ verified 2026-11-26: `pg_dump` of the `cot` database as `martiuser` refuses (`permission denied for table`) when a table in it belongs to `postgres`; the update treats a failed dump as a stop before any change.
+- Not verified on a box: the 5.7 layout (`<volume>/15/data`): no 5.7 Docker bundle is in our files folder. It is read from the Dockerfile only.
+
 ## CloudTAK: documentation site
 
 **Source (official):** https://docs.cloudtak.io/ ("Get started with CloudTAK | CloudTAK Documentation"). The same site holds the integrations (ETL) pages at https://docs.cloudtak.io/integrations/, which the CloudTAK page already links.
