@@ -114,8 +114,8 @@ class Update(base.Hub):
     def configs(self, keystore='takserver.jks', oauth='false'):
         _ks = f'/opt/tak/federation-hub/certs/files/{keystore}'
         base._write(self.fh / 'configs' / 'federation-hub-broker.yml',
-                    f'keystoreType: JKS\nkeystoreFile: {_ks}\nkeystorePassword: atakatak\n')
-        ui = f'keystoreType: JKS\nkeystoreFile: {_ks}\nkeystorePassword: atakatak\n'
+                    f'keystoreType: JKS\nkeystoreFile: {_ks}\n')
+        ui = f'keystoreType: JKS\nkeystoreFile: {_ks}\n'
         if oauth is not None:
             ui += f'allowOauth: {oauth}\n'
         base._write(self.fh / 'configs' / 'federation-hub-ui.yml', ui)

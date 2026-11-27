@@ -34990,12 +34990,12 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                 if not reachable:
                     plog(f'⚠ Skipping auto OAuth enable: Authentik API unreachable ({ak_err})')
                 else:
-                    ak_oauth_app = None
+                    hub_sso_app = None
                     if oauth_left_alone:
                         plog(f"✓ Hub sign-in with Authentik left as it was set on the hub (allowOauth: {hub_state['sso_flag'] or 'not set'}). "
                              f'Use "Enable Authentik login" to turn it on.')
                     else:
-                        ak_oauth_app = _ensure_authentik_fedhub_oauth_app(settings, plog=plog)
+                        hub_sso_app = _ensure_authentik_fedhub_oauth_app(settings, plog=plog)
                     fh_domain = _get_service_domain(settings, 'fedhub')
                     fh_host = fh_domain or (remote.get('host') or '').strip() or 'localhost'
                     redirect_uri = (
@@ -35025,8 +35025,8 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                         else:
                             plog('⚠ keycloak.der generation failed (OAuth may fail until fixed)')
 
-                    if ak_oauth_app and ak_oauth_app[0] and ak_oauth_app[1]:
-                        client_id, client_secret = ak_oauth_app[0], ak_oauth_app[1]
+                    if hub_sso_app and hub_sso_app[0] and hub_sso_app[1]:
+                        client_id, client_secret = hub_sso_app[0], hub_sso_app[1]
                         patch_cmd = (
                             f'cd {fh_dir}/configs && '
                             f'sudo sed -i -E "/^keycloak(Auth|Token)Endpoint[[:space:]]*:/d; /^keycloak(Access|Refresh)TokenName[[:space:]]*:/d" federation-hub-ui.yml && '
