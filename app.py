@@ -1686,7 +1686,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.4.9-alpha"
+VERSION = "10.4.10-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -5703,6 +5703,19 @@ def _detect_modules_uncached():
             'route': _sim_desc['route'], 'priority': _sim_desc['priority'], 'conflicts': [],
             'requires_modules': list(_sim_desc.get('requires_modules') or [])}
 
+    # MeshRelay PTT server — registry-resident (modules/meshrelay.py), ops #973.
+    _mr_desc = mod_registry.MODULES.get('meshrelay')
+    if _mr_desc:
+        try:
+            _mr_state = _mr_desc['detect'](mod_registry.get_ctx())
+        except Exception:
+            _mr_state = {}
+        modules['meshrelay'] = {'name': _mr_desc['name'],
+            'installed': bool(_mr_state.get('installed')), 'running': bool(_mr_state.get('running')),
+            'description': _mr_desc['description'], 'icon': _mr_desc['icon'],
+            'route': _mr_desc['route'], 'priority': _mr_desc['priority'], 'conflicts': [],
+            'requires_modules': list(_mr_desc.get('requires_modules') or [])}
+
     # TAK Client Feed — registry-resident (modules/clientfeed.py), v10.1.76.
     # Tile identity + probes come from the descriptor, not an inline block.
     _ef_desc = mod_registry.MODULES.get('clientfeed')
@@ -6392,6 +6405,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     simm = modules.get('simulator', {})
     if simm.get('installed'):
         parts.append(link('/simulator', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F3AF</span><span>TAK Simulator</span>', 'TAK Simulator'))
+    mrm = modules.get('meshrelay', {})
+    if mrm.get('installed'):
+        parts.append(link('/meshrelay', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F4FB</span><span>MeshRelay</span>', 'MeshRelay'))
     cf = modules.get('clientfeed', {})
     if cf.get('installed'):
         parts.append(link('/clientfeed', '<img src="/static/logos/tak-client-skittle.png" alt="" class="nav-icon" style="height:22px;width:22px;object-fit:contain;display:block"><span>TAK Client Feed</span>', 'TAK Client Feed'))
@@ -17651,8 +17667,8 @@ def connectivity_anchor_disconnect_api():
 # remote code (CLAUDE.md supply-chain rule). WHEN YOU EDIT connectivity-anchor-
 # bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
-_CONN_ANCHOR_BOOTSTRAP_COMMIT = '1e2d5e85f65dd7ca0b9891e9daab650353ad7304'
-_CONN_ANCHOR_BOOTSTRAP_SHA256 = '32a5b17458f0a8bcd97141464c9754ef05b9afb2d0d03f59577f738b9db61142'
+_CONN_ANCHOR_BOOTSTRAP_COMMIT = 'ff8c12efd2a3a710f50f602d9ebc3cc173b0ffe5'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = '6f51526762ed0ab4133772d49ca30bc2a84c5c39f47bf5f42ab233c18a70b741'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
@@ -21196,6 +21212,7 @@ def guarddog_page():
         {'id': 'takportal', 'name': 'TAK Portal', 'monitored': modules.get('takportal', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'takportal_ctr', 'interval': '1 min', 'desc': 'Checks TAK Portal container is running. Alert and auto-restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (GET /login on port 3100). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'meshrelay', 'name': 'MeshRelay', 'monitored': modules.get('meshrelay', {}).get('installed'), 'monitors': [{'name': 'Service / login / dashboard', 'id': 'meshrelay_http', 'interval': '1 min', 'desc': 'Checks the ptt-server service is running, the dashboard answers on its loopback port, and config.json still requires a login (auth_enabled true) and keeps the dashboard on 127.0.0.1 (web_bind). Fails if anyone turns the login off or opens the dashboard port to the outside.'}]},
         {'id': 'simulator', 'name': 'TAK Simulator', 'monitored': modules.get('simulator', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'simulator_ctr', 'interval': '1 min', 'desc': 'Checks the tak-simulator container is running (liveness only). A scenario that is not running is normal and never alerts.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': "Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops. Also repairs CloudTAK by itself when it was recreated without the infra-TAK settings (e.g. by a TAK Portal marketplace install), at most 3 times an hour; emails only if that repair does not work."}]},
@@ -23976,6 +23993,20 @@ def _f2b_selfheal_sshd_backend(plog=None):
 # the jail as configured. A security control that cannot fire must never be
 # reachable by a code path that leaves no trace.
 _F2B_OWNED_FILTERS = {
+    'meshrelay-auth': (
+        "[Definition]\n"
+        "# ops #973 — MeshRelay phone logins. Read from the app's own source (server.go, v4.6.0):\n"
+        "#     Auth failed: unknown user NAME from 1.2.3.4:5000\n"
+        "#     Auth failed: wrong password for user NAME from 1.2.3.4:5000\n"
+        "#     JOIN rejected: NAME from 1.2.3.4:5000 (not authenticated)\n"
+        "# Phones talk UDP straight to the app (no proxy), so this is the real client address.\n"
+        "# NAME is typed by the sender and can contain anything, so the address is taken from the\n"
+        "# END of the line: the app writes it last and the pattern is anchored there, so a name\n"
+        "# like 'x from 8.8.8.8:1' cannot make the jail ban someone else.\n"
+        "failregex = ^.*Auth failed: (?:unknown user|wrong password for user) .* from <HOST>:\\d+\\s*$\n"
+        "            ^.*JOIN rejected: .* from <HOST>:\\d+ \\(not authenticated\\)\\s*$\n"
+        "ignoreregex =\n"
+    ),
     'clientfeed': (
         "[Definition]\n"
         "# v10.1.77 — TAK Client Feed. The producer is _clientfeed_log_failure() in app.py,\n"
@@ -26866,6 +26897,95 @@ def _f2b_disarm_clientfeed_jail():
         return (False, 'jail removal failed: %s' % str(e)[:200])
 
 
+# ops #973 — MeshRelay phone-login jail. Fleet constants, not a UI knob. A phone that fails a
+# login 10 times in 10 minutes is a guesser; a typo or two is not.
+MESHRELAY_F2B_MAXRETRY = 10
+MESHRELAY_F2B_FINDTIME = 600
+MESHRELAY_F2B_BANTIME = 3600
+
+
+# ops #973 (Security, ops #980): phones talk UDP, and a UDP source address can be forged, so a
+# line like "Auth failed ... from <victim ip>" can be made by anyone. The jail therefore never
+# blocks: its only action writes a Guard Dog log line. (A name with a new line can fake a whole
+# journal line too.) Ryan is asked to log names with %q; until then nothing here can cut off a
+# real phone.
+MESHRELAY_F2B_ACTION = 'infratak-meshrelay-alert'
+MESHRELAY_F2B_ACTION_PATH = '/etc/fail2ban/action.d/infratak-meshrelay-alert.conf'
+_MESHRELAY_ALERT_ACTION = (
+    "[Definition]\n"
+    "# Alert only. No iptables, no block: the sender address of a UDP packet can be forged.\n"
+    "actionban  = mkdir -p /var/log/takguard"
+    " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
+    " | fail2ban: Alert only, nothing blocked: many failed MeshRelay phone logins name <ip>"
+    " (the address may be forged)\""
+    " >> /var/log/takguard/restarts.log\n"
+    "actionunban =\n"
+)
+
+
+def _f2b_arm_meshrelay_jail(log_fn=None):
+    """Write the meshrelay-auth filter + alert-only jail, reload fail2ban, check it loaded.
+    (ok, message).
+
+    Reads the ptt-server journal (no log file to prepare, no Caddy change, so nothing here can
+    stop Caddy). It never blocks anyone: see the note above MESHRELAY_F2B_ACTION. fail2ban
+    missing is not an error: MeshRelay works, it is just unwatched, and the message says so."""
+    if not _f2b_is_available():
+        return (False, 'fail2ban is not installed — MeshRelay works, but repeated bad phone '
+                       'logins raise no alert. Deploy the fail2ban module to arm it.')
+    try:
+        _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+        _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+        _makedirs_priv('/etc/fail2ban/action.d', exist_ok=True)
+        _write_priv('/etc/fail2ban/filter.d/meshrelay-auth.conf', _F2B_OWNED_FILTERS['meshrelay-auth'])
+        _write_priv(MESHRELAY_F2B_ACTION_PATH, _MESHRELAY_ALERT_ACTION)
+        jail_conf = (
+            "[meshrelay-auth]\n"
+            "enabled  = true\n"
+            "filter   = meshrelay-auth\n"
+            "backend  = systemd\n"
+            "journalmatch = _SYSTEMD_UNIT=ptt-server.service\n"
+            f"maxretry = {MESHRELAY_F2B_MAXRETRY}\n"
+            f"findtime = {MESHRELAY_F2B_FINDTIME}\n"
+            f"bantime  = {MESHRELAY_F2B_BANTIME}\n"
+            f"ignoreip = {_f2b_trusted_ignoreip()}\n"
+            f"action   = {MESHRELAY_F2B_ACTION}\n"
+        )
+        _write_priv('/etc/fail2ban/jail.d/infratak-meshrelay-auth.conf', jail_conf)
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                           capture_output=True, text=True, timeout=45)
+        if r.returncode != 0:
+            return (False, 'jail written but fail2ban reload failed: %s' % ((r.stderr or r.stdout or '')[:160]))
+        v = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'meshrelay-auth']),
+                           capture_output=True, text=True, timeout=20)
+        if v.returncode != 0:
+            return (False, 'jail written and fail2ban reloaded, but the jail did not load: %s'
+                    % ((v.stderr or v.stdout or '')[:160]))
+        return (True, 'alert-only jail armed and loaded (%d failures in %ds raise one Guard Dog alert '
+                      'per address per %ds; nobody is blocked)'
+                % (MESHRELAY_F2B_MAXRETRY, MESHRELAY_F2B_FINDTIME, MESHRELAY_F2B_BANTIME))
+    except Exception as e:
+        return (False, 'jail setup failed: %s' % str(e)[:200])
+
+
+def _f2b_disarm_meshrelay_jail():
+    """Remove the meshrelay-auth jail + filter and reload. (ok, message)."""
+    if not _f2b_is_available():
+        return (True, 'fail2ban not installed — nothing to remove')
+    try:
+        removed = _f2b_remove_jail('infratak-meshrelay-auth.conf', 'MeshRelay uninstalled')
+        fpath = '/etc/fail2ban/filter.d/meshrelay-auth.conf'
+        for gone in (fpath, MESHRELAY_F2B_ACTION_PATH):
+            if _exists_priv(gone):
+                subprocess.run(_sudo_wrap(['rm', '-f', gone]), capture_output=True, timeout=10)
+                removed = True
+        if removed:
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, text=True, timeout=45)
+        return (True, 'jail removed' if removed else 'no jail present')
+    except Exception as e:
+        return (False, 'jail removal failed: %s' % str(e)[:200])
+
+
 # ops #638 — the console password login jail. Fleet constants, not a UI knob (same rule as
 # the clientfeed jail). The login route already answers 429 past 12 tries per 5 minutes per
 # address, so 10 failures in 10 minutes is reachable by a guesser and not by a typo or two.
@@ -28502,6 +28622,7 @@ def _guarddog_service_monitor_ids(settings):
         'takportal': ['takportal_ctr'],
         'mediamtx': ['mediamtx_svc'],
         'tak_video_restreamer': ['tvr_http'],
+        'meshrelay': ['meshrelay_http'],
         'simulator': ['simulator_ctr'],
         'nodered': ['nodered_http'],
         'cloudtak': ['cloudtak_ctr'],
@@ -28534,6 +28655,8 @@ def _guarddog_monitored_service_ids(settings):
         ids.append('tak_video_restreamer')
     if modules.get('simulator', {}).get('installed'):
         ids.append('simulator')
+    if modules.get('meshrelay', {}).get('installed'):
+        ids.append('meshrelay')
     if modules.get('nodered', {}).get('installed'):
         ids.append('nodered')
     if modules.get('cloudtak', {}).get('installed'):
@@ -29194,6 +29317,18 @@ def _monitor_health_check(monitor_id):
                 req = urllib.request.Request('http://127.0.0.1:3100/login', method='GET')
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     return resp.status == 200
+            except Exception:
+                return False
+        if monitor_id == 'meshrelay_http':
+            # ops #973: running, dashboard up, the login still required (auth_enabled true) and the
+            # dashboard bound to loopback (web_bind). Also drops a first admin password that is
+            # 24 hours old: this check runs every half minute, so it does not wait for a page view.
+            try:
+                try:
+                    mod_registry.meshrelay.expire_first_password(mod_registry.get_ctx())
+                except Exception:
+                    pass
+                return bool(mod_registry.meshrelay.health(mod_registry.get_ctx())[0])
             except Exception:
                 return False
         if monitor_id == 'simulator_ctr':
@@ -32332,6 +32467,7 @@ _MODULE_UPDATE_ROWS = (
     ('tak_video_restreamer', 'TAK Video Restreamer', None, False,
      'TAK Video Restreamer page → Update Now.'),
     ('simulator', 'TAK Simulator', None, False, 'TAK Simulator page → Rebuild Now.'),
+    ('meshrelay', 'MeshRelay', None, False, 'MeshRelay page → Update.'),
 )
 
 
@@ -32357,6 +32493,8 @@ def _module_update_info(key):
         return mod_registry.tvr.get_version_info(mod_registry.get_ctx())
     if key == 'simulator':
         return mod_registry.simulator.get_version_info(mod_registry.get_ctx())
+    if key == 'meshrelay':
+        return mod_registry.meshrelay.get_version_info(mod_registry.get_ctx())
     return {}
 
 
@@ -38479,6 +38617,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'netbird': 'netbird',
     'remote_assist': 'remote',
     'atlas': 'atlas',
+    'meshrelay': 'meshrelay',
 }
 
 def _get_service_domain(settings, service_key):
@@ -44845,6 +44984,20 @@ def generate_caddyfile(settings=None):
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'tak_video_restreamer'), tvr_host)
 
+    mr_mod = modules.get('meshrelay', {})
+    if mr_mod.get('installed'):
+        # ops #973: MeshRelay dashboard. Phones use UDP 5000 only, so the whole HTTP host sits
+        # behind Authentik; the app keeps its own login as well. Without Authentik the host
+        # answers 503: the dashboard is never published bare.
+        mr_host = sd.get('meshrelay') or _get_service_domain(settings, 'meshrelay')
+        mr_fa = []
+        if ak:
+            mr_fa = _caddy_forward_auth_lines(ak_up, "        ", app=_fa_app(mr_host))
+        mod_registry.meshrelay.append_caddy_vhost(
+            lines, mr_host, bool(ak), ak_up, _CADDY_STRIP_AUTHENTIK_HEADERS,
+            _emit_outpost_callback_rescue, f"{_pub_url(mr_host, settings)}/", mr_fa)
+        _emit_alias_redirect(_get_service_alias(settings, 'meshrelay'), mr_host)
+
     nb_mod = modules.get('netbird', {})
     if nb_mod.get('installed'):
         nb_host = sd.get('netbird') or _get_service_domain(settings, 'netbird')
@@ -48033,6 +48186,8 @@ def get_all_module_versions():
     if modules.get('simulator', {}).get('installed'):
         # v10.1.61: engine ships inside the console — 'update' = rebuild on a version change
         _set('simulator', lambda: mod_registry.simulator.get_version_info(mod_registry.get_ctx()))
+    if modules.get('meshrelay', {}).get('installed'):
+        _set('meshrelay', lambda: mod_registry.meshrelay.get_version_info(mod_registry.get_ctx()))
     if modules.get('netbird', {}).get('installed'):
         _set('netbird', _get_netbird_version_info)
     if modules.get('remote_assist', {}).get('installed'):
@@ -63941,13 +64096,113 @@ WEBODM_UPGRADE_WAIT_S = 1200   # DB upgrade + first 4.x start; WebODM DBs are sm
 WEBODM_PULL_TIMEOUT_S = 1800   # 3.x → 4.x pulls about 6 GB; 300 s ran out on test6 (10.3.10 T&E)
 
 
-def _webodm_pin_images(compose_txt, services=None):
+# Never move a box DOWN onto a pin (ops #1307, same trap as ops #1306). A pin move that goes
+# backwards is only safe while the new version wrote nothing the old one cannot read, and an
+# image whose data is a one-way format (a database schema, a flow store, a saved data file)
+# fails at the next start, in a loop, once the data has moved on. A box can be ahead of a pin
+# two ways: its compose names a newer exact tag, or it names a floating tag (`latest`, `alpine`,
+# `4`) that Docker pulled forward after the pin was written. The second is invisible in the
+# compose file, so the version Docker really ran is read from the container.
+_IMAGE_EXACT_TAG_RE = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)(?:-(\d+))?(?:-[A-Za-z][\w.]*)?$')
+
+
+def _image_ref_parts(ref):
+    """('nodered/node-red', '4.1.18-22') from an image reference. A registry host, the
+    docker.io/library/ prefix and a digest are dropped; no tag means `latest`."""
+    r = str(ref or '').strip().strip('\'"').split('@', 1)[0]
+    r = re.sub(r'^(?:docker\.io/)?(?:library/)?', '', r)
+    head, sep, tag = r.rpartition(':')
+    if not sep or '/' in tag:
+        return r, 'latest'
+    return head, tag or 'latest'
+
+
+def _image_exact_version(tag):
+    """(major, minor, patch, build) of an exact release tag such as `4.1.18-22`, `8.10.3-alpine`
+    or `v0.83.2`, or None for a floating tag (`latest`, `alpine`, `4`, `4.1`)."""
+    m = _IMAGE_EXACT_TAG_RE.match(str(tag or ''))
+    return tuple(int(x or 0) for x in m.groups()) if m else None
+
+
+def _image_ahead_of_pin(current_ref, pin_ref, running_lookup=None):
+    """True when the box already runs something newer than `pin_ref`, so moving it onto the pin
+    would be a downgrade (ops #1307). Only the same image is judged: a mirror or a fork is the
+    operator's. `running_lookup` is called, only for a floating tag, and returns the (major,
+    minor, patch) Docker really ran, or None when that is unknown (then the pin move goes ahead,
+    as before)."""
+    cur_repo, cur_tag = _image_ref_parts(current_ref)
+    pin_repo, pin_tag = _image_ref_parts(pin_ref)
+    pin_ver = _image_exact_version(pin_tag)
+    if cur_repo != pin_repo or pin_ver is None:
+        return False
+    cur_ver = _image_exact_version(cur_tag)
+    if cur_ver is not None:
+        return cur_ver > pin_ver
+    if running_lookup is None:
+        return False
+    try:
+        ran = running_lookup()
+    except Exception:
+        return False
+    return bool(ran) and tuple(ran[:3]) > pin_ver[:3]
+
+
+def _docker_env_version(*targets, env_name, timeout=20):
+    """(major, minor, patch) that `env_name` (for example NODE_RED_VERSION) holds in the first of
+    `targets` Docker knows, a container name or an image reference, or None. A container's
+    environment is the one of the image it was created from, so this is the version that ran,
+    not the one a later pull put on disk. Best-effort; never raises.
+
+    The Go template prints only the one variable asked for: a container's environment holds
+    secrets (Node-RED's .env, database passwords), and they must not pass through this process."""
+    if not re.fullmatch(r'[A-Z][A-Z0-9_]*', env_name or ''):
+        return None
+    fmt = ('{{range .Config.Env}}{{$p := split . "="}}{{if eq (index $p 0) "' + env_name + '"}}'
+           '{{println .}}{{end}}{{end}}')
+    for target in targets:
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', fmt, target]),
+                               capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            continue
+        if r.returncode != 0:
+            continue
+        m = re.search(rf'^{re.escape(env_name)}=v?(\d+)\.(\d+)\.(\d+)', r.stdout or '', re.M)
+        if m:
+            return tuple(int(x) for x in m.groups())
+    return None
+
+
+def _webodm_pin_images(compose_txt, services=None, kept=None):
     """Point each WebODM service's `image:` line at its WEBODM_IMAGES pin (every service, or
     only those in `services`). Installs from before the pins carry the floating refs they were
     deployed with; deploy writes the pins fresh, Update and the startup migration rewrite them
-    in place. Idempotent — an already-pinned file comes back unchanged."""
+    in place. Idempotent — an already-pinned file comes back unchanged.
+
+    ops #1307: the webapp and worker (one image, run twice) are left alone when either one is
+    NEWER than the pin, because the database behind them is migrated by the newer WebODM and the
+    older one is not built to read it; the database image is left alone when it is a newer
+    PostgreSQL major than the pin, because a data directory only opens on the major that made
+    it. Each service left alone is appended to `kept` as (service, image). The Celery broker and
+    nodeodx keep nothing on disk, so they always move to their pins."""
+    def _image_line(svc):
+        m = re.search(rf'^  {svc}:\n(?:    [^\n]*\n)*?    image: ([^\n]*)', compose_txt, re.M)
+        return m.group(1).strip() if m else ''
+
+    def _ahead(svc):
+        if svc in ('wo_webapp', 'wo_worker'):
+            return any(_image_ahead_of_pin(_image_line(s), WEBODM_IMAGES[s]) for s in ('wo_webapp', 'wo_worker'))
+        if svc == 'wo_db':
+            cur = re.search(r'webodm_db:(\d+)(?:@|$)', _image_line(svc))
+            return bool(cur) and int(cur.group(1)) > int(re.search(r'webodm_db:(\d+)', WEBODM_IMAGES[svc]).group(1))
+        return False
+
     for svc, image in WEBODM_IMAGES.items():
         if services and svc not in services:
+            continue
+        if _ahead(svc):
+            if kept is not None:
+                kept.append((svc, _image_line(svc)))
             continue
         compose_txt = re.sub(rf'(^  {svc}:\n(?:    [^\n]*\n)*?    image: )[^\n]*',
                              lambda m: m.group(1) + image, compose_txt, count=1, flags=re.M)
@@ -64940,9 +65195,13 @@ def _run_webodm_update():
         # Update means "move to the tested pins", not "pull whatever :latest is today" (ops #92).
         compose_path = os.path.join(wo_dir, 'docker-compose.yml')
         compose_txt = _read_priv(compose_path)
-        pinned = _webodm_pin_images(compose_txt)
+        kept = []   # ops #1307: services already newer than their pin are never moved back
+        pinned = _webodm_pin_images(compose_txt, kept=kept)
         if pinned != compose_txt:
             plog(f'Pinned WebODM images to the tested set (WebODM {WEBODM_VERSION}, {WEBODM_IMAGES["wo_broker"]})')
+        for _svc, _cur in kept:
+            plog(f'Kept {_svc} on {_cur}: it is newer than the tested pin ({WEBODM_IMAGES[_svc]}), '
+                 'and an older version cannot read the data the newer one already wrote')
         stripped = _webodm_strip_olefile(pinned)
         if stripped != pinned:
             plog('Applied WebODM security update to the webapp/worker entrypoints (ops #206)')
@@ -66982,6 +67241,134 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
     return True
 
 
+_MESHRELAY_RUN_USER = 'ptt'
+
+
+def _meshrelay_account_ready():
+    """True when the `ptt` account exists and is fit. Same rule as the broker's
+    `_meshrelay_account_problem` (Security, ops #980): not root, no login shell, its own group
+    as the primary group, and no other group at all."""
+    try:
+        import pwd, grp
+        pw = pwd.getpwnam(_MESHRELAY_RUN_USER)
+    except (KeyError, ImportError):
+        return False
+    if pw.pw_uid == 0 or pw.pw_gid == 0:
+        return False
+    if pw.pw_shell not in ('/usr/sbin/nologin', '/sbin/nologin', '/bin/false', '/usr/bin/false'):
+        return False
+    try:
+        if grp.getgrgid(pw.pw_gid).gr_name != _MESHRELAY_RUN_USER:
+            return False
+    except KeyError:
+        return False
+    if any(_MESHRELAY_RUN_USER in g.gr_mem and g.gr_name != _MESHRELAY_RUN_USER for g in grp.getgrall()):
+        return False
+    return True
+
+
+def _ensure_meshrelay_account(plog=None):
+    """ops #973: create the `ptt` account the MeshRelay unit runs as. True when it is there
+    and fit. Through the broker on a non-root console, directly as root otherwise. Never raises."""
+    def _log(m):
+        if plog:
+            plog(m)
+    try:
+        if _meshrelay_account_ready():
+            return True
+        if _broker_socket_present():
+            resp = _broker_request({'op': 'meshrelay_account'}, timeout=60)
+            if not resp.get('ok'):
+                _log(f"  ⚠ ptt account: {resp.get('error') or 'broker refused'}")
+        elif os.geteuid() == 0:
+            subprocess.run(['groupadd', '--system', _MESHRELAY_RUN_USER], capture_output=True, timeout=30)
+            subprocess.run(['useradd', '--system', '-g', _MESHRELAY_RUN_USER, '-M', '-d', '/nonexistent',
+                            '-s', '/usr/sbin/nologin', _MESHRELAY_RUN_USER], capture_output=True, timeout=30)
+        ok = _meshrelay_account_ready()
+        if ok:
+            _log("  ✓ ptt system account ready (MeshRelay does not run as the console's account)")
+        return ok
+    except Exception as e:
+        _log(f"  ⚠ ptt account error: {e}")
+        return False
+
+
+def _ensure_authentik_meshrelay_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
+    """ops #973: MeshRelay proxy provider + application in Authentik, added to the embedded
+    outpost. Same pattern as TAK Video Restreamer; Caddy forward_auth protects the dashboard host."""
+    if not fqdn or not ak_token:
+        return False
+    def log(msg):
+        if plog:
+            plog(msg)
+    import urllib.request as _urlreq
+    _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    _ak_url = _get_authentik_api_url(settings) if settings else 'http://127.0.0.1:9090'
+    try:
+        if not flow_pk or not inv_flow_pk:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+            flows = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
+            flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
+            req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
+            inv_flows = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
+            inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')), inv_flows[0]['pk'] if inv_flows else None)
+        if not flow_pk or not inv_flow_pk:
+            log("  ⚠ No authorization/invalidation flow — skipping MeshRelay proxy provider")
+            return False
+        host = f'https://{_pub_hostport(_get_service_domain(settings, "meshrelay") if settings else f"meshrelay.{fqdn}")}'
+        cookie = f'.{fqdn.split(":")[0]}'
+        provider_pk = None
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                data=json.dumps({'name': 'MeshRelay Proxy', 'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk, 'external_host': host, 'mode': 'forward_single',
+                    'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': cookie}).encode(),
+                headers=_ak_headers, method='POST')
+            provider_pk = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['pk']
+            log("  ✓ Proxy provider created")
+        except Exception as e:
+            if getattr(e, 'code', None) != 400:
+                raise
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search=MeshRelay', headers=_ak_headers)
+            results = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
+            if results:
+                provider_pk = results[0]['pk']
+                # Authentik 2026.8.5 validates a partial update as if `mode` were its default
+                # (`proxy`) and refuses a body without it: HTTP 400 "Internal host cannot be
+                # empty" (ops #708). Found again on a box by a second MeshRelay Deploy (ops #973).
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                    data=json.dumps({'name': 'MeshRelay Proxy', 'authorization_flow': flow_pk,
+                        'invalidation_flow': inv_flow_pk, 'mode': 'forward_single',
+                        'access_token_validity': _proxy_session_validity_to_write(
+                            results[0].get('access_token_validity')),
+                        'external_host': host, 'cookie_domain': cookie}).encode(),
+                    headers=_ak_headers, method='PATCH')
+                _urlreq.urlopen(req, timeout=10)
+                log("  ✓ Proxy provider already exists (external_host updated)")
+        if not provider_pk:
+            log("  ⚠ Could not create or find the MeshRelay proxy provider")
+            return False
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                data=json.dumps({'name': 'MeshRelay', 'slug': 'meshrelay',
+                    'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                headers=_ak_headers, method='POST')
+            _urlreq.urlopen(req, timeout=10)
+            log("  ✓ Application 'MeshRelay' created")
+        except Exception as e:
+            if getattr(e, 'code', None) != 400:
+                raise
+            req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/meshrelay/',
+                data=json.dumps({'provider': provider_pk}).encode(), headers=_ak_headers, method='PATCH')
+            _urlreq.urlopen(req, timeout=10)
+            log("  ✓ Application 'MeshRelay' updated")
+        _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
+        return True
+    except Exception as e:
+        log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+        return False
+
+
 def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
     """Create Federation Hub proxy provider + application in Authentik, add to embedded outpost.
     Same pattern as Node-RED / MediaMTX — Caddy forward_auth protects the route."""
@@ -68195,6 +68582,14 @@ def _heal_netbird_pinned_image(plog=None):
             _log(f"  ⚠ netbird: image NOT changed ({_msg}); NetBird keeps running as it was. "
                  "The next console start tries again.")
             return False
+        # ops #1307: this heal goes DOWN on purpose (it pulls a box off a bad newer image, and
+        # 0.83.2 -> 0.82.1 on a migrated store was drilled, ops #1088). When it does, say so once
+        # in plain words, so nobody reads a version going back as a fault.
+        _cur_srv = re.search(r'netbirdio/netbird-server:[^\s\'"]+', txt)
+        if _cur_srv and _image_ahead_of_pin(_cur_srv.group(0), _srv_img):
+            _log(f"  netbird: moved NetBird down from {_cur_srv.group(0).rsplit(':', 1)[-1]} to "
+                 f"{_srv_img.rsplit(':', 1)[-1]}: this box ran a newer version than the tested "
+                 f"one for its update channel, so it goes back to the tested one")
         _wrote = _netbird_sync_compose_image_tags(nb_dir)
         if not _wrote:
             _log("  ⚠ netbird: could not rewrite docker-compose.yml; starting NetBird as it was")
@@ -68950,7 +69345,7 @@ _AUTHENTIK_DEFAULT_ACCESS_TOKEN_VALIDITY = 'hours=1'
 # provider on the box belongs to the operator.
 _INFRATAK_PROXY_PROVIDER_NAMES = frozenset({
     'infra-TAK', 'TAK Portal Proxy', 'Node-RED Proxy', 'MediaMTX', 'Federation Hub Proxy',
-    'WebODM Proxy', 'TAK Video Restreamer Proxy', 'ATLAS MDM Proxy',
+    'WebODM Proxy', 'TAK Video Restreamer Proxy', 'ATLAS MDM Proxy', 'MeshRelay Proxy',
 })
 
 
@@ -69897,6 +70292,41 @@ def _nodered_port_holders_as_conflicts(port=1880):
 # on Node 24, a bigger change.
 NODERED_IMAGE = 'nodered/node-red:4.1.18-22'
 _NODERED_IMAGE_LINE_RE = re.compile(r'^(\s*image:\s*)nodered/node-red:\S+[ \t]*$', re.M)
+
+
+def _nodered_remote_image_cmd():
+    """The shell script that moves a REMOTE Node-RED onto NODERED_IMAGE (run over ssh in the
+    post-update step). It mirrors the local rule in _auto_nodered (ops #1307): a compose that
+    already names a newer exact tag, or a floating tag whose container ran a newer Node-RED, is
+    left alone, because an older Node-RED is not built to open flows a newer one saved.
+
+    Versions are compared with `sort -V` (GNU coreutils, on every host we deploy to) after
+    turning `4.1.18-22` into `4.1.18.22` (a floating tag's container version has no build part,
+    so `4.1.18` sorts below the pin and `5.0.10` above it, the same as the Python helper)."""
+    _pin_key = NODERED_IMAGE.split(':', 1)[1].replace('-', '.')
+    return (
+        'cd ~/node-red 2>/dev/null && test -f docker-compose.yml || '
+        '{ echo "[remote-nr] no compose — skipped"; exit 0; }; '
+        f'if grep -qF "image: {NODERED_IMAGE}" docker-compose.yml; '
+        f'then echo "[remote-nr] already on {NODERED_IMAGE}"; exit 0; fi; '
+        # the tag the compose names now; an exact tag is its own version, a floating one is
+        # judged by the Node-RED its container really ran
+        'cur=$(sed -n -E "s#^[[:space:]]*image:[[:space:]]*nodered/node-red:([^[:space:]]+).*#\\1#p" '
+        'docker-compose.yml | head -n 1); '
+        'if printf "%s" "$cur" | grep -qE "^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9]+)?(-[A-Za-z][A-Za-z0-9._]*)?$"; '
+        'then key=$(printf "%s" "$cur" | sed -E "s/^v//; s/-[A-Za-z][A-Za-z0-9._]*$//; s/-/./g"); '
+        # only NODE_RED_VERSION is printed: the container's environment holds its .env secrets
+        "else key=$(docker inspect nodered --format '{{range .Config.Env}}{{$p := split . \"=\"}}"
+        "{{if eq (index $p 0) \"NODE_RED_VERSION\"}}{{println .}}{{end}}{{end}}' 2>/dev/null "
+        '| sed -n -E "s/^NODE_RED_VERSION=v?([0-9]+\\.[0-9]+\\.[0-9]+).*/\\1/p" | head -n 1); fi; '
+        f'if [ -n "$key" ] && [ "$key" != "{_pin_key}" ] '
+        f'&& [ "$(printf "%s\\n%s\\n" "$key" "{_pin_key}" | sort -V | tail -n 1)" = "$key" ]; '
+        'then echo "[remote-nr] $cur (version $key) is newer than the pin — left alone (never a downgrade)"; exit 0; fi; '
+        'sed -i -E "s#^([[:space:]]*image:[[:space:]]*)nodered/node-red:[^[:space:]]+[[:space:]]*\\$'
+        f'#\\1{NODERED_IMAGE}#" docker-compose.yml && '
+        'docker compose pull --quiet 2>&1 && '
+        'docker compose up -d 2>&1'
+    )
 
 
 def _nodered_foreign_listener_lines(domain, port=1880, pulled=False):
@@ -115694,6 +116124,14 @@ def run_full_uninstall():
             plog(f"⚠ TAK Video Restreamer removal error (non-fatal): {e}")
         plog("✓ TAK Video Restreamer removed")
 
+        # 1b2. MeshRelay — ops #973: registry uninstall path (modules/meshrelay.py).
+        plog("━━━ MeshRelay ━━━")
+        try:
+            mod_registry.uninstall_module('meshrelay', log_fn=plog)
+        except Exception as e:
+            plog(f"⚠ MeshRelay removal error (non-fatal): {e}")
+        plog("✓ MeshRelay removed")
+
         # 1c. TAK Simulator — v10.1.61: registry uninstall path (modules/simulator.py).
         plog("━━━ TAK Simulator ━━━")
         try:
@@ -126939,7 +127377,19 @@ def _post_update_auto_deploy():
                         # Every box converges on NODERED_IMAGE (the same tag a Redeploy
                         # writes) — :latest, the old 4.0 pin, or any other tag.
                         _nr_img_m = _NODERED_IMAGE_LINE_RE.search(content)
-                        _nr_img_changed = bool(_nr_img_m) and \
+                        # ops #1307: never move a box DOWN onto the pin. A newer exact tag, or a
+                        # floating tag (`latest`) whose container ran a newer Node-RED (5.x on
+                        # Node 24 today), keeps its image: flows saved by the newer Node-RED are
+                        # not guaranteed to open on the older one.
+                        _nr_cur_img = (_nr_img_m.group(0).strip()[len('image:'):].strip()
+                                       if _nr_img_m else '')
+                        _nr_keep_img = bool(_nr_img_m) and _image_ahead_of_pin(
+                            _nr_cur_img, NODERED_IMAGE,
+                            lambda: _docker_env_version('nodered', _nr_cur_img, env_name='NODE_RED_VERSION'))
+                        if _nr_keep_img:
+                            print(f"Post-update: Node-RED image {_nr_cur_img} is newer than the pin "
+                                  f"{NODERED_IMAGE} — left alone (never a downgrade)")
+                        _nr_img_changed = bool(_nr_img_m) and not _nr_keep_img and \
                             _nr_img_m.group(0).strip() != f'image: {NODERED_IMAGE}'
                         if _nr_img_changed:
                             content = _NODERED_IMAGE_LINE_RE.sub(
@@ -127655,16 +128105,7 @@ def _post_update_auto_deploy():
                         return
                     if not (_nr_cfg.get('remote', {}).get('host') or '').strip():
                         return
-                    _cmd = (
-                        'cd ~/node-red 2>/dev/null && test -f docker-compose.yml || '
-                        '{ echo "[remote-nr] no compose — skipped"; exit 0; }; '
-                        f'if grep -qF "image: {NODERED_IMAGE}" docker-compose.yml; '
-                        f'then echo "[remote-nr] already on {NODERED_IMAGE}"; exit 0; fi; '
-                        'sed -i -E "s#^([[:space:]]*image:[[:space:]]*)nodered/node-red:[^[:space:]]+[[:space:]]*\\$'
-                        f'#\\1{NODERED_IMAGE}#" docker-compose.yml && '
-                        'docker compose pull --quiet 2>&1 && '
-                        'docker compose up -d 2>&1'
-                    )
+                    _cmd = _nodered_remote_image_cmd()
                     print(f"Post-update: moving remote Node-RED to {NODERED_IMAGE}...")
                     _ok, _out = _module_run(_nr_cfg, _cmd, timeout=1800)
                     for _line in (_out or '').strip().splitlines()[:10]:
@@ -129307,6 +129748,11 @@ _MODULE_CTX = {
     '_install_docker_engine': _install_docker_engine,
     '_get_authentik_env_value': _get_authentik_env_value,
     '_ensure_authentik_tvr_app': _ensure_authentik_tvr_app,
+    # meshrelay seams (ops #973): the `ptt` account (broker op), its Authentik proxy app, and
+    # the firewall "closed to the outside" call (ufw deny / firewalld remove)
+    '_ensure_meshrelay_account': _ensure_meshrelay_account,
+    '_ensure_authentik_meshrelay_app': _ensure_authentik_meshrelay_app,
+    '_fw_deny': _fw_deny,
     '_deregister_authentik_proxy_app': _deregister_authentik_proxy_app,
     '_w1_reassert_app_mfa': _w1_reassert_app_mfa,   # ATLAS (ops #985): a new app gets the MFA gate on a Hardened box
     # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION;
@@ -129327,6 +129773,8 @@ _MODULE_CTX = {
     'audit': audit,
     '_f2b_arm_clientfeed_jail': _f2b_arm_clientfeed_jail,
     '_f2b_disarm_clientfeed_jail': _f2b_disarm_clientfeed_jail,
+    '_f2b_arm_meshrelay_jail': _f2b_arm_meshrelay_jail,
+    '_f2b_disarm_meshrelay_jail': _f2b_disarm_meshrelay_jail,
     # ATLAS MDM needs this Authentik helper, which this file
     # already defines and did not previously hand to a module.
     '_outpost_add_providers_safe': _outpost_add_providers_safe,
@@ -129597,6 +130045,31 @@ def clientfeed_page():
         feed_host = f'{_ip}:5001' if _ip else ''
     return render_template('clientfeed.html', settings=settings, modules=modules,
                            clientfeed=state, feed_host=feed_host, version=VERSION)
+
+@app.route('/meshrelay')
+@login_required
+def meshrelay_page():
+    """MeshRelay PTT server page (ops #973)."""
+    from flask import abort
+    if not mod_registry.MODULES.get('meshrelay'):
+        abort(404)
+    mr = mod_registry.meshrelay
+    try:
+        mr.expire_first_password(mod_registry.get_ctx())      # the first admin password lives 24 hours
+    except Exception:
+        pass
+    settings = load_settings()
+    modules = detect_modules()
+    state = modules.get('meshrelay', {})
+    host = _get_service_domain(settings, 'meshrelay')
+    _job = mod_registry.job_state('meshrelay')
+    return render_template('meshrelay.html', settings=settings, modules=modules, meshrelay=state,
+                           mr_host=host, mr_url=(f'https://{_pub_hostport(host)}' if host else ''),
+                           mr_version=(settings.get('meshrelay') or {}).get('tag', ''),
+                           mr_pinned=mr.RELEASE['tag'], mr_pin_problem=mr.pin_problem(arch=_host_arch()),
+                           mr_ptt_port=mr.PTT_PORT, mr_first_password=settings.get(mr.FIRST_PW_KEY, ''),
+                           mr_notice=mr.NOTICE, mr_source=mr.NOTICE_SOURCE,
+                           deploying=_job.get('running', False), version=VERSION)
 
 try:
     import threading as _threading_sh

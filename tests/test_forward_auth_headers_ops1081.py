@@ -157,7 +157,7 @@ def test_generate_caddyfile_uses_the_writer_for_all_five_of_its_sites():
     src = _func_src('generate_caddyfile')
     assert 'trusted_proxies' not in src
     calls = re.findall(r'_caddy_forward_auth_lines\(([^\n]*)', src)
-    assert len(calls) == 4, calls                    # console, Node-RED, WebODM, ATLAS
+    assert len(calls) == 5, calls                    # console, Node-RED, WebODM, MeshRelay, ATLAS
     assert all(c.startswith('ak_up, ') for c in calls)
     # Federation Hub (ops #1204: no header is copied to it) calls the writer in its own helper
     assert src.count("_fedhub_forward_auth_lines(ak_up, '            ')") == 1
