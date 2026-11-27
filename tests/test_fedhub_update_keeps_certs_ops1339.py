@@ -111,19 +111,19 @@ class Update(base.Hub):
         self.oauth_calls = 0
 
     # -- state a customer box can be in -------------------------------------------------------
-    def configs(self, keystore='takserver.jks', oauth='false'):
-        _ks = f'/opt/tak/federation-hub/certs/files/{keystore}'
+    def configs(self, jks_name='takserver.jks', sso='false'):
+        jks_path = f'/opt/tak/federation-hub/certs/files/{jks_name}'
         base._write(self.fh / 'configs' / 'federation-hub-broker.yml',
-                    f'keystoreType: JKS\nkeystoreFile: {_ks}\n')
-        ui = f'keystoreType: JKS\nkeystoreFile: {_ks}\n'
-        if oauth is not None:
-            ui += f'allowOauth: {oauth}\n'
+                    f'keystoreType: JKS\nkeystoreFile: {jks_path}\n')
+        ui = f'keystoreType: JKS\nkeystoreFile: {jks_path}\n'
+        if sso is not None:
+            ui += f'allowOauth: {sso}\n'
         base._write(self.fh / 'configs' / 'federation-hub-ui.yml', ui)
 
-    def manual_certs(self, with_ca=True, keystore='takserver.jks'):
+    def manual_certs(self, with_ca=True, jks_name='takserver.jks'):
         """A hub set up by hand from the vendor guide: files named by the guide, not by the host."""
         self.files.mkdir(parents=True, exist_ok=True)
-        (self.files / keystore).write_text('ORIGINAL server keystore\n')
+        (self.files / jks_name).write_text('ORIGINAL server keystore\n')
         (self.files / 'truststore-root.jks').write_text('ORIGINAL truststore\n')
         (self.files / 'webadmin.p12').write_text('ORIGINAL admin cert\n')
         if with_ca:
@@ -241,8 +241,8 @@ def test_update_of_a_hub_with_a_ca_does_not_end_in_a_certificate_error(hub):
 
 
 def test_a_renamed_host_keeps_its_old_keystore(hub):
-    hub.configs(keystore='oldhost.jks')
-    hub.manual_certs(with_ca=False, keystore='oldhost.jks')
+    hub.configs(jks_name='oldhost.jks')
+    hub.manual_certs(with_ca=False, jks_name='oldhost.jks')
     before = hub.snapshot()
     hub.run()
     assert hub.status['error'] is False, '\n'.join(hub.log)
@@ -250,8 +250,8 @@ def test_a_renamed_host_keeps_its_old_keystore(hub):
 
 
 def test_keystore_named_in_the_config_but_missing_is_warned_not_rebuilt(hub):
-    hub.configs(keystore='gone.jks')
-    hub.manual_certs(with_ca=False, keystore='takserver.jks')
+    hub.configs(jks_name='gone.jks')
+    hub.manual_certs(with_ca=False, jks_name='takserver.jks')
     before = hub.snapshot()
     hub.run()
     log = '\n'.join(hub.log)
@@ -295,7 +295,7 @@ def test_unreadable_certs_folder_stops_before_any_change(hub):
 # ---- point 2: OAuth -------------------------------------------------------------------------------
 
 def test_oauth_set_off_by_the_operator_stays_off(hub):
-    hub.configs(oauth='false')
+    hub.configs(sso='false')
     hub.manual_certs()
     hub.run()
     assert hub.status['error'] is False, '\n'.join(hub.log)
@@ -305,7 +305,7 @@ def test_oauth_set_off_by_the_operator_stays_off(hub):
 
 
 def test_oauth_on_stays_on_and_is_resynced(hub):
-    hub.configs(oauth='true')
+    hub.configs(sso='true')
     hub.manual_certs()
     hub.run()
     assert hub.status['error'] is False, '\n'.join(hub.log)
@@ -314,7 +314,7 @@ def test_oauth_on_stays_on_and_is_resynced(hub):
 
 
 def test_registered_hub_with_no_allowoauth_line_is_left_alone(hub):
-    hub.configs(oauth=None)
+    hub.configs(sso=None)
     hub.manual_certs()
     hub.run()
     assert hub.oauth_calls == 0
@@ -323,7 +323,7 @@ def test_registered_hub_with_no_allowoauth_line_is_left_alone(hub):
 
 def test_first_deploy_still_turns_oauth_on_when_authentik_is_installed(hub):
     hub.deployed = False
-    hub.configs(oauth='false')          # the vendor default
+    hub.configs(sso='false')          # the vendor default
     hub.run(phase='Deploy')
     assert hub.status['error'] is False, '\n'.join(hub.log)
     assert hub.oauth_calls == 1
