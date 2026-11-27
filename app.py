@@ -26926,6 +26926,10 @@ def _ak_login_watch_once(now=None):
         def _take(ev, kind):
             pk = str(ev.get('pk') or '')
             ip = str(ev.get('client_ip') or '').strip()
+            # Authentik's action filter matches by substring: ?action=login also returns every
+            # login_failed event (seen on a real Rocky 9 box, Authentik 2026.8). Trust the event's own action.
+            if ev.get('action') != kind.split(' ')[0]:
+                return
             if not pk or pk in _AK_LOGIN_SEEN or not _recent(ev) or not _ak_login_outside(ip):
                 return
             ctx = ev.get('context') if isinstance(ev.get('context'), dict) else {}

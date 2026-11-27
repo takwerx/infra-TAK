@@ -583,7 +583,10 @@ def _ak_namespace(tmp_path, monkeypatch, events):
     def fake_events(base, token, query):
         if query['action'] == 'login_failed':
             return events['fail']
-        return [e for e in events['ok'] if e['client_ip'] == query['client_ip']]
+        # Authentik's ?action=login matches by substring: it returns login_failed events too
+        # (seen on a real Rocky 9 box). The fake does the same, so only the event's own
+        # `action` can tell the two apart.
+        return [e for e in events['ok'] + events['fail'] if e['client_ip'] == query['client_ip']]
     ns['_ak_login_events'] = fake_events
     for n in TREE.body:
         if isinstance(n, ast.FunctionDef) and n.name in names:
@@ -595,8 +598,8 @@ def _ak_namespace(tmp_path, monkeypatch, events):
     return ns
 
 
-def _ev(pk, ip, ago, now, user='alice', ctx_user=None):
-    return {'pk': pk, 'client_ip': ip, 'user': {'username': user},
+def _ev(pk, ip, ago, now, user='alice', ctx_user=None, action='login_failed'):
+    return {'pk': pk, 'action': action, 'client_ip': ip, 'user': {'username': user},
             'context': {'username': ctx_user or user},
             'created': time.strftime('%Y-%m-%dT%H:%M:%S.123456Z', time.gmtime(now - ago))}
 
@@ -606,7 +609,7 @@ def test_console_copies_outside_failures_and_good_logins_for_those_addresses_onl
     fails = [_ev(f'f{i}', '45.33.32.5', 300 - i, now, ctx_user='alice') for i in range(3)]
     fails += [_ev('p1', '10.0.0.5', 200, now), _ev('p2', '172.18.0.4', 200, now)]   # LDAP outpost, containers
     fails += [_ev('old', '45.33.32.6', 7200, now)]
-    oks = [_ev('o1', '45.33.32.5', 100, now), _ev('o2', '45.33.32.77', 100, now)]  # 2nd: no failures
+    oks = [_ev('o1', '45.33.32.5', 100, now, action='login'), _ev('o2', '45.33.32.77', 100, now, action='login')]  # 2nd: no failures
     ns = _ak_namespace(tmp_path, monkeypatch, {'fail': fails, 'ok': oks})
     assert ns['_ak_login_watch_once'](now) == 4
     text = (tmp_path / 'authentik-logins.log').read_text()
@@ -620,10 +623,24 @@ def test_console_copies_outside_failures_and_good_logins_for_those_addresses_onl
     assert ns['_ak_login_watch_once'](now) == 0, 'nor after a console restart'
 
 
+def test_failed_authentik_guesses_alone_never_become_a_login_ok(tmp_path, monkeypatch):
+    """Found on a real box: ?action=login also returns login_failed events. Without the check
+    on each event's own action, a scanner that only fails would look like a login that worked."""
+    now = time.time()
+    fails = [_ev(f'f{i}', '45.33.32.5', 300 - i, now) for i in range(5)]
+    ns = _ak_namespace(tmp_path, monkeypatch, {'fail': fails, 'ok': []})
+    assert ns['_ak_login_watch_once'](now) == 5
+    text = (tmp_path / 'authentik-logins.log').read_text()
+    assert 'login ok' not in text and text.count('login_failed') == 5
+    box = _Box(tmp_path)
+    box.run()
+    assert box.sent == []
+
+
 def test_copied_authentik_events_reach_the_watch_end_to_end(tmp_path, monkeypatch):
     now = time.time()
     fails = [_ev(f'f{i}', '45.33.32.5', 300 - i, now) for i in range(3)]
-    ns = _ak_namespace(tmp_path, monkeypatch, {'fail': fails, 'ok': [_ev('o1', '45.33.32.5', 100, now)]})
+    ns = _ak_namespace(tmp_path, monkeypatch, {'fail': fails, 'ok': [_ev('o1', '45.33.32.5', 100, now, action='login')]})
     ns['_ak_login_watch_once'](now)
     box = _Box(tmp_path)
     box.run()
