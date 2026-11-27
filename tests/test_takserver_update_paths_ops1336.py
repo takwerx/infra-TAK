@@ -437,7 +437,7 @@ class _Reached(Exception):
     pass
 
 
-def _migration(core_pkg, installed_after, ka=('ok', 'LIVE=60'), stop_at='keepalive'):
+def _migration(core_pkg, installed_after, ka=('ok', 'APPLIED=60/t'), stop_at='keepalive'):
     log, order = [], []
     status = {'running': True, 'complete': False, 'error': False}
     settings = {}
@@ -519,7 +519,7 @@ def test_the_converge_script_reads_the_newest_cluster_and_asks_the_running_serve
 
     def ssh(s1, cmd, timeout=15):
         seen['cmd'] = cmd
-        return True, 'PGCONF=/etc/postgresql/18/main/postgresql.conf\nIDLE=1\nLIVE=60'
+        return True, 'PGCONF=/etc/postgresql/18/main/postgresql.conf\nIDLE=1\nAPPLIED=60/t'
 
     n = _load(['_split_db_keepalives_converge'],
               extra={'_ssh_probe': ssh, '_PG_REMOTE_PGDATA_SH': 'true', 'TAK_PG_MAJORS': (15, 18),
@@ -527,7 +527,8 @@ def test_the_converge_script_reads_the_newest_cluster_and_asks_the_running_serve
     st, out = n['_split_db_keepalives_converge']({'host': 'db1'})
     assert st == 'ok'
     assert 'sort -V | tail -1' in seen['cmd']                 # the NEW cluster wins over the old one
-    assert 'pg_settings' in seen['cmd'] and 'systemctl reload postgresql-18' in seen['cmd']
+    assert 'pg_file_settings' in seen['cmd'] and 'systemctl reload postgresql-18' in seen['cmd']
+    assert 'from pg_settings' not in seen['cmd']              # a Unix socket always reads 0 there
     assert 'restart' not in seen['cmd']                       # reload only: no connection dropped
 
 

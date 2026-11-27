@@ -15669,7 +15669,7 @@ def _split_db_keepalives_converge(s1):
     """Put tcp_keepalives_* on the PostgreSQL cluster that is SERVING on Server One, then reload.
 
     Returns (status, output) with status 'ok' (the file has the lines AND the running server
-    reports idle=60), 'no_pgconf' (no postgresql.conf found) or 'fail'. One function for the
+    applied idle=60, APPLIED=60/t in the output), 'no_pgconf' (no postgresql.conf found) or 'fail'. One function for the
     boot retrofit and the 5.8 split migration (ops #1336): the migration builds a new cluster
     with the stock 7200 s idle time, which is what dropped the 16-hour test8 link.
 
@@ -15694,9 +15694,13 @@ def _split_db_keepalives_converge(s1):
                   for _m in sorted(set(TAK_PG_MAJORS) | {16})) +
         'echo "PGCONF=$PGCONF"; '
         'echo "IDLE=$(sudo grep -c \'^tcp_keepalives_idle = 60\' \"$PGCONF\")"; '
-        # what the RUNNING server says (pg_settings shows seconds; SHOW prints "1min")
-        'sleep 2; echo "LIVE=$(cd /tmp && sudo -u postgres psql -tAX -c '
-        '"select setting from pg_settings where name=\'tcp_keepalives_idle\'" 2>/dev/null | tail -1)"'
+        # Did the RUNNING server apply the line at the reload? pg_file_settings says so. NOT
+        # pg_settings / SHOW: over a Unix socket (all `sudo -u postgres psql` has) PostgreSQL
+        # reports every tcp_keepalives_* as 0, whatever the file says (measured on a PG 18.7
+        # Server One with the lines set, ops #1336).
+        'sleep 2; echo "APPLIED=$(cd /tmp && sudo -u postgres psql -tAX -c '
+        '"select setting||\'/\'||applied::text from pg_file_settings where name=\'tcp_keepalives_idle\' '
+        'order by seqno desc limit 1" 2>/dev/null | tail -1)"'
     )
     ok, out = _ssh_probe(s1, cmd, timeout=90)
     out = out or ''
@@ -105675,10 +105679,10 @@ def run_takserver_58_two_server_migration(core_pkg_path, db_pkg_path, s1_cfg, ta
         # already marked this box done (from the PostgreSQL 15 cluster), so it never re-ran.
         # Converge the new cluster here, by reload, before TAK starts.
         _ka_status, _ka_out = _split_db_keepalives_converge(s1_cfg)
-        _ka_live = re.search(r'LIVE=(\S+)', _ka_out or '')
-        if _ka_status == 'ok' and _ka_live and _ka_live.group(1) == '60':
-            say('  ✓ Database keepalives set on the new cluster (tcp_keepalives_idle=60, reported by '
-                'the running server).')
+        _ka_live = re.search(r'APPLIED=(\S+)', _ka_out or '')
+        if _ka_status == 'ok' and _ka_live and _ka_live.group(1) == '60/t':
+            say('  ✓ Database keepalives set on the new cluster (tcp_keepalives_idle=60, applied by '
+                'the running server at its reload).')
             try:
                 _st = load_settings()
                 _st['split_db_keepalives_state'] = f'done:{SPLIT_DB_KEEPALIVE_FIX_VERSION}'
