@@ -73,7 +73,9 @@ class Box:
         self.ed.mkdir()
         self.events = []
         self.writes = []
-        (self.ed / 'mediamtx_config_editor.py').write_text(editor_text(editor_version))
+        text = editor_text(editor_version) if editor_version is not None else \
+            editor_text('2.1.20').replace('CURRENT_VERSION = "v2.1.20"\n', '')
+        (self.ed / 'mediamtx_config_editor.py').write_text(text)
         if overlay is not None:
             (self.ed / 'mediamtx_ldap_overlay.py').write_text(overlay)
         if ensure is not None:
@@ -236,6 +238,7 @@ def test_nothing_in_the_kept_path_needs_a_download(tmp_path, monkeypatch):
     ({'patch_changes': True}, 'mediamtx_config_editor.py'),   # the patch chain would change the editor
     ({'editor_version': '2.1.17'}, 'mediamtx_config_editor.py'),   # equal to the pin: refreshed, as always
     ({'editor_version': '2.1.14'}, 'mediamtx_config_editor.py'),   # older than the pin
+    ({'editor_version': None}, 'mediamtx_config_editor.py'),       # version unreadable: not "newer", refreshed
 ])
 def test_a_needed_write_takes_the_old_path(tmp_path, monkeypatch, kw, what):
     box = Box(tmp_path, monkeypatch, **kw)
