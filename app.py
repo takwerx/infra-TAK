@@ -13288,14 +13288,59 @@ def _rollback_pin_changes(console_dir, ref, channel, current):
     return out
 
 
-def _rollback_pin_message(label, changes):
-    """Plain words for the operator: what the older release puts back by itself."""
-    if not changes:
+def _rollback_redis_hazard(console_dir, ref, label, compose_image, seen_version):
+    """Plain words when the older release `ref` would break this box's Authentik redis, else ''.
+    ops #1306 / #1330: before 10.4.9 a floating redis tag (alpine, latest, 8) was pinned back to
+    the pin with no look at the version it really ran. The older release does that again after the
+    rollback, and a redis that ran something newer cannot read the dump it saved ("Can't handle
+    RDB format version"): redis crash-loops and Authentik sign-in stops. The older code cannot be
+    changed, so say it first. `compose_image`: the redis `image:` of ~/authentik/docker-compose.yml
+    ('' when there is none); `seen_version`: REDIS_VERSION of the running container ('' unknown)."""
+    if _console_release_app_has(console_dir, ref, 'def _authentik_redis_seen_version(') is not False:
+        return ''              # that release looks at the version first (True), or git cannot say (None)
+    m = re.fullmatch(r'(?:docker\.io/)?(?:library/)?redis(?::([\w.-]+))?', str(compose_image or '').strip().strip('\'"'))
+    if not m:
         return ''
-    lines = '; '.join(f'{n} {then} (this version {now})' for n, now, then in changes)
-    return (f'{label} runs its own start-up checks and may set these back to the versions it was '
-            f'tested with: {lines}. If this server already runs a newer one of them, check it after '
-            'the rollback.')
+    tag = m.group(1) or 'latest'
+    if not (tag in ('alpine', 'latest') or re.fullmatch(r'\d+(?:\.\d+)?(?:-alpine)?', tag)):
+        return ''              # an exact version or another image: the older release leaves it alone
+    sv = re.match(r'(\d+)\.(\d+)\.(\d+)', str(seen_version or ''))
+    pin = re.match(r'.*?(\d+)\.(\d+)\.(\d+)', AUTHENTIK_REDIS_IMAGE.rsplit(':', 1)[-1])
+    if not sv or not pin or tuple(int(x) for x in sv.groups()) <= tuple(int(x) for x in pin.groups()):
+        return ''
+    return (f'Authentik redis on this server runs {".".join(sv.groups())} on the floating tag "{tag}". '
+            f'{label} sets a floating redis back to {AUTHENTIK_REDIS_IMAGE.rsplit(":", 1)[-1]}, which '
+            f'cannot read what {".".join(sv.groups())} saved, so redis would stop and Authentik '
+            'sign-in would fail until you press Update Now again.')
+
+
+def _rollback_redis_hazard_here(console_dir, ref, label):
+    """_rollback_redis_hazard with this box's own answers. Never raises: no answer, no warning."""
+    try:
+        compose = os.path.expanduser('~/authentik/docker-compose.yml')
+        if not os.path.exists(compose):
+            return ''
+        with open(compose, encoding='utf-8') as f:
+            im = re.search(r'(?m)^\s*image:\s*[\'"]?([^\s\'"#]*redis[^\s\'"#]*)', f.read())
+        if not im:
+            return ''
+        seen = _authentik_redis_seen_version(im.group(1))
+        return _rollback_redis_hazard(console_dir, ref, label, im.group(1), seen or '')
+    except Exception:
+        return ''
+
+
+def _rollback_pin_message(label, changes, hazards=()):
+    """Plain words for the operator: what the older release puts back by itself, and what it
+    would break on this server."""
+    out = []
+    if changes:
+        lines = '; '.join(f'{n} {then} (this version {now})' for n, now, then in changes)
+        out.append(f'{label} runs its own start-up checks and may set these back to the versions it was '
+                   f'tested with: {lines}. If this server already runs a newer one of them, check it after '
+                   'the rollback.')
+    out.extend(h for h in hazards if h)
+    return ' '.join(out)
 
 
 @app.route('/api/console/rollback/preview')
@@ -13316,9 +13361,11 @@ def console_rollback_preview_api():
         changes = _rollback_pin_changes(console_dir, ref, channel, globals())
     except Exception:
         changes = []
+    hazards = [h for h in (_rollback_redis_hazard_here(console_dir, ref, label),) if h]
     return jsonify({'ok': True, 'available': True, 'label': label,
                     'changes': [{'name': n, 'now': a, 'then': b} for n, a, b in changes],
-                    'message': _rollback_pin_message(label, changes)})
+                    'hazards': hazards,
+                    'message': _rollback_pin_message(label, changes, hazards)})
 
 
 @app.route('/api/console/rollback', methods=['POST'])
@@ -13356,6 +13403,7 @@ def console_rollback_api():
             return jsonify({'ok': False, 'error': why + ' Nothing was changed.'}), 500
         # What the older release will need (read from git, before anything moves).
         orig_ref = _rollback_current_ref(console_dir)
+        redis_hazard = _rollback_redis_hazard_here(console_dir, target, f'Version {label}')
         # 2. Check out FIRST. If this fails nothing else has been touched.
         checkout_r = _rollback_git(console_dir, ['checkout', '--force', target])
         if checkout_r.returncode != 0:
@@ -13412,7 +13460,8 @@ def console_rollback_api():
             pin_note = _rollback_pin_message(
                 f'Version {label}',
                 _rollback_pin_changes(console_dir, target,
-                                      (s.get('update_channel') or 'main').strip().lower(), globals()))
+                                      (s.get('update_channel') or 'main').strip().lower(), globals()),
+                [redis_hazard])
         except Exception:
             pin_note = ''
         _detached_console_restart()

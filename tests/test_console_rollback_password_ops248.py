@@ -47,7 +47,8 @@ _FUNCS = {'verify_password', 'hash_password', '_hash_method_error', 'stored_hash
           # ops #1330: the route makes sure the release is on the box, and checks out first
           '_rollback_git', '_rollback_resolve_target', '_rollback_current_ref',
           '_console_release_const', '_rollback_pin_short', '_rollback_pin_changes',
-          '_rollback_pin_message'}
+          '_rollback_pin_message', '_rollback_redis_hazard', '_rollback_redis_hazard_here',
+          '_console_release_app_has'}
 _ASSIGNS = {'PASSWORD_HASH_METHOD', '_HASH_METHOD_ERRORS', 'check_password_hash',
             'generate_password_hash', '_MEDIAMTX_EDITOR_HASHING_SINCE',
             '_ROLLBACK_REPO_URL', '_ROLLBACK_REF_RE', '_ROLLBACK_SHA_RE', '_ROLLBACK_PIN_WATCH'}

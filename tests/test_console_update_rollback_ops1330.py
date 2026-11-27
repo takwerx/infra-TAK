@@ -251,7 +251,8 @@ _ROUTE_FUNCS = ['verify_password', 'hash_password', '_hash_method_error', 'store
                 '_require_admin_password', '_rollback_git', '_rollback_resolve_target',
                 '_rollback_current_ref', '_console_release_const', '_console_release_editor_ref',
                 '_console_release_has_file', '_rollback_pin_short', '_rollback_pin_changes',
-                '_rollback_pin_message', 'console_rollback_api', 'console_rollback_preview_api']
+                '_rollback_pin_message', '_rollback_redis_hazard', '_rollback_redis_hazard_here',
+                '_console_release_app_has', 'console_rollback_api', 'console_rollback_preview_api']
 _ROUTE_ASSIGNS = ['PASSWORD_HASH_METHOD', '_HASH_METHOD_ERRORS', 'check_password_hash',
                   'generate_password_hash', '_ROLLBACK_REPO_URL', '_ROLLBACK_REF_RE',
                   '_ROLLBACK_SHA_RE', '_ROLLBACK_PIN_WATCH']
@@ -300,6 +301,9 @@ def _route(repo, record, editor='ok', channel='main', lacks_hashing=True, atlas_
         'NETBIRD_SERVER_DEV_IMAGE': 'netbirdio/netbird-server:0.84.0',
         'WEBODM_VERSION': '4.0.1',
         'MEDIAMTX_EDITOR_REF': 'v2.1.17',
+        'AUTHENTIK_REDIS_IMAGE': 'docker.io/library/redis:8.10.3-alpine',
+        # what Docker says the redis ran (REDIS_VERSION); '' = not on this box
+        '_authentik_redis_seen_version': lambda image: state.get('redis_seen', ''),
     }
     parts = [_src(n) for n in _ROUTE_FUNCS + _ROUTE_ASSIGNS if n not in g and _have(n)]
     exec('\n\n'.join(parts), g)
@@ -591,3 +595,59 @@ def test_the_console_page_shows_the_note_and_the_rollback_notice():
     assert "/api/console/rollback/preview" in html
     gd = (REPO / 'templates' / 'guarddog.html').read_text(encoding='utf-8')
     assert "console_rollback', {}).get('label')" in gd
+
+
+# --------------------------------------------------------------------------- #
+# 3b. A rollback to a release that pins a floating redis back (the ops #1306 loop)
+# --------------------------------------------------------------------------- #
+
+PIN = 'docker.io/library/redis:8.10.3-alpine'
+
+
+def _hazard(ref_has_guard, image, seen, label='Version v10.4.8-alpha'):
+    g = _ns('_rollback_redis_hazard', AUTHENTIK_REDIS_IMAGE=PIN,
+            _console_release_app_has=lambda d, r, needle: ref_has_guard)
+    return g['_rollback_redis_hazard']('/x', 'ref', label, image, seen)
+
+
+@pytest.mark.parametrize('image', ['redis:alpine', 'docker.io/library/redis:alpine', 'redis', 'redis:latest',
+                                   'redis:8', 'redis:8.10', 'redis:8-alpine'])
+def test_floating_redis_that_ran_newer_warns_when_the_older_release_has_no_guard(image):
+    msg = _hazard(False, image, '8.12.0')
+    assert 'runs 8.12.0' in msg and 'Version v10.4.8-alpha sets a floating redis back to 8.10.3-alpine' in msg
+    assert 'Update Now' in msg and '<' not in msg
+
+
+@pytest.mark.parametrize('case', [
+    (True, 'redis:alpine', '8.12.0'),            # that release looks at the version first
+    (None, 'redis:alpine', '8.12.0'),            # git cannot say: no guess
+    (False, 'redis:8.12.0-alpine', '8.12.0'),    # an exact version: the older release leaves it alone
+    (False, 'valkey/valkey:8', '8.12.0'),        # another image
+    (False, 'redis:alpine', '8.10.3'),           # no newer than the pin
+    (False, 'redis:alpine', '8.9.0'),
+    (False, 'redis:alpine', ''),                 # Docker could not say
+    (False, '', '8.12.0'),                       # no redis service
+])
+def test_no_redis_warning_when_there_is_nothing_to_break(case):
+    assert _hazard(*case) == ''
+
+
+def test_preview_and_answer_carry_the_redis_warning(boxrepo, tmp_path, monkeypatch):
+    home = tmp_path / 'home'
+    (home / 'authentik').mkdir(parents=True)
+    (home / 'authentik' / 'docker-compose.yml').write_text(
+        'services:\n  redis:\n    image: redis:alpine\n    restart: unless-stopped\n')
+    monkeypatch.setenv('HOME', str(home))
+    st = _route(boxrepo, {'available': True, 'tag': 'v10.4.8-alpha'})
+    st['redis_seen'] = '8.12.0'
+    d = st['client'].get('/api/console/rollback/preview').get_json()
+    assert len(d['hazards']) == 1 and 'floating redis back to 8.10.3-alpine' in d['message']
+    r = _post(st)
+    assert r.status_code == 200
+    assert 'floating redis back to 8.10.3-alpine' in r.get_json()['message']
+    # No Authentik compose on the box: nothing to warn about, and the rollback is unchanged.
+    monkeypatch.setenv('HOME', str(tmp_path / 'nohome'))
+    _on_new_release(boxrepo)
+    st = _route(boxrepo, {'available': True, 'tag': 'v10.4.8-alpha'})
+    st['redis_seen'] = '8.12.0'
+    assert st['client'].get('/api/console/rollback/preview').get_json()['hazards'] == []
