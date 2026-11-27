@@ -197,7 +197,9 @@ def console(tmp_path):
 
 
 def _log_lines(console):
-    return console.log.read_text().splitlines() if console.log.exists() else []
+    # failed-login lines only: a good login adds a `login ok` line for the Guard Dog watch (ops #1406)
+    lines = console.log.read_text().splitlines() if console.log.exists() else []
+    return [ln for ln in lines if 'failed login' in ln]
 
 
 def _login(console, client, path='/login', **kw):

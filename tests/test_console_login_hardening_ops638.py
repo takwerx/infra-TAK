@@ -128,7 +128,9 @@ def login_app(tmp_path):
 
 
 def _lines(path):
-    return path.read_text().splitlines() if path.exists() else []
+    # failed-login lines only: a good login adds a `login ok` line for the Guard Dog watch (ops #1406)
+    lines = path.read_text().splitlines() if path.exists() else []
+    return [ln for ln in lines if 'failed login' in ln]
 
 
 @pytest.mark.parametrize('path', ['/login', '/'])
@@ -167,6 +169,19 @@ def test_a_good_login_writes_nothing_and_notes_the_length(login_app):
     assert _lines(login_app['log']) == []
     assert json.loads(login_app['auth_path'].read_text())['password_min_len_ok'] is True
     assert login_app['_console_password_needs_change']() is False
+
+
+@pytest.mark.parametrize('path', ['/login', '/'])
+def test_a_good_login_writes_one_login_ok_line_that_never_counts_as_a_failure(login_app, path):
+    """ops #1406: the Guard Dog watch needs the good login in the same file. It is never a
+    failed-login line, so the console jail (which matches only `failed login`) cannot ban on it."""
+    c = login_app['app'].test_client()
+    r = c.post(path, data={'password': RIGHT}, environ_base={'REMOTE_ADDR': '203.0.113.7'})
+    assert r.status_code == 302
+    ok = [ln for ln in login_app['log'].read_text().splitlines() if 'login ok' in ln]
+    assert len(ok) == 1 and ok[0].endswith('console: login ok from 203.0.113.7')
+    assert RIGHT not in login_app['log'].read_text()
+    assert _lines(login_app['log']) == []
 
 
 def test_a_short_password_login_keeps_the_banner(login_app):
