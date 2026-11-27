@@ -56,6 +56,8 @@ _WANT = {
     '_docker_env_version', '_webodm_pin_images', '_webodm_strip_olefile', 'WEBODM_OLEFILE_STRIP',
     'WEBODM_VERSION', 'WEBODM_IMAGES', 'NODERED_IMAGE', '_NODERED_IMAGE_LINE_RE',
     '_nodered_remote_image_cmd', '_heal_netbird_pinned_image', '_netbird_sync_compose_image_tags',
+    # ops #1327: the heal now compares tags exactly before it acts
+    '_netbird_compose_image_tags', '_netbird_compose_on_target',
 }
 
 
@@ -463,6 +465,10 @@ def _run_netbird_heal(tmp_path, monkeypatch, image, dashboard='netbirdio/dashboa
              NETBIRD_SERVER_DEV_IMAGE='netbirdio/netbird-server:0.83.2',
              _write_priv=lambda p, c: pytest.fail('plain write expected'),
              _read_priv=lambda p: pytest.fail('plain read expected'),
+             # ops #1327: pull + data backup before the compose is rewritten. Proven in
+             # test_netbird_image_change_safety_ops1327.py; here it only has to say yes.
+             _netbird_prepare_image_change=lambda *a, **k: (True, None, ''),
+             _netbird_revert_compose=lambda *a, **k: None,
              subprocess=types.SimpleNamespace(run=lambda cmd, **kw: ran.append(cmd) or types.SimpleNamespace(
                  returncode=0, stdout='', stderr='')))
     result = ns['_heal_netbird_pinned_image'](log.append)

@@ -37,6 +37,8 @@ docs/*
 !docs/RECOVERY.md
 !docs/PORTS.md
 !docs/CONSOLE-ACTIONS.md
+!docs/SECURITY-PRACTICES.md
+!docs/infra-TAK-security-practices.pdf
 memory-bank/
 .cursor/
 .cursorrules
