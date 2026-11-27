@@ -1,0 +1,229 @@
+{% extends 'base.html' %}
+{% block title %}Wazuh agent — infra-TAK{% endblock %}
+{% block page_css %}<style>
+*{box-sizing:border-box;margin:0;padding:0}
+.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s;text-transform:none;letter-spacing:normal}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-secondary{background:var(--border);color:var(--text-secondary);border:1px solid var(--border)}.btn-secondary:hover{background:#253040}
+.mono{font-family:'JetBrains Mono',monospace}
+.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:260px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8;white-space:pre-wrap}
+.url-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);word-break:break-all;line-height:1.6}
+.warn-box{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:8px;padding:12px 14px;font-size:12px;color:#f59e0b;line-height:1.6;margin-bottom:16px}
+.ok-box{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.25);border-radius:8px;padding:12px 14px;font-size:12px;color:#22c55e;line-height:1.6;margin-bottom:16px}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+label.f{display:block;font-size:12px;color:var(--text-secondary);margin:14px 0 6px}
+input.t,textarea.t{width:100%;background:#050810;border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text-primary);font-family:'JetBrains Mono',monospace;font-size:12px}
+textarea.t{height:120px}
+.src{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--border);font-size:12px;color:var(--text-secondary);line-height:1.5}
+.src small{display:block;color:var(--text-dim)}
+.src .w{color:#f59e0b}
+.pill{display:inline-block;padding:2px 10px;border-radius:99px;font-size:11px;font-weight:600;font-family:'JetBrains Mono',monospace;margin-right:6px}
+.pill.g{background:rgba(34,197,94,.12);color:#22c55e}.pill.r{background:rgba(239,68,68,.12);color:var(--red)}.pill.y{background:rgba(245,158,11,.12);color:#f59e0b}
+</style>{% endblock %}
+{% block content %}<div class="main">
+
+<div style="display:flex;align-items:center;gap:16px;margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border)">
+  <span style="font-size:34px">&#128737;</span>
+  <div>
+    <div class="mono" style="font-size:20px;font-weight:700;color:var(--text-primary);letter-spacing:.04em">WAZUH AGENT</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Sends this server's security logs to your Wazuh server</div>
+  </div>
+</div>
+
+<div class="warn-box">{{ wz_warning }}</div>
+
+{% macro sources_box(prefix) %}
+{% for s in wz_sources %}
+<label class="src"><input type="checkbox" class="{{ prefix }}src" value="{{ s.key }}">
+  <span>{{ s.label }}
+    <small class="mono">{{ s.files.get(wz_family) or s.files.get('*') }}</small>
+    {% if s.warn %}<small class="w">{{ s.warn }}</small>{% endif %}</span></label>
+{% endfor %}
+{% endmacro %}
+
+{% macro server_form(prefix) %}
+<label class="f" for="{{ prefix }}server">Wazuh server (host name or IP address)</label>
+<input class="t" id="{{ prefix }}server" autocomplete="off" spellcheck="false" placeholder="wazuh.example.org">
+<label class="f" for="{{ prefix }}ca">Wazuh server certificate (PEM, the CA that signed the enrollment service on port 1515)</label>
+<textarea class="t" id="{{ prefix }}ca" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
+<label class="f" for="{{ prefix }}pw">Enrollment password (typed here, used once, never saved)</label>
+<input class="t" id="{{ prefix }}pw" type="password" autocomplete="off">
+<label class="f" for="{{ prefix }}name">Agent name on the Wazuh server</label>
+<input class="t" id="{{ prefix }}name" autocomplete="off" value="{{ wz_default_name }}">
+<label class="f">Log sources to send (none are sent unless you tick them)</label>
+{{ sources_box(prefix) }}
+<div class="row"><button class="btn btn-secondary" onclick="checkServer('{{ prefix }}')">Check server</button></div>
+<div id="{{ prefix }}probe" style="margin-top:12px"></div>
+{% endmacro %}
+
+{% if not wazuh.get('installed') %}
+<div class="card">
+  <div class="card-title">Install</div>
+  <p style="font-size:13px;color:var(--text-secondary);line-height:1.7;margin-bottom:6px">
+    Installs the Wazuh agent {{ wz_pin }} from one checked file. No Wazuh package source is added to this server.
+    The agent opens no port on this server; it only connects out to your Wazuh server (ports 1514 and 1515).
+    Wazuh cannot run commands here, change this server's firewall or push settings to the agent: those are turned off and checked again at every start.
+  </p>
+  <p style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-bottom:6px">{{ wz_transport }}</p>
+  {% if wz_pin_problem %}<div class="warn-box">{{ wz_pin_problem }}</div>{% endif %}
+  {{ server_form('i_') }}
+  <div class="row">
+    <label style="font-size:12px;color:var(--text-secondary);display:flex;gap:8px;align-items:center"><input type="checkbox" id="i_confirm" disabled>
+      <span id="i_confirmText">Run "Check server" first.</span></label>
+  </div>
+  <div class="row"><button class="btn btn-primary" id="deployBtn" onclick="startInstall()" disabled>Install Wazuh agent</button></div>
+</div>
+<div class="card" id="logCard" style="{% if not deploying %}display:none{% endif %}">
+  <div class="card-title">Log</div>
+  <div class="log-box" id="logBox"></div>
+</div>
+{% else %}
+<div class="card">
+  <div class="card-title">Agent</div>
+  <div id="pills"><span class="pill y">reading status…</span></div>
+  <table class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:14px;line-height:1.9">
+    <tr><td style="padding-right:18px">Version</td><td id="v_ver">…</td></tr>
+    <tr><td>Server</td><td id="v_server">…</td></tr>
+    <tr><td>Agent name</td><td id="v_name">…</td></tr>
+    <tr><td>Log sources</td><td id="v_src">…</td></tr>
+  </table>
+  <div id="v_problems" style="margin-top:12px"></div>
+  <div class="row">
+    <button class="btn btn-secondary" onclick="svc('start')">Start</button>
+    <button class="btn btn-secondary" onclick="svc('restart')">Restart</button>
+    <button class="btn btn-secondary" onclick="svc('stop')">Stop</button>
+    <button class="btn btn-primary" id="updBtn" onclick="doUpdate()" disabled>Update to {{ wz_pin }}</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">Recent agent log</div>
+  <div class="log-box" id="agentLog" style="height:160px"></div>
+</div>
+
+<div class="card">
+  <div class="card-title">Change server or log sources</div>
+  <p style="font-size:12px;color:var(--text-dim);line-height:1.6">Enrolls the agent again. You need the enrollment password once more.</p>
+  {{ server_form('c_') }}
+  <div class="row">
+    <label style="font-size:12px;color:var(--text-secondary);display:flex;gap:8px;align-items:center"><input type="checkbox" id="c_confirm" disabled>
+      <span id="c_confirmText">Run "Check server" first.</span></label>
+  </div>
+  <div class="row"><button class="btn btn-primary" id="enrollBtn" onclick="startEnroll()" disabled>Enroll again</button></div>
+</div>
+<div class="card" id="logCard" style="{% if not deploying %}display:none{% endif %}">
+  <div class="card-title">Log</div>
+  <div class="log-box" id="logBox"></div>
+</div>
+
+<div class="card">
+  <div class="card-title">Remove</div>
+  <p style="font-size:13px;color:var(--text-secondary);line-height:1.7;margin-bottom:14px">
+    Stops the agent and removes it completely: its folder, keys, settings and the downloaded file. The Wazuh server keeps the events it already has.
+  </p>
+  <button class="btn btn-danger" onclick="doUninstall()">Uninstall Wazuh agent</button>
+</div>
+{% endif %}
+
+<script>
+const J = {'Content-Type':'application/json'};
+const el = id => document.getElementById(id);
+const probed = {};
+function picked(prefix){ return Array.from(document.querySelectorAll('.'+prefix+'src:checked')).map(x => x.value); }
+function say(node, cls, text){ node.textContent = ''; const d = document.createElement('div'); d.className = cls; d.textContent = text; node.appendChild(d); }
+
+async function checkServer(prefix){
+  const out = el(prefix+'probe'); say(out, 'warn-box', 'Checking …');
+  const body = JSON.stringify({server: el(prefix+'server').value, ca_pem: el(prefix+'ca').value});
+  const d = await (await fetch('/api/wazuh/probe', {method:'POST', headers:J, body})).json().catch(()=>({ok:false,error:'The console did not answer.'}));
+  const cb = el(prefix+'confirm'), ct = el(prefix+'confirmText'), go = el(prefix === 'i_' ? 'deployBtn' : 'enrollBtn');
+  cb.checked = false; cb.disabled = true; go.disabled = true; delete probed[prefix];
+  if(!d.ok){ say(out, 'warn-box', d.error || 'The check failed.'); ct.textContent = 'Run "Check server" first.'; return; }
+  probed[prefix] = d.confirm_fingerprint;
+  out.textContent = '';
+  const box = document.createElement('div'); box.className = 'ok-box';
+  box.textContent = 'The server answered and its certificate matches the one you pasted and the name ' + d.server + '. ' +
+    'Certificate: ' + (d.subject || 'unknown') + (d.not_after ? ' (valid until ' + d.not_after + ')' : '') + '. ' +
+    'Fingerprint of the certificate you pasted: ' + d.confirm_fingerprint + '. No password was sent.';
+  out.appendChild(box);
+  cb.disabled = false;
+  ct.textContent = 'This is my Wazuh server, and the fingerprint above is the one I expect.';
+  cb.onchange = () => { go.disabled = !cb.checked; };
+}
+
+function formBody(prefix){
+  return JSON.stringify({server: el(prefix+'server').value.trim(), ca_pem: el(prefix+'ca').value,
+    password: el(prefix+'pw').value, agent_name: el(prefix+'name').value.trim(),
+    sources: picked(prefix), confirm_fingerprint: probed[prefix] || ''});
+}
+
+function followLog(btn, doneText){
+  el('logCard').style.display = 'block';
+  const box = el('logBox');
+  const t = setInterval(async () => {
+    const d = await (await fetch('/api/wazuh/log')).json().catch(()=>({}));
+    box.textContent = (d.entries||[]).join('\n'); box.scrollTop = box.scrollHeight;
+    if(d.complete || d.error){ clearInterval(t); if(d.complete) setTimeout(()=>location.reload(), 1500); else btn.textContent = 'Failed — see the log'; }
+  }, 1500);
+}
+
+async function startInstall(){
+  const btn = el('deployBtn'); btn.disabled = true; btn.textContent = 'Installing …';
+  const d = await (await fetch('/api/wazuh/deploy', {method:'POST', headers:J, body: formBody('i_')})).json().catch(()=>({}));
+  el('i_pw').value = '';
+  if(d.error){ alert(d.error); btn.textContent = 'Install Wazuh agent'; btn.disabled = false; return; }
+  followLog(btn);
+}
+async function startEnroll(){
+  const btn = el('enrollBtn'); btn.disabled = true; btn.textContent = 'Working …';
+  const d = await (await fetch('/api/wazuh/enroll', {method:'POST', headers:J, body: formBody('c_')})).json().catch(()=>({}));
+  el('c_pw').value = '';
+  if(!d.success){ alert(d.error || 'failed'); btn.textContent = 'Enroll again'; btn.disabled = false; return; }
+  followLog(btn);
+}
+async function svc(v){
+  const d = await (await fetch('/api/wazuh/service', {method:'POST', headers:J, body: JSON.stringify({verb:v})})).json().catch(()=>({}));
+  if(!d.success) alert(d.error || 'failed');
+  setTimeout(loadStatus, 800);
+}
+async function doUpdate(){
+  const btn = el('updBtn'); btn.disabled = true; btn.textContent = 'Updating …';
+  const d = await (await fetch('/api/wazuh/update', {method:'POST', headers:J, body:'{}'})).json().catch(()=>({}));
+  if(d.error) alert(d.error);
+  location.reload();
+}
+async function doUninstall(){
+  if(!confirm('Uninstall the Wazuh agent?\n\nThe agent, its keys and settings are deleted from this server.')) return;
+  const pw = prompt('Confirm with your infra-TAK admin password:');
+  if(!pw) return;
+  const d = await (await fetch('/api/wazuh/uninstall', {method:'POST', headers:J, body: JSON.stringify({password: pw})})).json().catch(()=>({}));
+  if(d && d.error){ alert(d.error); return; }
+  setTimeout(()=>location.reload(), 1500);
+}
+
+function pill(text, cls){ const s = document.createElement('span'); s.className = 'pill ' + cls; s.textContent = text; return s; }
+async function loadStatus(){
+  if(!el('pills')) return;
+  const d = await (await fetch('/api/wazuh/status')).json().catch(()=>null);
+  if(!d) return;
+  const p = el('pills'); p.textContent = '';
+  p.appendChild(pill(d.running ? 'running' : 'stopped', d.running ? 'g' : 'r'));
+  p.appendChild(pill(d.enrolled ? 'enrolled' : 'not enrolled', d.enrolled ? 'g' : 'y'));
+  p.appendChild(pill(d.connected ? 'connected' : 'not connected', d.connected ? 'g' : 'y'));
+  p.appendChild(pill(d.lockdown_ok ? 'lock-down intact: yes' : 'lock-down intact: NO', d.lockdown_ok ? 'g' : 'r'));
+  el('v_ver').textContent = (d.version || 'unknown') + (d.update_available ? '  (pinned: ' + d.pinned + ')' : '');
+  el('v_server').textContent = d.server || '-';
+  el('v_name').textContent = d.agent_name || '-';
+  el('v_src').textContent = (d.sources || []).join(', ') || 'none';
+  el('agentLog').textContent = d.log || '';
+  const pr = el('v_problems'); pr.textContent = '';
+  (d.problems || []).forEach(x => { const b = document.createElement('div'); b.className = 'warn-box'; b.textContent = x; pr.appendChild(b); });
+  el('updBtn').disabled = !d.update_available;
+}
+loadStatus(); setInterval(loadStatus, 30000);
+</script>
+</div>{% endblock %}

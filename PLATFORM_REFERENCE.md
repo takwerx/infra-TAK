@@ -334,6 +334,24 @@ Official: [GitHub, linking to a release](https://docs.github.com/repositories/re
 - Caddy and fail2ban update from OS packages, and TAK Server and Federation Hub from tak.gov, so there is no public release page for the version they will install. No link is shown for them.
 - The dashboard module card is itself a link (`<a class="module-card">`). A link inside it makes the browser close the card's link early and push the inner link out of the card. ✅ verified 2026-11-21, Chrome, a test12 console page. The card's "What's new" is a span that opens the page from a click handler.
 
+## Wazuh agent (ops #1421, security review ops #1422)
+
+Official source: https://documentation.wazuh.com/current/ (4.14) and the signed package indexes at packages.wazuh.com. Only the agent is covered; the Wazuh server and the 5.x line are not reviewed.
+
+- The agent is installed from one exact, SHA-256-pinned file, never from the Wazuh apt or yum repository. Signing key `0DCFCA5547B19D2A6099506096B3EE5F29111145` (Wazuh.com Signing Key); it expires 2027-05-15, which does not stop a pinned install. The signed apt `InRelease` and yum `repomd.xml.asc` both verify with it, and their hashes equal the files we pin. ✅ verified 2026-11-27 (Security lead, ops #1422).
+- 4.14.11 is the lowest version we allow. Wazuh fixed root-level agent bugs in 4.14.6, .7, .8, .9, .10 and .11 (4.14.10: command injection in the rootcheck promiscuous-interface check, symlink following in logcollector and FIM; 4.14.11: how the agent handles requests from the manager), so the pin moves only through the Security upgrade watch and a full test. ✅ verified 2026-11-27.
+- Install starts nothing. After start, `wazuh-agentd` runs as `wazuh`; `wazuh-execd`, `wazuh-syscheckd`, `wazuh-logcollector` and `wazuh-modulesd` run as root. The agent opens no listening port (only an outbound connection to 1514/tcp; enrollment uses 1515/tcp). About 43 MB resident at idle. ✅ verified 2026-11-27 (Ubuntu 22.04 arm64 container, real 4.14.11 .deb).
+- Defaults that matter: active response is ON in the stock `ossec.conf`; the stock config reads the whole systemd journal, `audit.log`, syslog/auth.log and any database or web logs it finds (`add_localfiles.sh`), and runs `netstat` and `last` as commands; `agent.remote_conf=1` in `internal_options.conf` (the server can push configuration); `logcollector.remote_commands`, `wazuh_command.remote_commands` and `sca.remote_commands` are 0. 👁 read from the unpacked 4.14.11 package files 2026-11-27 (amd64 and arm64).
+- `/var/ossec/etc/local_internal_options.conf` overrides `internal_options.conf` and survives upgrades; `agent.remote_conf=0` there is the documented way to ignore pushed configuration. 📖 docs 4.14. A real server pushing an `agent.conf` block to prove the agent ignores it has not been done yet (test in ops #1421's PR).
+- Enrollment: `<client><enrollment>` takes `manager_address`, `port`, `agent_name` (2 or more of letters, digits, `-`, `_`, `.`), `server_ca_path` ("if no CA certificate is set, the server will not be verified"), `authorization_pass_path`. The agent enrolls itself at start when `client.keys` is empty. 📖 docs 4.14 (`ossec-conf/client`).
+- The manager must be the same version as the agent or newer. 📖 docs 4.14.
+- Packaging: `apt remove` keeps `/var/ossec` and the `wazuh` user (only `purge` deletes them); a reinstall after `remove` keeps an edited `ossec.conf` and writes `ossec.conf.new`; a fresh install overwrites it. `dnf remove` drops the user but leaves `/var/ossec`. The rpm loads the SELinux module `wazuh` (`semodule -i /var/ossec/var/selinux/wazuh.pp`) and removes it on uninstall. ✅ verified 2026-11-27 (Ubuntu 22.04 arm64 container, Rocky 9 arm64 rpm); the SELinux module is 👁 read from `rpm -qp --scripts`.
+- The `.deb` carries a clearsigned dpkg-sig member `_gpgbuilder`: `gpg --verify _gpgbuilder` works directly, and the md5/sha1 inside match the members. `rpm -K` says `digests signatures OK` with only the Wazuh key imported. ✅ verified 2026-11-27.
+- Wazuh security advisories are at `repos/wazuh/wazuh/security-advisories` on the GitHub API; the global `/advisories/GHSA-…` call gives 404 for them. ✅ verified 2026-11-27.
+- The event channel on 1514 is AES with the agent key, not TLS (`crypto_method aes`, log line `Using AES as encryption method`). Whether it is FIPS-validated has not been checked. ✅ verified 2026-11-27 for the method; FIPS not checked.
+
+---
+
 ---
 
 ## Adding to this file

@@ -5975,6 +5975,20 @@ def _detect_modules_uncached():
             'route': _mr_desc['route'], 'priority': _mr_desc['priority'], 'conflicts': [],
             'requires_modules': list(_mr_desc.get('requires_modules') or [])}
 
+    # Wazuh agent — registry-resident (modules/wazuh.py), ops #1421. Installed means the real
+    # package is installed (dpkg/rpm), never that a folder exists.
+    _wz_desc = mod_registry.MODULES.get('wazuh')
+    if _wz_desc:
+        try:
+            _wz_state = _wz_desc['detect'](mod_registry.get_ctx())
+        except Exception:
+            _wz_state = {}
+        modules['wazuh'] = {'name': _wz_desc['name'],
+            'installed': bool(_wz_state.get('installed')), 'running': bool(_wz_state.get('running')),
+            'description': _wz_desc['description'], 'icon': _wz_desc['icon'],
+            'route': _wz_desc['route'], 'priority': _wz_desc['priority'], 'conflicts': [],
+            'requires_modules': list(_wz_desc.get('requires_modules') or [])}
+
     # TAK Client Feed — registry-resident (modules/clientfeed.py), v10.1.76.
     # Tile identity + probes come from the descriptor, not an inline block.
     _ef_desc = mod_registry.MODULES.get('clientfeed')
@@ -6682,6 +6696,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     mrm = modules.get('meshrelay', {})
     if mrm.get('installed'):
         parts.append(link('/meshrelay', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F4FB</span><span>MeshRelay</span>', 'MeshRelay'))
+    wzm = modules.get('wazuh', {})
+    if wzm.get('installed'):
+        parts.append(link('/wazuh', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F6E1</span><span>Wazuh agent</span>', 'Wazuh agent'))
     cf = modules.get('clientfeed', {})
     if cf.get('installed'):
         parts.append(link('/clientfeed', '<img src="/static/logos/tak-client-skittle.png" alt="" class="nav-icon" style="height:22px;width:22px;object-fit:contain;display:block"><span>TAK Client Feed</span>', 'TAK Client Feed'))
@@ -33460,6 +33477,8 @@ _MODULE_UPDATE_ROWS = (
      'TAK Video Restreamer page → Update Now.'),
     ('simulator', 'TAK Simulator', None, False, 'TAK Simulator page → Rebuild Now.'),
     ('meshrelay', 'MeshRelay', None, False, 'MeshRelay page → Update.'),
+    # ops #1421 (Security #1422 C10): gated, so it is mailed only for the version infra-TAK pins
+    ('wazuh', 'Wazuh agent', None, True, 'Wazuh agent page → Update.'),
 )
 
 
@@ -33487,6 +33506,8 @@ def _module_update_info(key):
         return mod_registry.simulator.get_version_info(mod_registry.get_ctx())
     if key == 'meshrelay':
         return mod_registry.meshrelay.get_version_info(mod_registry.get_ctx())
+    if key == 'wazuh':
+        return mod_registry.wazuh.get_version_info(mod_registry.get_ctx())
     return {}
 
 
@@ -49426,6 +49447,8 @@ def get_all_module_versions():
         _set('simulator', lambda: mod_registry.simulator.get_version_info(mod_registry.get_ctx()))
     if modules.get('meshrelay', {}).get('installed'):
         _set('meshrelay', lambda: mod_registry.meshrelay.get_version_info(mod_registry.get_ctx()))
+    if modules.get('wazuh', {}).get('installed'):
+        _set('wazuh', lambda: mod_registry.wazuh.get_version_info(mod_registry.get_ctx()))
     if modules.get('netbird', {}).get('installed'):
         _set('netbird', _get_netbird_version_info)
     if modules.get('remote_assist', {}).get('installed'):
@@ -68965,6 +68988,27 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
     return True
 
+
+def _wazuh_agent_op(req, timeout=900):
+    """ops #1421: one call to the broker's `wazuh_agent` op (Security #1422 C3). Through the
+    broker socket on a non-root console. A root console with no broker runs the SAME gate
+    (_check_wazuh_agent then _do_wazuh_agent) in this process, so there is one rulebook."""
+    if _broker_socket_present():
+        return _broker_request(req, timeout=timeout)
+    if os.geteuid() != 0:
+        return {'ok': False, 'error': 'The infra-TAK broker is not running, so the Wazuh agent cannot be managed.'}
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location('takwerx_broker_inproc', _BROKER_SOURCE)
+    _b = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_b)
+    try:
+        _b._check_wazuh_agent(req)
+    except _b.Denied as _d:
+        return {'ok': False, 'code': 'DENIED', 'error': str(_d)}
+    return _b._do_wazuh_agent(req)
+
+
+_BROKER_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'broker', 'takwerx_broker.py')
 
 _MESHRELAY_RUN_USER = 'ptt'
 
@@ -118544,6 +118588,15 @@ def run_full_uninstall():
             plog(f"⚠ MeshRelay removal error (non-fatal): {e}")
         plog("✓ MeshRelay removed")
 
+        # 1b3. Wazuh agent — ops #1421: purge through the broker op (modules/wazuh.py).
+        if mod_registry.MODULES.get('wazuh') and modules.get('wazuh', {}).get('installed'):
+            plog("━━━ Wazuh agent ━━━")
+            try:
+                mod_registry.uninstall_module('wazuh', log_fn=plog)
+                plog("✓ Wazuh agent removed")
+            except Exception as e:
+                plog(f"⚠ Wazuh agent removal error (non-fatal): {e}")
+
         # 1c. TAK Simulator — v10.1.61: registry uninstall path (modules/simulator.py).
         plog("━━━ TAK Simulator ━━━")
         try:
@@ -129294,6 +129347,15 @@ def _startup_migrations():
         except Exception as _cs_err:
             print(f"Startup migration: caddy self-heal error (non-fatal): {_cs_err}", flush=True)
 
+        # ops #1421 (Security #1422 C6): the Wazuh agent's lock-down is checked on every console
+        # start and so after every Update Now (which restarts the console). Writes nothing
+        # when it is intact, so the agent is never restarted for nothing.
+        try:
+            if mod_registry.MODULES.get('wazuh'):
+                mod_registry.wazuh.reassert(mod_registry.get_ctx())
+        except Exception as _wz_err:
+            print(f"Startup migration: Wazuh lock-down check error (non-fatal): {_wz_err}", flush=True)
+
         # ops #633: move the renewal script from /opt/tak to LE_RENEW_SCRIPT first,
         # so the heal below patches the copy that will actually run.
         try:
@@ -132676,6 +132738,7 @@ _MODULE_CTX = {
     # meshrelay seams (ops #973): the `ptt` account (broker op), its Authentik proxy app, and
     # the firewall "closed to the outside" call (ufw deny / firewalld remove)
     '_ensure_meshrelay_account': _ensure_meshrelay_account,
+    '_wazuh_agent_op': _wazuh_agent_op,     # ops #1421
     '_ensure_authentik_meshrelay_app': _ensure_authentik_meshrelay_app,
     '_fw_deny': _fw_deny,
     '_deregister_authentik_proxy_app': _deregister_authentik_proxy_app,
@@ -132994,6 +133057,25 @@ def meshrelay_page():
                            mr_pinned=mr.RELEASE['tag'], mr_pin_problem=mr.pin_problem(arch=_host_arch()),
                            mr_ptt_port=mr.PTT_PORT, mr_first_password=settings.get(mr.FIRST_PW_KEY, ''),
                            mr_notice=mr.NOTICE, mr_source=mr.NOTICE_SOURCE,
+                           deploying=_job.get('running', False), version=VERSION)
+
+@app.route('/wazuh')
+@login_required
+def wazuh_page():
+    """Wazuh agent page (ops #1421)."""
+    from flask import abort
+    if not mod_registry.MODULES.get('wazuh'):
+        abort(404)
+    settings = load_settings()
+    modules = detect_modules()
+    state = modules.get('wazuh', {})
+    wz = mod_registry.wazuh
+    _job = mod_registry.job_state('wazuh')
+    return render_template('wazuh.html', settings=settings, modules=modules, wazuh=state,
+                           wz_sources=wz.SOURCES, wz_family=_distro_family(), wz_pin=wz.PIN_RELEASE,
+                           wz_pin_problem=wz.pin_problem(mod_registry.get_ctx()),
+                           wz_warning=wz.CARD_WARNING, wz_transport=wz.TRANSPORT_NOTE,
+                           wz_default_name=wz.default_agent_name(),
                            deploying=_job.get('running', False), version=VERSION)
 
 try:
