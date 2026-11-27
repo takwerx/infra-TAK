@@ -38,7 +38,8 @@ def _const(name):
 
 
 def _reclone_sh(tag):
-    ns = {'shlex': shlex, 'CLOUDTAK_CUSTOM_COMPOSE': _const('CLOUDTAK_CUSTOM_COMPOSE')}
+    ns = {'shlex': shlex, 'CLOUDTAK_CUSTOM_COMPOSE': _const('CLOUDTAK_CUSTOM_COMPOSE'),
+          '_CT_REMOTE_HAS_DATA_SH': _const('_CT_REMOTE_HAS_DATA_SH')}
     exec(compile(ast.get_source_segment(APP, _func('_cloudtak_remote_reclone_sh')), 'app.py', 'exec'), ns)
     return ns['_cloudtak_remote_reclone_sh'](tag)
 
