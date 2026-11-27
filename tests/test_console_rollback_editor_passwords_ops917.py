@@ -268,16 +268,21 @@ def test_no_clear_answer_is_a_failure(out):
 
 
 # --------------------------------------------------------------------------- #
-# The rollback route: passwords first, checkout second, stop on failure
+# The rollback route: checkout first (ops #1330), passwords second, stop and put back on failure
 # --------------------------------------------------------------------------- #
 
 PASSWORD = 'right-pw'
 PWHASH = werkzeug_security.generate_password_hash(PASSWORD, method='pbkdf2:sha256')
 
 _ROUTE_FUNCS = ['verify_password', 'hash_password', '_hash_method_error', 'stored_hash_unusable',
-                '_require_admin_password', 'console_rollback_api']
+                '_require_admin_password', 'console_rollback_api',
+                # ops #1330: the route makes sure the release is on the box, and checks out first
+                '_rollback_git', '_rollback_resolve_target', '_rollback_current_ref',
+                '_console_release_const', '_rollback_pin_short', '_rollback_pin_changes',
+                '_rollback_pin_message']
 _ROUTE_ASSIGNS = ['PASSWORD_HASH_METHOD', '_HASH_METHOD_ERRORS', 'check_password_hash',
-                  'generate_password_hash']
+                  'generate_password_hash', '_ROLLBACK_REPO_URL', '_ROLLBACK_REF_RE',
+                  '_ROLLBACK_SHA_RE', '_ROLLBACK_PIN_WATCH']
 
 
 def _route(ref, unhash_result):
@@ -289,8 +294,20 @@ def _route(ref, unhash_result):
         returncode, stdout, stderr = 0, '', ''
 
     def _run(argv, **kw):
-        log.append('checkout' if 'checkout' in argv else 'git')
-        return _R()
+        r = _R()
+        if 'checkout' in argv:
+            log.append('checkout')
+            return r
+        log.append('git')
+        if 'rev-parse' in argv and '--verify' in argv:
+            r.stdout = 'a' * 40          # the release's commit
+        elif 'rev-parse' in argv:
+            r.stdout = 'b' * 40
+        elif 'symbolic-ref' in argv:
+            r.stdout = 'dev'
+        elif 'grep' in argv:
+            r.returncode = 1
+        return r
 
     def _unhash_stub(settings):
         log.append('reset')
@@ -322,7 +339,7 @@ def _post(state):
     return state['client'].post('/api/console/rollback', json={'password': PASSWORD})
 
 
-def test_rollback_to_a_release_pinning_editor_2_1_14_resets_passwords_before_the_checkout():
+def test_rollback_to_a_release_pinning_editor_2_1_14_resets_passwords_after_the_checkout():
     st = _route('v2.1.14', {'state': 'reset', 'count': 2})
     r = _post(st)
     assert r.status_code == 200, r.get_json()
@@ -332,7 +349,9 @@ def test_rollback_to_a_release_pinning_editor_2_1_14_resets_passwords_before_the
     assert '<' not in d['message']                      # shown as HTML by the console page
     log = st['log']
     assert 'reset' in log, 'the rollback never changed the editor passwords'
-    assert log.index('reset') < log.index('checkout')   # before the older release goes live
+    # ops #1330: the older release is checked out FIRST; a checkout that cannot be made no longer
+    # leaves the passwords changed with the console still on the new version.
+    assert log.index('checkout') < log.index('reset')
     assert st['restarts'] == [1]
 
 
@@ -342,7 +361,9 @@ def test_rollback_stops_with_nothing_changed_when_the_passwords_cannot_be_change
     assert r.status_code == 500
     d = r.get_json()
     assert d['ok'] is False and 'Nothing was changed' in d['error']
-    assert 'checkout' not in st['log'] and st['restarts'] == []
+    # checked out, the reset failed, checkout put back (a second one), no restart
+    assert [x for x in st['log'] if x in ('checkout', 'reset')] == ['checkout', 'reset', 'checkout']
+    assert st['restarts'] == []
     assert st['settings']['console_rollback']['available'] is True    # can be tried again
 
 
@@ -364,6 +385,6 @@ def test_pin_old_but_nothing_hashed_rolls_back_with_the_plain_message():
     assert 'new passwords' not in d['message'] and d['editor_passwords_reset'] == 0
 
 
-def test_the_real_route_calls_the_reset_before_git_checkout():
+def test_the_real_route_calls_the_reset_after_the_first_git_checkout():
     route = _src('console_rollback_api')
-    assert route.index('_mediamtx_editor_unhash_for_rollback(') < route.index("'checkout'")
+    assert route.index("'checkout'") < route.index('_mediamtx_editor_unhash_for_rollback(')

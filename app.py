@@ -11836,9 +11836,36 @@ def support_diagnostics_email():
     return jsonify({'success': True, 'message': f'Sent to {to}'})
 
 
+def _release_version_tuple(v):
+    """(10, 4, 9) from '10.4.9-alpha', 'v10.4.9' ...; None when it is not a plain version."""
+    try:
+        return tuple(int(p) for p in str(v or '').strip().lstrip('v').replace('-alpha', '').replace('-beta', '').split('.'))
+    except ValueError:
+        return None
+
+
+def _console_ahead_of_main_message(latest, running=None):
+    """ops #1330: '' unless the console runs a NEWER version than the newest main release
+    `latest`. A dev box switched to the main channel then says "Up to date" while it holds code
+    main does not have, and the parts pinned per channel (NetBird, Authentik) follow main's older
+    values. Plain words, shown on the console page. Never raises."""
+    cur = _release_version_tuple(VERSION if running is None else running)
+    new = _release_version_tuple(latest)
+    if not cur or not new or cur <= new:
+        return ''
+    return (f'This server runs {VERSION}, which is newer than the newest main release '
+            f'({str(latest).strip().lstrip("v")}). Main has older versions of some parts, such as '
+            'NetBird and Authentik, and staying on main can move those parts back to them. '
+            'Switch to the dev channel to stay on this code.')
+
+
 def _update_check_response(data):
     """Return JSON response with no-cache headers so FQDN/proxy path never serves stale update badge."""
     from flask import make_response
+    if isinstance(data, dict) and data.get('channel') == 'main' and not data.get('check_failed'):
+        _ahead = _console_ahead_of_main_message(data.get('latest'))
+        if _ahead:
+            data = {**data, 'ahead_of_channel': True, 'ahead_message': _ahead}
     r = make_response(jsonify(data))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     r.headers['Pragma'] = 'no-cache'
@@ -12524,21 +12551,8 @@ def update_apply():
 
     # v0.9.3: Record current version for one-step rollback before updating
     try:
-        _pre_update_version = VERSION
         _s = load_settings()
-        # Determine the current git tag so rollback can fetch it
-        _cur_tag_r = subprocess.run(
-            ['git', f'--git-dir={os.path.join(console_dir, ".git")}',
-             f'--work-tree={console_dir}', 'describe', '--tags', '--exact-match'],
-            capture_output=True, text=True, timeout=10
-        )
-        _cur_tag = (_cur_tag_r.stdout or '').strip() if _cur_tag_r.returncode == 0 else f'v{VERSION}'
-        _s['console_rollback'] = {
-            'available':   True,
-            'version':     VERSION,
-            'tag':         _cur_tag,
-            'snapshot_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-        }
+        _s['console_rollback'] = _console_rollback_snapshot(console_dir, VERSION)
         save_settings(_s)
     except Exception:
         pass
@@ -13125,6 +13139,188 @@ def console_migrate_nonroot_status_api():
     return jsonify({'state': state, 'nonroot': nonroot, 'detail': detail})
 
 
+# ops #1330: the Rollback never changes anything until it knows the release it goes back to is on
+# this box, checks out FIRST, and only then runs the module steps that older release needs. Before,
+# three module steps (MediaMTX editor passwords to plain text, ATLAS identity headers, the
+# MediaMTX remote HLS port) ran before the checkout and the `git fetch` answer was thrown away: a
+# checkout that failed (no network and no local tag, a tag that never existed) left the console
+# on the new version with those three changes applied.
+_ROLLBACK_REPO_URL = 'https://github.com/takwerx/infra-TAK.git'
+_ROLLBACK_REF_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+_ROLLBACK_SHA_RE = re.compile(r'[0-9a-f]{40}')
+
+# The pinned versions the older release puts back when it runs its own start-up checks after the
+# rollback (its code is not ours to change). Plain constants in app.py, read from the old release
+# with git and compared with this one. NetBird is listed for the update channel the box is on.
+_ROLLBACK_PIN_WATCH = (
+    ('NetBird server', 'NETBIRD_SERVER_IMAGE', 'main'),
+    ('NetBird dashboard', 'NETBIRD_DASHBOARD_IMAGE', 'main'),
+    ('NetBird server', 'NETBIRD_SERVER_DEV_IMAGE', 'dev'),
+    ('NetBird dashboard', 'NETBIRD_DASHBOARD_DEV_IMAGE', 'dev'),
+    ('Authentik redis', 'AUTHENTIK_REDIS_IMAGE', ''),
+    ('Authentik connection pool', '_AUTHENTIK_PGBOUNCER_IMAGE', ''),
+    ('Node-RED', 'NODERED_IMAGE', ''),
+    ('WebODM', 'WEBODM_VERSION', ''),
+    ('CloudTAK media server', 'MEDIA_INFRA_IMAGE', ''),
+    ('CloudTAK database', 'POSTGIS_IMAGE', ''),
+    ('TURN server', 'COTURN_IMAGE', ''),
+    ('MediaMTX web editor', 'MEDIAMTX_EDITOR_REF', ''),
+)
+
+
+def _console_rollback_snapshot(console_dir, version):
+    """The record Update Now keeps for the Rollback button, taken before the update moves HEAD.
+    The tag is set only when HEAD is exactly on one. It used to fall back to `v{version}`, which
+    on a dev box (an untagged commit, with the same version string as the next release) is a tag
+    that does not exist yet or sits on another commit. The commit is recorded too, so the
+    Rollback goes to what really ran (ops #1330). Raises when git cannot be run."""
+    def _git_out(*args):
+        r = subprocess.run(
+            ['git', f'--git-dir={os.path.join(console_dir, ".git")}', f'--work-tree={console_dir}'] + list(args),
+            capture_output=True, text=True, timeout=10)
+        return (r.stdout or '').strip() if r.returncode == 0 else ''
+    tag = _git_out('describe', '--tags', '--exact-match')
+    sha = _git_out('rev-parse', 'HEAD').lower()
+    if not _ROLLBACK_SHA_RE.fullmatch(sha):
+        sha = ''
+    if not tag and not sha:
+        tag = f'v{version}'      # git could not say: the old guess, better than no rollback
+    return {
+        'available':   True,
+        'version':     version,
+        'tag':         tag,
+        'sha':         sha,
+        'label':       tag or f'{version} ({sha[:7]})',
+        'snapshot_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+    }
+
+
+def _rollback_git(console_dir, args, timeout=30):
+    return subprocess.run(
+        ['git', '-c', f'safe.directory={console_dir}'] + list(args),
+        cwd=console_dir, capture_output=True, text=True, timeout=timeout,
+        env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+
+
+def _rollback_resolve_target(console_dir, tag, sha):
+    """The commit a Rollback goes back to, made sure to be on this box. Returns (commit, error);
+    error is '' when it is. Changes nothing but the local tag list (the fetch)."""
+    why = ''
+    if tag:
+        try:
+            f = _rollback_git(console_dir, ['fetch', _ROLLBACK_REPO_URL,
+                                            f'refs/tags/{tag}:refs/tags/{tag}'], timeout=60)
+            if f.returncode != 0:
+                why = ((f.stderr or f.stdout or '').strip().splitlines() or ['git fetch failed'])[-1][:160]
+        except Exception as e:
+            why = str(e)[:160]
+    have_tag = ''
+    if tag:
+        try:
+            r = _rollback_git(console_dir, ['rev-parse', '-q', '--verify', f'refs/tags/{tag}^{{commit}}'], timeout=15)
+            out = (r.stdout or '').strip().lower()
+            have_tag = out if r.returncode == 0 and _ROLLBACK_SHA_RE.fullmatch(out) else ''
+        except Exception:
+            have_tag = ''
+    have_sha = ''
+    if sha:
+        try:
+            r = _rollback_git(console_dir, ['cat-file', '-e', f'{sha}^{{commit}}'], timeout=15)
+            have_sha = sha if r.returncode == 0 else ''
+        except Exception:
+            have_sha = ''
+    # What really ran wins over a tag that moved.
+    if have_sha:
+        if have_tag and have_tag != have_sha:
+            print(f'Rollback: tag {tag} now points to {have_tag[:7]}, not to the {have_sha[:7]} that ran: '
+                  'going back to the one that ran', flush=True)
+        return have_sha, ''
+    if have_tag:
+        return have_tag, ''
+    name = tag or (sha[:7] if sha else 'the previous version')
+    return '', (f'Could not get {name} onto this server' + (f' ({why})' if why else '') + '.')
+
+
+def _rollback_current_ref(console_dir):
+    """Where the console checkout is now, in a form `git checkout` takes back: the branch name,
+    else the commit. '' when git cannot say."""
+    try:
+        b = _rollback_git(console_dir, ['symbolic-ref', '-q', '--short', 'HEAD'], timeout=15)
+        name = (b.stdout or '').strip()
+        if b.returncode == 0 and _ROLLBACK_REF_RE.fullmatch(name):
+            return name
+        h = _rollback_git(console_dir, ['rev-parse', 'HEAD'], timeout=15)
+        c = (h.stdout or '').strip().lower()
+        return c if h.returncode == 0 and _ROLLBACK_SHA_RE.fullmatch(c) else ''
+    except Exception:
+        return ''
+
+
+def _console_release_const(console_dir, ref, name):
+    """The plain string constant `name` as release `ref` holds it in app.py ('' when it has none
+    or git cannot read it). Read from git's copy, never from the checkout."""
+    if not _ROLLBACK_REF_RE.fullmatch(str(ref or '')) or not re.fullmatch(r'[A-Z_][A-Z0-9_]*', str(name or '')):
+        return ''
+    try:
+        r = _rollback_git(console_dir, ['grep', '-h', '-E', rf'^{name}[[:space:]]*=', ref, '--', 'app.py'])
+    except Exception:
+        return ''
+    m = re.search(rf'''^{name}\s*=\s*["']([^"']+)["']''', r.stdout or '', re.M)
+    return m.group(1) if m else ''
+
+
+def _rollback_pin_short(v):
+    v = str(v or '')
+    return v.rsplit(':', 1)[-1] if ':' in v else v
+
+
+def _rollback_pin_changes(console_dir, ref, channel, current):
+    """[(name, this version, older release)] for every watched pin the older release `ref` sets
+    to something else. `current` maps constant name to the value this console holds."""
+    out = []
+    for label, const, only_channel in _ROLLBACK_PIN_WATCH:
+        if only_channel and only_channel != channel:
+            continue
+        now = str(current.get(const) or '')
+        then = _console_release_const(console_dir, ref, const)
+        if now and then and now != then:
+            out.append((label, _rollback_pin_short(now), _rollback_pin_short(then)))
+    return out
+
+
+def _rollback_pin_message(label, changes):
+    """Plain words for the operator: what the older release puts back by itself."""
+    if not changes:
+        return ''
+    lines = '; '.join(f'{n} {then} (this version {now})' for n, now, then in changes)
+    return (f'{label} runs its own start-up checks and may set these back to the versions it was '
+            f'tested with: {lines}. If this server already runs a newer one of them, check it after '
+            'the rollback.')
+
+
+@app.route('/api/console/rollback/preview')
+@login_required
+def console_rollback_preview_api():
+    """What the Rollback button would do, in plain words, before it is pressed (ops #1330).
+    Reads only. Never fails the page: a problem comes back as an empty list."""
+    console_dir = os.path.dirname(os.path.abspath(__file__))
+    rb = (load_settings().get('console_rollback') or {})
+    if not rb.get('available'):
+        return jsonify({'ok': True, 'available': False, 'changes': [], 'message': ''})
+    tag = str(rb.get('tag') or '').strip()
+    sha = str(rb.get('sha') or '').strip().lower()
+    ref = sha if _ROLLBACK_SHA_RE.fullmatch(sha) else tag
+    label = rb.get('label') or tag or sha[:7] or 'the previous version'
+    channel = (load_settings().get('update_channel') or 'main').strip().lower()
+    try:
+        changes = _rollback_pin_changes(console_dir, ref, channel, globals())
+    except Exception:
+        changes = []
+    return jsonify({'ok': True, 'available': True, 'label': label,
+                    'changes': [{'name': n, 'now': a, 'then': b} for n, a, b in changes],
+                    'message': _rollback_pin_message(label, changes)})
+
+
 @app.route('/api/console/rollback', methods=['POST'])
 @login_required
 def console_rollback_api():
@@ -13144,32 +13340,50 @@ def console_rollback_api():
     rb = s.get('console_rollback') or {}
     if not rb.get('available'):
         return jsonify({'ok': False, 'error': 'No rollback available (no snapshot recorded before last update)'}), 400
-    prev_tag = rb.get('tag', '').strip()
-    if not prev_tag:
+    prev_tag = str(rb.get('tag') or '').strip()
+    prev_sha = str(rb.get('sha') or '').strip().lower()
+    if prev_sha and not _ROLLBACK_SHA_RE.fullmatch(prev_sha):
+        prev_sha = ''
+    if prev_tag and not _ROLLBACK_REF_RE.fullmatch(prev_tag):
+        prev_tag = ''           # a stored value that looks like a git option never reaches git
+    if not prev_tag and not prev_sha:
         return jsonify({'ok': False, 'error': 'Rollback tag not recorded'}), 400
+    label = prev_tag or str(rb.get('label') or '') or prev_sha[:7]
     try:
-        git_cfg = ['git', '-c', f'safe.directory={console_dir}']
-        # Fetch the tag from origin
-        fetch_r = subprocess.run(
-            git_cfg + ['fetch', 'https://github.com/takwerx/infra-TAK.git',
-                       f'refs/tags/{prev_tag}:refs/tags/{prev_tag}'],
-            cwd=console_dir, capture_output=True, text=True, timeout=60,
-            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
-        )
-        # ops #917: a release that pins a web editor older than password hashing (2.1.15) would,
+        # ops #1330: 1. Make sure the release is here. Nothing on this box changes if it is not.
+        target, why = _rollback_resolve_target(console_dir, prev_tag, prev_sha)
+        if not target:
+            return jsonify({'ok': False, 'error': why + ' Nothing was changed.'}), 500
+        # What the older release will need (read from git, before anything moves).
+        orig_ref = _rollback_current_ref(console_dir)
+        # 2. Check out FIRST. If this fails nothing else has been touched.
+        checkout_r = _rollback_git(console_dir, ['checkout', '--force', target])
+        if checkout_r.returncode != 0:
+            err = (checkout_r.stderr or '').strip() or 'git checkout failed'
+            return jsonify({'ok': False, 'error': err}), 500
+        # 3. ops #917: a release that pins a web editor older than password hashing (2.1.15) would,
         # on its "Patch web editor", put back an editor that cannot read hashed passwords. Give
-        # the accounts plain-text passwords first (the editor's own rollback does the same).
-        # Done before the checkout so a failure here leaves the console as it was.
+        # the accounts plain-text passwords first (the editor's own rollback does the same). When
+        # that cannot be done the rollback stops and the checkout is put back.
         editor_reset = {'state': 'none', 'count': 0}
-        if _mediamtx_editor_ref_lacks_hashing(_console_release_editor_ref(console_dir, prev_tag)):
+        if _mediamtx_editor_ref_lacks_hashing(_console_release_editor_ref(console_dir, target)):
             editor_reset = _mediamtx_editor_unhash_for_rollback(s)
             if editor_reset['state'] == 'fail':
+                back = None
+                if orig_ref:
+                    back = _rollback_git(console_dir, ['checkout', '--force', orig_ref])
+                if back is not None and back.returncode == 0:
+                    return jsonify({'ok': False, 'error': (
+                        'Rollback stopped: the MediaMTX web editor passwords could not be changed '
+                        'for the older version. Nothing was changed.')}), 500
                 return jsonify({'ok': False, 'error': (
                     'Rollback stopped: the MediaMTX web editor passwords could not be changed '
-                    'for the older version. Nothing was changed.')}), 500
+                    'for the older version, and the console files could not be put back. Press '
+                    'Rollback again, or restart the console, to finish going back to '
+                    f'{label}.')}), 500
         # ops #1151: an older release cannot keep ATLAS on Authentik's signed token (its
         # Caddyfile does not pass the token and its Authentik reconfigure takes the signing
-        # key off). Put such a deployment back on the identity headers first, or it refuses
+        # key off). Put such a deployment back on the identity headers, or it refuses
         # every administrator after the rollback. A failure here does not stop the rollback.
         atlas_reset = {}
         try:
@@ -13178,31 +13392,31 @@ def console_rollback_api():
                 atlas_reset = _atlas_rb(
                     mod_registry.get_ctx(),
                     lambda m: print(f'Rollback: ATLAS {m}', flush=True),
-                    _console_release_has_file(console_dir, prev_tag,
+                    _console_release_has_file(console_dir, target,
                                               'modules/atlas_signed_identity.py')) or {}
         except Exception as _arb:
             print(f'Rollback: ATLAS sign-in step error (non-fatal): {str(_arb)[:160]}', flush=True)
         # ops #1149: a release without the closed HLS port on a remote MediaMTX box gets the
-        # port back (bind and firewall rule) before the checkout. A failure does not stop the
-        # rollback.
+        # port back (bind and firewall rule). A failure does not stop the rollback.
         hls_port_reset = 'none'
         try:
-            hls_port_reset = _mediamtx_remote_hls_port_before_rollback(s, console_dir, prev_tag)
+            hls_port_reset = _mediamtx_remote_hls_port_before_rollback(s, console_dir, target)
         except Exception as _hpr:
             print(f'Rollback: MediaMTX HLS port step error (non-fatal): {str(_hpr)[:160]}', flush=True)
-        checkout_r = subprocess.run(
-            git_cfg + ['checkout', '--force', prev_tag],
-            cwd=console_dir, capture_output=True, text=True, timeout=30,
-            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
-        )
-        if checkout_r.returncode != 0:
-            err = (checkout_r.stderr or '').strip() or 'git checkout failed'
-            return jsonify({'ok': False, 'error': err}), 500
-        # Clear rollback availability (one rollback per update)
+        # Clear rollback availability (one rollback per update). Settings are read again: the
+        # steps above can take minutes.
+        s = load_settings()
         s['console_rollback'] = {'available': False}
         save_settings(s)
+        try:
+            pin_note = _rollback_pin_message(
+                f'Version {label}',
+                _rollback_pin_changes(console_dir, target,
+                                      (s.get('update_channel') or 'main').strip().lower(), globals()))
+        except Exception:
+            pin_note = ''
         _detached_console_restart()
-        message = f'Rolled back to {prev_tag}. Console is restarting.'
+        message = f'Rolled back to {label}. Console is restarting.'
         if editor_reset['state'] == 'reset':
             message += (' The MediaMTX web editor in that version cannot read the new password '
                         'format, so its accounts got new passwords. The admin password is on '
@@ -13215,8 +13429,10 @@ def console_rollback_api():
         if 'failed' in atlas_reset.values():
             message += (' ATLAS could not be set back to the sign-in of that version. If the '
                         'ATLAS console refuses administrators, press Update Now again.')
+        if pin_note:
+            message += ' ' + pin_note
         return jsonify({
-            'ok': True, 'tag': prev_tag,
+            'ok': True, 'tag': label,
             'message': message,
             'editor_passwords_reset': editor_reset['count'],
         })
@@ -126033,6 +126249,48 @@ def _post_update_service_recovery_sweep(plog):
     }
 
 
+# ops #1330: the post-update run is stamped (`last_console_version` / `last_console_sha`) only
+# when it finished. It used to be stamped in a `finally`, so a run that raised (docker or the
+# broker not up yet after a reboot, a bug in one step) was marked done, and the next start took
+# the "same version" branch and never ran it again; only a killed process re-ran it. Now a raised
+# run is not stamped and runs again at the next console start. A bug that raises every time
+# would re-run a full post-update on every boot for ever, so after this many starts in a row for
+# the same version and commit the run is stamped anyway and the journal says why.
+_POST_UPDATE_MAX_FAILED_STARTS = 3
+
+
+def _post_update_finish_settings(s, ok, version, sha, error=''):
+    """Record how a post-update run ended in the settings dict `s` (changed in place; the caller
+    saves it). Returns (stamped, journal_message). `ok`: the run returned. Not ok: it raised."""
+    sha = sha or ''
+    if ok:
+        s['last_console_version'] = version
+        if sha:
+            s['last_console_sha'] = sha
+        s.pop('post_update_failed', None)
+        return True, f"last_console_version saved as {version} (sha {sha[:7] or 'n/a'})"
+    key = f"{version}@{sha or 'n/a'}"
+    prev = s.get('post_update_failed') if isinstance(s.get('post_update_failed'), dict) else {}
+    try:
+        count = (int(prev.get('count') or 0) + 1) if prev.get('key') == key else 1
+    except (TypeError, ValueError):
+        count = 1
+    s['post_update_failed'] = {
+        'key': key, 'count': count, 'error': str(error or '')[:300],
+        'at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+    }
+    if count >= _POST_UPDATE_MAX_FAILED_STARTS:
+        s['last_console_version'] = version
+        if sha:
+            s['last_console_sha'] = sha
+        return True, (f"post-update for {version} (sha {sha[:7] or 'n/a'}) failed {count} starts in a "
+                      f"row, last error: {str(error)[:200]}. Giving up: saved last_console_version "
+                      f"anyway, so it does not run again on every boot.")
+    return False, (f"post-update for {version} (sha {sha[:7] or 'n/a'}) did NOT finish ({str(error)[:200]}). "
+                   f"last_console_version is not saved, so it runs again at the next console start "
+                   f"(failed {count} of {_POST_UPDATE_MAX_FAILED_STARTS}).")
+
+
 def _post_update_auto_deploy():
     """After a console update, automatically re-deploy Guard Dog and reconfigure Authentik.
 
@@ -128077,6 +128335,8 @@ def _post_update_auto_deploy():
             print("Post-update: auto-deploy complete")
 
         def _run_post_update_guarded():
+            _pu_ok = False      # ops #1330: stamped as done only when the run returned
+            _pu_err = ''
             try:
                 _w = 0
                 while _stack_job_running() and _w < 3 * 3600:
@@ -128086,17 +128346,18 @@ def _post_update_auto_deploy():
                     _w += 10
                 _POST_UPDATE_ACTIVE['on'] = True
                 _run_post_update()
+                _pu_ok = True
             except Exception as _e:
+                _pu_err = str(_e) or type(_e).__name__
                 print(f"Post-update: migration thread error: {_e}", flush=True)
             finally:
                 _POST_UPDATE_ACTIVE['on'] = False
                 try:
                     s_done = load_settings()
-                    s_done['last_console_version'] = VERSION
-                    if cur_sha:
-                        s_done['last_console_sha'] = cur_sha
+                    _pu_stamped, _pu_msg = _post_update_finish_settings(
+                        s_done, _pu_ok, VERSION, cur_sha, _pu_err or 'the run did not finish')
                     save_settings(s_done)
-                    print(f"Post-update: last_console_version saved as {VERSION} (sha {cur_sha[:7] or 'n/a'})", flush=True)
+                    print(f"Post-update: {_pu_msg}", flush=True)
                 except Exception as _e:
                     print(f"Post-update: failed to save last_console_version: {_e}", flush=True)
                 try:
