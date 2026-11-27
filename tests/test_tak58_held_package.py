@@ -23,6 +23,7 @@ postinst stop, went looking for upgrade-db.sh, and left TAK stopped on an untouc
 app.py and run with the package manager and systemctl faked.
 """
 
+import importlib.util
 import os
 import pathlib
 import re
@@ -83,6 +84,54 @@ def _run(versions, install_rc, held=True):
     n['run_takserver_58_migration']('/tmp/takserver_5.8-RELEASE92_all.deb', log=log,
                                     status=status)
     return calls, log, status
+
+
+def _broker():
+    spec = importlib.util.spec_from_file_location(
+        'takwerx_broker_gh761', REPO / 'broker' / 'takwerx_broker.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _install_argv(held):
+    """The argv the 5.8 update really sends to apt-get, taken from the function itself."""
+    calls, _, _ = _run(('5.7-RELEASE43', '5.8-RELEASE105'), 0, held=held)
+    cmd = [c for c, _ in calls if isinstance(c, str) and 'apt-get install' in c][0]
+    words = shlex.split(cmd)
+    while words and re.fullmatch(r'[A-Z_]+=\S*', words[0]):
+        words.pop(0)                      # DEBIAN_FRONTEND=noninteractive
+    assert words[-1] == '2>&1'
+    return words[:-1]
+
+
+def test_gh761_the_install_command_passes_the_broker_rulebook():
+    # GH #761: the console sent --allow-change-held-packages, a non-root console routes
+    # apt through the broker, and the broker's allow-list refused it ("option not
+    # allowed") after TAK Server was already stopped. The flag is sent whether or not a
+    # package is held, so this holds for the held and the not-held box alike.
+    B = _broker()
+    for held in (True, False):
+        argv = _install_argv(held)
+        assert argv[:2] == ['apt-get', 'install']
+        assert '--allow-change-held-packages' in argv
+        B.check_exec(argv)                # raises Denied on the base branch
+
+
+def test_gh761_only_the_exact_flag_spelling_is_allowed():
+    # The control is allowed; shortened spellings and the neighbouring unsafe flag are not.
+    B = _broker()
+    deb = '/tmp/takserver_5.8-RELEASE105_all.deb'
+    base = ['apt-get', 'install', '-y', '--allow-downgrades']
+    B.check_exec(base + ['--allow-change-held-packages', deb])
+    B.check_exec(base + [deb])
+    for bad in ('--allow-change-held-package', '--allow-change-held', '--allow-change',
+                '--allow-c', '--allow-change-held-packages=1', '--allow-unauthenticated'):
+        try:
+            B.check_exec(base + [bad, deb])
+        except B.Denied:
+            continue
+        raise AssertionError('broker allowed %s' % bad)
 
 
 def test_install_is_allowed_past_a_hold():
