@@ -1048,6 +1048,20 @@ function instanceRow(i){
   row.appendChild(rowButton(i.renewal_enabled ? 'Renewal: on' : 'Renewal: off',
                             'btn-secondary',
                             function(){ toggleRenewal(i); }));
+  // Authentik administrators are also ATLAS administrators (ops #1416). On by
+  // default. Off leaves only the groups the operator owns; the server refuses
+  // unless one of them exists and has a member.
+  row.appendChild(rowButton(i.authentik_admins_on ? 'Authentik admins: on'
+                                                  : 'Authentik admins: off',
+                            'btn-secondary',
+                            function(){ toggleAuthentikAdmins(i); }));
+  if (i.authentik_admins_problem) {
+    const warn = document.createElement('div');
+    warn.className = 'banner-bad';
+    warn.style.marginTop = '8px';
+    warn.textContent = i.authentik_admins_problem;
+    row.appendChild(warn);
+  }
   row.appendChild(rowButton('Update', 'btn-primary',
                             function(){ startUpdate(i.slug); }));
   row.appendChild(rowButton(i.running ? 'Restart' : 'Start', 'btn-secondary',
@@ -1100,6 +1114,29 @@ function toggleRenewal(i){
     .then(function(r){ return r.json(); })
     .then(function(d){
       if (!d.success) { alert(d.error || 'Could not change certificate renewal.'); return; }
+      setTimeout(function(){ location.reload(); }, 1200);
+    }).catch(function(){});
+}
+
+function toggleAuthentikAdmins(i){
+  const on = !i.authentik_admins_on;
+  const ask = on
+    ? 'Let Authentik administrators administer ATLAS again? The "authentik Admins" '
+      + 'group is added back to ATLAS\'s admin group and to Authentik\'s access '
+      + 'policy for ATLAS.'
+    : 'Stop Authentik administrators from administering ATLAS? "authentik Admins" '
+      + 'is removed from ATLAS\'s admin group and from Authentik\'s access policy '
+      + 'for ATLAS. Only your own ATLAS admin group (and the agency group) can '
+      + 'then sign in as an ATLAS administrator. This is refused unless that group '
+      + 'exists and has at least one member.';
+  if (!confirm(ask)) return;
+  fetch('/api/atlas/instances/' + encodeURIComponent(i.slug || 'atlas') + '/authentik-admins',
+        {method: 'POST', credentials: 'same-origin',
+         headers: {'Content-Type': 'application/json'},
+         body: JSON.stringify({enabled: on})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (!d.success) { alert(d.error || 'Could not change the Authentik administrators setting.'); return; }
       setTimeout(function(){ location.reload(); }, 1200);
     }).catch(function(){});
 }

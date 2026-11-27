@@ -47,6 +47,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import atlas_instances
+
 #: Every access policy this module makes starts with this, followed by the
 #: application slug. app.py's boot converge (`_ensure_app_access_policies`) reads
 #: it to know such an application is already restricted, and must not add
@@ -131,6 +133,42 @@ def is_access_binding(binding):
             and binding.get('enabled', True) and not binding.get('negate'))
 
 
+#: Key in a deployment's record. Absent means on: Authentik's superuser group is
+#: an ATLAS administrator group (ops #1416, TAK-MDM issue 14). Only an operator's
+#: explicit "off" writes it, so a box that never touched the switch holds nothing.
+OFF_KEY = 'authentik_admins_off'
+
+
+def global_admins_wanted(inst):
+    """The operator's choice: are Authentik's administrators also ATLAS's? Default yes."""
+    return not (inst or {}).get(OFF_KEY)
+
+
+def state_key(inst_prefix):
+    """Where the last answer of the lockout guard is recorded (per deployment)."""
+    return inst_prefix + 'authentik_admins_state'
+
+
+def global_admins_in_force(settings, inst):
+    """Whether the global administrators are in the access policy and on the admin line now.
+
+    ⚠️ **The switch is the wish; this is what is true.** Off holds only while the
+    lockout guard passed the last time it ran (`guard`). Every writer of the
+    policy or the admin line reads this one answer, so they cannot disagree.
+    A switch that was never turned off, or whose guard never ran, is in force.
+    """
+    if global_admins_wanted(inst):
+        return True
+    state = (settings or {}).get(state_key(_prefix_of(inst)))
+    if isinstance(state, dict) and state.get('global_in') is False:
+        return False
+    return True
+
+
+def _prefix_of(inst):
+    return atlas_instances.derive(inst)['settings_prefix']
+
+
 def _find(api, path, field, value):
     """The row whose `field` is exactly `value` (Authentik's filters are not identities)."""
     for row in api.results('%s?%s=%s' % (path, field, urllib.parse.quote(value))):
@@ -139,16 +177,68 @@ def _find(api, path, field, value):
     return None
 
 
+def _has_member(row):
+    """True when this group row lists at least one enabled user.
+
+    ⚠️ Authentik lists a group's users on the group row (`users_obj` with
+    `is_active`; `users` holds the keys). A group whose only member was
+    disabled admits nobody who can sign in, so it does not count.
+    """
+    objs = row.get('users_obj')
+    if isinstance(objs, list):
+        return any(u.get('is_active', True) for u in objs)
+    return bool(row.get('users'))
+
+
+def guard(api, policy_groups, env_groups, admin_group=None):
+    """May the global administrators be taken out? ``(ok, why)``.
+
+    ⚠️ **The lockout guard (ops #1416).** Taking `authentik Admins` out of both
+    gates is safe only when somebody else can still get in. One group must be in
+    **both** gates, the access policy (`policy_groups`) *and* the ATLAS admin
+    line (`env_groups`), must exist in Authentik, and must hold at least one
+    enabled user. A group in only one gate lets people through Authentik for
+    ATLAS to turn away (or the reverse), which is the same lockout.
+
+    Pure on purpose, and a question that cannot be asked is a no, never a yes:
+    an Authentik that did not answer must not read as "your group has members".
+    """
+    skip = {admin_group or ADMIN_GROUP, ADMIN_GROUP}
+    both = [g for g in policy_groups if g in env_groups and g not in skip]
+    if not both:
+        return False, ('none of your own groups is in both ATLAS\'s admin line and '
+                       'Authentik\'s access policy for ATLAS')
+    for group in both:
+        try:
+            row = _find(api, 'core/groups/', 'name', group)
+        except Exception as exc:
+            return False, 'could not ask Authentik about "%s": %s' % (group, str(exc)[:60])
+        if row is not None and _has_member(row):
+            return True, 'group "%s" exists and has a member' % group
+    return False, ('%s %s in Authentik, or has no enabled member'
+                   % (' and '.join('"%s"' % g for g in both),
+                      'is missing' if len(both) == 1 else 'are missing'))
+
+
 def _outcome(status, detail=''):
     return {'status': status, 'detail': detail}
 
 
-def ensure(api, app_slug, add=(), remove=(), plog=None, admin_group=None):
+def ensure(api, app_slug, add=(), remove=(), plog=None, admin_group=None,
+           include_global=True):
     """Make the application's one access policy admit global admins plus `add`.
 
     The policy keeps whatever groups it already holds (so the agency's admin
     group and a later standard group are each added by their own caller without
-    undoing the other), minus `remove`. The global administrators are always in.
+    undoing the other), minus `remove`. The global administrators are in unless
+    the operator turned that off for this deployment (`include_global=False`,
+    ops #1416): then neither Authentik's superuser group nor the default name is
+    in the policy, and it admits only the other groups.
+
+    ⚠️ **A policy with no group is refused, not written.** With the global
+    administrators out and nothing else to admit, the expression would be empty
+    (invalid in Authentik) and the only honest reading is "nobody", which is the
+    lockout the guard exists to prevent. Nothing is changed in that case.
 
     ⚠️ **`admin_group` is the superuser group as Authentik has it now** (ops
     #1289), from `atlas.global_admin_group`. `authentik Admins` is only the
@@ -194,10 +284,21 @@ def ensure(api, app_slug, add=(), remove=(), plog=None, admin_group=None):
             current = [g for g in current if g != ADMIN_GROUP]
             log('  ✓ The old group name "%s" is no longer in the access policy '
                 '(Authentik has no such group)' % ADMIN_GROUP)
-        wanted = [admin_group]
+        if include_global:
+            wanted = [admin_group]
+            skip = set()
+        else:
+            wanted = []
+            skip = {admin_group, ADMIN_GROUP}
         for group in list(current) + list(add):
-            if group not in wanted and group not in remove:
+            if group not in wanted and group not in remove and group not in skip:
                 wanted.append(group)
+        if not wanted:
+            detail = ('the access policy "%s" would admit nobody: the Authentik '
+                      'administrators are switched off for ATLAS and no other '
+                      'group is in it' % name)
+            log('  ⚠ ' + detail)
+            return _outcome('failed', detail)
         expression = build_expression(wanted)
         changed = False
 
@@ -286,7 +387,7 @@ def _supersede(api, bindings, groups, log, admin_group=ADMIN_GROUP):
     return removed
 
 
-def revoke(api, app_slug, group, plog=None, admin_group=None):
+def revoke(api, app_slug, group, plog=None, admin_group=None, include_global=True):
     """Take `group` out of this application's way in. True when anything changed.
 
     ⚠️ Two places can hold it: our policy (one name in the "or") and a direct
@@ -307,7 +408,7 @@ def revoke(api, app_slug, group, plog=None, admin_group=None):
     pol = _find(api, 'policies/expression/', 'name', policy_name(app_slug))
     if pol is not None and group in parse_groups(pol.get('expression')):
         result = ensure(api, app_slug, remove=[group], plog=plog,
-                        admin_group=admin_group)
+                        admin_group=admin_group, include_global=include_global)
         if result['status'] == 'failed':
             raise RuntimeError(result['detail'])
         changed = True
