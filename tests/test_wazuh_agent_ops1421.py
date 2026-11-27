@@ -553,3 +553,34 @@ def test_the_real_package_layout_passes_the_home_check(monkeypatch):
     assert B._wazuh_home_ok() is False
     t[B.WAZUH_ETC] = (st.S_IFLNK | 0o777, 0)             # a link
     assert B._wazuh_home_ok() is False
+
+
+@pytest.mark.skipif(not HAS_OPENSSL, reason='openssl needed')
+def test_enrolling_again_stops_the_agent_and_empties_the_old_keys_but_a_plain_reassert_does_not(tree):
+    """An agent that already holds keys never enrolls again; the old keys belong to the old server."""
+    keys = tree.home / 'etc' / 'client.keys'
+    keys.write_text('001 old-name any oldkey\n')
+    pem = _make_cert(tree.tmp)
+    r = B._do_wazuh_agent(dict(GOOD, ca_pem=pem, password='pw-new'))
+    assert r['ok'] is True
+    assert keys.read_text() == '' and ['systemctl', 'stop', 'wazuh-agent'] in tree.calls
+    # the update / console-start re-assert has no password: keys and agent are left alone
+    keys.write_text('001 old-name any oldkey\n')
+    tree.calls.clear()
+    r = B._do_wazuh_agent(dict(GOOD))
+    assert r['ok'] is True and keys.read_text().startswith('001 ')
+    assert ['systemctl', 'stop', 'wazuh-agent'] not in tree.calls
+
+
+def test_the_key_reset_never_follows_a_link(tree):
+    if not hasattr(os, 'symlink'):
+        pytest.skip('no symlinks')
+    victim = tree.tmp / 'victim.txt'
+    victim.write_text('keep me')
+    os.symlink(victim, tree.home / 'etc' / 'client.keys')
+    pem_ok = HAS_OPENSSL
+    if not pem_ok:
+        pytest.skip('openssl needed')
+    r = B._do_wazuh_agent(dict(GOOD, ca_pem=_make_cert(tree.tmp), password='pw'))
+    assert r['ok'] is False and 'agent keys' in r['error']
+    assert victim.read_text() == 'keep me'

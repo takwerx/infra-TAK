@@ -7252,6 +7252,21 @@ def _wazuh_configure(req, family):
         if why:
             return {'ok': False, 'error': f'no usable server certificate on file: {why}'}
     if 'password' in req:
+        # A new enrollment (new server, new name, retry): an agent that already holds keys
+        # does not enroll again, and the old keys belong to the old server. Stop the agent
+        # and empty client.keys first (Wazuh's own way to re-register an agent).
+        _wazuh_run(['systemctl', 'stop', WAZUH_UNIT], 90)
+        try:
+            fd = os.open(WAZUH_KEYS, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                if stat.S_ISREG(os.fstat(fd).st_mode):
+                    os.ftruncate(fd, 0)
+            finally:
+                os.close(fd)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            return {'ok': False, 'error': f'could not reset the old agent keys: {e}'}
         _wazuh_write(WAZUH_PASS, req['password'] + '\n', 0o640)
     _wazuh_write(WAZUH_OSSEC_CONF, _wazuh_render_ossec(req['server'], req['agent_name'],
                                                        req['sources'], family), 0o640)
