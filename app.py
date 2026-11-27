@@ -127540,7 +127540,10 @@ def _startup_migrations():
         except Exception as _f2b_e3e:
             print(f"Startup migration: takserver banaction converge error (non-fatal): {_f2b_e3e}", flush=True)
         # ops #1406 — the watch timer; after the converge above has put the newest script on disk.
-        _startup_converge_f2b_watch()
+        try:
+            _startup_converge_f2b_watch()
+        except Exception as _f2b_e1406:
+            print(f"Startup migration: fail2ban watch converge error (non-fatal): {_f2b_e1406}", flush=True)
         # v10.3.4 — refused-cert phones move to the takserver-badcert jail, which never
         # blocks enrollment (8446). Before recidive's exemption so both land in one start.
         try:

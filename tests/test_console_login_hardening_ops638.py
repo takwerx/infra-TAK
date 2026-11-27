@@ -113,7 +113,7 @@ def login_app(tmp_path):
         'VERSION': 'test',
         'print': lambda *a, **kw: printed.append(' '.join(str(x) for x in a)),
     }
-    exec(_src({'_client_ip', '_safe_next_path', '_console_log_failed_login', '_note_password_length',
+    exec(_src({'_client_ip', '_safe_next_path', '_console_log_failed_login', '_console_log_login_ok', '_note_password_length',
                '_console_password_needs_change', '_console_password_length_state',
                'console_password_confirm_length', 'login', 'index'},
               {'CONSOLE_PASSWORD_MIN_LEN', 'CONSOLE_LOGIN_FAIL_LOG', 'CONSOLE_LOGIN_FAIL_LOG_MAX',

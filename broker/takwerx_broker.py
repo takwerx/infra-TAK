@@ -864,6 +864,7 @@ UNIT_FILES = frozenset({
     'mediamtx-webeditor.service.d/10-infratak-journal.conf',
     'mediamtx-webeditor.service.d/20-infratak-home.conf',
     'ptt-server.service',       # ops #973: MeshRelay PTT server, runs as its own `ptt` account
+    'infratak-f2b-watch.service', 'infratak-f2b-watch.timer',   # ops #1406: Guard Dog login/fail2ban watch
 })
 _UNIT_FILE_RE = re.compile(r'^tak[a-z0-9]+guard\.(service|timer)$')   # Guard Dog watchers
 # Users a non-root unit may run as, and the groups it may add. A unit running as

@@ -191,6 +191,7 @@ class Console:
             '_upgrade_password_hash': lambda auth, p: None,
             '_note_password_length': lambda p: None,
             '_console_log_failed_login': lambda path: None,
+            '_console_log_login_ok': lambda: None,
             '_safe_next_path': lambda: '',
             'stored_hash_unusable': lambda h: None,
         }

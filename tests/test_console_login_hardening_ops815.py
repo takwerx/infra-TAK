@@ -70,6 +70,7 @@ _FUNCS = (
     '_client_ip', '_rate_limit_ip_key', '_is_rate_limited', '_effective_request_host',
     '_same_origin_ok', 'ensure_session_valid', 'verify_password',
     '_safe_next_path', '_console_note_failed_password_check', '_console_log_failed_login',
+    '_console_log_login_ok',
     'login', 'logout', 'index', '_enforce_session_idle_lock', 'hardening_apply',
     'console_restart_safe', 'console_power_api',
     'guarddog_send_alert_email', 'guarddog_send_sms',
