@@ -51357,15 +51357,29 @@ def _mediamtx_editor_refresh(deploy_cfg, is_remote):
                        '), so the file on the box was kept. '), installed
 
 
+def _mediamtx_patch_try_quiet_first(view):
+    """ops #1387: run Patch web editor once with MediaMTX left running (`_try_guarded=True`).
+    The pass raises _MtxReclaimNeeded at the first file it would have to write; nothing has been
+    written or stopped by then, so the whole view runs again on the full path
+    (`_try_guarded=False`: stop both services, take the folder back, write)."""
+    @wraps(view)
+    def run():
+        try:
+            return view(_try_guarded=True)
+        except _MtxReclaimNeeded:
+            return view(_try_guarded=False)
+    return run
+
+
 @app.route('/api/mediamtx/recovery', methods=['POST'])
 @login_required
-def mediamtx_recovery(_try_guarded=True):
+@_mediamtx_patch_try_quiet_first
+def mediamtx_recovery(_try_guarded=False):
     """Patch web editor: refresh editor, apply endpoint patch, sync overlay file, install prestart script, restart.
 
-    ops #1387: when nothing in the editor's folder needs writing (an editor kept because it is
-    newer than the pin, overlay and prestart script already current), MediaMTX is not stopped
-    and no stream drops. The first file that does need writing sends the route back to the top
-    on the full path (`_try_guarded=False`): stop both services, take the folder back, write."""
+    ops #1387: with `_try_guarded` (the decorator's first pass) MediaMTX is not stopped and no file
+    in the editor's folder is written; the pass ends at the first file that would change. The
+    default, False, is the full path every caller had before."""
     import tempfile
     import urllib.request
     settings = load_settings()
@@ -51537,11 +51551,7 @@ def mediamtx_recovery(_try_guarded=True):
         return jsonify({'success': True, 'message': msg, 'webeditor_running': active,
                         'editor_refreshed': bool(_refreshed), 'editor_version': _installed,
                         'mediamtx_stopped': bool(_restart_after) and 'mediamtx' in _restart_after})
-    except _MtxReclaimNeeded:
-        # ops #1387: a file in the folder must be written after all. Nothing has been written
-        # or stopped yet; run the whole route again on the full path (stop, take back, write).
-        return mediamtx_recovery(_try_guarded=False)
-    except Exception as e:
+    except Exception as e:           # _MtxReclaimNeeded is no Exception: it goes up to the route
         return jsonify({'error': str(e)[:200]}), 500
     finally:
         # ops #643: never leave MediaMTX stopped because a step above failed.

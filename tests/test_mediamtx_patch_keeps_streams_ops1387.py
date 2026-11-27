@@ -17,6 +17,7 @@ folder while the account that owns it can plant links" is unchanged.
 The app.py code is run for real against a real temporary folder (links, modes) and a fake host.
 """
 import ast
+import functools
 import os
 import pathlib
 import re
@@ -128,7 +129,7 @@ class Box:
             return s + '# patched\n' if patch_changes else s
 
         ns = {
-            'os': os, 're': re, 'shlex': shlex, '_stat': stat, '__file__': self.app_file,
+            'os': os, 're': re, 'shlex': shlex, '_stat': stat, '__file__': self.app_file, 'wraps': functools.wraps,
             'subprocess': types.SimpleNamespace(run=run), 'jsonify': lambda d: d,
             'load_settings': lambda: {}, '_get_module_deployment_config': lambda s, k: box.cfg,
             '_MEDIAMTX_EDITOR_DIR': str(self.ed), '_MEDIAMTX_CONF_DIR': str(tmp_path / 'etc'),
@@ -159,8 +160,11 @@ class Box:
         for name in ('_mediamtx_version_tuple', '_mediamtx_editor_newer_than_pin', '_mediamtx_editor_body_problem',
                      '_mediamtx_editor_remote_fetch_cmd', '_mediamtx_editor_refresh',
                      '_mediamtx_editor_installed_version', '_mediamtx_editor_reclaim_applies',
-                     '_mediamtx_editor_dir_has_links', '_mediamtx_editor_put', 'mediamtx_recovery'):
+                     '_mediamtx_editor_dir_has_links', '_mediamtx_editor_put',
+                     '_mediamtx_patch_try_quiet_first', 'mediamtx_recovery'):
             exec(compile(swap(_fn(name)), 'app.py', 'exec'), ns)
+        # as app.py decorates it: the first pass leaves MediaMTX running, the retry is the old path
+        ns['mediamtx_recovery'] = ns['_mediamtx_patch_try_quiet_first'](ns['mediamtx_recovery'])
         self.ns = ns
 
     def patch(self):
@@ -444,8 +448,23 @@ def test_every_write_into_the_folder_goes_through_put():
 
 def test_the_retry_runs_the_full_path_and_is_not_swallowed():
     rec = _fn('mediamtx_recovery')
-    assert 'except _MtxReclaimNeeded:' in rec
-    assert rec.index('except _MtxReclaimNeeded:') < rec.index('except Exception as e:')
-    assert 'mediamtx_recovery(_try_guarded=False)' in rec
-    # the refresh (which writes the editor file) is never reached on the kept path unless the editor is newer
+    dec = _fn('_mediamtx_patch_try_quiet_first')
+    assert 'except _MtxReclaimNeeded:' in dec
+    assert 'view(_try_guarded=True)' in dec and 'view(_try_guarded=False)' in dec
+    assert dec.index('view(_try_guarded=True)') < dec.index('view(_try_guarded=False)')
+    # the route's own `except Exception` comes after the signal can leave it (it is no Exception)
+    assert 'except _MtxReclaimNeeded' not in rec
+    # the refresh (which writes the editor file) is never reached on the quiet pass unless the editor is newer
     assert rec.index('raise _MtxReclaimNeeded') < rec.index('_mediamtx_editor_refresh(')
+    # decorator order: the route is login-protected, the quiet-first wrapper sits directly on the view
+    assert re.search(r"@app\.route\('/api/mediamtx/recovery', methods=\['POST'\]\)\n@login_required\n"
+                     r"@_mediamtx_patch_try_quiet_first\ndef mediamtx_recovery\(_try_guarded=False\):", APP)
+    # the default is the old path, so a caller that does not know about the flag changes nothing
+    assert 'def mediamtx_recovery(_try_guarded=False):' in APP
+
+
+def test_no_route_is_called_by_name():
+    """redteam-selfaudit route-bound-to-helper: the retry must not call the view by name."""
+    calls = [n for n in ast.walk(_TREE) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == 'mediamtx_recovery']
+    assert calls == []
