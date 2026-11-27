@@ -122922,29 +122922,22 @@ def _ensure_console_restart_timer(settings=None):
 
 
 def _takserver_started_before_package():
-    """ops #1337: True when the running TAK Server process started BEFORE the package's files
-    were last unpacked (so it is still the OLD code), False when it started after, None when
-    that cannot be told. Process start from /proc, unpack time from dpkg's own file list."""
+    """ops #1337: True when TAK Server was last STARTED before the package's files were last
+    unpacked (so what runs is still the OLD code), False when it started after, None when that
+    cannot be told. The unit is a SysV init script (Type=forking, MainPID 0), so there is no
+    process to read: use the time systemd says the unit became active, against dpkg's file list
+    (rewritten at every unpack)."""
     try:
-        pid = 0
         for unit in ('takserver', 'takserver-noplugins'):
-            r = subprocess.run(['systemctl', 'show', '-p', 'MainPID', '--value', unit],
+            r = subprocess.run(['systemctl', 'show', '-p', 'ActiveEnterTimestampMonotonic', '--value', unit],
                                capture_output=True, text=True, timeout=5)
             v = (r.stdout or '').strip()
-            if v.isdigit() and int(v) > 0:
-                pid = int(v)
-                break
-        if not pid:
-            return None
-        rest = open(f'/proc/{pid}/stat').read().rsplit(')', 1)[1].split()
-        started = None
-        for line in open('/proc/stat'):
-            if line.startswith('btime'):
-                started = int(line.split()[1]) + int(rest[19]) / os.sysconf('SC_CLK_TCK')
-                break
-        if started is None:
-            return None
-        return started < os.path.getmtime('/var/lib/dpkg/info/takserver.list')
+            if not (v.isdigit() and int(v) > 0):
+                continue
+            uptime = float(open('/proc/uptime').read().split()[0])
+            active_since = time.time() - (uptime - int(v) / 1e6)
+            return active_since < os.path.getmtime('/var/lib/dpkg/info/takserver.list')
+        return None
     except Exception:
         return None
 

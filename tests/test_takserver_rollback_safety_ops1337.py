@@ -369,29 +369,28 @@ def test_heal_clears_the_state_and_runs_the_database_setup_when_tak_started_afte
     assert any('schema_version 100 -> 105' in l for l in log), log
 
 
-def test_the_jvm_age_check_compares_process_start_with_the_unpack_time():
-    def run_with(unpack_mtime):
+def test_the_start_age_check_compares_the_units_active_time_with_the_unpack_time():
+    # the unit has no MainPID (SysV script, Type=forking): its own active-since time is used
+    def run_with(unpack_mtime, active_usec=900_000_000):
         sub = _Sub()
-        sub.when('MainPID', out='4242\n')
-        stat = '4242 (java) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 30 0 5000 0 0'
+        sub.when('ActiveEnterTimestampMonotonic', out=f'{active_usec}\n')
 
         def fake_open(path, *a, **k):
             import io
-            if path == '/proc/4242/stat':
-                return io.StringIO(stat)
-            if path == '/proc/stat':
-                return io.StringIO('cpu 1 2 3\nbtime 1000\n')
+            if path == '/proc/uptime':
+                return io.StringIO('1000.00 3000.00\n')       # up 1000 s
             raise FileNotFoundError(path)
 
-        fake_os = types.SimpleNamespace(
-            sysconf=lambda k: 100,
-            path=types.SimpleNamespace(getmtime=lambda p: unpack_mtime))
-        ns = {'subprocess': sub, 'os': fake_os, 'open': fake_open}
+        # now = 5000; boot = 4000; the unit became active 900 s after boot = 4900
+        fake_os = types.SimpleNamespace(path=types.SimpleNamespace(getmtime=lambda p: unpack_mtime))
+        ns = {'subprocess': sub, 'os': fake_os, 'open': fake_open,
+              'time': types.SimpleNamespace(time=lambda: 5000.0)}
         _load(ns, ['_takserver_started_before_package'])
-        return ns['_takserver_started_before_package']()      # process started at 1000 + 5000/100 = 1050
+        return ns['_takserver_started_before_package']()
 
-    assert run_with(1100) is True      # package unpacked after the process started: old code running
-    assert run_with(1000) is False     # process started after the unpack
+    assert run_with(4950) is True      # package unpacked after TAK Server started: old code running
+    assert run_with(4800) is False     # TAK Server started after the unpack
+    assert run_with(4950, active_usec=0) is None      # never started: cannot tell
 
 
 # ── 6. a downgrade with no database dump ───────────────────────────────────────────────────
