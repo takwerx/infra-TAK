@@ -105050,7 +105050,7 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
             ulog("  ⚠ Could not compare the installed version with the package (rpm query failed); "
                  "continuing because dnf reported success.")
         elif not _dnf_ok:
-            ulog("  dnf exit was non-zero, but rpm -q confirms the package is installed — continuing.")
+            ulog("  The package manager exited non-zero, but rpm -q confirms the package is installed — continuing.")
 
         # SELinux: the rpm ships apply-selinux.sh — re-apply under enforcing (postinst may reset it).
         _enf = subprocess.run('getenforce 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
