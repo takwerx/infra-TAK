@@ -57184,6 +57184,12 @@ _CT_BUCKET_RE = re.compile(r'^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
 _CT_ENV_LINE_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$')
 _CT_GARAGE_ENDPOINT = 'http://store:3900'
 _CT_MINIO_ENDPOINT = 'http://store:9000'
+# ops #1334: the MinIO program that can read ~/CloudTAK/.docker-store is a Docker image that can
+# never be downloaded again. A copy of it is saved in the CloudTAK folder before the first
+# service is stopped, so no prune or half-finished state can leave the files unreadable.
+_CT_LEGACY_IMAGE_TAR = '.minio-legacy-image.tar'
+_CT_MIGRATE_MARGIN = 1024 ** 3        # free space that must remain after the copy (fleet constant)
+_CT_APP_SERVICES = ['api', 'events', 'tiles', 'retention']   # what the migration stops
 
 
 def _cloudtak_compose_is_garage(cloudtak_dir):
@@ -58485,15 +58491,31 @@ def _cloudtak_print_converge(ct_dir, plog=None):
     return result
 
 
+# ops #1334: what makes ~/CloudTAK more than a checkout: the object store's live data. A re-clone
+# deletes the whole tree, so while either folder exists the tree is repaired in place (only .git is
+# replaced) and nothing else is touched. (.env is not listed: Deploy reads it before the repo prep
+# and writes it back with every secret kept, ops #198.)
+_CT_REMOTE_HAS_DATA_SH = "{ [ -d ~/CloudTAK/.docker-garage ] || [ -d ~/CloudTAK/.docker-store ]; }"
+_CT_LOCAL_DATA_NAMES = ('.docker-garage', '.docker-store')
+
+
+def _cloudtak_has_data(ct_dir):
+    """The names of the data folders / key file a CloudTAK tree holds (see _CT_REMOTE_HAS_DATA_SH)."""
+    return [n for n in _CT_LOCAL_DATA_NAMES if os.path.lexists(os.path.join(ct_dir, n))]
+
+
 def _cloudtak_remote_reclone_sh(release_tag=None):
     """Remote Deploy's repo prep: re-clone ~/CloudTAK (the tag) or pull (no tag). The re-clone
     deletes the whole tree, so the operator's docker-compose.custom.yml (GH #261) is moved aside
     first and put back after — it is theirs, and seeding a fresh one would silently drop their
-    services. A failed clone leaves it in ~/.cloudtak-custom-compose.keep for the next run."""
+    services. A failed clone leaves it in ~/.cloudtak-custom-compose.keep for the next run.
+    ops #1334: a tree that holds data (.docker-garage, .docker-store) is never deleted: a
+    broken checkout there is repaired in place."""
     keep = '~/.cloudtak-custom-compose.keep'
     custom = f'~/CloudTAK/{CLOUDTAK_CUSTOM_COMPOSE}'
     save = f'{{ ! [ -e {custom} -o -L {custom} ] || cp -Pp {custom} {keep}; }} && '
     restore = f' && {{ ! [ -e {keep} -o -L {keep} ] || mv -f {keep} {custom}; }}'
+    repo = 'https://github.com/dfpc-coe/CloudTAK.git'
     if release_tag:
         tag = shlex.quote(release_tag)
         # ops #198: a valid checkout is updated IN PLACE, the same as the local Deploy. The tree
@@ -58505,6 +58527,12 @@ def _cloudtak_remote_reclone_sh(release_tag=None):
             f"cd ~/CloudTAK && git fetch --depth 1 origin tag {tag} && git checkout -f {tag} && "
             "cd ~ && test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml; "
             "else ")
+        repair = (
+            f"if {_CT_REMOTE_HAS_DATA_SH}; then "
+            f"cd ~/CloudTAK && rm -rf .git && git init -q && git remote add origin {repo} && "
+            f"git fetch --depth 1 origin tag {tag} && git checkout -f {tag} && "
+            "cd ~ && test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml; "
+            "else ")
         # Stop a stack that is already there before deleting its tree. The Garage store
         # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
         # it came back during the rm -rf, Docker re-created the folder, and Garage
@@ -58512,21 +58540,23 @@ def _cloudtak_remote_reclone_sh(release_tag=None):
         # mismatch (ops #33 box test, redeploy over an existing remote install). ops #348: `stop`,
         # not `down` — `down` orphans postgis' anonymous data volume (users reset, ops #346).
         return (
-            inplace +
+            inplace + repair +
             "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
             "(cd ~/CloudTAK && docker compose stop) >/dev/null 2>&1 || true; fi; "
             + save +
-            f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {tag} "
-            "https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK" + restore + " && "
+            f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {tag} {repo} ~/CloudTAK" + restore + " && "
             "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml; "
-            "fi"
+            "fi; fi"
         )
     return (
         "if [ -d ~/CloudTAK/.git ]; then "
         "cd ~/CloudTAK && git pull --rebase --autostash; "
+        f"elif {_CT_REMOTE_HAS_DATA_SH}; then "
+        f"cd ~/CloudTAK && rm -rf .git && git init -q && git remote add origin {repo} && "
+        "git fetch --depth 1 origin HEAD && git checkout -f FETCH_HEAD; "
         "else "
         + save +
-        "rm -rf ~/CloudTAK && git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK"
+        f"rm -rf ~/CloudTAK && git clone --depth 1 {repo} ~/CloudTAK"
         + restore + "; "
         "fi; "
         "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
@@ -58574,7 +58604,87 @@ def _cloudtak_legacy_minio_image(cloudtak_dir):
     return ''
 
 
-def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None):
+def _cloudtak_env_parse_text(text):
+    """KEY -> value from the TEXT of a CloudTAK .env (the remote host's, read over SSH)."""
+    out = {}
+    for ln in (text or '').splitlines():
+        m = _CT_ENV_LINE_RE.match(ln.rstrip('\n'))
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def _cloudtak_keep_legacy_image(cloudtak_dir, img, plog, remote_cfg=None):
+    """ops #1334: save the MinIO image into the CloudTAK folder (docker save), once, BEFORE any
+    service is stopped. MinIO can no longer be downloaded, and the image is unused whenever the
+    store container is Garage, so `docker image prune -af` (or a recreate) would delete the only
+    program that can read .docker-store. Best effort: a box that cannot save it still migrates
+    as before. Returns True when a copy is there."""
+    try:
+        if remote_cfg is not None:
+            ok, _ = _ssh_probe(remote_cfg, f"test -s ~/CloudTAK/{_CT_LEGACY_IMAGE_TAR}", timeout=20)
+            if ok:
+                return True
+            ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && docker save -o {_CT_LEGACY_IMAGE_TAR} {shlex.quote(img)}",
+                                 timeout=900)
+        else:
+            tar = os.path.join(cloudtak_dir, _CT_LEGACY_IMAGE_TAR)
+            if os.path.isfile(tar) and os.path.getsize(tar) > 0:
+                return True
+            rc, _o, err = _cloudtak_docker(['docker', 'save', '-o', tar, img], timeout=900)
+            ok, out = rc == 0, err
+        if ok:
+            plog("  ✓ Saved a copy of the MinIO program in ~/CloudTAK (it cannot be downloaded again)")
+        else:
+            plog(f"  ⚠ Could not save a copy of the MinIO program: {(out or '').strip()[-200:]}")
+        return bool(ok)
+    except Exception as e:
+        plog(f"  ⚠ Could not save a copy of the MinIO program: {str(e)[:200]}")
+        return False
+
+
+def _cloudtak_load_legacy_image(cloudtak_dir, plog, remote_cfg=None):
+    """ops #1334: the MinIO image from the copy `_cloudtak_keep_legacy_image()` saved, for a box
+    where Docker no longer holds it. '' when there is no copy or it will not load."""
+    try:
+        if remote_cfg is not None:
+            ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && test -s {_CT_LEGACY_IMAGE_TAR} && "
+                                 f"docker load -i {_CT_LEGACY_IMAGE_TAR}", timeout=600)
+        else:
+            tar = os.path.join(cloudtak_dir, _CT_LEGACY_IMAGE_TAR)
+            if not (os.path.isfile(tar) and os.path.getsize(tar) > 0):
+                return ''
+            rc, out, err = _cloudtak_docker(['docker', 'load', '-i', tar], timeout=600)
+            ok, out = rc == 0, (out or '') + (err or '')
+        if not ok:
+            return ''
+        for ln in (out or '').splitlines():
+            m = re.match(r'^Loaded image:\s*(\S+)\s*$', ln.strip())
+            if m and 'minio' in m.group(1).lower() and _CT_IMAGE_REF_RE.match(m.group(1)):
+                plog(f"  ✓ Loaded the saved MinIO program ({m.group(1)})")
+                return m.group(1)
+    except Exception:
+        pass
+    return ''
+
+
+def _cloudtak_rclone_bytes(out):
+    """Bytes from `rclone size --json` output, or None when it cannot be read."""
+    m = re.search(r'\{[^{}]*"bytes"\s*:\s*(\d+)[^{}]*\}', out or '')
+    return int(m.group(1)) if m else None
+
+
+def _cloudtak_migrate_space_short(need_bytes, free_bytes):
+    """None when `need_bytes` of new files fit in `free_bytes` with the margin left over, else the
+    number of bytes missing. An unreadable number (None) never blocks, as in the Update check."""
+    if need_bytes is None or free_bytes is None:
+        return None
+    short = need_bytes + _CT_MIGRATE_MARGIN - free_bytes
+    return short if short > 0 else None
+
+
+def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None,
+                                      restart_on_fail=False, remote_cfg=None):
     """Copy .docker-store (MinIO) into Garage, verify, archive. Returns (ok, error).
 
     Upstream's `cloudtak.sh migrate-store`, step for step — stop the services that use the
@@ -58582,92 +58692,170 @@ def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None
     MinIO, move .docker-store aside — with one deliberate difference: `rclone copy --update`
     and `check --one-way` instead of `sync`/`check`, so this can never delete or downgrade a
     file already in Garage. On ANY failure .docker-store is left exactly where it was —
-    nothing is archived until the copy verified."""
+    nothing is archived until the copy verified.
+
+    ops #1334: `remote_cfg` runs the same steps on the remote CloudTAK host (upstream's own
+    script does `rclone sync` there). `restart_on_fail=True` starts the services this function
+    stopped again when it fails, for callers that have no rollback of their own (Deploy, Update
+    config, the startup repair); the Update path rolls the whole stack back instead."""
+    remote = remote_cfg is not None
     bucket = env.get('ASSET_BUCKET', '')
     if not _CT_BUCKET_RE.match(bucket):
         return False, 'ASSET_BUCKET is missing or invalid in CloudTAK .env'
     if not env.get('MINIO_ROOT_USER') or not env.get('MINIO_ROOT_PASSWORD'):
         return False, 'MINIO_ROOT_USER / MINIO_ROOT_PASSWORD are missing from CloudTAK .env — the MinIO data cannot be read'
     img = legacy_image if (legacy_image and _CT_IMAGE_REF_RE.match(legacy_image)) else ''
-    img = img or _cloudtak_legacy_minio_image(cloudtak_dir)
+    if not img and not remote:
+        img = _cloudtak_legacy_minio_image(cloudtak_dir)
+    img = img or _cloudtak_load_legacy_image(cloudtak_dir, plog, remote_cfg)
     if not img:
         return False, ('no MinIO image is cached on this box to read .docker-store with, and MinIO can no '
                        'longer be downloaded from any registry. Your files are safe in ~/CloudTAK/.docker-store.')
     env_path = os.path.join(cloudtak_dir, '.env')
-    _cloudtak_env_set(env_path, {'MINIO_LEGACY_IMAGE': img})
+
+    def _env_img(value):
+        """Put MINIO_LEGACY_IMAGE in .env (compose interpolates it), or drop it (value None)."""
+        if not remote:
+            if value:
+                _cloudtak_env_set(env_path, {'MINIO_LEGACY_IMAGE': value})
+            else:
+                _cloudtak_env_set(env_path, remove=('MINIO_LEGACY_IMAGE',))
+            return
+        if value:
+            q = shlex.quote(value)
+            sh = ("cd ~/CloudTAK && if grep -q '^MINIO_LEGACY_IMAGE=' .env; then "
+                  f"sed -i 's|^MINIO_LEGACY_IMAGE=.*|MINIO_LEGACY_IMAGE='{q}'|' .env; else "
+                  "{ [ -z \"$(tail -c1 .env)\" ] || echo >> .env; }; "
+                  f"echo MINIO_LEGACY_IMAGE={q} >> .env; fi")
+        else:
+            sh = "cd ~/CloudTAK && sed -i '/^MINIO_LEGACY_IMAGE=/d' .env"
+        _ssh_probe(remote_cfg, sh, timeout=30)
+
+    def _run(args, timeout=600):
+        return _cloudtak_compose_at(cloudtak_dir, args, remote_cfg=remote_cfg, timeout=timeout)
+
+    _cloudtak_keep_legacy_image(cloudtak_dir, img, plog, remote_cfg)
+    _env_img(img)
     plog(f"  Moving CloudTAK's files from MinIO to Garage (reading them with {img})")
     plog("  CloudTAK is stopped while the files are copied")
     mig = ['--profile', 'migrate']
 
     def _step(label, args, timeout=600):
-        rc, out = _cloudtak_compose_run(cloudtak_dir, args, timeout=timeout)
+        rc, out = _run(args, timeout=timeout)
         plog(f"  {'✓' if rc == 0 else '✗'} {label}" + ('' if rc == 0 else f": {out.strip()[-400:]}"))
         return rc == 0, out
 
     def _cleanup():
-        _cloudtak_compose_run(cloudtak_dir, mig + ['rm', '-sf', 'minio-legacy'], timeout=120)
+        _run(mig + ['rm', '-sf', 'minio-legacy'], timeout=120)
 
-    ok, _ = _step('Stopped CloudTAK services', ['stop', 'api', 'events', 'tiles', 'retention'])
-    if not ok:
-        return False, 'could not stop the CloudTAK services'
-    ok, out = _step('Started Garage and the legacy MinIO',
-                    mig + ['up', '-d', '--pull', 'missing', 'store', 'minio-legacy'], timeout=900)
-    if not ok:
+    def _fail(msg):
+        """Every failure after the first stop: clean up, and (when asked) start the services again."""
         _cleanup()
-        return False, 'could not start Garage and the legacy MinIO (output above)'
-    rclone = mig + ['run', '--rm', '--quiet-pull', 'migrate']
-    for side in ('garage', 'minio'):
-        for _i in range(30):
-            rc, out = _cloudtak_compose_run(cloudtak_dir, rclone + ['lsd', f'{side}:'], timeout=180)
-            if rc == 0:
-                break
-            time.sleep(2)
-        else:
-            _cleanup()
-            return False, f'the {side} store never answered: ' + out.strip()[-300:]
-    # `copy --update`, NOT upstream's `sync`: sync makes Garage MATCH the source, deleting
-    # whatever the source lacks. If anything ever starts minio-legacy after a migration, docker
-    # recreates .docker-store and MinIO initialises it as a fresh EMPTY store (seen on test12,
-    # 2026-10-07) — a sync from that would wipe Garage. copy never deletes, and --update never
-    # replaces a newer file already in Garage. For a first migration into an empty Garage the
-    # result is identical to sync.
-    ok, out = _step('Copied files from MinIO to Garage',
-                    rclone + ['copy', '--update', '-v', f'minio:{bucket}', f'garage:{bucket}'], timeout=7200)
-    if not ok:
-        _cleanup()
-        return False, 'copying the files failed (rclone output above)'
-    _n = sum(1 for l in out.splitlines() if ': Copied (' in l)
-    plog(f"    {_n} file(s) copied")
-    # --one-way: every MinIO file must be in Garage; files only Garage has are fine.
-    ok, out = _step('Verified every file arrived (rclone check)',
-                    rclone + ['check', '--one-way', '--size-only', f'minio:{bucket}', f'garage:{bucket}'],
-                    timeout=3600)
-    if not ok:
-        _cleanup()
-        return False, 'verification failed — not every file arrived (rclone output above)'
-    _cleanup()
-    src = os.path.join(cloudtak_dir, '.docker-store')
-    archive = os.path.join(cloudtak_dir, '.docker-store-migrated-' + time.strftime('%Y%m%d_%H%M%S'))
+        if restart_on_fail:
+            rc, out = _run(['start'] + _CT_APP_SERVICES, timeout=300)
+            plog("  ✓ CloudTAK was started again. Your files are still in ~/CloudTAK/.docker-store." if rc == 0
+                 else f"  ⚠ CloudTAK could not be started again: {(out or '').strip()[-300:]}")
+        return False, msg
+
     try:
-        os.rename(src, archive)
-    except OSError:
-        r = subprocess.run(_sudo_wrap(['mv', src, archive]), capture_output=True, text=True, timeout=120)
-        if r.returncode != 0:
-            return False, ('files copied and verified, but .docker-store could not be moved aside: '
-                           + (r.stderr or '').strip()[:200])
-    _cloudtak_env_set(env_path, remove=('MINIO_LEGACY_IMAGE',))
-    plog(f"  ✓ Old MinIO data kept at ~/CloudTAK/{os.path.basename(archive)} — remove it once CloudTAK checks out")
-    return True, ''
+        ok, _ = _step('Stopped CloudTAK services', ['stop'] + _CT_APP_SERVICES)
+        if not ok:
+            return _fail('could not stop the CloudTAK services')
+        ok, out = _step('Started Garage and the legacy MinIO',
+                        mig + ['up', '-d', '--pull', 'missing', 'store', 'minio-legacy'], timeout=900)
+        if not ok:
+            return _fail('could not start Garage and the legacy MinIO (output above)')
+        rclone = mig + ['run', '--rm', '--quiet-pull', 'migrate']
+        for side in ('garage', 'minio'):
+            for _i in range(30):
+                rc, out = _run(rclone + ['lsd', f'{side}:'], timeout=180)
+                if rc == 0:
+                    break
+                time.sleep(2)
+            else:
+                return _fail(f'the {side} store never answered: ' + out.strip()[-300:])
+        # ops #1334: the copy needs room. Garage keeps its own copy of every file next to
+        # .docker-store (same disk), and the Update check only sizes the Docker images.
+        rc, out = _run(rclone + ['size', '--json', f'minio:{bucket}'], timeout=1800)
+        src_bytes = _cloudtak_rclone_bytes(out) if rc == 0 else None
+        rc, out = _run(rclone + ['size', '--json', f'garage:{bucket}'], timeout=1800)
+        have_bytes = _cloudtak_rclone_bytes(out) if rc == 0 else 0
+        if src_bytes is not None:
+            if remote:
+                _fid, _free = _cloudtak_fs_free_remote(remote_cfg, '$HOME/CloudTAK')
+            else:
+                _fid, _free = _cloudtak_fs_free_local(cloudtak_dir)
+            _short = _cloudtak_migrate_space_short(max(0, src_bytes - (have_bytes or 0)), _free)
+            if _short:
+                gb = 1024 ** 3
+                plog(f"  ✗ Not enough free disk space to copy CloudTAK's files: they are {src_bytes / gb:.1f} GB, "
+                     f"and {(_free or 0) / gb:.1f} GB is free (about {(_short + gb - 1) // gb:.0f} GB more is needed, "
+                     "with 1 GB to spare). Nothing was moved.")
+                plog("  Free some space (old logs or backups), then run this again. Do NOT run "
+                     "`docker image prune -a`: it would delete the only program that can read these files.")
+                return _fail('not enough free disk space to copy the files')
+        # `copy --update`, NOT upstream's `sync`: sync makes Garage MATCH the source, deleting
+        # whatever the source lacks. If anything ever starts minio-legacy after a migration, docker
+        # recreates .docker-store and MinIO initialises it as a fresh EMPTY store (seen on test12,
+        # 2026-10-07) — a sync from that would wipe Garage. copy never deletes, and --update never
+        # replaces a newer file already in Garage. For a first migration into an empty Garage the
+        # result is identical to sync.
+        ok, out = _step('Copied files from MinIO to Garage',
+                        rclone + ['copy', '--update', '-v', f'minio:{bucket}', f'garage:{bucket}'], timeout=7200)
+        if not ok:
+            return _fail('copying the files failed (rclone output above)')
+        _n = sum(1 for l in out.splitlines() if ': Copied (' in l)
+        plog(f"    {_n} file(s) copied")
+        # --one-way: every MinIO file must be in Garage; files only Garage has are fine.
+        ok, out = _step('Verified every file arrived (rclone check)',
+                        rclone + ['check', '--one-way', '--size-only', f'minio:{bucket}', f'garage:{bucket}'],
+                        timeout=3600)
+        if not ok:
+            return _fail('verification failed — not every file arrived (rclone output above)')
+        _cleanup()
+        archive_name = '.docker-store-migrated-' + time.strftime('%Y%m%d_%H%M%S')
+        if remote:
+            ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && {{ mv .docker-store {archive_name} || "
+                                 f"sudo -n mv .docker-store {archive_name}; }}", timeout=120)
+            if not ok:
+                return _fail('files copied and verified, but .docker-store could not be moved aside: '
+                             + (out or '').strip()[:200])
+        else:
+            src = os.path.join(cloudtak_dir, '.docker-store')
+            archive = os.path.join(cloudtak_dir, archive_name)
+            try:
+                os.rename(src, archive)
+            except OSError:
+                r = subprocess.run(_sudo_wrap(['mv', src, archive]), capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    return _fail('files copied and verified, but .docker-store could not be moved aside: '
+                                 + (r.stderr or '').strip()[:200])
+        _env_img(None)
+        # the saved MinIO program is not needed any more (the files are in Garage and archived)
+        try:
+            if remote:
+                _ssh_probe(remote_cfg, f"rm -f ~/CloudTAK/{_CT_LEGACY_IMAGE_TAR}", timeout=30)
+            else:
+                subprocess.run(_sudo_wrap(['rm', '-f', os.path.join(cloudtak_dir, _CT_LEGACY_IMAGE_TAR)]),
+                               capture_output=True, text=True, timeout=60)
+        except Exception:
+            pass
+        plog(f"  ✓ Old MinIO data kept at ~/CloudTAK/{archive_name} — remove it once CloudTAK checks out")
+        return True, ''
+    except Exception as e:
+        return _fail(f'migration error: {str(e)[:300]}')
 
 
-def _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=None, start=True):
+def _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=None, start=True, restart_on_fail=False):
     """Bring a Garage-based CloudTAK tree to a working store. Returns (ok, error). Never raises.
 
     No-op for a MinIO-era tree. Otherwise, in upstream's order:
       1. GARAGE_RPC_SECRET (64 hex, not all zeros) and AWS_S3_Endpoint=http://store:3900 in .env
       2. MinIO data still in .docker-store -> _cloudtak_migrate_minio_to_garage()
       3. `docker compose up -d` when start=True
-    The caller decides what a failure means (the Update path rolls back; boot just reports)."""
+    The caller decides what a failure means (the Update path rolls back; boot just reports).
+    ops #1334: `restart_on_fail=True` starts the services the migration stopped when it fails,
+    for the callers with no rollback of their own (Deploy, Update config, the startup repair)."""
     try:
         if not _cloudtak_compose_is_garage(cloudtak_dir):
             return True, ''
@@ -58688,7 +58876,8 @@ def _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=None, start=True)
             if 'AWS_S3_Endpoint' in upd:
                 plog(f"  ✓ CloudTAK now talks to the Garage store ({_CT_GARAGE_ENDPOINT})")
         if os.path.isdir(os.path.join(cloudtak_dir, '.docker-store')):
-            ok, err = _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image)
+            ok, err = _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image,
+                                                         restart_on_fail=restart_on_fail)
             if not ok:
                 return False, err
         if start:
@@ -59491,11 +59680,12 @@ def _cloudtak_remote_compose_is_garage(remote_cfg):
         return False
 
 
-def _cloudtak_remote_garage_sh(legacy_image=''):
+def _cloudtak_remote_garage_sh():
     """Shell for the remote host: secret + endpoint in .env (upstream's ensure_rpc_secret and
-    endpoint rewrite), then upstream's migrate-store when MinIO data is still in .docker-store."""
-    img = legacy_image if (legacy_image and _CT_IMAGE_REF_RE.match(legacy_image)) else ''
-    mig_env = f"MINIO_LEGACY_IMAGE={shlex.quote(img)} " if img else ''
+    endpoint rewrite). ops #1334: it no longer runs upstream's `./cloudtak.sh migrate-store` —
+    that script copies with `rclone sync` (cloudtak.sh in 13.127.0, line 485), which can delete
+    newer Garage files, and it leaves the services stopped when it fails. The move itself is
+    `_cloudtak_migrate_minio_to_garage(remote_cfg=...)`, the same steps as on this box."""
     return (
         "set -e; cd ~/CloudTAK; "
         "cur=$(grep '^GARAGE_RPC_SECRET=' .env | head -n1 | cut -d= -f2-); "
@@ -59504,8 +59694,28 @@ def _cloudtak_remote_garage_sh(legacy_image=''):
         "  sed -i '/^GARAGE_RPC_SECRET=/d' .env; echo \"GARAGE_RPC_SECRET=$s\" >> .env; "
         "  echo 'Generated the Garage store secret (GARAGE_RPC_SECRET)'; fi; "
         "if grep -q '^AWS_S3_Endpoint=' .env; then sed -i 's|^AWS_S3_Endpoint=.*|AWS_S3_Endpoint=http://store:3900|' .env; "
-        "else echo 'AWS_S3_Endpoint=http://store:3900' >> .env; fi; "
-        f"if [ -d .docker-store ]; then {mig_env}./cloudtak.sh migrate-store; fi")
+        "else echo 'AWS_S3_Endpoint=http://store:3900' >> .env; fi")
+
+
+def _cloudtak_remote_garage_converge(remote_cfg, plog, legacy_image='', restart_on_fail=False):
+    """`_cloudtak_garage_converge()` for the remote CloudTAK host: secret and endpoint in .env,
+    then any MinIO data moved into Garage. Returns (ok, error). Never raises."""
+    try:
+        ok, out = _ssh_probe(remote_cfg, _cloudtak_remote_garage_sh(), timeout=300)
+        for _l in (out or '').strip().splitlines()[-10:]:
+            plog(f"  {_l}")
+        if not ok:
+            return False, 'could not write the Garage secret and endpoint to the remote .env'
+        if not _ssh_probe(remote_cfg, "test -d ~/CloudTAK/.docker-store", timeout=20)[0]:
+            return True, ''
+        ok_env, env_text = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env', timeout=20)
+        if not ok_env:
+            return False, 'could not read the remote CloudTAK .env'
+        return _cloudtak_migrate_minio_to_garage('~/CloudTAK', _cloudtak_env_parse_text(env_text), plog,
+                                                  legacy_image=legacy_image or None,
+                                                  restart_on_fail=restart_on_fail, remote_cfg=remote_cfg)
+    except Exception as e:
+        return False, f'Garage store setup error on the remote host: {str(e)[:300]}'
 
 
 def _cloudtak_remote_media_bufs(remote_cfg, plog):
@@ -60526,6 +60736,17 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
         return []
 
 
+def _cloudtak_version_is_newer(have, release_tag):
+    """True when the CloudTAK version `have` (x.y.z) is newer than the release tag `release_tag`.
+    False when either cannot be read, so a number we cannot read never blocks a Deploy."""
+    try:
+        _have = tuple(int(x) for x in re.findall(r'\d+', have or '')[:3])
+        _want = tuple(int(x) for x in re.findall(r'\d+', release_tag or '')[:3])
+    except Exception:
+        return False
+    return bool(_have and _want and _want < _have)
+
+
 def run_cloudtak_deploy(cfg=None):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -60606,6 +60827,17 @@ def run_cloudtak_deploy(cfg=None):
                     return
                 plog(f"  Old MinIO folder on the remote host: installing {_rt} first (CloudTAK 14 cannot move it into Garage).")
                 remote_release_tag = _rt
+            # ops #1334: the same never-downgrade guard as Update (see the local Deploy).
+            _rv_now = ''
+            try:
+                _rv_now = _cloudtak_running_version(None, remote_cfg=remote_cfg)
+            except Exception:
+                pass
+            if _cloudtak_version_is_newer(_rv_now, remote_release_tag):
+                plog(f"✓ CloudTAK {_rv_now} is newer than the version we test ({remote_release_tag}). Nothing to do.")
+                plog("  Nothing was changed and CloudTAK is still running as before.")
+                cloudtak_deploy_status.update({'running': False, 'error': False})
+                return
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
             else:
@@ -60679,12 +60911,11 @@ def run_cloudtak_deploy(cfg=None):
             plog("✓ Remote .env and override written")
             # v10.2.7: Garage (CloudTAK >= 13.102.0) — secret, endpoint, and any MinIO data moved.
             if _cloudtak_remote_compose_is_garage(remote_cfg):
-                _gok, _gout = _ssh_probe(remote_cfg, _cloudtak_remote_garage_sh(_cloudtak_remote_legacy_image(remote_cfg)),
-                                         timeout=7200)
-                for _l in (_gout or '').strip().splitlines()[-25:]:
-                    plog(f"  {_l}")
+                # ops #1334: on a failure the services the move stopped are started again.
+                _gok, _gerr = _cloudtak_remote_garage_converge(
+                    remote_cfg, plog, legacy_image=_cloudtak_remote_legacy_image(remote_cfg), restart_on_fail=True)
                 if not _gok:
-                    plog("✗ Garage store setup failed on the remote host (output above)")
+                    plog(f"✗ Garage store setup failed on the remote host: {_gerr}")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
 
@@ -60820,6 +61051,18 @@ def run_cloudtak_deploy(cfg=None):
                 return
             plog(f"  Old MinIO folder found: installing {_dh_tag} first (CloudTAK 14 cannot move it into Garage).")
             release_tag = _dh_tag
+        # ops #1334: Deploy has the same "never downgrade" guard as Update. When the release lookup
+        # fails the pin (13.127.0) is used, and over a CloudTAK 14 box that is a downgrade.
+        _dv_now = ''
+        try:
+            _dv_now = _cloudtak_running_version(cloudtak_dir)
+        except Exception:
+            pass
+        if _cloudtak_version_is_newer(_dv_now, release_tag):
+            plog(f"✓ CloudTAK {_dv_now} is newer than the version we test ({release_tag}). Nothing to do.")
+            plog("  Nothing was changed and CloudTAK is still running as before.")
+            cloudtak_deploy_status.update({'running': False, 'error': False})
+            return
         if os.path.exists(cloudtak_dir):
             # A real checkout needs a VALID repo, not merely a .git directory — a deleted or
             # interrupted CloudTAK can leave a HOLLOW .git (objects/ + info/ but no HEAD/config),
@@ -60936,6 +61179,15 @@ def run_cloudtak_deploy(cfg=None):
         compose_yml = os.path.join(cloudtak_dir, 'docker-compose.yml')
         compose_yaml = os.path.join(cloudtak_dir, 'compose.yaml')
         if not os.path.exists(compose_yml) and not os.path.exists(compose_yaml):
+            # ops #1334: this re-clone deletes the whole tree, and the keep-aside below carries only
+            # plugin state. A tree that holds the object store's data or its keys is never deleted.
+            _held = _cloudtak_has_data(cloudtak_dir)
+            if _held:
+                plog(f"✗ ~/CloudTAK has no docker-compose.yml, and it holds your data ({', '.join(_held)}).")
+                plog("  Nothing was deleted and nothing was changed. A re-clone would delete that data.")
+                plog("  Check that the CloudTAK release could be downloaded (GitHub, DNS), then run Deploy again.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
             plog("  docker-compose.yml missing — re-cloning...")
             # GH #261: the operator's compose file is theirs — carry it across the re-clone.
             # ops #216: and TAK Portal's plugins, route files, overlays and repo copies.
@@ -61203,14 +61455,22 @@ def run_cloudtak_deploy(cfg=None):
             plog("1. Check system resources:")
             plog("     df -h  # Ensure you have ≥20GB free disk")
             plog("     free -h  # Ensure you have ≥8GB free RAM")
+            _held = _cloudtak_has_data(cloudtak_dir)
             plog("2. Clean up docker state:")
             plog(f"     cd {cloudtak_dir} && sudo docker compose down --remove-orphans")
-            plog("     sudo docker system prune -a --volumes  # WARNING: removes ALL unused images/volumes")
+            if _held:
+                # ops #1334: `prune -a` removes the MinIO image that is the only reader of
+                # .docker-store, `--volumes` the database volume, and rm -rf the data folders.
+                plog("     sudo docker builder prune -af   # unused build cache only")
+                plog(f"   Do NOT run `docker system prune -a --volumes` or delete {cloudtak_dir}: it holds your data ({', '.join(_held)}).")
+            else:
+                plog("     sudo docker system prune -a --volumes  # WARNING: removes ALL unused images/volumes")
             plog("3. Retry deploy from console, or manually:")
             plog(f"     cd {cloudtak_dir} && sudo docker compose build --no-cache")
-            plog("4. If failure persists, you may need to re-clone CloudTAK:")
-            plog(f"     sudo rm -rf {cloudtak_dir}")
-            plog("     (then retry deploy from console)")
+            if not _held:
+                plog("4. If failure persists, you may need to re-clone CloudTAK:")
+                plog(f"     sudo rm -rf {cloudtak_dir}")
+                plog("     (then retry deploy from console)")
             plog("")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
@@ -61223,7 +61483,7 @@ def run_cloudtak_deploy(cfg=None):
         if _cloudtak_compose_is_garage(cloudtak_dir):
             plog("")
             plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
-            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False)
+            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False, restart_on_fail=True)
             if not _gok:
                 plog(f"✗ Garage store setup failed: {_gerr}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -61656,17 +61916,26 @@ def run_cloudtak_redeploy(cfg=None):
                 plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
-            _g_sh = ''
-            if _cloudtak_remote_compose_is_garage(remote_cfg):
-                _g_sh = '( ' + _cloudtak_remote_garage_sh(_cloudtak_remote_legacy_image(remote_cfg)) + ' ) && '
-            cmd = (
+            # ops #1334: the files move is its own step (it used to ride in this one command), so a
+            # failure starts the stopped services again and says why.
+            ok, out = _ssh_probe(
+                remote_cfg,
                 "mv /tmp/.env ~/CloudTAK/.env && chmod 600 ~/CloudTAK/.env && "
                 "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
-                "( " + _cloudtak_remote_custom_compose_sh() + " ) && "   # GH #261
-                + _g_sh +
-                "cd ~/CloudTAK && docker compose up -d"
-            )
-            ok, out = _ssh_probe(remote_cfg, cmd, timeout=7200 if _g_sh else 180)
+                "( " + _cloudtak_remote_custom_compose_sh() + " )",   # GH #261
+                timeout=60)
+            if not ok:
+                plog(f"✗ Could not place the CloudTAK config on the remote host: {(out or '')[:200]}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            if _cloudtak_remote_compose_is_garage(remote_cfg):
+                _gok, _gerr = _cloudtak_remote_garage_converge(
+                    remote_cfg, plog, legacy_image=_cloudtak_remote_legacy_image(remote_cfg), restart_on_fail=True)
+                if not _gok:
+                    plog(f"✗ Garage store setup failed on the remote host: {_gerr}")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
+            ok, out = _ssh_probe(remote_cfg, "cd ~/CloudTAK && docker compose up -d", timeout=180)
             if not ok:
                 plog(f"✗ Restart failed: {(out or '')[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -61734,7 +62003,7 @@ def run_cloudtak_redeploy(cfg=None):
         # and MinIO data still in .docker-store has to move into Garage first (upstream's
         # migrate-store, same steps). No-op on a MinIO-era tree.
         if _cloudtak_compose_is_garage(cloudtak_dir):
-            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False)
+            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False, restart_on_fail=True)
             if not _gok:
                 plog(f"✗ Garage store setup failed: {_gerr}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -62695,9 +62964,27 @@ def _cloudtak_update_space_problem(cloudtak_dir, remote_cfg=None):
     return None
 
 
-def _cloudtak_update_space_lines(problem):
-    """The log lines for a refused Update: what is short, that nothing changed, what to do."""
+def _cloudtak_update_space_lines(problem, minio_store=False):
+    """The log lines for a refused Update: what is short, that nothing changed, what to do.
+
+    ops #1334: `minio_store=True` (the box still has ~/CloudTAK/.docker-store) leaves out
+    `docker image prune -af`. The old MinIO program is a Docker image nobody can download any more,
+    it is unused while the store container is Garage, and it is the only thing that can read the
+    files in .docker-store, so that prune would make them unreadable."""
     gb = 1024 ** 3
+    if minio_store:
+        return [
+            f"✗ Not enough free disk space to update CloudTAK: {problem['free'] / gb:.1f} GB free for "
+            f"{problem['what']} ({problem['where']}); the update needs about {problem['need'] / gb:.0f} GB.",
+            "  Nothing was changed. CloudTAK is still running as before.",
+            "  Free some space, then press Update again. A safe way: run `docker builder prune -af` on this",
+            "  server (unused build cache), and delete old logs or backups.",
+            "  Do NOT run `docker image prune -a` or `docker system prune -a` yet: this server still has your",
+            "  files in the old MinIO folder (~/CloudTAK/.docker-store), and the MinIO program that reads",
+            "  them is a Docker image that cannot be downloaded again. Those commands would delete it.",
+            "  Do not delete Docker volumes: they hold your data.",
+            "  " + _FREE_SPACE_BACKUPS_HINT,
+        ]
     return [
         f"✗ Not enough free disk space to update CloudTAK: {problem['free'] / gb:.1f} GB free for "
         f"{problem['what']} ({problem['where']}); the update needs about {problem['need'] / gb:.0f} GB.",
@@ -62802,7 +63089,7 @@ def run_cloudtak_update():
         _space = _cloudtak_update_space_problem(None if is_remote else os.path.expanduser('~/CloudTAK'),
                                                 remote_cfg=(remote_cfg if is_remote else None))
         if _space:
-            for _l in _cloudtak_update_space_lines(_space):
+            for _l in _cloudtak_update_space_lines(_space, minio_store=bool(_store_now)):
                 plog(_l)
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
@@ -63065,11 +63352,9 @@ def run_cloudtak_update():
             if _cloudtak_remote_compose_is_garage(remote_cfg):
                 plog("")
                 plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
-                _gok, _gout = _ssh_probe(remote_cfg, _cloudtak_remote_garage_sh(legacy_minio_img), timeout=7200)
-                for _l in (_gout or '').strip().splitlines()[-25:]:
-                    plog(f"  {_l}")
+                _gok, _gerr = _cloudtak_remote_garage_converge(remote_cfg, plog, legacy_image=legacy_minio_img)
                 if not _gok:
-                    plog("✗ Garage store setup failed on the remote host (output above)")
+                    plog(f"✗ Garage store setup failed on the remote host: {_gerr}")
                     _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog)
                     _cloudtak_restore_images(_ct_snap, plog, remote_cfg=remote_cfg)
                     plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
@@ -128888,7 +129173,7 @@ try:
                 cloudtak_deploy_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}")
                 print(f"[startup-garage] {m}", flush=True)
             _gl("CloudTAK store repair: this CloudTAK version keeps its files in Garage — finishing the switch")
-            _ok, _err = _cloudtak_garage_converge(_ct, _gl, start=True)
+            _ok, _err = _cloudtak_garage_converge(_ct, _gl, start=True, restart_on_fail=True)
             _gl("✓ CloudTAK store repaired — CloudTAK is running on Garage" if _ok
                 else f"✗ CloudTAK store repair failed: {_err}")
             cloudtak_deploy_status.update({'running': False, 'complete': _ok, 'error': not _ok})
