@@ -44,7 +44,8 @@ PAGE = (REPO / 'templates' / 'fail2ban.html').read_text(encoding='utf-8')
 FUNCS = ('_f2b_starlink_state_path', '_f2b_starlink_load', '_f2b_starlink_save',
          '_f2b_starlink_enabled', '_f2b_starlink_cidrs', '_f2b_starlink_known',
          '_f2b_starlink_parse', '_f2b_starlink_fetch', '_f2b_starlink_refresh',
-         '_f2b_starlink_status', '_f2b_fleet_ignore_cidrs', '_f2b_trusted_ignoreip',
+         '_f2b_starlink_status', '_f2b_fleet_ignore_cidrs', '_f2b_retired_cidrs',
+         '_f2b_trusted_ignoreip',
          '_f2b_operator_extra', '_f2b_hide_starlink', '_f2b_selfheal_trusted_ignoreip')
 
 
@@ -210,6 +211,21 @@ def test_off_again_strips_them_even_from_a_stored_line(ns):
     ns['_settings']['fail2ban_never_ban_starlink'] = False
     # the operator's own entry survives; no Starlink range is kept as if typed
     assert ns['_f2b_operator_extra'](stored).split() == ['203.0.113.5']
+
+
+def test_works_beside_a_removed_trusted_address(ns):
+    """Starlink on and an address taken off Trusted networks (ops #1286): a jail rewrite
+    keeps the Starlink ranges and the operator's own entry, and drops the removed one."""
+    ns['_f2b_starlink_refresh'](force=True)
+    ns['_settings']['fail2ban_never_ban_starlink'] = True
+    ns['_settings']['fail2ban_ignore_cidrs'] = '198.51.100.9'
+    stored = ns['_f2b_trusted_ignoreip']('203.0.113.5')
+    ns['_settings']['fail2ban_ignore_cidrs'] = ''
+    ns['_settings']['fail2ban_ignore_retired'] = '198.51.100.9'
+    assert ns['_f2b_operator_extra'](stored).split() == ['203.0.113.5']
+    after = ns['_f2b_trusted_ignoreip'](ns['_f2b_operator_extra'](stored)).split()
+    assert '198.51.100.9' not in after and '203.0.113.5' in after
+    assert any(t.startswith('98.97.') for t in after)
 
 
 def test_page_field_hides_the_ranges(ns):

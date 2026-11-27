@@ -154,7 +154,7 @@
 <div id="group-names-warning" style="display:none;margin-top:14px;padding:12px 14px;border:1px solid var(--red);border-radius:8px;background:rgba(239,68,68,.08)">
 <div style="font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:600;color:var(--red);margin-bottom:6px">⚠ Group names that need a look</div>
 <div id="group-names-rows" style="display:flex;flex-direction:column;gap:4px;font-family:'JetBrains Mono',monospace;font-size:11px"></div>
-<div style="margin-top:8px;font-size:11px;color:var(--text-secondary);line-height:1.5">Authentik gives a person's groups to each app as one list with a separator between the names. A group name that holds a separator can be read by an app as a different group, and that can give its members access they should not have. If you did not make this group on purpose, check who made it and who is in it (Authentik Admin → Directory → Groups), then rename or delete it. infra-TAK does not change it for you.</div>
+<div style="margin-top:8px;font-size:11px;color:var(--text-secondary);line-height:1.5">Authentik gives a person's groups to each app as one list with a separator between the names. A group name that holds a separator can be read by an app as a different group, and that can give its members access they should not have. TAK Portal 2.0.42 refuses these characters in new group names, but it does not clean old ones. To fix a name: Authentik Admin → Directory → Groups → rename the group so it has no <code>|</code>, <code>;</code> or <code>,</code>. First check who made it and who is in it, because a rename can change who has access. infra-TAK does not rename it for you.</div>
 </div>
 </div>
 
@@ -529,7 +529,7 @@ async function refreshGroupNames(){
         rows.innerHTML = found.map(function(f){
             var why = (f.reads_as && f.reads_as.length)
                 ? 'can be read as ' + f.reads_as.map(function(n){ return '<span style="color:var(--red);font-weight:600">' + escapeHtml(n) + '</span>'; }).join(', ')
-                : 'holds the separator |';
+                : 'holds a separator (| ; ,)';
             return '<div><span style="color:var(--cyan)">' + escapeHtml(f.name) + '</span> <span style="color:var(--text-dim)">' + why + '</span></div>';
         }).join('');
         box.style.display = 'block';
