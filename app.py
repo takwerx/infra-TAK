@@ -62350,9 +62350,12 @@ def _cloudtak_api_stability_watch(cloudtak_dir, plog, remote_cfg=None, seconds=1
 _CT_DB_CONTAINER = 'cloudtak-postgis-1'
 _CT_UPDATE_DUMP_KEEP = 2
 _CT_UPDATE_DUMP_REMOTE_DIR = '~/CloudTAK-update-dumps'
-_CT_DB_SCHEMA_SQL = ("SELECT md5(coalesce(string_agg(table_schema||'.'||table_name||'.'||column_name"
-                     "||':'||data_type, ',' ORDER BY table_schema, table_name, column_name), '')) "
-                     "FROM information_schema.columns WHERE table_schema NOT IN ('pg_catalog','information_schema')")
+# BASE TABLES only: an extension upgrade (PostGIS) changes its views, never the tables CloudTAK owns.
+_CT_DB_SCHEMA_SQL = ("SELECT md5(coalesce(string_agg(c.table_schema||'.'||c.table_name||'.'||c.column_name"
+                     "||':'||c.data_type, ',' ORDER BY c.table_schema, c.table_name, c.column_name), '')) "
+                     "FROM information_schema.columns c JOIN information_schema.tables t "
+                     "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
+                     "WHERE t.table_type = 'BASE TABLE' AND c.table_schema NOT IN ('pg_catalog','information_schema')")
 _CT_DB_MIGRATIONS_SQL = 'SELECT count(*) FROM drizzle.__drizzle_migrations'
 _CT_DB_SIZE_SQL = "SELECT pg_database_size('gis')"
 _CT_UPDATE_DUMP_MIN_SPARE = 512 * 1024 ** 2

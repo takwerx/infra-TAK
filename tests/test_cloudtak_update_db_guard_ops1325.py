@@ -512,3 +512,14 @@ def test_every_failure_after_up_asks_the_database_before_rolling_back():
         tail = b[m.end():m.end() + 900]
         assert '_cloudtak_update_db_moved_lines(_db_guard)' in tail
         assert '_cloudtak_rollback_after_failed_up' not in tail[:tail.index('_cloudtak_update_db_moved_lines')]
+
+
+def test_the_schema_fingerprint_reads_base_tables_only():
+    # ops #1325: verified against a real PostGIS 17 (new chat tables made, old ones dropped, a column added:
+    # three different fingerprints; no change: the same one). Views belong to extensions (PostGIS upgrades
+    # change them), so only base tables count.
+    node = next(n for n in TREE.body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == '_CT_DB_SCHEMA_SQL' for t in n.targets))
+    sql = ''.join(c.value for c in ast.walk(node.value) if isinstance(c, ast.Constant) and isinstance(c.value, str))
+    assert "t.table_type = 'BASE TABLE'" in sql
+    assert 'information_schema.columns' in sql and "'pg_catalog'" in sql
