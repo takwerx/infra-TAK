@@ -64335,7 +64335,7 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
             db_upgrade = _webodm_db_needs_upgrade(wo_dir_remote, cfg=deploy_cfg)
             if db_upgrade:
                 plog('  This redeploy upgrades the WebODM database (PostgreSQL 9.5 → 18). A backup is made first.')
-                _webodm_db_room_check(plog, cfg=deploy_cfg)
+                _webodm_prepare_db_upgrade(wo_dir_remote, old_compose, plog, cfg=deploy_cfg)
     except Exception as e:
         plog(f'✗ {e}')
         _webodm_deploy_status.update({'running': False, 'error': str(e)})
@@ -64536,7 +64536,7 @@ def _run_webodm_deploy(settings):
             db_upgrade = _webodm_db_needs_upgrade(wo_dir)
             if db_upgrade:
                 plog('This Reapply upgrades the WebODM database (PostgreSQL 9.5 → 18). A backup is made first.')
-                _webodm_db_room_check(plog)
+                _webodm_prepare_db_upgrade(wo_dir, old_compose, plog)
 
         plog('Creating directories…')
         for sub in ['', 'plugins', 'media', 'db']:
@@ -64905,6 +64905,28 @@ def _webodm_db_room_check(plog, cfg=None):
                            + _FREE_SPACE_BACKUPS_HINT)
 
 
+def _webodm_prepare_db_upgrade(wo_dir, old_compose, plog, cfg=None):
+    """Before the 9.5 → 18 move, with nothing changed yet: make sure the 9.5 database is running
+    (the room check and the dump run inside it), then check there is room. A stopped wo_db is
+    started from the compose file on disk, but only while that file still names the old image:
+    started from a compose that names the 4.x image it would begin the one-way upgrade itself,
+    with no dump (a half-finished earlier update leaves that state)."""
+    for attempt in range(13):
+        r = _webodm_db_sh('true', timeout=15, cfg=cfg)
+        if r.returncode == 0:
+            break
+        if attempt == 0:
+            if re.search(r'^    image: webodm/webodm_db:18', old_compose or '', re.M):
+                raise RuntimeError('WebODM\'s database is stopped and its compose file already names the new '
+                                   'WebODM version (an earlier update did not finish). Nothing was changed. '
+                                   'Start it with: docker start wo_db, then press Update or Reapply again.')
+            _webodm_compose(wo_dir, 'up -d wo_db', timeout=120, cfg=cfg)
+        time.sleep(5)
+    else:
+        raise RuntimeError('could not start the WebODM database to back it up. Nothing was changed.')
+    _webodm_db_room_check(plog, cfg)
+
+
 def _webodm_backup_db_95(cfg=None):
     """pg_dumpall the 9.5 database into the db volume root (the upgrade leaves `backup-*` names
     in place) and check the dump holds WebODM's database. Returns its path under the WebODM dir."""
@@ -65054,7 +65076,7 @@ def _run_webodm_update():
         db_upgrade = _webodm_db_needs_upgrade(wo_dir)
         if db_upgrade:
             plog('This update upgrades the WebODM database (PostgreSQL 9.5 → 18). A backup is made first.')
-            _webodm_db_room_check(plog)
+            _webodm_prepare_db_upgrade(wo_dir, compose_txt, plog)
         _webodm_move_to_new_images(wo_dir, compose_path, compose_txt, stripped, db_upgrade, plog)
         plog('Update complete.')
         _webodm_update_status.update({'running': False, 'complete': True, 'error': False})

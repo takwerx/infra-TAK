@@ -134,14 +134,28 @@ def test_update_stops_on_a_database_version_it_does_not_know():
 
 
 def test_update_reads_the_data_without_starting_the_database_when_wo_db_is_down():
-    # Starting wo_db with a compose that already names the 4.x image would itself start the
-    # one-way upgrade. The probe runs a one-off container with a shell instead.
+    # Reading the version never starts wo_db: a one-off container with a shell as its entrypoint.
+    # Only afterwards, for a 9.5 database and a compose that still names the old image, is wo_db
+    # started (the room check and the dump run inside it).
     box = wo579.Box(exec_fails=True)
     status, _ = wo579._run(box)
-    assert status['complete'] or status['error']
-    assert ('compose', 'up -d wo_db') not in box.calls
-    probes = [c for c in box.calls if c[0] == 'compose' and c[1].startswith('run --rm --no-deps -T --entrypoint sh wo_db')]
-    assert probes, box.calls
+    assert status['complete'], status['log']
+    keys = [c[1] for c in box.calls if c[0] == 'compose']
+    probe = next(i for i, a in enumerate(keys) if a.startswith('run --rm --no-deps -T --entrypoint sh wo_db'))
+    assert probe < keys.index('up -d wo_db') < keys.index('pull')
+    assert box.events == ['pull', 'dump', 'write', 'up']
+
+
+def test_a_half_finished_update_is_not_started_blind():
+    # An earlier update that died after writing the 4.x compose leaves 4.x pins over 9.5 data
+    # with wo_db stopped. `up -d wo_db` there would start the one-way upgrade with no dump.
+    box = wo579.Box(exec_fails=True)
+    box.compose = box.compose.replace('image: webodm/webodm_db@sha256:03f18ec0089325ec2b8975ba1781277bcdc212b6d86c9de33f6409d313e90430',
+                                      'image: webodm/webodm_db:18@sha256:' + 'a' * 64)
+    status, _ = wo579._run(box)
+    assert status['error'] and 'did not finish' in status['error'], status
+    assert ('compose', 'up -d wo_db') not in box.calls and ('compose', 'up -d') not in box.calls
+    assert ('compose', 'pull') not in box.calls and box.writes == [] and box.pending_writes == []
 
 
 def test_update_with_an_empty_database_volume_has_nothing_to_upgrade():

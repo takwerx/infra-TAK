@@ -58,7 +58,7 @@ WANT = {'WEBODM_VERSION', 'WEBODM_IMAGES', '_webodm_pin_images', 'WEBODM_OLEFILE
         '_FREE_SPACE_BACKUPS_HINT',
         # ops #1328: the shared routine and the host adapters it runs through
         '_WebodmResult', '_webodm_remote', '_webodm_run', '_webodm_put_file', '_webodm_db_data_probe',
-        '_webodm_move_to_new_images', 'WEBODM_PENDING_COMPOSE'}
+        '_webodm_move_to_new_images', 'WEBODM_PENDING_COMPOSE', '_webodm_prepare_db_upgrade'}
 
 
 class Box:
@@ -129,6 +129,9 @@ class Box:
         if action == 'pull':
             self.events.append('pull')
             return self._r(0 if self.pull_ok else 1, err='' if self.pull_ok else 'pull access denied')
+        if action == 'up -d wo_db':
+            self.exec_fails = False   # the 9.5 database is up again
+            return self._r()
         if action == 'up -d':
             self.events.append('up')
             self.running_images = self.compose
