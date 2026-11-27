@@ -26116,6 +26116,21 @@ def fail2ban_status_api():
         return jsonify({'available': False, 'error': str(e)[:200]})
 
 
+@app.route('/api/fail2ban/ban-summary', methods=['GET', 'POST'])
+@login_required
+def fail2ban_ban_summary_api():
+    """ops #1395: the opt-in daily ban summary mail. Default OFF. Routine bans are never
+    mailed one by one; this is the only ban mail an owner can ask for. The ban notifier
+    (infratak-f2b-notify) reads settings.f2b_daily_summary on every ban."""
+    s = load_settings()
+    if request.method == 'POST':
+        data = request.get_json(force=True, silent=True) or {}
+        s['f2b_daily_summary'] = bool(data.get('enabled', False))
+        save_settings(s)
+    return jsonify({'ok': True, 'enabled': bool(s.get('f2b_daily_summary', False)),
+                    'alert_email_set': bool((s.get('guarddog_alert_email') or '').strip())})
+
+
 @app.route('/api/fail2ban/authentik/config', methods=['POST'])
 @login_required
 def fail2ban_authentik_toggle_api():
@@ -28440,6 +28455,9 @@ def fail2ban_uninstall_api():
             '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf',
             '/etc/systemd/system/authentik-log-forwarder.service',
             '/usr/local/sbin/infratak-f2b-notify',
+            '/var/log/takguard/f2b-notify-state.json',
+            '/var/log/takguard/f2b-notify-state.json.lock',
+            '/var/log/takguard/f2b-notify-state.json.tmp',
         ]:
             subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True)  # v10.0.5 non-root
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
@@ -122571,15 +122589,33 @@ def _fail2ban_install_and_configure(plog):
 # The ban notifier fail2ban runs as root. Module level so the startup converge can bring
 # an existing box's copy up to date: the hook below writes it once and never again.
 _F2B_NOTIFY_SCRIPT = r'''#!/usr/bin/env python3
-"""infratak-f2b-notify: email alert when fail2ban bans an IP (Authentik / TAK Server jails).
+"""infratak-f2b-notify: runs after every fail2ban ban (ops #1395).
 Called by fail2ban action: infratak-f2b-notify <ip> [jail]
 Reads guarddog_alert_email + email_relay from infra-TAK settings.json.
 Sends via localhost:25 (same Postfix relay Guard Dog uses). Exits cleanly
 if email is not configured so fail2ban does not treat it as an error.
+
+A public box is probed by bots all day, so a ban is NOT a reason to email (10.4.7 to
+10.4.9 mailed every one: about 25 mails in 6 hours on test6). The ban is still logged
+by the action (dashboard line) and fail2ban. This script mails only when a person is
+needed:
+  - a TAK Server jail ban where the device showed a client certificate (a real device
+    is locked out), or
+  - an SSH jail ban after failed passwords for a real local account (not root, not a
+    system account).
+A name or address is mailed once a day, and a box is mailed at most 3 times a day, so
+even a real attack cannot flood the inbox. Everything else is routine: no email.
+Optional (default off, settings f2b_daily_summary): one summary mail a day.
 """
-import sys, os, re, json, smtplib, subprocess
+import sys, os, re, json, smtplib, subprocess, ipaddress, pwd, time
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
+
+STATE_PATH = '/var/log/takguard/f2b-notify-state.json'
+F2B_LOG = '/var/log/fail2ban.log'
+PERSON_DAY_CAP = 3
+PERSON_COOLDOWN = 86400
+SUMMARY_EVERY = 86400
 
 
 def _find_settings():
@@ -122656,16 +122692,9 @@ def _duration_label(seconds):
     return f'{max(1, seconds // 60)} min'
 
 
-def _tak_reason(ip, jail='takserver'):
-    badcert = jail == 'takserver-badcert'
-    bantime = 600 if badcert else 3600
-    try:
-        with open(TAK_BADCERT_JAIL if badcert else TAK_JAIL) as f:
-            m = re.search(r'^bantime\s*=\s*(\d+)', f.read(), re.M)
-        if m:
-            bantime = int(m.group(1))
-    except Exception:
-        pass
+def _tak_scan(ip):
+    """(kind, certificate subject) for one address, read from the TAK log. The subject is
+    '' when the device never showed a client certificate (a scanner)."""
     kinds, subject = {}, ''
     try:
         with open(TAK_LOG, 'rb') as f:
@@ -122682,7 +122711,20 @@ def _tak_reason(ip, jail='takserver'):
                     subject = s.group(1).strip()[:200]
     except Exception:
         pass
-    kind = max(kinds, key=kinds.get) if kinds else 'other'
+    return (max(kinds, key=kinds.get) if kinds else 'other'), subject
+
+
+def _tak_reason(ip, jail='takserver'):
+    badcert = jail == 'takserver-badcert'
+    bantime = 600 if badcert else 3600
+    try:
+        with open(TAK_BADCERT_JAIL if badcert else TAK_JAIL) as f:
+            m = re.search(r'^bantime\s*=\s*(\d+)', f.read(), re.M)
+        if m:
+            bantime = int(m.group(1))
+    except Exception:
+        pass
+    kind, subject = _tak_scan(ip)
     if badcert:
         return (_tak_explain(ip, kind, subject, _duration_label(bantime), jail) +
                 "\n\nOnly TAK streaming is blocked (8089, 8443, federation). Enrollment (8446), "
@@ -122692,9 +122734,229 @@ def _tak_reason(ip, jail='takserver'):
             "from that address.")
 
 
+def _tail_text(path, nbytes):
+    """Last nbytes of a log file as text, '' when it cannot be read."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - nbytes))
+            return f.read().decode('utf-8', 'replace')
+    except Exception:
+        return ''
+
+
+def _resolve_jail(ip, hint):
+    """Which jail made this ban. The shared Guard Dog action passes 'authentik' for every
+    jail (sshd, console, takportal, mediamtx, clientfeed...), so the name is read from
+    fail2ban's own log: it writes `[jail] Ban IP` BEFORE it runs the actions. The TAK
+    actions name their jail correctly and are trusted as given."""
+    if hint in ('takserver', 'takserver-badcert'):
+        return hint
+    found = None
+    pat = re.compile(r'\[([^\]\s]+)\] Ban ' + re.escape(ip) + r'\s*$')
+    for line in _tail_text(F2B_LOG, 256 * 1024).splitlines():
+        m = pat.search(line)
+        if m:
+            found = m.group(1)
+    return found or hint
+
+
+def _clean(text, limit=60):
+    """Attacker-controlled text (certificate names) kept to plain characters, so it can
+    sit in a mail subject."""
+    return re.sub(r'[^A-Za-z0-9 ._@=,-]', '', text or '')[:limit].strip()
+
+
+def _cert_name(subject):
+    m = re.search(r'CN=([^,;]+)', subject or '')
+    return _clean(m.group(1) if m else subject)
+
+
+_SSH_FAIL_RE = re.compile(
+    r'Failed (?:password|keyboard-interactive/pam|publickey) for (?!invalid user )(\S+) '
+    r'from (\S+) port')
+
+
+def _ssh_log_text():
+    for p in ('/var/log/auth.log', '/var/log/secure'):
+        if os.path.exists(p):
+            return _tail_text(p, 4 * 1024 * 1024)
+    try:   # no auth file (journal only)
+        r = subprocess.run(['journalctl', '-t', 'sshd', '--since', '2 hours ago',
+                            '--no-pager', '-o', 'cat'],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout
+    except Exception:
+        return ''
+
+
+def _is_real_account(name, console_uid):
+    """A human account on this box: exists, not root, has a login shell, and is a normal
+    user (uid 1000 up) or the console's own user. Bots guess root, admin, postgres,
+    oracle and the like; those are not real accounts here and stay routine."""
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,32}', name or ''):
+        return False
+    try:
+        pw = pwd.getpwnam(name)
+    except KeyError:
+        return False
+    if pw.pw_uid == 0 or pw.pw_name == 'root':
+        return False
+    if pw.pw_shell.endswith(('nologin', 'false')) or not pw.pw_shell:
+        return False
+    return 1000 <= pw.pw_uid < 60000 or pw.pw_uid == console_uid
+
+
+def _ssh_real_user(ip, console_uid):
+    for line in _ssh_log_text().splitlines():
+        m = _SSH_FAIL_RE.search(line)
+        if m and m.group(2) == ip and _is_real_account(m.group(1), console_uid):
+            return m.group(1)
+    return ''
+
+
+def _person_needed(ip, jail, console_uid):
+    """(key, subject line, text) when this ban needs a person, else None (routine)."""
+    j = jail.lower()
+    if j in ('takserver', 'takserver-badcert'):
+        kind, subject = _tak_scan(ip)
+        if subject:
+            name = _cert_name(subject)
+            return ('tak:' + name, f'a TAK device ({name}) is blocked',
+                    'A device that showed a TAK certificate was blocked. A real user may '
+                    'be locked out.\n\n' + _tak_reason(ip, j))
+    if j == 'sshd':
+        user = _ssh_real_user(ip, console_uid)
+        if user:
+            return ('ssh:' + user, f'SSH password failures on account {user}',
+                    f'{ip} failed SSH passwords for the real account "{user}" on this '
+                    f'server, so it is blocked.\n\nBots guess names like root and admin. '
+                    f'This was a real account here. It may be someone mistyping, or '
+                    f'someone trying to get in.')
+    return None
+
+
+def _locked_state(fn):
+    """Run fn(state) with the state file locked; returns (result, ok). Several copies of
+    this script run at once in a burst, so the read-change-write must be one step."""
+    import fcntl
+    lock = None
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        lock = open(STATE_PATH + '.lock', 'a')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(STATE_PATH) as f:
+                st = json.load(f)
+            if not isinstance(st, dict):
+                st = {}
+        except Exception:
+            st = {}
+        result = fn(st)
+        tmp = STATE_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(st, f)
+        os.replace(tmp, STATE_PATH)
+        return result, True
+    except Exception as e:
+        print(f"infratak-f2b-notify: state file unusable: {e}", file=sys.stderr)
+        return None, False
+    finally:
+        if lock:
+            lock.close()
+
+
+def _person_gate(st, key, now):
+    """'send', 'repeat' (this name was mailed in the last day) or 'cap' (3 mails today)."""
+    sent = [t for t in st.get('person_sent', []) if now - t < 86400]
+    seen = {k: t for k, t in st.get('person_seen', {}).items() if now - t < PERSON_COOLDOWN}
+    verdict = 'send'
+    if key in seen:
+        verdict = 'repeat'
+    elif len(sent) >= PERSON_DAY_CAP:
+        verdict = 'cap'
+    else:
+        sent.append(now)
+        seen[key] = now
+    st['person_sent'], st['person_seen'] = sent, seen
+    return verdict
+
+
+def _person_undo(st, key, now):
+    """The mail did not go out: give the slot back so the next ban can try again."""
+    if isinstance(st.get('person_seen'), dict):
+        st['person_seen'].pop(key, None)
+    if st.get('person_sent'):
+        st['person_sent'].pop()
+
+
+def _summary_gate(st, now):
+    """True once per 24 hours (and records it)."""
+    if now - float(st.get('summary_at', 0) or 0) < SUMMARY_EVERY:
+        return False
+    st['summary_at'] = now
+    return True
+
+
+def _recent_bans(now, window=86400):
+    """[(jail, ip)] for bans in the last day, from fail2ban's own log."""
+    pat = re.compile(r'^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ .*\[([^\]\s]+)\] Ban (\S+)\s*$')
+    out = []
+    for line in _tail_text(F2B_LOG, 8 * 1024 * 1024).splitlines():
+        m = pat.match(line)
+        if not m:
+            continue
+        try:
+            t = time.mktime(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S'))
+        except Exception:
+            continue
+        if 0 <= now - t <= window:
+            out.append((m.group(2), m.group(3)))
+    return out
+
+
+def _summary_text(server_id, bans):
+    by_jail, by_ip = {}, {}
+    for jail, ip in bans:
+        by_jail[jail] = by_jail.get(jail, 0) + 1
+        by_ip[ip] = by_ip.get(ip, 0) + 1
+    jails = ', '.join(f'{j} {n}' for j, n in sorted(by_jail.items(), key=lambda x: -x[1]))
+    top = '\n'.join(f'  {ip}  ({n} bans)' for ip, n in
+                    sorted(by_ip.items(), key=lambda x: -x[1])[:5])
+    return (f'fail2ban summary for {server_id}, last 24 hours:\n\n'
+            f'  Bans:     {len(bans)} from {len(by_ip)} addresses\n'
+            f'  By jail:  {jails}\n\n'
+            f'Top sources:\n{top}\n\n'
+            f'Routine bans are not mailed one by one. See the Fail2ban page in your '
+            f'infra-TAK console for the full list. You turned this summary on there.\n')
+
+
+def _send(settings, recipients, subject, body):
+    relay = settings.get('email_relay', {})
+    from_addr = relay.get('from_addr', 'noreply@localhost')
+    from_name = relay.get('from_name', 'Guard Dog')
+    msg = MIMEText(body, 'plain', 'utf-8')
+    msg['From'] = f'{from_name} <{from_addr}>'
+    msg['To'] = ', '.join(recipients)
+    msg['Subject'] = subject
+    try:
+        with smtplib.SMTP('localhost', 25, timeout=15) as smtp:
+            smtp.sendmail(from_addr, recipients, msg.as_string())
+        print(f"infratak-f2b-notify: alert sent to {msg['To']}", file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"infratak-f2b-notify: email failed: {e}", file=sys.stderr)
+        return False
+
+
 def main():
     ip   = sys.argv[1] if len(sys.argv) > 1 else 'unknown'
-    jail = sys.argv[2] if len(sys.argv) > 2 else 'authentik'
+    hint = sys.argv[2] if len(sys.argv) > 2 else 'authentik'
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        print("infratak-f2b-notify: no valid address given — no email sent", file=sys.stderr)
+        sys.exit(0)
     settings_path = _find_settings()
     if not settings_path:
         print("infratak-f2b-notify: settings.json not found — no email sent",
@@ -122736,51 +122998,58 @@ def main():
                   file=sys.stderr)
             sys.exit(0)
 
-    relay     = settings.get('email_relay', {})
-    from_addr = relay.get('from_addr', 'noreply@localhost')
-    from_name = relay.get('from_name', 'Guard Dog')
     server_id = (settings.get('server_nickname') or
                  settings.get('fqdn') or
                  settings.get('server_ip', 'infra-TAK'))
+    # guarddog_alert_email may hold several comma-joined addresses (v10.1.30).
+    recipients = [a for a in re.split(r'[,;\s]+', to_addr) if a]
+    now = time.time()
+    jail = _resolve_jail(ip, hint)
+
+    # Opt-in daily summary (default off). It rides on the next ban after 24 hours, so no
+    # timer is needed: a box that has no bans has nothing to report.
+    if settings.get('f2b_daily_summary'):
+        due, ok = _locked_state(lambda st: _summary_gate(st, now))
+        bans = _recent_bans(now) if (ok and due) else []
+        if bans:
+            if not _send(settings, recipients,
+                         f'[{server_id}] fail2ban: {len(bans)} bans in the last 24 hours',
+                         _summary_text(server_id, bans)):
+                _locked_state(lambda st: st.update(summary_at=0))
+
+    try:
+        console_uid = os.stat(settings_path).st_uid
+    except Exception:
+        console_uid = -1
+    need = _person_needed(ip, jail, console_uid)
+    if not need:
+        print(f"infratak-f2b-notify: routine ban of {ip} ({jail}) — no email sent",
+              file=sys.stderr)
+        sys.exit(0)
+    key, headline, detail = need
+    verdict, ok = _locked_state(lambda st: _person_gate(st, key, now))
+    if ok and verdict != 'send':
+        print(f"infratak-f2b-notify: {key} already mailed today or 3 mails sent today "
+              f"({verdict}) — no email sent", file=sys.stderr)
+        sys.exit(0)
+
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-
-    _reasons = {
-        'authentik':  'Too many failed Authentik login attempts',
-        'takserver':  'Too many failed TAK Server connection attempts (scanner or bad certificate)',
-        'takserver-badcert': 'A flood of TAK Server connections with a refused certificate',
-    }
-    reason     = _reasons.get(jail.lower(), f'Too many failed {jail} attempts')
     jail_label = {'authentik': 'Authentik', 'takserver': 'TAK Server',
-                  'takserver-badcert': 'TAK Server, refused certificate'}.get(jail.lower(), jail)
-    explain    = (_tak_reason(ip, jail.lower()) + '\n\n'
-                  if jail.lower() in ('takserver', 'takserver-badcert') else '')
-
-    subject = f'[{server_id}] fail2ban: Banned {ip} ({jail_label})'
+                  'takserver-badcert': 'TAK Server, refused certificate',
+                  'sshd': 'SSH'}.get(jail.lower(), _clean(jail))
     body = (
-        f'fail2ban has banned the following IP address:\n\n'
+        f'fail2ban blocked an address and this one needs a person to look at it:\n\n'
         f'  IP:     {ip}\n'
         f'  Jail:   {jail_label}\n'
         f'  Server: {server_id}\n'
-        f'  Time:   {ts}\n'
-        f'  Reason: {reason}\n\n'
-        f'{explain}'
+        f'  Time:   {ts}\n\n'
+        f'{detail}\n\n'
+        f'Routine bans (bots and scanners) are no longer emailed. They stay on the '
+        f'Fail2ban page and in the Guard Dog log.\n'
         f'To unban this IP, open your infra-TAK console → Fail2ban page.\n'
     )
-
-    # guarddog_alert_email may hold several comma-joined addresses (v10.1.30).
-    recipients = [a for a in re.split(r'[,;\s]+', to_addr) if a]
-
-    msg = MIMEText(body, 'plain', 'utf-8')
-    msg['From'] = f'{from_name} <{from_addr}>'
-    msg['To'] = ', '.join(recipients)
-    msg['Subject'] = subject
-
-    try:
-        with smtplib.SMTP('localhost', 25, timeout=15) as smtp:
-            smtp.sendmail(from_addr, recipients, msg.as_string())
-        print(f"infratak-f2b-notify: alert sent to {msg['To']}", file=sys.stderr)
-    except Exception as e:
-        print(f"infratak-f2b-notify: email failed: {e}", file=sys.stderr)
+    if not _send(settings, recipients, f'[{server_id}] fail2ban: {headline}', body) and ok:
+        _locked_state(lambda st: _person_undo(st, key, now))
 
 
 if __name__ == '__main__':
