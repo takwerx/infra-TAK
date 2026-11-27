@@ -194,6 +194,27 @@ def test_kept_editor_and_current_files_leave_mediamtx_running(tmp_path, monkeypa
     assert ('hand_over', 'mediamtx') in box.events      # ownership is still put right
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason='root can open a folder of mode 000')
+def test_the_kept_path_works_on_a_box_shaped_folder(tmp_path, monkeypatch):
+    """A real box: __pycache__ 750 mediamtx (not listable by the console), users.json 600 and a
+    share-links file next to the editor. The red-on-aws-arm case: the scan counted the unreadable
+    __pycache__ and the route always stopped MediaMTX."""
+    box = Box(tmp_path, monkeypatch)
+    cache = box.ed / '__pycache__'
+    cache.mkdir()
+    (cache / 'x.pyc').write_text('x')
+    os.chmod(cache, 0o000)
+    os.chmod(box.ed / 'users.json', 0o600)
+    try:
+        out = box.patch()
+    finally:
+        os.chmod(cache, 0o755)
+    assert out['success'] is True
+    assert not box.stopped_mediamtx()
+    assert out['mediamtx_stopped'] is False
+    assert not box.writes_to_folder()
+
+
 def test_nothing_in_the_kept_path_needs_a_download(tmp_path, monkeypatch):
     box = Box(tmp_path, monkeypatch)
     box.patch()
@@ -374,6 +395,22 @@ def test_link_scan_says_yes_when_it_cannot_look(tmp_path):
     assert ns['_mediamtx_editor_dir_has_links']() is False
     ns['_MEDIAMTX_EDITOR_DIR'] = str(tmp_path / 'not-there')
     assert ns['_mediamtx_editor_dir_has_links']() is True
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root can open a folder of mode 000')
+def test_a_subfolder_the_console_cannot_open_does_not_count(tmp_path):
+    """aws-arm, ops #1387: the editor's __pycache__ is 750 `mediamtx`, so the console cannot list
+    it. Counting that as 'cannot tell' sent every real box down the stopping path."""
+    ed, ns = _helpers(tmp_path)
+    (ed / 'a.py').write_text('x')
+    cache = ed / '__pycache__'
+    cache.mkdir()
+    (cache / 'x.pyc').write_text('x')
+    os.chmod(cache, 0o000)
+    try:
+        assert ns['_mediamtx_editor_dir_has_links']() is False
+    finally:
+        os.chmod(cache, 0o755)
 
 
 def test_the_reclaim_guard_matches_what_the_reclaim_used_to_check(tmp_path):

@@ -123467,23 +123467,33 @@ def _mediamtx_editor_reclaim_applies():
 
 
 def _mediamtx_editor_dir_has_links():
-    """True when the editor's dir (or /usr/local/etc/mediamtx.yml) holds a link or special
-    file, or cannot be listed. Looks only: it changes nothing. The reclaim drops these; a Patch
-    that skips the reclaim must not skip that clean-up, so it takes the full path instead.
-    Mirrors the reclaim's own walk (lstat, links never followed)."""
-    unreadable = []
+    """True when a link or special file is visible in the editor's dir (or at
+    /usr/local/etc/mediamtx.yml), or the dir itself cannot be listed. Looks only: it changes
+    nothing. The reclaim drops these; a Patch that skips the reclaim keeps that clean-up for
+    everything it can see, so it takes the full path instead. Mirrors the reclaim's own walk
+    (lstat, links never followed).
+
+    A SUBFOLDER the console cannot open is skipped, not counted: the editor's __pycache__ is
+    750 `mediamtx` on every box (the editor runs with UMask 0027), so counting it would send
+    every real box down the full path (seen on aws-arm, ops #1387). That is safe: the path
+    that skips the reclaim never writes (_mediamtx_editor_put raises instead), so a link it
+    cannot see is never written through."""
+    top_unreadable = []
+
+    def _skip(err):
+        if getattr(err, 'filename', None) == _MEDIAMTX_EDITOR_DIR:
+            top_unreadable.append(err)
     try:
         if os.path.islink(os.path.join(_MEDIAMTX_CONF_DIR, 'mediamtx.yml')):
             return True
-        for root, dirs, files in os.walk(_MEDIAMTX_EDITOR_DIR, followlinks=False,
-                                         onerror=unreadable.append):
+        for root, dirs, files in os.walk(_MEDIAMTX_EDITOR_DIR, followlinks=False, onerror=_skip):
             for name in dirs + files:
                 st = os.lstat(os.path.join(root, name))
                 if _stat.S_ISLNK(st.st_mode) or not (_stat.S_ISREG(st.st_mode) or _stat.S_ISDIR(st.st_mode)):
                     return True
     except Exception:
         return True                 # cannot see inside: the full path decides
-    return bool(unreadable)         # a folder os.walk could not open
+    return bool(top_unreadable)     # the dir itself could not be opened
 
 
 def _mediamtx_editor_put(path, content, perm=None):
