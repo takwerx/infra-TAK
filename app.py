@@ -14254,6 +14254,51 @@ def _pg_keepalive_sh(conf_expr):
     )
 
 
+# ops #1338: restart the PostgreSQL that SERVES the database port, never "15".
+# After the TAK 5.8 split migration Server One keeps the old PostgreSQL 15 cluster, stopped, as
+# the rollback next to PostgreSQL 18. `pg_ctlcluster 15 main restart || systemctl restart
+# postgresql` therefore succeeded on the OLD cluster whenever 18 was down, and the fallback that
+# would have started 18 never ran. This function (run on Server One over SSH) asks
+# pg_lsclusters: the cluster configured on the database port wins, the newest major wins a tie
+# or a missing match, and an older cluster is never picked while a newer one exists. Without
+# pg_lsclusters (RHEL, PGDG units) it picks the active `postgresql-N` unit, else the newest.
+# tak-remotedb-watch.sh carries the SAME text (a test keeps them identical).
+_PG_CTL_SH = r"""pgctl() {
+A="$1"; P="${2:-5432}"; S=""
+if command -v pg_lsclusters >/dev/null 2>&1; then
+  L=$(pg_lsclusters -h 2>/dev/null)
+  S=$(printf '%s\n' "$L" | awk -v p="$P" '$3==p {print $1" "$2}' | sort -n | tail -1)
+  [ -n "$S" ] || S=$(printf '%s\n' "$L" | awk 'NF {print $1" "$2}' | sort -n | tail -1)
+fi
+if [ -n "$S" ]; then
+  set -- $S
+  sudo -n pg_ctlcluster "$1" "$2" "$A" 2>&1 || sudo -n systemctl "$A" "postgresql@$1-$2" 2>&1
+  return $?
+fi
+U=""
+for u in $(systemctl list-units --all --type=service --no-legend 'postgresql-*.service' 2>/dev/null | awk '{print $1}' | sed 's/\.service$//' | sort -V -r); do
+  systemctl is-active --quiet "$u" 2>/dev/null && { U="$u"; break; }
+done
+[ -n "$U" ] || U=$(systemctl list-unit-files --no-legend 'postgresql-*.service' 2>/dev/null | awk '{print $1}' | sed 's/\.service$//' | sort -V | tail -1)
+[ -n "$U" ] || U=postgresql
+sudo -n systemctl "$A" "$U" 2>&1
+}
+"""
+
+
+def _pg_ctl_cmd(action, db_port=5432):
+    """Remote shell text that start/stop/restart/reloads Server One's serving PostgreSQL
+    (see _PG_CTL_SH). `action` is one of four literals and the port is forced to an int, so
+    nothing a request carries reaches the shell."""
+    if action not in ('start', 'stop', 'restart', 'reload'):
+        raise ValueError('bad PostgreSQL action: %r' % (action,))
+    try:
+        port = int(str(db_port).strip() or 5432)
+    except (TypeError, ValueError):
+        port = 5432
+    return _PG_CTL_SH + 'pgctl %s %d' % (action, port)
+
+
 def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     """RHEL/Rocky Server One (DB box) setup — the dnf/PGDG/.noarch.rpm/systemctl/firewalld/
     /var/lib/pgsql mirror of the Debian _setup_server_one, per TAK Server Config Guide 5.7
@@ -14618,11 +14663,11 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     if db_pkg_path and db_pkg_name:
         # Fix any corrupted pg_hba.conf before trying to start PG
         _ssh_probe(s1, (
-            'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | head -1); '
+            'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | sort -V | tail -1); '
             '[ -n "$PG_MAIN" ] && [ -f "$PG_MAIN/pg_hba.conf" ] && '
             'sudo sed -i "s/md5host/md5\\nhost/g" "$PG_MAIN/pg_hba.conf" 2>/dev/null; true'
         ), timeout=10)
-        _ssh_probe(s1, 'sudo pg_ctlcluster 15 main start 2>/dev/null; true', timeout=20)
+        _ssh_probe(s1, _pg_ctl_cmd('start', db_port) + ' >/dev/null 2>&1; true', timeout=20)
         already_ok = False
         verify_cmd = 'sudo -u postgres psql -lqt 2>/dev/null | grep -q cot && systemctl is-active postgresql >/dev/null 2>&1 && echo PG_OK'
         vok, vout = _ssh_probe(s1, verify_cmd, timeout=10)
@@ -14646,12 +14691,13 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
             ok, out = _ssh_probe(s1, install_cmd, timeout=600)
             log.append(out or '')
             if not ok:
-                _ssh_probe(s1, 'sudo pg_ctlcluster 15 main start 2>/dev/null; true', timeout=20)
+                _ssh_probe(s1, _pg_ctl_cmd('start', db_port) + ' >/dev/null 2>&1; true', timeout=20)
                 vok, vout = _ssh_probe(s1, verify_cmd, timeout=10)
                 if not (vok and 'PG_OK' in (vout or '')):
                     diag_cmd = (
-                        'echo "--- cluster start attempt ---"; '
-                        'sudo pg_ctlcluster 15 main start 2>&1; '
+                        _PG_CTL_SH +
+                        'echo "--- cluster start attempt ---"; ' +
+                        'pgctl start %d; ' % int(db_port) +
                         'echo "--- cluster logs ---"; '
                         'sudo cat /var/lib/postgresql/15/main/log/$(ls -t /var/lib/postgresql/15/main/log/ 2>/dev/null | head -1) 2>/dev/null | tail -30 || echo "no cluster logs"; '
                         'echo "--- postgresql.conf listen ---"; '
@@ -14689,7 +14735,7 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     # Step 2: Configure PostgreSQL for remote access
     # Fix any previously corrupted pg_hba.conf lines (e.g. "md5host" from missing newline)
     pg_config_cmd = (
-        'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | head -1) && '
+        'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | sort -V | tail -1) && '
         '[ -n "$PG_MAIN" ] && [ -f "$PG_MAIN/postgresql.conf" ] && '
         "sudo sed -i '/^\\s*#*\\s*listen_addresses\\s*=/d' \"$PG_MAIN/postgresql.conf\" && "
         "printf \"\\nlisten_addresses = '*'\\n\" | sudo tee -a \"$PG_MAIN/postgresql.conf\" > /dev/null && "
@@ -14698,9 +14744,10 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
         # v10.1.9 W1: fresh splits get hostssl+SCRAM (encrypted wire); retrofit boxes keep their
         # existing plaintext line here — _enable_server_one_db_tls handles their upgrade.
         f'(grep -q "^host.*{core_ip}/32" "$PG_MAIN/pg_hba.conf" 2>/dev/null || '
-        f'printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && '
-        '(sudo pg_ctlcluster 15 main restart 2>/dev/null || sudo systemctl restart postgresql 2>/dev/null || true)'
+        f'printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && ' +
+        '(pgctl restart %d >/dev/null 2>&1 || true)' % int(db_port)
     )
+    pg_config_cmd = _PG_CTL_SH + pg_config_cmd
     ok, out = _ssh_probe(s1, pg_config_cmd, timeout=30)
     if not ok:
         log.append('PostgreSQL remote-access config failed: ' + (out or ''))
@@ -98598,7 +98645,7 @@ def takserver_control():
         s1 = tak_cfg.get('server_one', {})
         if s1.get('host'):
             pg_action = 'restart' if action == 'restart' else action
-            db_cmd = f'sudo pg_ctlcluster 15 main {pg_action} 2>&1 || sudo systemctl {pg_action} postgresql 2>&1'
+            db_cmd = _pg_ctl_cmd(pg_action, (tak_cfg.get('database') or {}).get('port') or 5432)
             ok, out = _ssh_probe(s1, db_cmd, timeout=30)
             verify_ok, verify_out = _ssh_probe(s1, 'pg_isready -q && echo DB_OK', timeout=10)
             db_running = verify_ok and 'DB_OK' in (verify_out or '')
@@ -105551,7 +105598,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
                     upgrade_log.append("  " + line)
         if not ok:
             # Verify PG is still running (SchemaManager may exit non-zero with warnings)
-            _ssh_probe(s1_cfg, 'sudo pg_ctlcluster 15 main start 2>/dev/null; true', timeout=20)
+            _ssh_probe(s1_cfg, _pg_ctl_cmd('start', db_port) + ' >/dev/null 2>&1; true', timeout=20)
             verify_cmd = 'sudo -u postgres psql -lqt 2>/dev/null | grep -q cot && pg_isready -q && echo PG_OK'
             vok, vout = _ssh_probe(s1_cfg, verify_cmd, timeout=10)
             if vok and 'PG_OK' in (vout or ''):
