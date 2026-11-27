@@ -1298,6 +1298,72 @@ def _authentik_tighten_env_backups(folder):
     return changed
 
 
+AUTHENTIK_ENV_BACKUPS_KEEP = 20   # ops #1379: newest copies kept per tag (fleet constant)
+_AK_ENV_BACKUP_RE = re.compile(r'^\.env\.(?:bak\.(?P<tag>.+)|(?P<dmg>damaged))\.(?P<ts>\d+)$')
+
+
+def _authentik_prune_env_backups(env_path, keep=AUTHENTIK_ENV_BACKUPS_KEEP):
+    """ops #1379: keep only the newest `keep` copies per tag of `<folder>/.env.bak.<tag>.<time>`
+    (and of `.env.damaged.<time>`); delete the rest. Returns how many it deleted. Never raises.
+
+    Every copy holds PG_PASS and AUTHENTIK_SECRET_KEY and the autotune writer made one per
+    change, so a long-running box held 586. The newest backup that is still sane (the one the
+    Deploy guard restores from) is never deleted, even when 20 newer ones of its tag are
+    damaged. Only regular files with exactly these names are touched: never `.env` itself,
+    never a symlink, never a compose backup or any other name."""
+    try:
+        if keep < 1:
+            return 0
+        folder = os.path.dirname(env_path) or '.'
+        names = os.listdir(folder)
+        groups = {}
+        for name in names:
+            m = _AK_ENV_BACKUP_RE.match(name)
+            if not m:
+                continue
+            fp = os.path.join(folder, name)
+            try:
+                if os.path.islink(fp) or not os.path.isfile(fp):
+                    continue
+                mt = os.stat(fp).st_mtime
+            except OSError:
+                continue
+            tag = 'damaged' if m.group('dmg') else m.group('tag')
+            groups.setdefault(tag, []).append((int(m.group('ts')), mt, fp))
+        if not any(len(v) > keep for v in groups.values()):
+            return 0
+        try:
+            protected = _authentik_env_newest_good_backup(env_path)[0]
+        except Exception:
+            protected = None
+        deleted = 0
+        for items in groups.values():
+            items.sort(reverse=True)
+            for _ts, _mt, fp in items[keep:]:
+                if protected and os.path.abspath(fp) == os.path.abspath(protected):
+                    continue
+                try:
+                    os.unlink(fp)
+                    deleted += 1
+                except OSError:
+                    continue
+        return deleted
+    except Exception:
+        return 0
+
+
+def _authentik_prune_env_backups_quiet(env_path, plog=None):
+    """Run the prune after a backup write and say so once; a problem here never stops the writer."""
+    n = _authentik_prune_env_backups(env_path)
+    if n and plog:
+        try:
+            plog(f"  authentik .env: removed {n} old backup copies (kept the newest "
+                 f"{AUTHENTIK_ENV_BACKUPS_KEEP} of each kind)")
+        except Exception:
+            pass
+    return n
+
+
 def _authentik_env_newest_good_backup(env_path):
     """Newest `<env>.bak*` next to env_path that is still sane, as (path, text); else (None, None)."""
     folder = os.path.dirname(env_path) or '.'
@@ -1346,6 +1412,7 @@ def _authentik_env_restore_from_backup(env_path, plog):
     except Exception as e:
         plog(f"  authentik .env: could not restore from {os.path.basename(bak)}: {e}")
         return False
+    _authentik_prune_env_backups_quiet(env_path)    # ops #1379: the .env.damaged copy above is one more
     plog(f"  ⚠ authentik .env was missing or damaged: restored from {os.path.basename(bak)} "
          f"(the database password and secret key are the original ones)")
     return True
@@ -76414,6 +76481,7 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
         backup_path = f'{env_path}.bak.gunicorn-timeout.{int(_t.time())}'
         with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
+        _authentik_prune_env_backups_quiet(env_path)   # ops #1379: keep the newest 20 copies per tag
 
         new_line = f'GUNICORN_CMD_ARGS=--timeout={int(value)}\n'
         sep = '' if env_text.endswith('\n') or not env_text else '\n'
@@ -76538,6 +76606,7 @@ def _ensure_authentik_pg_persistent_connections(plog, max_age=10, health_checks=
         backup_path = f'{env_path}.bak.pg-persistent-conn.{int(_t.time())}'
         with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
+        _authentik_prune_env_backups_quiet(env_path)   # ops #1379: keep the newest 20 copies per tag
 
         appended = []
         if not has_max_age:
@@ -76653,6 +76722,7 @@ def _patch_authentik_conn_max_age_60_to_10(plog=None):
         backup_path = f'{ak_env}.bak.conn-max-age-60to10.{int(_t.time())}'
         with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
+        _authentik_prune_env_backups_quiet(ak_env)   # ops #1379: keep the newest 20 copies per tag
 
         new_text = env_text.replace(
             'AUTHENTIK_POSTGRESQL__CONN_MAX_AGE=60',
@@ -76763,6 +76833,7 @@ def _patch_authentik_web_max_requests_to_1000(plog=None):
         backup_path = f'{ak_env}.bak.max-requests-1000.{int(_t.time())}'
         with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
+        _authentik_prune_env_backups_quiet(ak_env)   # ops #1379: keep the newest 20 copies per tag
 
         new_text = env_text
         _changes = []
@@ -76926,6 +76997,7 @@ def _patch_authentik_max_requests_snap_to_baseline_if_pgbouncer(plog=None):
         _backup = f'{ak_env}.bak.snap-to-baseline.{_now}'
         with _open_secret_w(_backup) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(_env_text)
+        _authentik_prune_env_backups_quiet(ak_env)   # ops #1379: keep the newest 20 copies per tag
 
         _new_text = re.sub(
             r'^AUTHENTIK_WEB__MAX_REQUESTS=\d+\s*$',
@@ -78393,6 +78465,7 @@ def _authentik_apply_official_tunings(plog):
             plog(f"  authentik tunings: made {_n} old .env backup file(s) private (mode 600)")
     except Exception:
         pass
+    _authentik_prune_env_backups_quiet(env_path, plog)    # ops #1379: a long-running box held 586 copies
 
     # ops #1332: never build on a .env that lost its secrets (an empty or cut-short file).
     if not _authentik_env_sane(content):
@@ -78485,6 +78558,7 @@ def _authentik_apply_official_tunings(plog):
         _bak = f"{env_path}.bak.tunings.{int(time.time())}"      # ops #1332: this writer kept no backup
         with _open_secret_w(_bak) as f:
             f.write(content)
+        _authentik_prune_env_backups_quiet(env_path, plog)   # ops #1379: keep the newest 20 copies per tag
         with _open_secret_w(env_path) as f:
             f.write(new_content)
         plog("  authentik tunings: .env updated:")
@@ -84673,6 +84747,7 @@ def _authentik_max_requests_autotune_apply(plog, new_max, new_jitter, reason):
         _backup = f"{ak_env}.bak.autotune.{_now}"
         with _open_secret_w(_backup) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(_txt)
+        _authentik_prune_env_backups_quiet(ak_env, plog)   # ops #1379: keep the newest 20 copies per tag
 
         _new_txt = re.sub(
             r'^AUTHENTIK_WEB__MAX_REQUESTS=\d+\s*$',
