@@ -567,3 +567,14 @@ def test_the_inline_script_parses(tmp_path):
     js.write_text(body)
     r = subprocess.run(['node', '--check', str(js)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.parametrize('line,words', [
+    ('wazuh-agentd: ERROR: Duplicate agent name: t2-agent. Unable to add agent (from manager)', 'Remove that agent'),
+    ('wazuh-authd: ERROR: Invalid password provided by 10.0.0.5. Closing connection.', 'enrollment password'),
+    ('wazuh-agentd: ERROR: 18:self-signed certificate', 'did not accept'),
+    ('wazuh-agentd: ERROR: Unable to connect to enrollment service at 10.0.0.5:1515', 'port (1515)'),
+])
+def test_the_real_agent_log_lines_become_plain_reasons(line, words):
+    """Lines copied from a real 4.14.11 agent and manager (ops #1421 box tests, Nov 27, 2026)."""
+    assert words in W._why_not(line)

@@ -317,10 +317,11 @@ _FAIL_RES = (
     (re.compile(r'Invalid password|Wrong password|Incorrect password', re.I),
      'The Wazuh server refused the enrollment password.'),
     (re.compile(r'Duplicate agent name|already exists', re.I),
-     'The Wazuh server already has an agent with this name. Pick another agent name.'),
+     'The Wazuh server already has an agent with this name, probably from an earlier install here. '
+     'Remove that agent on the Wazuh server, or pick another agent name.'),
     (re.compile(r'Unable to connect to enrollment service|Could not connect to enrollment', re.I),
      'The agent could not reach the Wazuh enrollment port (1515).'),
-    (re.compile(r'verification failed|certificate verify failed|SSL', re.I),
+    (re.compile(r'verification failed|certificate verify failed|Problem with certificate|self-signed certificate|SSL error', re.I),
      'The agent did not accept the Wazuh server certificate.'),
 )
 
