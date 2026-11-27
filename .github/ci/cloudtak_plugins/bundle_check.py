@@ -671,8 +671,10 @@ def cmd_verify(a):
     expect = json.loads(Path(a.expect).read_text(encoding='utf-8'))
     lines, problems = verify_bundle(expect, a.dist)
     print('\n'.join(lines))
-    total = sum(1 for ln in lines if not ln.startswith(' '))
-    print(f"\n{total - problems} of {total} checks passed" if lines else 'nothing to check')
+    skipped = sum(1 for ln in lines if ln.startswith('skip'))
+    total = sum(1 for ln in lines if not ln.startswith((' ', 'skip')))
+    print(f"\n{total - problems} of {total} checks passed" + (f" ({skipped} skipped: private)" if skipped else '')
+          if lines else 'nothing to check')
     return 1 if problems else 0
 
 
