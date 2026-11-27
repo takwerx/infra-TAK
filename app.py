@@ -99012,6 +99012,22 @@ def takserver_update_config():
 def takserver_update_config_status_api():
     return jsonify(takserver_update_config_status)
 
+def _pg_isready_cmd(db_port=5432):
+    """Remote shell text that asks Server One "is PostgreSQL accepting connections on the
+    database port?" (ops #1382). Always passes -p: on Debian/Ubuntu `pg_isready` is the
+    pg_wrapper, and with no port it picks the lowest-numbered cluster, which after the 5.8
+    split migration is the stopped old 15 on 5433. As the non-root SSH user that prints
+    "Invalid data directory for cluster 18 main" and exits 1 although 18 is up on 5432.
+    The port is forced to an int, so nothing a request carries reaches the shell."""
+    try:
+        port = int(str(db_port).strip() or 5432)
+    except (TypeError, ValueError):
+        port = 5432
+    if not (1 <= port <= 65535):
+        port = 5432
+    return 'pg_isready -q -p %d' % port
+
+
 @app.route('/api/takserver/control', methods=['POST'])
 @login_required
 def takserver_control():
@@ -99030,7 +99046,7 @@ def takserver_control():
             pg_action = 'restart' if action == 'restart' else action
             db_cmd = f'sudo pg_ctlcluster 15 main {pg_action} 2>&1 || sudo systemctl {pg_action} postgresql 2>&1'
             ok, out = _ssh_probe(s1, db_cmd, timeout=30)
-            verify_ok, verify_out = _ssh_probe(s1, 'pg_isready -q && echo DB_OK', timeout=10)
+            verify_ok, verify_out = _ssh_probe(s1, _pg_isready_cmd((tak_cfg.get('database') or {}).get('port') or 5432) + ' && echo DB_OK', timeout=10)
             db_running = verify_ok and 'DB_OK' in (verify_out or '')
             results['database'] = {'success': ok or db_running, 'running': db_running, 'host': s1['host']}
         else:
@@ -105982,7 +105998,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         if not ok:
             # Verify PG is still running (SchemaManager may exit non-zero with warnings)
             _ssh_probe(s1_cfg, 'sudo pg_ctlcluster 15 main start 2>/dev/null; true', timeout=20)
-            verify_cmd = 'sudo -u postgres psql -lqt 2>/dev/null | grep -q cot && pg_isready -q && echo PG_OK'
+            verify_cmd = 'sudo -u postgres psql -lqt 2>/dev/null | grep -q cot && ' + _pg_isready_cmd(db_port) + ' && echo PG_OK'
             vok, vout = _ssh_probe(s1_cfg, verify_cmd, timeout=10)
             if vok and 'PG_OK' in (vout or ''):
                 ulog("⚠ Install had warnings but PostgreSQL is running and cot database exists")
