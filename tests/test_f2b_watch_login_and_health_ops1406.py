@@ -100,6 +100,13 @@ class _Box:
         else:
             self.ssh_log += f'{t}.1+00:00 box sshd[1]: Accepted {method} for {user} from {ip} port 5000 ssh2\n'
 
+    def ssh_pam_fail(self, user, ip, ago, also_failed_line=False):
+        stamp = _utc(self.now - ago).replace(' ', 'T') + '.1+00:00'
+        self.ssh_log += f'{stamp} box sshd[1]: error: PAM: Authentication failure for {user} from {ip}\n'
+        if also_failed_line:
+            self.ssh_log += (f'{stamp} box sshd[1]: Failed keyboard-interactive/pam for {user} '
+                             f'from {ip} port 5000 ssh2\n')
+
     def console(self, kind, ip, ago):
         txt = 'failed login' if kind == 'fail' else 'login ok'
         with open(self.tmp / 'console-auth.log', 'a') as f:
@@ -188,6 +195,24 @@ def test_ssh_login_that_worked_after_failed_guesses_sends_one_email(tmp_path):
     assert box.sent[0][1] == ['owner@example.org']
     box.tick(runs=3)                                   # same cause, same day: no second mail
     assert len(box.sent) == 1
+
+
+def test_pam_keyboard_interactive_failures_count_once_each(tmp_path):
+    """Seen on a real Ubuntu 22.04 box: a PAM login that fails logs only
+    `error: PAM: Authentication failure for USER from IP`."""
+    box = _Box(tmp_path)
+    for i in range(3):
+        box.ssh_pam_fail('jsmith', '198.51.100.9', 300 - i * 10)
+    box.ssh('ok', 'jsmith', '198.51.100.9', 200, method='keyboard-interactive/pam')
+    box.run()
+    assert len(box.sent) == 1 and '3 failed guesses' in _text(box.sent[0][2])
+    # the same failure written twice (PAM line and Failed line) is ONE failure: 2 of them are not enough
+    twice = _Box(tmp_path / 'twice')
+    for i in range(2):
+        twice.ssh_pam_fail('jsmith', '198.51.100.9', 300 - i * 10, also_failed_line=True)
+    twice.ssh('ok', 'jsmith', '198.51.100.9', 200, method='keyboard-interactive/pam')
+    twice.run()
+    assert twice.sent == []
 
 
 def test_console_and_authentik_logins_after_failures_each_send_one(tmp_path):

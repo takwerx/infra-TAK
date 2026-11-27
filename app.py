@@ -125373,6 +125373,9 @@ _ISO_RE = re.compile(r'(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:[.,]\d+)?
 _SYSLOG_RE = re.compile(r'([A-Z][a-z]{2}) +(\d{1,2}) (\d\d):(\d\d):(\d\d)')
 _SSH_WATCH_FAIL = re.compile(
     r'Failed (?:password|keyboard-interactive/pam) for (?:invalid user )?(\S+) from (\S+) port')
+# keyboard-interactive (PAM) logins fail as "error: PAM: Authentication failure for USER from IP",
+# seen on a real box (ops #1406); sshd may also write the "Failed ..." line for the same failure.
+_SSH_WATCH_PAM = re.compile(r'error: PAM: Authentication failure for (?:invalid user )?(\S+) from (\S+)\s*$')
 _SSH_WATCH_OK = re.compile(
     r'Accepted (?:password|publickey|keyboard-interactive/pam|gssapi\S*) for (\S+) from (\S+) port')
 _CONSOLE_WATCH_RE = re.compile(r'console: (failed login|login ok) from (\S+)')
@@ -125440,8 +125443,13 @@ def _login_events(now, config_dir):
     logs. kind is 'fail' or 'ok'. SSH counts password failures only: a rejected public key
     is how a client with several keys in its agent normally connects."""
     out = []
+    last_fail = {}
     for line in _ssh_watch_text().splitlines():
         m = _SSH_WATCH_FAIL.search(line)
+        fmt = 'failed'
+        if not m:
+            m = _SSH_WATCH_PAM.search(line)
+            fmt = 'pam'
         kind = 'fail'
         if not m:
             m = _SSH_WATCH_OK.search(line)
@@ -125449,8 +125457,14 @@ def _login_events(now, config_dir):
         if not m:
             continue
         t = _line_time(line, now)
-        if t is not None:
-            out.append((t, 'ssh', kind, m.group(2), m.group(1)))
+        if t is None:
+            continue
+        if kind == 'fail':   # one failure can be written in both formats: count it once
+            prev = last_fail.get((m.group(2), m.group(1)))
+            last_fail[(m.group(2), m.group(1))] = (t, fmt)
+            if prev is not None and prev[1] != fmt and abs(t - prev[0]) < 2:
+                continue
+        out.append((t, 'ssh', kind, m.group(2), m.group(1)))
     for fname, rx, svc in (('console-auth.log', _CONSOLE_WATCH_RE, 'console'),
                            ('authentik-logins.log', _AUTHENTIK_WATCH_RE, 'authentik')):
         for line in _watch_file_text(os.path.join(config_dir, fname)).splitlines():
