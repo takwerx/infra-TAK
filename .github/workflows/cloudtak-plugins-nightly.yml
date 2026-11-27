@@ -16,6 +16,8 @@ name: CloudTAK plugins nightly
 #                   the check; the job is green only when the check catches it. If the check ever
 #                   goes blind, the canary turns the run red.
 # Each plugin's expected menu entry is read from the plugin's own source (see bundle_check.py).
+# ops #1414: it also reads every CloudTAK API call each plugin's browser code makes and checks that
+# CloudTAK still has that route (a plugin's main action, not only its menu entry).
 #
 # Public repo, GitHub-hosted runners, no secrets, read-only token: no cost. Not a self-hosted job:
 # it runs other people's plugin code through npm.
@@ -160,6 +162,35 @@ jobs:
           set -o pipefail
           python3 -I .github/ci/cloudtak_plugins/bundle_check.py verify-in-image --expect "$RUNNER_TEMP/work/expect.json" --image cloudtak-nightly | tee "$RUNNER_TEMP/in-image.txt"
           { echo; echo "Console's own look inside the image:"; echo '```'; cat "$RUNNER_TEMP/in-image.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      # ops #1414. The menu entry loading does not mean the plugin's action works: CloudTAK 14.0.0 removed
+      # routes and changed chat, and a plugin that calls a route that is gone still shows its menu. This reads
+      # every CloudTAK API call each plugin's browser code makes and checks CloudTAK's own source (plus the
+      # routes the plugin ships) still defines that route with that method. No TAK Server or login needed.
+      - name: Check each plugin's CloudTAK API calls still have a route
+        if: ${{ !matrix.expect_red }}
+        run: |
+          set -o pipefail
+          python3 -I .github/ci/cloudtak_plugins/bundle_check.py verify-routes --expect "$RUNNER_TEMP/work/expect.json" --ct "$RUNNER_TEMP/CloudTAK" | tee "$RUNNER_TEMP/routes.txt"
+          { echo; echo "API calls the plugins make, against this CloudTAK's routes:"; echo '```'; cat "$RUNNER_TEMP/routes.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Canary - the route check must catch a route that is gone
+        if: ${{ !matrix.expect_red }}
+        run: |
+          set -u
+          python3 -I - "$RUNNER_TEMP/work/expect.json" "$RUNNER_TEMP/work/expect-canary.json" <<'PY'
+          import json, sys
+          e = json.load(open(sys.argv[1]))
+          for p in e['plugins']:
+              if not p.get('skipped'):
+                  p['calls'] = p['calls'] + [{'method': 'get', 'path': '/api/route-that-cloudtak-never-had', 'file': 'canary.ts', 'line': 1}]
+          json.dump(e, open(sys.argv[2], 'w'))
+          PY
+          if python3 -I .github/ci/cloudtak_plugins/bundle_check.py verify-routes --expect "$RUNNER_TEMP/work/expect-canary.json" --ct "$RUNNER_TEMP/CloudTAK" > "$RUNNER_TEMP/routes-canary.txt"; then
+            echo "::error::The route check did NOT notice a route that does not exist. It is blind to what it exists for."
+            exit 1
+          fi
+          grep -c '^FAIL' "$RUNNER_TEMP/routes-canary.txt" | sed 's/^/Good: the route check caught the canary on this many plugins: /'
 
       - name: Canary - the check must catch it
         if: ${{ matrix.expect_red }}
