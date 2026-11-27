@@ -156,9 +156,14 @@ def test_email_the_strip_is_stable_over_repeated_deploys():
     assert cf.count('smtp_header_checks') == 1
 
 
-def test_email_the_alias_line_added_after_our_block_is_not_ours_to_strip():
-    cf = 'a = 1\n' + er.render_main_cf_block('h', '587') + 'virtual_alias_maps = hash:/etc/postfix/virtual_root\n'
-    assert 'virtual_alias_maps = hash:/etc/postfix/virtual_root' in er.strip_main_cf_block(cf)
+def test_email_the_alias_line_we_add_after_our_block_goes_but_a_merged_one_stays():
+    ours = 'virtual_alias_maps = hash:/etc/postfix/virtual_root\n'
+    merged = 'virtual_alias_maps = hash:/etc/postfix/mine hash:/etc/postfix/virtual_root\n'
+    cf = 'a = 1\n' + er.render_main_cf_block('h', '587') + ours + 'inet_interfaces = all\n'
+    out = er.strip_main_cf_block(cf)
+    assert 'virtual_root' not in out and 'inet_interfaces' not in out       # the box's real tail (nuc)
+    assert 'hash:/etc/postfix/mine' in er.strip_main_cf_block(
+        'a = 1\n' + er.render_main_cf_block('h', '587') + merged)
 
 
 def test_email_generic_keeps_an_operator_entry_and_replaces_our_own_line():

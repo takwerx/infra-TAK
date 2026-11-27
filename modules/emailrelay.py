@@ -86,6 +86,10 @@ def _is_block_line(line):
     t = line.strip()
     if t.startswith(_BLOCK_COMMENT_PREFIXES):
         return True
+    # The line sync_root_alias() adds after our block, when it is exactly ours. One that also
+    # names an operator's map is not ours alone and stays.
+    if re.fullmatch(r'virtual_alias_maps\s*=\s*hash:' + re.escape(ROOT_ALIAS_MAP), t):
+        return True
     m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*=', t)
     return bool(m) and m.group(1) in _BLOCK_KEYS
 

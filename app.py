@@ -44207,7 +44207,7 @@ def _caddy_save_first_copy(prev_text):
                 return False                    # already holds the oldest copy
             except Exception:
                 pass
-        _write_priv(CADDYFILE_FIRST_COPY_PATH, text, perm=0o640)
+        _write_priv(CADDYFILE_FIRST_COPY_PATH, text, perm=0o644)
         return True
     except Exception:
         return False
