@@ -1272,6 +1272,32 @@ def _authentik_env_sane(text):
     return has_pass and bool(seen.get('AUTHENTIK_SECRET_KEY'))
 
 
+def _authentik_tighten_env_backups(folder):
+    """ops #1332: make every old `.env.bak*` / `.env.damaged*` copy private (0600). Returns how many it changed.
+
+    Six writers made these with a plain open() (0644) while they hold PG_PASS and
+    AUTHENTIK_SECRET_KEY, so every local user could read them, and a long-running box carries
+    hundreds (autotune writes one per change). Idempotent; a file we do not own is skipped."""
+    changed = 0
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0
+    for name in names:
+        if not (name.startswith('.env.bak') or name.startswith('.env.damaged')):
+            continue
+        fp = os.path.join(folder, name)
+        try:
+            if os.path.islink(fp) or not os.path.isfile(fp):
+                continue
+            if os.stat(fp).st_mode & 0o077:
+                os.chmod(fp, 0o600)
+                changed += 1
+        except OSError:
+            continue
+    return changed
+
+
 def _authentik_env_newest_good_backup(env_path):
     """Newest `<env>.bak*` next to env_path that is still sane, as (path, text); else (None, None)."""
     folder = os.path.dirname(env_path) or '.'
@@ -78360,6 +78386,13 @@ def _authentik_apply_official_tunings(plog):
     except Exception as e:
         plog(f"  authentik tunings: read error: {e}")
         return False
+
+    try:
+        _n = _authentik_tighten_env_backups(ak_dir)         # ops #1332: old backups are 0644 and hold the secrets
+        if _n:
+            plog(f"  authentik tunings: made {_n} old .env backup file(s) private (mode 600)")
+    except Exception:
+        pass
 
     # ops #1332: never build on a .env that lost its secrets (an empty or cut-short file).
     if not _authentik_env_sane(content):

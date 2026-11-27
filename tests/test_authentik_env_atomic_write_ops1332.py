@@ -267,6 +267,32 @@ def test_tunings_and_cidr_writers_now_keep_a_0600_backup(tmp_path, monkeypatch):
         assert stat.S_IMODE(b.stat().st_mode) == 0o600
 
 
+def test_old_world_readable_env_backups_are_made_private(tmp_path, monkeypatch):
+    home = tmp_path / 'home'
+    ak = home / 'authentik'
+    ak.mkdir(parents=True)
+    (ak / '.env').write_text(GOOD_ENV)
+    old = [ak / '.env.bak.autotune.1', ak / '.env.bak.before-pgbouncer.2', ak / '.env.damaged.3']
+    for f in old:
+        f.write_text(GOOD_ENV)
+        os.chmod(f, 0o644)
+    other = ak / 'docker-compose.yml.bak.routing-repair.4'      # not an .env backup: left alone
+    other.write_text('services: {}\n')
+    os.chmod(other, 0o644)
+    monkeypatch.setenv('HOME', str(home))
+    log = _Log()
+    ns = _tunings_ns(log, _load('_open_secret_w')['_open_secret_w'])
+    ns['_authentik_apply_official_tunings'](log)
+    for f in old:
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600, f
+    assert stat.S_IMODE(other.stat().st_mode) == 0o644
+    assert 'made 3 old .env backup file(s) private' in log.text()
+    # idempotent: a second run has nothing left to change
+    log2 = _Log()
+    ns['_authentik_apply_official_tunings'](log2)
+    assert 'private (mode 600)' not in log2.text()
+
+
 # ── a damaged .env: no tuning on top of it, restore from a good backup ────────
 
 @pytest.mark.parametrize('bad', ['', 'AUTHENTIK_ERROR_REPORTING__ENABLED=false\n', 'PG_PASS=abc'])
@@ -390,7 +416,7 @@ def test_volume_probe_reads_docker_volume_ls():
 
 def _tunings_ns(log, open_secret_w):
     ns = _load('_authentik_env_sane', '_authentik_env_newest_good_backup',
-               '_authentik_env_restore_from_backup',
+               '_authentik_env_restore_from_backup', '_authentik_tighten_env_backups',
                '_authentik_apply_official_tunings', '_authentik_fix_trusted_proxy_cidrs')
     from datetime import datetime
     ns.update({
