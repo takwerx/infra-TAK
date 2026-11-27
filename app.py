@@ -34571,11 +34571,11 @@ def _fedhub_read_state(cfg, fh_dir):
     Returns a dict: `error` (text, empty when fine), `has_hub` (the folder exists and is not
     empty), `cert_names` (files in certs/files that are certificates, see
     _fedhub_cert_files_present), `keystores` (keystoreFile names the hub config points at),
-    `oauth` ('true', 'false' or None: the hub's own allowOauth), `sources` (which of
+    `sso_flag` ('true', 'false' or None: the hub's own allowOauth line), `sources` (which of
     certs/files, certs/cert-metadata.sh, configs, policies exist, for the backup).
     A listing that fails for a reason other than "no such folder" is an error: the caller stops
     rather than guess that the hub has no certificates."""
-    st = {'error': '', 'has_hub': False, 'cert_names': [], 'keystores': [], 'oauth': None, 'sources': []}
+    st = {'error': '', 'has_hub': False, 'cert_names': [], 'keystores': [], 'sso_flag': None, 'sources': []}
     q = shlex.quote
 
     def _ls(path):
@@ -34623,7 +34623,7 @@ def _fedhub_read_state(cfg, fh_dir):
                 continue
             m = re.match(r'^allowOauth:\s*(\S+)', ln)
             if m:
-                st['oauth'] = m.group(1).strip('"\'').lower()
+                st['sso_flag'] = m.group(1).strip('"\'').lower()
             elif 'Permission denied' in ln:
                 st['error'] = f'could not read the hub config: {ln[:160]}'
                 return st
@@ -34708,7 +34708,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
         hub_state = _fedhub_read_state(cfg, fh_dir)
         # A registered hub keeps its own allowOauth unless it is already on (then the Authentik
         # client details are re-synced as before). Only a first deploy turns it on by itself.
-        oauth_left_alone = hub_was_registered and hub_state['has_hub'] and hub_state['oauth'] != 'true'
+        oauth_left_alone = hub_was_registered and hub_state['has_hub'] and hub_state['sso_flag'] != 'true'
         if hub_state['error']:
             plog(f"✗ {hub_state['error']}")
             plog('✗ Stopped before any change: the update will not guess whether this hub has certificates.')
@@ -34990,14 +34990,12 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                 if not reachable:
                     plog(f'⚠ Skipping auto OAuth enable: Authentik API unreachable ({ak_err})')
                 else:
+                    ak_oauth_app = None
                     if oauth_left_alone:
-                        client_id = client_secret = None
-                        plog(f"✓ Hub sign-in with Authentik left as it was set on the hub (allowOauth: {hub_state['oauth'] or 'not set'}). "
+                        plog(f"✓ Hub sign-in with Authentik left as it was set on the hub (allowOauth: {hub_state['sso_flag'] or 'not set'}). "
                              f'Use "Enable Authentik login" to turn it on.')
                     else:
-                        client_id, client_secret, _auth_url, _token_url = _ensure_authentik_fedhub_oauth_app(
-                            settings, plog=plog
-                        )
+                        ak_oauth_app = _ensure_authentik_fedhub_oauth_app(settings, plog=plog)
                     fh_domain = _get_service_domain(settings, 'fedhub')
                     fh_host = fh_domain or (remote.get('host') or '').strip() or 'localhost'
                     redirect_uri = (
@@ -35027,7 +35025,8 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                         else:
                             plog('⚠ keycloak.der generation failed (OAuth may fail until fixed)')
 
-                    if client_id and client_secret:
+                    if ak_oauth_app and ak_oauth_app[0] and ak_oauth_app[1]:
+                        client_id, client_secret = ak_oauth_app[0], ak_oauth_app[1]
                         patch_cmd = (
                             f'cd {fh_dir}/configs && '
                             f'sudo sed -i -E "/^keycloak(Auth|Token)Endpoint[[:space:]]*:/d; /^keycloak(Access|Refresh)TokenName[[:space:]]*:/d" federation-hub-ui.yml && '
