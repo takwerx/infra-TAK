@@ -99,6 +99,14 @@ def _folder_intact(box):
                    for c in box.calls), [c for c in box.calls if 'rm ' in c]
 
 
+def _made_something(box):
+    """True when a docker call that creates, starts, removes or builds ran. The read-only look at the
+    volume is `docker run --rm ... sh -c 'cat PG_VERSION'` and is not one of them."""
+    return any(c.startswith(('docker rm ', 'docker create ', 'docker start ', 'docker tag '))
+               or (c.startswith('docker run ') and ' --rm ' not in c)
+               or ' docker build ' in c for c in box.calls)
+
+
 def _no_volume_changes(box):
     assert not any(c.startswith('docker volume') and 'inspect' not in c for c in box.calls), box.calls
 
@@ -168,15 +176,14 @@ def test_a_folder_with_missing_parts_is_refused_and_nothing_is_changed(tmp_path,
         (box.old_ctx / gone).unlink()
     box, ns, st, log = _press(tmp_path, mutate=mutate)
     assert st['error'] and 'not complete' in log and words in log
-    assert not any(c.startswith(('docker rm ', 'docker run ', 'docker create ')) for c in box.calls)
+    assert not _made_something(box), box.calls
     assert box.containers == {}
 
 
 def test_volume_of_another_postgresql_major_is_refused_before_anything_changes(tmp_path):
     box, ns, st, log = _press(tmp_path, layout='ROOT=17 LEGACY=none')
     assert st['error'] and 'PostgreSQL 18 but your data is PostgreSQL 17' in log
-    assert not any(c.startswith(('docker rm ', 'docker run ', 'docker create ', 'docker build')
-                                ) or ' docker build ' in c for c in box.calls)
+    assert not _made_something(box), box.calls
     assert box.containers == {}
     _folder_intact(box)
 
@@ -230,8 +237,7 @@ def test_a_volume_that_may_be_a_new_empty_database_is_never_given_to_tak(tmp_pat
         box.vol_created = volume_made
     box, ns, st, log = _press(tmp_path, mutate=mutate)
     assert st['error'] and why in log and 'EMPTY' in log
-    assert not any(c.startswith(('docker rm ', 'docker run ', 'docker create ', 'docker start '))
-                   or ' docker build ' in c for c in box.calls), box.calls
+    assert not _made_something(box), box.calls
     assert box.containers == {}
     _folder_intact(box)
     _no_volume_changes_other_than_inspect(box)
