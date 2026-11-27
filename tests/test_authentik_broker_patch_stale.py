@@ -160,6 +160,7 @@ def _converge(ak, docker):
         # ops #178: the compose `up -d` goes through the locked runner; no lock in this sandbox.
         '_ak_compose_subprocess': lambda argv, holder, plog=None, wait=None, **kw: docker.run(argv, **kw),
         '_AK_COMPOSE_LOCK_WAIT_LONG_S': 420,
+        '_authentik_redis_rdb_heal': lambda *a, **k: False,   # ops #1306, tested in its own file
     }
     exec(compile(SRC, 'app.py', 'exec'), ns)
     ns['_startup_authentik_idle_load_converge'](log=logs.append)

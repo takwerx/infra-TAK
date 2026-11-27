@@ -74850,6 +74850,13 @@ def _authentik_redis_image_target(current):
     redis image on a floating tag (alpine, latest, a bare major or minor) or on an older
     exact version. Left alone (None): the pin itself, a newer exact version (never a
     downgrade), a digest pin and any other image (a mirror, valkey): those are the operator's.
+
+    ops #1306 / GH #759: a floating tag names no version, so "never a downgrade" needs the
+    version it really resolved to. The `alpine` tag had moved to 8.12.0 on boxes; the pin moved
+    it back to 8.10.3, which cannot read the RDB v17 dump 8.12.0 saved on stop, and redis
+    crash-looped. A floating tag is pinned only when the redis that ran (the container) and
+    the redis it would run (the local image) are both no newer than the pin; when Docker
+    cannot tell, it is left alone (the next boot asks again).
     """
     if not isinstance(current, str):
         return None
@@ -74861,16 +74868,105 @@ def _authentik_redis_image_target(current):
     pin_tag = AUTHENTIK_REDIS_IMAGE.rsplit(':', 1)[-1]
     if tag == pin_tag:
         return None            # the pin, written in the short form
-    if tag in ('alpine', 'latest'):
+    pin_ver = tuple(int(x) for x in re.match(r'(\d+)\.(\d+)\.(\d+)', pin_tag).groups())
+
+    def _floating():
+        seen = _authentik_redis_seen_version(cur)
+        if seen is None:
+            return None        # Docker did not answer: never guess into a downgrade
+        sv = re.match(r'(\d+)\.(\d+)\.(\d+)', seen)
+        if sv and tuple(int(x) for x in sv.groups()) > pin_ver:
+            return None        # the data may be newer than the pin can read
         return AUTHENTIK_REDIS_IMAGE
+
+    if tag in ('alpine', 'latest'):
+        return _floating()
     ver = re.fullmatch(r'(\d+)(?:\.(\d+))?(?:\.(\d+))?(-alpine)?', tag)
     if not ver:
         return None            # a variant we do not know (bookworm, trixie, ...)
     parts = ver.group(1, 2, 3)
     if parts[2] is None:
-        return AUTHENTIK_REDIS_IMAGE   # `8`, `8.10`, `8-alpine`: floats to the newest patch release
-    pin_ver = tuple(int(x) for x in re.match(r'(\d+)\.(\d+)\.(\d+)', pin_tag).groups())
+        return _floating()     # `8`, `8.10`, `8-alpine`: floats to the newest patch release
     return AUTHENTIK_REDIS_IMAGE if tuple(int(x) for x in parts) < pin_ver else None
+
+
+def _authentik_redis_seen_version(image):
+    """The newest redis version this box has run or would run for the Authentik `redis`
+    service (ops #1306): REDIS_VERSION from the authentik-redis-1 container and from the
+    local `image`. '' when neither exists, None when Docker could not answer."""
+    best, best_t = '', ()
+    for _kind, _name in (('container', 'authentik-redis-1'), ('image', image)):
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--type', _kind, '-f',
+                                           '{{range .Config.Env}}{{println .}}{{end}}', _name]),
+                               capture_output=True, text=True, timeout=20)
+        except Exception:
+            return None
+        if r.returncode != 0:
+            if 'no such' in ((r.stderr or '') + (r.stdout or '')).lower():
+                continue       # that container / image is not on this box
+            return None
+        vm = re.search(r'^REDIS_VERSION=(\d+)\.(\d+)\.(\d+)', r.stdout or '', re.M)
+        if not vm:
+            return None        # an image that does not say its version: unknown
+        t = tuple(int(x) for x in vm.groups())
+        if t > best_t:
+            best, best_t = '.'.join(vm.groups()), t
+    return best
+
+
+_AK_REDIS_RDB_FATAL = "Can't handle RDB format version"
+
+
+def _authentik_redis_rdb_heal(ak_dir, log):
+    """ops #1306 / GH #759: un-stick an Authentik redis that crash-loops on a dump.rdb written
+    by a newer redis ("Can't handle RDB format version N"). Boxes the 10.4.8 pin moved from a
+    floating 8.12.0 back to 8.10.3 are in that loop now; the pin fix above stops new ones.
+
+    Moves dump.rdb aside in the volume (kept as dump.rdb.unreadable-<time>.bak) and starts
+    redis empty, the workaround the reporter verified. Nothing is lost: Authentik has not
+    used Redis since 2025.10, and a redis that cannot load the file holds nothing. Acts only
+    on that exact log line, after the last successful start, while the container is not up.
+    Returns True when it moved the file."""
+    try:
+        st = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}} {{.State.Restarting}}',
+                                        'authentik-redis-1']), capture_output=True, text=True, timeout=20)
+        if st.returncode != 0:
+            return False
+        running, _, restarting = (st.stdout or '').strip().partition(' ')
+        if running == 'true' and restarting != 'true':
+            return False       # up and serving
+        lg = subprocess.run(_sudo_wrap(['docker', 'logs', '--tail', '60', 'authentik-redis-1']),
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20)
+        out = lg.stdout or ''
+        i = out.rfind(_AK_REDIS_RDB_FATAL)
+        if i < 0 or out.rfind('Ready to accept connections') > i:
+            return False
+        bak = f'/data/dump.rdb.unreadable-{int(time.time())}.bak'
+        log(f'redis crash-loops on a dump.rdb from a newer redis ({_AK_REDIS_RDB_FATAL}) — '
+            f'moving it aside as {bak[6:]} and starting redis empty (Authentik does not use Redis)')
+        with _authentik_compose_lock('redis-rdb-heal', plog=log, timeout=_AK_COMPOSE_LOCK_WAIT_S) as _locked:
+            if not _locked:
+                log('redis heal: compose lock busy — retries next boot')
+                return False
+            for _cmd, _t in ((['docker', 'compose', 'stop', 'redis'], 120),
+                             (['docker', 'compose', 'run', '--rm', '--no-deps', '-T', '--entrypoint', 'mv',
+                               'redis', '/data/dump.rdb', bak], 120),
+                             (['docker', 'compose', 'up', '-d', '--no-deps', 'redis'], 180)):
+                r = subprocess.run(_sudo_wrap(_cmd), cwd=ak_dir, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True, timeout=_t)
+                if r.returncode != 0:
+                    log(f'redis heal: `{" ".join(_cmd[:3])}` failed rc={r.returncode}: '
+                        f'…{(r.stdout or "")[-200:]} — retries next boot')
+                    if _cmd[2] != 'up':   # never leave redis stopped
+                        subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d', '--no-deps', 'redis']),
+                                       cwd=ak_dir, capture_output=True, text=True, timeout=180)
+                    return False
+        log('redis heal: dump.rdb moved aside, redis started')
+        return True
+    except Exception as e:
+        log(f'redis heal skipped ({str(e)[:120]}) — retries next boot')
+        return False
 
 
 _DOCKER_SOCKET_PATHS = ('/var/run/docker.sock', '/run/docker.sock')
@@ -121693,6 +121789,13 @@ def _startup_authentik_idle_load_converge(log=None):
                        f'— canary re-forces next boot')
                 else:
                     _l('compose applied')
+
+            # ops #1306 / GH #759: a redis that crash-loops on a dump.rdb from a newer redis
+            # (boxes the 10.4.8 pin downgraded) is started empty. After an apply, give a
+            # recreated redis a moment to fail first, so this pass sees it.
+            if compose_changed or force_up:
+                time.sleep(15)
+            _authentik_redis_rdb_heal(ak_dir, _l)
 
             # ── W2: delete the stock rules via API AFTER the bounce, once the server
             # answers (the mask mount is live by now, so nothing recreates them).
