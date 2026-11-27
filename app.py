@@ -125926,12 +125926,10 @@ def _fail2ban_add_guarddog_hook(plog):
     notify_path = '/usr/local/sbin/infratak-f2b-notify'
     _write_priv(notify_path, _F2B_NOTIFY_SCRIPT, perm=0o755)
     plog(f"fail2ban guarddog hook: wrote {notify_path}")
-    try:
-        if _f2b_watch_ensure():
-            plog("fail2ban guarddog hook: watch timer (login after failed guesses, fail2ban failing) started")
-    except Exception as _we:
-        plog(f"fail2ban guarddog hook: watch timer not started (non-fatal, {type(_we).__name__}); "
-             "the console start-up check will try again")
+    try:   # no message here: the console start-up check prints one and tries again if this fails
+        _f2b_watch_ensure()
+    except Exception:
+        pass
 
     # ── Step 2: fail2ban action definition ────────────────────────────────────
     # %% in ini = literal % after ConfigParser interpolation → shell %
