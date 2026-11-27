@@ -64,7 +64,10 @@ _SUPPORT = {
     '_netbird_compose_image_tags', '_netbird_compose_on_target', '_netbird_pull_images',
     '_netbird_data_fingerprint', '_netbird_backup_data', '_netbird_prepare_image_change',
     '_netbird_revert_compose',
+    # ops #1307 (merged from dev): the heal says so when it moves NetBird down
+    '_image_ref_parts', '_image_exact_version', '_image_ahead_of_pin',
 }
+_SUPPORT_NAMES = {'_IMAGE_EXACT_TAG_RE'}
 
 
 def _compose(srv='0.82.1', dash='v2.96.0', srv_line=None):
@@ -188,7 +191,9 @@ def _load(nb, monkeypatch, *, target=(_NEW, _DASH_NEW), settings=None, fake=None
     tree = ast.parse(APP)
     want = _ENTRY | _SUPPORT
     parts = [ast.get_source_segment(APP, n) for n in tree.body
-             if isinstance(n, ast.FunctionDef) and n.name in want]
+             if (isinstance(n, ast.FunctionDef) and n.name in want)
+             or (isinstance(n, ast.Assign) and {t.id for t in n.targets
+                                                if isinstance(t, ast.Name)} & _SUPPORT_NAMES)]
     assert {'_heal_netbird_pinned_image', 'netbird_control_api',
             '_netbird_sync_compose_image_tags'} <= {
         n.name for n in tree.body if isinstance(n, ast.FunctionDef)}, 'a function under test was renamed'
