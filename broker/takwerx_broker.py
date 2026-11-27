@@ -6897,7 +6897,7 @@ def _wazuh_conf_problems(ossec_text, opts_text, dropin_text=None):
     try:
         root = ET.fromstring(ossec_text)
     except ET.ParseError:
-        return ['ossec.conf does not parse']
+        return ['ossec.conf is not the single-block file infra-TAK writes (it does not parse)']
     if root.tag != 'ossec_config':
         return ['ossec.conf has no ossec_config root']
     allowed_top = {'client', 'client_buffer', 'rootcheck', 'wodle', 'sca', 'syscheck',
@@ -7002,8 +7002,22 @@ def _wazuh_root_dir(path):
 
 
 def _wazuh_home_ok():
-    """/var/ossec and /var/ossec/etc must be real, root-owned directories."""
-    return _wazuh_root_dir(WAZUH_HOME) and _wazuh_root_dir(WAZUH_ETC)
+    """/var/ossec must be a real, root-owned directory nobody else can write to, and
+    /var/ossec/etc a real directory owned by root or by the `wazuh` account. The 4.14.11
+    package makes etc `wazuh:wazuh 770` (read on a real box, ops #1421), so "root-owned"
+    would refuse every install. Root only writes below /var/ossec through mkstemp + rename,
+    which never follows a link, and `wazuh` cannot replace /var/ossec/etc itself (it has
+    no write access to /var/ossec)."""
+    try:
+        home, etc = os.lstat(WAZUH_HOME), os.lstat(WAZUH_ETC)
+    except OSError:
+        return False
+    try:
+        wazuh_uid = pwd.getpwnam(WAZUH_GROUP).pw_uid
+    except KeyError:
+        wazuh_uid = 0
+    return (stat.S_ISDIR(home.st_mode) and home.st_uid == 0 and not (home.st_mode & 0o022)
+            and stat.S_ISDIR(etc.st_mode) and etc.st_uid in (0, wazuh_uid))
 
 
 def _wazuh_write(path, data, mode):

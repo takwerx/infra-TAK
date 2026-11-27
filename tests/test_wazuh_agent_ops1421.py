@@ -345,6 +345,7 @@ def tree(tmp_path, monkeypatch):
                       ('WAZUH_DROPIN_DIR', str(dropin)), ('WAZUH_DROPIN', str(dropin / 'infratak.conf'))):
         monkeypatch.setattr(B, name, val)
     monkeypatch.setattr(B, '_wazuh_root_dir', lambda p: os.path.isdir(p) and not os.path.islink(p))
+    monkeypatch.setattr(B, '_wazuh_home_ok', lambda: os.path.isdir(B.WAZUH_ETC) and not os.path.islink(B.WAZUH_ETC))
     monkeypatch.setattr(B.os, 'fchown', lambda *a, **k: None)
     monkeypatch.setattr(B.grp, 'getgrnam', lambda n: types.SimpleNamespace(gr_gid=os.getgid()))
     calls = []
@@ -511,7 +512,7 @@ def test_the_write_helper_refuses_any_path_that_is_not_one_of_ours(tree):
 
 
 def test_the_write_helper_refuses_when_var_ossec_is_not_a_root_owned_directory(tree, monkeypatch):
-    monkeypatch.setattr(B, '_wazuh_root_dir', lambda p: False)
+    monkeypatch.setattr(B, '_wazuh_home_ok', lambda: False)
     with pytest.raises(B.Denied):
         B._wazuh_write(B.WAZUH_OSSEC_CONF, 'x', 0o640)
 
@@ -523,3 +524,32 @@ def test_the_real_root_check_rejects_a_symlinked_var_ossec(tmp_path):
     link.symlink_to(real)
     assert B._wazuh_root_dir(str(link)) is False
     assert B._wazuh_root_dir(str(tmp_path / 'missing')) is False
+
+
+def _fake_lstat(table):
+    import stat as _st
+
+    def lstat(p):
+        mode, uid = table[p]
+        return types.SimpleNamespace(st_mode=mode, st_uid=uid)
+    return lstat
+
+
+def test_the_real_package_layout_passes_the_home_check(monkeypatch):
+    """ops #1421, read on a real Ubuntu 22.04 box with the 4.14.11 .deb: /var/ossec is
+    root:wazuh 750 and /var/ossec/etc is wazuh:wazuh 770. 'etc must be root-owned' refused every install."""
+    import stat as st
+    monkeypatch.setattr(B.pwd, 'getpwnam', lambda n: types.SimpleNamespace(pw_uid=114))
+    t = {B.WAZUH_HOME: (st.S_IFDIR | 0o750, 0), B.WAZUH_ETC: (st.S_IFDIR | 0o770, 114)}
+    monkeypatch.setattr(B.os, 'lstat', _fake_lstat(t))
+    assert B._wazuh_home_ok() is True
+    t[B.WAZUH_ETC] = (st.S_IFDIR | 0o770, 114)
+    t[B.WAZUH_HOME] = (st.S_IFDIR | 0o770, 0)            # group-writable /var/ossec: wazuh could swap etc
+    assert B._wazuh_home_ok() is False
+    t[B.WAZUH_HOME] = (st.S_IFDIR | 0o750, 1000)         # not root's
+    assert B._wazuh_home_ok() is False
+    t[B.WAZUH_HOME] = (st.S_IFDIR | 0o750, 0)
+    t[B.WAZUH_ETC] = (st.S_IFDIR | 0o770, 1000)          # etc owned by someone else
+    assert B._wazuh_home_ok() is False
+    t[B.WAZUH_ETC] = (st.S_IFLNK | 0o777, 0)             # a link
+    assert B._wazuh_home_ok() is False
