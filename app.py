@@ -104981,15 +104981,17 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         upgrade_log.append(entry); print(entry, flush=True)
+    _rc_last = {'ok': None}   # result of the latest rc() call (ops #1336)
     def rc(cmd, label=None, timeout=3600):
         if label: ulog(label)
         try:
             r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
             for ln in ((r.stdout or '') + (r.stderr or '')).strip().split('\n')[-12:]:
                 if ln.strip(): upgrade_log.append("  " + ln)
-            return r.returncode == 0
+            _rc_last['ok'] = (r.returncode == 0)
+            return _rc_last['ok']
         except Exception as e:
-            ulog(f"  ! {str(e)[:160]}"); return False
+            ulog(f"  ! {str(e)[:160]}"); _rc_last['ok'] = False; return False
     try:
         pkg_name = os.path.basename(rpm_path)
         ulog("=" * 50); ulog("TAK Server update (upgrade) — RHEL/Rocky .rpm"); ulog("=" * 50)
@@ -105024,7 +105026,8 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
         # deps when swapping the takserver rpm. NEVER use --allowerasing here (it would let dnf
         # erase the DB to resolve a conflict).
         ulog(""); ulog("Installing upgrade package: " + pkg_name)
-        _dnf_ok = rc(f'dnf install -y {shlex.quote(rpm_path)} --setopt=clean_requirements_on_remove=false 2>&1', "Upgrading via dnf (guide §5.2.1)...")
+        rc(f'dnf install -y {shlex.quote(rpm_path)} --setopt=clean_requirements_on_remove=false 2>&1', "Upgrading via dnf (guide §5.2.1)...")
+        _dnf_ok = bool(_rc_last['ok'])
         if not os.path.exists('/opt/tak'):
             ulog("  /opt/tak missing after dnf install — forcing reinstall...")
             rc(f'dnf reinstall -y {shlex.quote(rpm_path)} 2>&1 || dnf install -y {shlex.quote(rpm_path)} --setopt=clean_requirements_on_remove=false 2>&1')
