@@ -105,7 +105,9 @@ def test_pinned_postgresql_major_is_one_the_security_table_checks():
 def test_override_pins_postgis_image():
     body = _func('_cloudtak_build_override_yml')
     post = body.split('  postgis:\n', 1)[1]
-    assert 'image: {postgis_image}' in post.split('environment:')[0]
+    # ops #1335: the image line is '' when the data is on a newer PostgreSQL than the pin
+    assert '{postgis_image_line}' in post.split('environment:')[0]
+    assert "postgis_image_line = f'    image: {postgis_image}\\n' if postgis_image else ''" in body
     # arm64 only for a CloudTAK on this box — the console can't see a remote host's arch
     assert ("postgis_image = POSTGIS_IMAGE_ARM64 if (not _ct_is_remote and _host_arch() == 'arm64') "
             "else POSTGIS_IMAGE") in body

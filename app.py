@@ -55824,6 +55824,120 @@ MEDIA_INFRA_MULTIARCH = True
 POSTGIS_IMAGE = 'postgis/postgis:17-3.7-alpine'
 POSTGIS_IMAGE_ARM64 = 'imresamu/postgis:17-3.6-alpine'
 
+# ops #1335: the pin above is forced on every box at every console start, so it must never push a
+# database back to a PostgreSQL major older than its own data ("database files are incompatible
+# with server", the ops #1306 shape: a crash loop with no way to start). PostgreSQL 18 images keep
+# the cluster in /var/lib/postgresql/18/docker, older ones in /var/lib/postgresql/data.
+# `docker cp` reads PG_VERSION from a stopped or crash-looping container too.
+_CT_POSTGIS_DATA_DIRS = ('data',) + tuple(f'{n}/docker' for n in range(18, 24))
+_CT_POSTGIS_IMAGE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/:@-]{0,199}')
+# The same read on a remote CloudTAK host. Prints IMAGE <name>, IMGMAJOR <n> and MAJOR <n> lines;
+# NONE when there is no postgis container there.
+_CT_POSTGIS_REMOTE_PROBE_SH = (
+    'CID=$(docker ps -a -q -f name=postgis | head -1); [ -n "$CID" ] || { echo NONE; exit 0; }; '
+    'echo "IMAGE $(docker inspect -f \'{{.Config.Image}}\' "$CID" 2>/dev/null)"; '
+    'echo "IMGMAJOR $(docker inspect -f \'{{range .Config.Env}}{{println .}}{{end}}\' "$CID" 2>/dev/null '
+    '| sed -n \'s/^PG_MAJOR=//p\' | head -1)"; '
+    'for d in ' + ' '.join(_CT_POSTGIS_DATA_DIRS) + '; do '
+    'v=$(docker cp "$CID:/var/lib/postgresql/$d/PG_VERSION" - 2>/dev/null | tar -xO 2>/dev/null); '
+    'if [ -n "$v" ]; then echo "MAJOR ${v%%.*}"; exit 0; fi; done; echo UNKNOWN'
+)
+_CT_POSTGIS_NOTED = set()
+
+
+def _cloudtak_postgis_state(remote_cfg=None):
+    """What the CloudTAK postgis container holds (ops #1335): {'data_major': int or None,
+    'image': str, 'image_major': int or None}. data_major is the PostgreSQL major in the data
+    directory (PG_VERSION, read with `docker cp`, so a stopped container works); None when it
+    cannot be read: no container yet (no data to protect), Docker not answering, no cluster.
+    Never raises."""
+    out = {'data_major': None, 'image': '', 'image_major': None}
+    try:
+        if remote_cfg:
+            ok, txt = _ssh_probe(remote_cfg, _CT_POSTGIS_REMOTE_PROBE_SH, timeout=40)
+            if not ok:
+                return out
+            for line in (txt or '').splitlines():
+                key, _, val = line.strip().partition(' ')
+                val = val.strip()
+                if key == 'IMAGE':
+                    out['image'] = val
+                elif key == 'IMGMAJOR' and val.isdigit():
+                    out['image_major'] = int(val)
+                elif key == 'MAJOR' and val.isdigit():
+                    out['data_major'] = int(val)
+            return out
+        import io as _io
+        import tarfile as _tarfile
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-a', '-q', '-f', 'name=postgis']),
+                           capture_output=True, text=True, timeout=20)
+        ids = (r.stdout or '').split() if r.returncode == 0 else []
+        if not ids:
+            return out
+        cid = ids[0]
+        ins = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', '--type', 'container', '-f',
+                        '{{.Config.Image}}{{println}}{{range .Config.Env}}{{println .}}{{end}}', cid]),
+            capture_output=True, text=True, timeout=20)
+        if ins.returncode == 0:
+            lines = (ins.stdout or '').splitlines()
+            out['image'] = (lines[0].strip() if lines else '')
+            pm = re.search(r'^PG_MAJOR=(\d+)', ins.stdout or '', re.M)
+            if pm:
+                out['image_major'] = int(pm.group(1))
+        for d in _CT_POSTGIS_DATA_DIRS:
+            cp = subprocess.run(_sudo_wrap(['docker', 'cp', f'{cid}:/var/lib/postgresql/{d}/PG_VERSION', '-']),
+                                capture_output=True, timeout=30)
+            if cp.returncode != 0 or not cp.stdout:
+                continue
+            with _tarfile.open(fileobj=_io.BytesIO(cp.stdout)) as tf:
+                member = next((m for m in tf.getmembers() if m.isfile()), None)
+                text = tf.extractfile(member).read().decode('utf-8', 'replace') if member else ''
+            vm = re.match(r'\s*(\d+)', text)
+            if vm:
+                out['data_major'] = int(vm.group(1))
+                break
+    except Exception:
+        pass
+    return out
+
+
+def _cloudtak_postgis_guard(pin_image, settings, is_remote, log=None):
+    """ops #1335: the postgis image line for the CloudTAK override. `pin_image` when the data
+    is on the pin's PostgreSQL major or older, or unknown (no container, Docker not answering).
+    When the data is NEWER than the pin, the pin would start an older server on it and the
+    database would crash-loop, so it is not forced: the image the container already runs is kept
+    when that image can read the data, else '' (no image line, the compose file's own pin is
+    used) and the reason is logged once in plain words. Never raises."""
+    _log = log or (lambda m: print(f'[cloudtak] {m}', flush=True))
+    try:
+        pm = re.match(r'[^:]+:(\d+)', pin_image)
+        pin_major = int(pm.group(1)) if pm else 0
+        remote_cfg = None
+        if is_remote:
+            remote_cfg = (_get_cloudtak_deployment_config(settings).get('remote') or None)
+            if not remote_cfg:
+                return pin_image
+        st = _cloudtak_postgis_state(remote_cfg)
+        data = st['data_major']
+        if data is None or not pin_major or data <= pin_major:
+            return pin_image
+        keep = ''
+        if (st['image'] and _CT_POSTGIS_IMAGE_RE.fullmatch(st['image'])
+                and (st['image_major'] or 0) >= data):
+            keep = st['image']
+        msg = (f"CloudTAK's database holds PostgreSQL {data} data, newer than the PostgreSQL {pin_major} "
+               f"that infra-TAK pins ({pin_image}). The pin is NOT forced: an older server cannot start on "
+               + (f"newer data. The database keeps running {keep}." if keep else
+                  "newer data. No image is set here, so CloudTAK's own image line applies."))
+        if msg not in _CT_POSTGIS_NOTED:
+            _CT_POSTGIS_NOTED.add(msg)
+            _log(msg)
+        return keep
+    except Exception as e:
+        _log(f'PostGIS data check skipped ({str(e)[:120]}); keeping the pin')
+        return pin_image
+
 # ops #202: containers that make outbound TLS trust the HOST's CA bundle, not the one baked
 # into their image. An image's bundle is frozen at build time, so when a CA update removes a
 # root, the host drops it and the container keeps trusting it.
@@ -56006,6 +56120,12 @@ def _cloudtak_build_override_yml(settings):
     # ops #110: postgis pin. Arch is only known for a CloudTAK on this box; a remote host gets
     # the amd64 tag, the same single-arch repo upstream's own pin already pointed it at.
     postgis_image = POSTGIS_IMAGE_ARM64 if (not _ct_is_remote and _host_arch() == 'arm64') else POSTGIS_IMAGE
+    # ops #1335: never force the pin onto data a newer PostgreSQL wrote ('' = leave the image alone).
+    try:
+        postgis_image = _cloudtak_postgis_guard(postgis_image, settings, _ct_is_remote)
+    except Exception:
+        pass
+    postgis_image_line = f'    image: {postgis_image}\n' if postgis_image else ''
     # ops #202: media (MediaMTX pulling external sources, Node for proxy leases) trusts the
     # host CA bundle. Local only: the bundle path is this box's, like the console cert above.
     media_ca_env, media_ca_vols = ('', '') if _ct_is_remote else _container_ca_trust(node=True)
@@ -56072,8 +56192,7 @@ services:
 {media_ca_env}{media_ca_vol_block}  postgis:
     # ops #110: infra-TAK pins postgis itself — CloudTAK's 17-3.4-alpine tag is frozen at
     # PostgreSQL 17.0. Same PG major; PostGIS extensions are updated after the swap.
-    image: {postgis_image}
-    environment:
+{postgis_image_line}    environment:
       POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD:-docker}}"
 {_sim_networks_top}"""
 
