@@ -47121,6 +47121,76 @@ def _ak_resolved_authentik_tags(ak_dir=None):
     return True, _ak_tags_from_text(_r.stdout or ''), ''
 
 
+# ops #1322: ONE read-only SSH call that says which Authentik a REMOTE host has. Constant text, no
+# operator input in it. `[[:space:]]` and not `[ \t]`: inside a grep bracket `\t` is a backslash and
+# a `t`, not a tab. Every line it prints starts AKREAD_ so a login banner cannot be mistaken for it.
+_AK_REMOTE_READ_CMD = (
+    "if cd ~/authentik 2>/dev/null; then "
+    "echo \"AKREAD_RUN=$(docker ps --filter name=authentik-server --format '{{.Image}}' 2>/dev/null | head -1)\"; "
+    "if [ -e .env ]; then "
+    "if [ -r .env ]; then echo AKREAD_ENVSTATE=ok; "
+    "echo \"AKREAD_ENV=$(grep -E '^[[:space:]]*AUTHENTIK_TAG[[:space:]]*=' .env 2>/dev/null | tail -1)\"; "
+    "else echo AKREAD_ENVSTATE=unreadable; fi; "
+    "else echo AKREAD_ENVSTATE=missing; fi; "
+    "echo \"AKREAD_COMPOSE=$(grep -oE 'AUTHENTIK_TAG:-[^}]+' docker-compose.yml 2>/dev/null | head -1)\"; "
+    "echo AKREAD_DONE; "
+    "else echo AKREAD_NODIR; fi"
+)
+# YYYY.M.P with an optional -suffix (a release candidate, `-distroless`). All three numbers are
+# required: `2026.8`, `latest` or no tag are floating tags, they can run any later patch, and a tag
+# text that does not say which version runs must never be guessed at.
+_AK_REMOTE_TAG_RE = re.compile(r'^(\d{4})\.(\d{1,2})\.(\d{1,3})(?:-[0-9A-Za-z][0-9A-Za-z.\-]*)?$')
+
+
+def _ak_remote_current_version(remote):
+    """Which Authentik a REMOTE host runs now, read before Update changes anything (ops #1322).
+
+    Returns {'ok': True, 'tag', 'tuple': (year, month, patch), 'what'} or {'ok': False, 'error', 'hint'?}.
+    The RUNNING authentik-server image wins: it is what wrote the database, and a half-finished
+    earlier update (new pin written, old container still up) must still be able to retry. With no
+    container running, what compose would start decides: the `.env` pin when there is one (it
+    overrides the compose default), else the compose default. Anything it cannot read, or that does
+    not name a version, is an error, never a guess. Read-only: no write, no restart."""
+    _host = (remote.get('host') or '').strip()
+    _ok, _out = _ssh_probe(remote, _AK_REMOTE_READ_CMD, timeout=20)
+    if not _ok:
+        return {'ok': False, 'error': f'could not read {_host} over SSH ({(_out or "no answer").strip()[:160]})'}
+    _f = {}
+    for _line in (_out or '').splitlines():
+        if _line.startswith('AKREAD_'):
+            _k, _, _v = _line.partition('=')
+            _f[_k.strip()] = _v.strip()
+    if 'AKREAD_NODIR' in _f:
+        return {'ok': False, 'error': f'there is no ~/authentik folder on {_host}'}
+    if 'AKREAD_DONE' not in _f:
+        return {'ok': False, 'error': f'the read of {_host} did not finish'}
+    _running = _f.get('AKREAD_RUN', '')
+    if _running:
+        _tag = _running.rsplit(':', 1)[1] if ':' in _running else ''
+        _what = 'the running server image'
+    elif _f.get('AKREAD_ENVSTATE') == 'unreadable':
+        return {'ok': False, 'error': f'Authentik is stopped on {_host} and its .env file cannot be read by the SSH user'}
+    else:
+        _tag = _ak_env_tag(env_txt=_f.get('AKREAD_ENV', ''))
+        _what = 'the .env pin'
+        if not _tag:
+            _m = re.match(r'AUTHENTIK_TAG:-(\S+)', _f.get('AKREAD_COMPOSE', ''))
+            _tag = _m.group(1).strip('"\'').lstrip('vV') if _m else ''
+            _what = 'the compose file pin'
+    _tag = (_tag.split() or [''])[0]       # `2026.8.7 # note` in an .env line: first word only
+    _m = _AK_REMOTE_TAG_RE.match(_tag.lstrip('vV'))
+    if not _m:
+        if not _tag:
+            return {'ok': False, 'error': f'{_host} has no Authentik tag in {_what}'}
+        return {'ok': False,
+                'error': (f'{_what} on {_host} names "{_tag[:40]}", which is not a version number, so '
+                          f'infra-TAK cannot tell whether the update would go backwards'),
+                'hint': 'Set AUTHENTIK_TAG on the host to the version that is really running, '
+                        'then press Update again.'}
+    return {'ok': True, 'tag': _tag.lstrip('vV'), 'tuple': tuple(int(_x) for _x in _m.groups()),
+            'what': _what}
+
+
 def _get_authentik_version_info():
     """Return {version: str, update_available: bool, latest: str|None} for Authentik.
 
@@ -72206,6 +72276,24 @@ def authentik_control():
             if not _ak_tag_is_sane(latest):
                 return jsonify({'error': f'Refusing to update: target release '
                                          f'"{latest}" is not a valid Authentik version.'}), 500
+            # ops #1322: never walk a remote host BACKWARDS either (the local branch has refused
+            # this since v10.1.39). Authentik's database migrations do not go back, so an older
+            # server may not start. Read first; the first write is the `sed` below. A host we
+            # cannot read is refused, not guessed at.
+            _mod_result_step('authentik', 'read the version on the remote host (remote)')
+            _rh = (remote.get('host') or '').strip()
+            _cur = _ak_remote_current_version(remote)
+            if not _cur['ok']:
+                _hint = _cur.get('hint') or 'Fix that, then press Update again.'
+                return jsonify({'error': f'Refusing to update {_rh}: {_cur["error"]}. '
+                                         f'Nothing was changed. {_hint}'}), 500
+            _cur_t = (_cur['tuple'] + (0, 0, 0))[:3]
+            _tgt_t = (_ak_ver_tuple(latest) + (0, 0, 0))[:3]
+            if _cur_t > _tgt_t:
+                return jsonify({'error': f'Refusing to downgrade Authentik on {_rh}: v{_cur["tag"]} '
+                                         f'({_cur["what"]}), this channel targets v{latest}. '
+                                         f'Nothing was changed. Promote the vetted release instead of '
+                                         f'downgrading a live IdP.'}), 409
             # v10.2.8 W10b: remember the tag this host is pinned to now, so a failure can restore it.
             _rp_ok, _rp_out = _ssh_probe(remote, f"cd {ak_dir} && grep -oE 'AUTHENTIK_TAG:-[^}}]+' docker-compose.yml | head -1 | cut -d- -f2", timeout=10)
             _remote_prev = (_rp_out or '').strip().splitlines()[0].strip() if _rp_ok and (_rp_out or '').strip() else ''
