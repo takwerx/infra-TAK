@@ -406,3 +406,51 @@ def test_the_row_says_what_the_switch_is():
 def test_the_route_is_registered_for_post_only():
     src = (ROOT / 'modules' / 'atlas.py').read_text(encoding='utf-8')
     assert "instances/<slug>/authentik-admins', 'methods': ['POST']" in src
+
+
+# --------------------------------------------------------------------------- #
+# The other writers of the same policy read what is in force
+# --------------------------------------------------------------------------- #
+
+
+def test_the_boot_converge_does_not_put_the_global_group_back(authentik):
+    """A console restart must keep an off switch off (it reads the stored answer)."""
+    fake = authentik(FakeAuthentik(
+        groups=[SUPER, OURS], apps={'atlas': {'pk': 'app-pk'}},
+        policies=[policy('atlas', ['ATLAS-Admins'])], bindings=[bound()]))
+    s = settings_for([PLAIN_OFF])
+    s[atlas_access.state_key('atlas_')] = {'global_in': False}
+    ctx = make_ctx(s)
+
+    out = atlas.converge_access(ctx, 'http://ak', {}, lambda m: None)
+
+    assert out == {'atlas': 'present'}
+    assert atlas_access.parse_groups(fake.policies[0]['expression']) == ['ATLAS-Admins']
+
+
+def test_the_boot_converge_keeps_the_global_group_when_the_guard_never_confirmed_off(authentik):
+    fake = authentik(FakeAuthentik(
+        groups=[SUPER, OURS], apps={'atlas': {'pk': 'app-pk'}},
+        policies=[policy('atlas', ['ATLAS-Admins'])], bindings=[bound()]))
+    ctx = make_ctx(settings_for([PLAIN_OFF]))      # a wish, no guard answer
+
+    atlas.converge_access(ctx, 'http://ak', {}, lambda m: None)
+
+    assert atlas_access.parse_groups(fake.policies[0]['expression']) == \
+        ['authentik Admins', 'ATLAS-Admins']
+
+
+def test_the_agency_group_writer_honours_an_off_switch(authentik):
+    fake = authentik(FakeAuthentik(
+        groups=[SUPER, {'name': 'atlas-corona-admins', 'pk': 'g-a'}],
+        apps={'atlas-corona': {'pk': 'app-pk'}},
+        policies=[policy('atlas-corona', ['atlas-corona-admins'])],
+        bindings=[bound(policy_pk='p-atlas', name=atlas_access.POLICY_PREFIX + 'atlas-corona')]))
+    s = settings_for([CORONA_OFF])
+    s[atlas_access.state_key('atlas_corona_')] = {'global_in': False}
+    ctx = make_ctx(s)
+
+    out = atlas.agency_admin_group_outcome(ctx, CORONA_OFF, 'http://ak', {})
+
+    assert out['status'] in ('present', 'created')
+    assert atlas_access.parse_groups(fake.policies[0]['expression']) == ['atlas-corona-admins']
