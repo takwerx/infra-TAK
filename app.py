@@ -14097,6 +14097,16 @@ def console_rollback_api():
             hls_port_reset = _mediamtx_remote_hls_port_before_rollback(s, console_dir, target)
         except Exception as _hpr:
             print(f'Rollback: MediaMTX HLS port step error (non-fatal): {str(_hpr)[:160]}', flush=True)
+        # ops #1428: a release older than 10.4.4 rewrites the Authentik compose file at its start when
+        # its layout is not PyYAML's default, and recreates the LDAP outpost under the running TAK
+        # Server. Users in a group then get no missions or data feeds until TAK's API restarts.
+        # Write the file in the layout it expects first. A failure does not stop the rollback.
+        compose_layout = 'none'
+        try:
+            compose_layout = _authentik_compose_before_rollback(console_dir, target)
+        except Exception as _cpl:
+            compose_layout = 'failed'
+            print(f'Rollback: Authentik compose step error (non-fatal): {str(_cpl)[:160]}', flush=True)
         # Clear rollback availability (one rollback per update). Settings are read again: the
         # steps above can take minutes.
         s = load_settings()
@@ -14124,6 +14134,9 @@ def console_rollback_api():
         if 'failed' in atlas_reset.values():
             message += (' ATLAS could not be set back to the sign-in of that version. If the '
                         'ATLAS console refuses administrators, press Update Now again.')
+        if compose_layout == 'failed':
+            message += (' The Authentik settings file could not be prepared for that version. If CloudTAK '
+                        'or ATAK Data Sync show no missions after the rollback, press Update Now again.')
         if pin_note:
             message += ' ' + pin_note
         return jsonify({
@@ -84108,6 +84121,7 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
         # GH #549 (box boot): TAK and the local outpost started within the window above, so
         # neither start counts as an outage, and a TAK that came up while Authentik answered
         # 502 was never looked at. Once per TAK start, after it has settled: one HTTPS login.
+        https_looked = False
         if (check_outpost and not reasons and ldap_start is not None
                 and abs(ldap_start - tak_start) < _TAK_LDAP_RECYCLE_MIN_TAK_UPTIME_S
                 and time.time() - tak_start >= _TAK_BOOT_HTTPS_CHECK_AFTER_S
@@ -84123,6 +84137,7 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 pass
             boot_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
             if boot_pass and _ensure_ldapsearch():
+                https_looked = True
                 try:
                     boot_verdict, _boot_summary = _tak_api_user_check(plog, tag, boot_pass, wait_s=0)
                 except Exception:
@@ -84130,6 +84145,23 @@ def _tak_recycle_after_ldap_outage(plog, trigger, check_outpost=True, final=Fals
                 if boot_verdict == 'broken':
                     reasons.append("TAK Server started together with Authentik (box boot) and its HTTPS "
                                    "side gives users no groups")
+        # ops #1428: the HTTPS side can already be stuck when an update ends, with nothing left that
+        # asks for a check. A console rolled back to a release older than 10.4.4 recreates the LDAP
+        # outpost under a running TAK at its start, marks that start as handled and, with clients
+        # connected, leaves TAK's API without groups on purpose. Update Now then sees no new outpost
+        # start, no reason, and the box stays stuck (run fi-20261127-190409: missionfeed_forward).
+        # So the end of every update looks once, like the box-boot check above; broken becomes a
+        # reason and the usual path heals it (the API process alone first).
+        if (check_outpost and final and not reasons and not https_looked and ldap_start is not None
+                and time.time() - tak_start >= _TAK_BOOT_HTTPS_CHECK_AFTER_S):
+            upd_pass = _get_authentik_env_value(load_settings(), 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+            if upd_pass and _ensure_ldapsearch():
+                try:
+                    upd_verdict, _upd_summary = _tak_api_user_check(plog, tag, upd_pass, wait_s=0)
+                except Exception:
+                    upd_verdict = 'unknown'
+                if upd_verdict == 'broken':
+                    reasons.append("TAK Server's HTTPS side gave users no groups at the end of the console update")
         reasons = list(dict.fromkeys(reasons))   # a kept reason is also found again above
         if not reasons:
             if pending:
@@ -122637,6 +122669,61 @@ def _console_release_app_has(console_dir, tag, needle):
     except Exception:
         return None
     return True if r.returncode == 0 else (False if r.returncode == 1 else None)
+
+
+# ops #1428: a line of the ops #860 rule in `_self_heal_authentik_compose` (10.4.4 and newer leave a
+# formatting-only difference in the Authentik compose file alone; the stamp it writes says so).
+_ROLLBACK_COMPOSE_RULE = 'only formatting differs'
+
+
+def _authentik_compose_before_rollback(console_dir, tag, path=None, plog=None):
+    """ops #1428, console rollback: a release older than 10.4.4 treats ANY difference between
+    ~/authentik/docker-compose.yml and PyYAML's default layout as damage. At its start it rewrites
+    the file and recreates the LDAP outpost under the running TAK Server, and TAK's API process
+    then keeps a dead LDAP connection: users in a group see no missions or data feeds over HTTPS
+    (run fi-20261127-190409: 10.3.12 after Update Now to 10.4.10). The older code cannot be
+    changed, so write the file in the layout it expects before it starts. Same data, so a newer
+    release does not care either way. A release that has the rule is left alone; one that lacks
+    it, or one git cannot read, is served (the safe side). The old file is kept next to the new.
+    Never raises. Returns 'none' (nothing to do), 'rewritten' or 'failed' (the rollback goes on)."""
+    log = plog or (lambda m: print(f'Rollback: {m}', flush=True))
+    try:
+        if _console_release_app_has(console_dir, tag, _ROLLBACK_COMPOSE_RULE) is True:
+            return 'none'
+        path = path or os.path.expanduser('~/authentik/docker-compose.yml')
+        if not os.path.exists(path):
+            return 'none'
+        import yaml as _yaml
+        with open(path, encoding='utf-8') as f:
+            orig = f.read()
+        data = _yaml.safe_load(orig)
+        if not isinstance(data, dict):
+            return 'none'
+        canon = _yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
+        if canon == orig:
+            return 'none'
+        ok, err = _validate_authentik_compose(canon)
+        if not ok:
+            log(f'Authentik compose file left as it is: the old layout is not valid YAML ({str(err)[:160]})')
+            return 'failed'
+        if _yaml.safe_load(canon) != data:
+            log('Authentik compose file left as it is: the old layout would change its data')
+            return 'failed'
+        with _authentik_compose_lock('rollback-compose-layout') as locked:
+            if not locked:
+                log('Authentik compose file left as it is: another job holds its lock')
+                return 'failed'
+            backup = f'{path}.rollback-bak-{int(time.time())}'
+            with open(backup, 'w', encoding='utf-8') as bf:
+                bf.write(orig)
+            with open(path, 'w', encoding='utf-8') as wf:
+                wf.write(canon)
+        log(f'Authentik compose file written in the layout the older release expects '
+            f'(same data; the old file is {os.path.basename(backup)}), so its start does not recreate the LDAP outpost')
+        return 'rewritten'
+    except Exception as e:
+        log(f'Authentik compose file step error (non-fatal): {str(e)[:160]}')
+        return 'failed'
 
 
 def _mediamtx_remote_hls_port_before_rollback(settings, console_dir, tag):
