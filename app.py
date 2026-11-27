@@ -24554,6 +24554,49 @@ def _f2b_sshd_logpath():
     return ''
 
 
+def _f2b_sshd_section_logpath_to_journal(text, exists=None):
+    """Rewrite a dead `logpath` of the [sshd] jail, and only that jail (ops #1342).
+
+    Returns (new_text, changed). Only lines inside the `[sshd]` section are touched: a
+    `logpath` whose file is missing becomes `backend  = systemd`, and the `backend = auto`
+    that came with it (_f2b_pin_file_backend) is dropped so the section names one backend.
+    Every other section in the same file (another jail, [DEFAULT]) keeps its own
+    `logpath` and `backend` lines, even when its file is missing: those jails tail files
+    that may be absent until their module is deployed. Before this the check was
+    `'[sshd]' in text` for the whole file, then every missing `logpath` in it was rewritten."""
+    exists = exists or os.path.exists
+    out, section, hit = [], None, False
+
+    for line in text.splitlines(True):
+        sm = re.match(r'^\s*\[([^\]]+)\]\s*$', line)
+        if sm:
+            section = sm.group(1).strip()
+            out.append(line)
+            continue
+        if section == 'sshd':
+            m = re.match(r'^\s*logpath\s*=\s*(\S+)\s*$', line)
+            if m and not exists(m.group(1)):
+                if not hit:
+                    out.append('backend  = systemd\n')   # journal instead of a dead file
+                hit = True
+                continue
+        out.append(line)
+    if not hit:
+        return text, False
+    # Drop the file backend(s) of the [sshd] section; ours stays. Done in a second pass
+    # because a `backend = auto` line can come before or after the logpath line.
+    final, section = [], None
+    for line in out:
+        sm = re.match(r'^\s*\[([^\]]+)\]\s*$', line)
+        if sm:
+            section = sm.group(1).strip()
+        elif (section == 'sshd' and line != 'backend  = systemd\n'
+              and re.match(r'^\s*backend\s*=', line)):
+            continue
+        final.append(line)
+    return ''.join(final), True
+
+
 def _f2b_selfheal_sshd_backend(plog=None):
     """Repair an sshd jail pointing at a syslog file this box does not have.
 
@@ -24584,21 +24627,10 @@ def _f2b_selfheal_sshd_backend(plog=None):
             continue
         if '[sshd]' not in text:
             continue
-        out, hit = [], False
-        for line in text.splitlines(True):
-            m = re.match(r'^\s*logpath\s*=\s*(\S+)\s*$', line)
-            if m and not os.path.exists(m.group(1)):
-                out.append('backend  = systemd\n')   # journal instead of a dead file
-                hit = True
-            else:
-                out.append(line)
+        new_text, hit = _f2b_sshd_section_logpath_to_journal(text)
         if hit:
-            # The jail now has one source, the journal. Drop the `backend = auto` that came
-            # with the logpath (_f2b_pin_file_backend) so the file names one backend only.
-            out = [l for l in out if l == 'backend  = systemd\n'
-                   or not re.match(r'^\s*backend\s*=', l)]
             try:
-                _write_priv(path, ''.join(out))
+                _write_priv(path, new_text)
                 changed.append(os.path.basename(path))
             except Exception as e:
                 _log(f"fail2ban self-heal: could not rewrite {path}: {e}")
@@ -130932,6 +130964,48 @@ def _startup_broker_converge():
 _startup_broker_converge()
 
 
+def _f2b_start_if_down(_log=None):
+    """Make sure fail2ban is running: start it unless it is active or still starting.
+
+    ops #1342: the ufw lock switch stops fail2ban and starts it again some steps later.
+    A step in between that raised or timed out used to leave fail2ban stopped, and on
+    Debian nothing else starts it. This is the one place that puts it back. Starting an
+    active unit is not needed, so an active fail2ban is left alone. Never raises."""
+    try:
+        act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+        if act in ('active', 'activating'):
+            return act
+        r = subprocess.run(_sudo_wrap(['systemctl', 'start', 'fail2ban']),
+                           capture_output=True, text=True, timeout=120)
+        if _log:
+            _log(f"fail2ban: was {act or 'unknown'} after the lock switch; started it again "
+                 f"({'ok' if r.returncode == 0 else f'start FAILED, rc {r.returncode}'})")
+        return 'started' if r.returncode == 0 else 'failed'
+    except Exception as e:
+        if _log:
+            _log(f"fail2ban: could not check or start it after the lock switch (non-fatal): {str(e)[:120]}")
+        return 'error'
+
+
+def _f2b_enabled_but_down(act):
+    """True when fail2ban is enabled at boot but not running, or still stopping
+    (`act` is the is-active answer: inactive, failed or deactivating).
+
+    ops #1342: the console may have died between the lock switch's stop and its start, so
+    the next boot finds fail2ban stopped, or its stop still unbanning. A unit that was
+    disabled (uninstall) or never installed reads as not enabled, so it is left alone.
+    Never raises."""
+    if act not in ('inactive', 'failed', 'deactivating'):
+        return False
+    try:
+        en = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', 'fail2ban']),
+                            capture_output=True, text=True, timeout=15).stdout.strip()
+        return en == 'enabled'
+    except Exception:
+        return False
+
+
 def _startup_f2b_ufw_lock_switch():
     """Move fail2ban's jails from the stock `ufw` action to the locked `infratak-ufw`
     action, once per box, then repair IPv4 again (now and 3 minutes later).
@@ -130942,8 +131016,18 @@ def _startup_f2b_ufw_lock_switch():
     it unbans every IP through the OLD, unlocked action. So the console stops fail2ban
     while holding the ufw lock (one exact argv the broker allows), and no other ufw
     writer can run until every one of those unbans is done. If that stop is refused or
-    fails, nothing is changed and the next start tries again."""
+    fails, nothing is changed and the next start tries again.
+
+    ops #1342: once the stop has been tried, fail2ban is ALWAYS put back (a `finally`),
+    whatever happens in between (a stop that times out, a write that raises). If the
+    console itself dies in that window, the next start finds fail2ban either still
+    stopping (`deactivating`: the cut-off switch's stop is still unbanning; wait for it
+    under the same lock) or already stopped, and starts it when it is enabled
+    (_f2b_enabled_but_down). Before this, each case left no jail running, and on Debian
+    nothing else starts fail2ban."""
     _log = lambda m: print(f"Startup migration: {m}", flush=True)
+    stop_tried = False
+    started = False
     try:
         if _distro_family() == 'rhel' or _fw_backend() != 'ufw':
             return
@@ -130951,43 +131035,62 @@ def _startup_f2b_ufw_lock_switch():
             return
         stale = _f2b_stale_ufw_jails()
         outdated = _f2b_ufw_action_outdated()
-        if stale or outdated:
+        try:
+            changes = bool(stale or outdated)
             act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                                  capture_output=True, text=True, timeout=15).stdout.strip()
-            if act == 'active':
-                r = subprocess.run(
-                    # Literal path on purpose: broker/scan_enforce_coverage.py (and the broker's
-                    # one exact allowed argv, FLOCK_F2B_STOP_ARGV) read the argv shape, and a
-                    # variable shows up as <var> and is reported as a denied call site.
-                    # tests/test_ufw_lock_and_parity.py keeps it equal to _UFW_LOCK_PATH.
-                    _sudo_wrap(['flock', '-w', '90', '/run/infratak-ufw.lock', 'systemctl', 'stop', 'fail2ban']),
-                    capture_output=True, text=True, timeout=300)
+            down = _f2b_enabled_but_down(act)
+            cut_off = down and act == 'deactivating'    # an earlier switch's stop is still running
+            revive = down and not cut_off               # enabled, stopped
+            if (changes and act == 'active') or cut_off:
+                stop_tried = True
+                try:
+                    r = subprocess.run(
+                        # Literal path on purpose: broker/scan_enforce_coverage.py (and the broker's
+                        # one exact allowed argv, FLOCK_F2B_STOP_ARGV) read the argv shape, and a
+                        # variable shows up as <var> and is reported as a denied call site.
+                        # tests/test_ufw_lock_and_parity.py keeps it equal to _UFW_LOCK_PATH.
+                        _sudo_wrap(['flock', '-w', '90', '/run/infratak-ufw.lock', 'systemctl', 'stop', 'fail2ban']),
+                        capture_output=True, text=True, timeout=300)
+                except subprocess.TimeoutExpired:
+                    _log("fail2ban: the stop under the ufw lock took over 300 s — putting fail2ban "
+                         "back; jails stay on the stock ufw action and the next console start "
+                         "tries again")
+                    return
                 if r.returncode != 0:
                     _log(f"fail2ban: could not stop it under the ufw lock (rc {r.returncode}: "
                          f"{(r.stderr or r.stdout or '').strip()[:120]}) — jails stay on the stock "
                          f"ufw action; the next console start tries again")
                     return
-            if not _f2b_ensure_ufw_action():
-                _log("fail2ban: could not write the infratak-ufw action — jails stay on ufw")
-                if act == 'active':
-                    subprocess.run(_sudo_wrap(['systemctl', 'start', 'fail2ban']),
-                                   capture_output=True, text=True, timeout=120)
-                return
-            for path, txt in stale:
-                _write_priv(path, _F2B_STALE_UFW_RE.sub(r'\g<1>infratak-ufw', txt))
-            names = ', '.join(os.path.basename(p) for p, _ in stale)
-            if act == 'active':
+            if changes:
+                if not _f2b_ensure_ufw_action():
+                    _log("fail2ban: could not write the infratak-ufw action — jails stay on ufw")
+                    return
+                for path, txt in stale:
+                    _write_priv(path, _F2B_STALE_UFW_RE.sub(r'\g<1>infratak-ufw', txt))
+            else:
+                _f2b_ensure_ufw_action()          # keep the file current (a later release may change it)
+            if stop_tried or revive:
                 r2 = subprocess.run(_sudo_wrap(['systemctl', 'start', 'fail2ban']),
                                     capture_output=True, text=True, timeout=120)
+                started = True      # set after the call: if it raised, the finally tries again
                 how = 'restarted' if r2.returncode == 0 else f'start FAILED (rc {r2.returncode})'
+                if revive or cut_off:
+                    how = ('was enabled but not running, or still stopping (stopped by hand, or an earlier '
+                           'lock switch may have been cut off), so ' + ('started' if r2.returncode == 0 else how))
             else:
                 how = f'not running ({act or "unknown"}), left stopped'
-            if stale:
-                _log(f"fail2ban: jails moved to the locked infratak-ufw action ({names}); fail2ban {how}")
-            else:
-                _log(f"fail2ban: infratak-ufw action updated (IPv6 bans use ufw prepend); fail2ban {how}")
-        else:
-            _f2b_ensure_ufw_action()          # keep the file current (a later release may change it)
+            if changes:
+                names = ', '.join(os.path.basename(p) for p, _ in stale)
+                if stale:
+                    _log(f"fail2ban: jails moved to the locked infratak-ufw action ({names}); fail2ban {how}")
+                else:
+                    _log(f"fail2ban: infratak-ufw action updated (IPv6 bans use ufw prepend); fail2ban {how}")
+            elif stop_tried or revive:
+                _log(f"fail2ban: enabled but not running at console start; fail2ban {how}")
+        finally:
+            if stop_tried and not started:
+                _f2b_start_if_down(_log)
         _ufw_ipv4_parity_heal(_log)
 
         def _later():
