@@ -460,7 +460,7 @@ def test_a_stored_value_that_looks_like_a_git_option_never_reaches_git(boxrepo):
 
 
 def test_snapshot_records_the_commit_and_a_tag_only_when_head_is_on_one(boxrepo):
-    g = _ns('_ROLLBACK_SHA_RE', '_console_rollback_snapshot')
+    g = _ns('_ROLLBACK_SHA_RE', '_update_rollback_snapshot', '_console_rollback_snapshot')
     snap = g['_console_rollback_snapshot']
     box = boxrepo['box']
     _git(box, 'checkout', '-q', '--detach', 'v10.4.8-alpha')
@@ -474,14 +474,14 @@ def test_snapshot_records_the_commit_and_a_tag_only_when_head_is_on_one(boxrepo)
 
 
 def test_snapshot_without_git_keeps_the_old_guess_rather_than_no_rollback(tmp_path):
-    g = _ns('_ROLLBACK_SHA_RE', '_console_rollback_snapshot')
+    g = _ns('_ROLLBACK_SHA_RE', '_update_rollback_snapshot', '_console_rollback_snapshot')
     rec = g['_console_rollback_snapshot'](str(tmp_path), '10.4.9-alpha')
     assert rec['tag'] == 'v10.4.9-alpha' and rec['sha'] == ''
 
 
 def test_update_now_uses_the_snapshot_helper():
     src = _src('update_apply')
-    assert "_console_rollback_snapshot(console_dir, VERSION)" in src
+    assert "_console_rollback_snapshot(" in src and "console_dir, VERSION, _s.get('console_rollback')" in src
     assert "f'v{VERSION}'" not in src            # the guessed tag is gone from Update Now
 
 

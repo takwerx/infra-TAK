@@ -65,7 +65,7 @@ def _run_startup(tmp_path, monkeypatch, capsys, settings, on_box):
     ns = {
         'os': os, 're': re, 'datetime': datetime, 'BASE_DIR': str(REPO), 'VERSION': '10.2.11-alpha',
         'AUTHENTIK_VETTED_RELEASE': '2025.10', '_pin_takserver_jvm': lambda *a, **k: None,
-        '_gd_baked_remote_values': lambda p: None,
+        '_gd_baked_remote_values': lambda p: None, '_gd_stamp_console_version': lambda: None,
         '_guarddog_server_identifier': lambda s: (_ for _ in ()).throw(_Stop()),   # first use after the SMS refresh
         'subprocess': _Proc, '_sudo_wrap': lambda a: a, '_makedirs_priv': lambda d: None,
         '_read_priv': lambda p: (_ for _ in ()).throw(FileNotFoundError(p)),
