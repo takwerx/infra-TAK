@@ -7239,6 +7239,10 @@ def _wazuh_install(req, family):
         why = _wazuh_existing_wazuh(family)
         if why:
             return {'ok': False, 'error': why}
+    was_enabled = False
+    if upgrade:
+        r0, _ = _wazuh_run(['systemctl', 'is-enabled', WAZUH_UNIT], 30)
+        was_enabled = bool(r0 and (r0.stdout or '').strip() == 'enabled')
     tool = ['apt-get', 'install', '-y'] if family == 'debian' else ['dnf', 'install', '-y']
     if upgrade and family == 'debian':
         tool.append('--allow-downgrades')
@@ -7253,6 +7257,9 @@ def _wazuh_install(req, family):
     for verb in ('stop', 'disable'):
         _wazuh_run(['systemctl', verb, WAZUH_UNIT], 60)
     _wazuh_run(['systemctl', 'daemon-reload'], 60)
+    if upgrade and was_enabled and rc == 0:
+        # an update must not turn off start-at-boot (found on the reboot test, Nov 27)
+        _wazuh_run(['systemctl', 'enable', WAZUH_UNIT], 60)
     return {'ok': rc == 0, 'rc': rc, **({} if rc == 0 else {'error': out or f'rc={rc}'})}
 
 

@@ -598,3 +598,29 @@ def test_connected_is_read_from_a_big_window_not_the_40_line_tail(tree):
     assert B._do_wazuh_agent({'op': 'wazuh_agent', 'action': 'verify'})['connected'] is False
     (tree.home / 'logs' / 'ossec.log').write_text('')
     assert B._do_wazuh_agent({'op': 'wazuh_agent', 'action': 'verify'})['connected'] is False
+
+
+@pytest.mark.parametrize('enabled_before,expect_enable', [('enabled\n', True), ('disabled\n', False)])
+def test_an_upgrade_keeps_start_at_boot_as_it_was_and_a_fresh_install_never_enables(tmp_path, monkeypatch, enabled_before, expect_enable):
+    """Reboot test, Nov 27: after Update the unit was disabled, so the agent did not come back after a reboot."""
+    monkeypatch.setattr(B, 'WAZUH_HOME', str(tmp_path / 'x'))
+    monkeypatch.setattr(B, 'WAZUH_MARK', str(tmp_path / 'marked'))
+    (tmp_path / 'marked').write_text('x')
+    monkeypatch.setattr(B, '_wazuh_family', lambda: 'debian')
+    monkeypatch.setattr(B, '_wazuh_arch', lambda: 'amd64')
+    monkeypatch.setattr(B, '_wazuh_pkg_installed', lambda f: True)
+    runs = []
+
+    def run(argv, timeout=120):
+        runs.append(list(argv))
+        out = enabled_before if argv[:2] == ['systemctl', 'is-enabled'] else ''
+        return types.SimpleNamespace(returncode=0, stdout=out, stderr=''), ''
+    monkeypatch.setattr(B, '_wazuh_run', run)
+    monkeypatch.setattr(B, '_do_exec', lambda req: {'ok': True, 'returncode': 0, 'stdout_b64': '', 'stderr_b64': ''})
+    f = '/x/wazuh-agent_4.14.11-1_amd64.deb'
+    r = B._do_wazuh_agent({'op': 'wazuh_agent', 'action': 'install', 'file': f, 'upgrade': True})
+    assert r['ok'] and (['systemctl', 'enable', 'wazuh-agent'] in runs) is expect_enable
+    runs.clear()
+    monkeypatch.setattr(B, '_wazuh_existing_wazuh', lambda fam: '')
+    B._do_wazuh_agent({'op': 'wazuh_agent', 'action': 'install', 'file': f})
+    assert ['systemctl', 'enable', 'wazuh-agent'] not in runs
