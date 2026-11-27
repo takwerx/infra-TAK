@@ -2036,6 +2036,9 @@ CLOUDTAK_VETTED_RELEASE = "13.127.0"    # OFFLINE FALLBACK ONLY since v10.1.17 �
 # tests/test_cloudtak_major_cap_ops1074.py
 CLOUDTAK_MAX_MAJOR = 14
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
+# ops #1343: the Caddyfile as it was before infra-TAK first regenerated it (see
+# _caddy_save_first_copy). Never read by Caddy or by us; it is there for a person to restore from.
+CADDYFILE_FIRST_COPY_PATH = CADDYFILE_PATH + ".infratak-prev"
 # Caddy's certificate store, and the issuer subdirectory Let's Encrypt lands in.
 # Caddy namespaces the store by the ACME directory URL, so the issuer name is NOT a
 # constant — see _caddy_acme_cert_base(). Never hardcode the LE name at a call site.
@@ -6499,6 +6502,20 @@ def _root_console_bar(settings):
             'bg': '#2b2411', 'border': 'rgba(234,179,8,.45)', 'html': body}
 
 
+def _legacy_remote_assist_bar(settings):
+    """Spec for the "old Remote Assist install left in place" bar, or None (ops #1343).
+    The startup migration that used to delete it (and its database volume) now only sets
+    legacy_remote_assist_notice. The flag clears itself at the next start once the old
+    ~/cfd-remote-assist folder is gone. No I/O on the render path."""
+    if not (settings or {}).get('legacy_remote_assist_notice'):
+        return None
+    body = ('⚠ An old Remote Assist install (~/cfd-remote-assist, from before v10.0.1) was left in '
+            'place on purpose: its database holds Remote Assist data. Back up what you need, then '
+            'remove that folder and install EUD Remote Assist from the Remote Assist page.')
+    return {'cls': 'legra-banner', 'key': 'legacy-remote-assist', 'fg': '#eab308',
+            'bg': '#2b2411', 'border': 'rgba(234,179,8,.45)', 'html': body}
+
+
 def _tak_cert_names_bar(settings):
     """Spec for the "TAK Server's certificate doesn't include <domain>" bar, or None.
 
@@ -6560,7 +6577,8 @@ def render_notice_bars(settings):
 
 def _render_notice_bars_inner(settings):
     specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings),
-                         _tak_cert_names_bar(settings), _root_console_bar(settings)) if b]
+                         _tak_cert_names_bar(settings), _root_console_bar(settings),
+                         _legacy_remote_assist_bar(settings)) if b]
     if not specs:
         return ''
     base = _custom_banner_height(settings or {})
@@ -45101,6 +45119,32 @@ def _nodered_no_sso_lines(nodered_up, login):
             '    }']
 
 
+def _caddy_save_first_copy(prev_text):
+    """Keep the Caddyfile an operator had before infra-TAK first replaced it (ops #1343).
+
+    generate_caddyfile() rewrites the generated part of the file and keeps only what sits
+    below CADDYFILE_USER_BLOCKS_MARKER, so a hand edit above the marker, or a hand-written
+    file with no marker at all, was lost and the only copy was in memory.
+    One copy, written once: an existing copy is never replaced, so it stays the oldest file
+    we saw. The one exception is a file with no marker: that is a hand-written file (never
+    ours), so it is saved even when an older copy exists. Never raises: a failed copy must
+    not stop the regenerate. Returns True when it wrote the copy."""
+    try:
+        text = prev_text.decode('utf-8', 'replace') if isinstance(prev_text, (bytes, bytearray)) else prev_text
+        if not (text or '').strip():
+            return False
+        if CADDYFILE_USER_BLOCKS_MARKER in text:
+            try:
+                _read_priv(CADDYFILE_FIRST_COPY_PATH)
+                return False                    # already holds the oldest copy
+            except Exception:
+                pass
+        _write_priv(CADDYFILE_FIRST_COPY_PATH, text, perm=0o644)
+        return True
+    except Exception:
+        return False
+
+
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
     Each service gets its own domain (customizable per-service, defaults to subdomain of base FQDN)."""
@@ -46063,6 +46107,7 @@ def generate_caddyfile(settings=None):
             _caddy_prev = _read_priv(CADDYFILE_PATH)
     except Exception:
         _caddy_prev = None
+    _caddy_save_first_copy(_caddy_prev)      # ops #1343: before the write, or nothing is left to save
     _write_priv(CADDYFILE_PATH, caddyfile)
     # Ask Caddy whether what we just wrote is actually loadable, BEFORE any of the 48
     # `systemctl reload caddy` sites acts on it. A rejected config is restored here rather
@@ -106011,6 +106056,29 @@ def _stack_restore_nodered(dest, label, plog):
         f"{k}={len(after.get(k) or [])}" for k in _NODERED_CFG_LISTS) + " — nothing dropped")
 
 
+def _console_version_tuple(v):
+    """'10.4.9-alpha' -> (10, 4, 9); None when no x.y.z can be read."""
+    m = re.search(r'(\d+)\.(\d+)\.(\d+)', str(v or ''))
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _stack_restore_too_new(backup_version, running_version=None):
+    """Why a backup cannot be restored by this console, or '' when it can (ops #1343).
+
+    A backup holds auth.json, update_channel, last_console_version and a pg_restore --clean
+    dump from the console that made it. Put onto an older console (after a rollback, or dev
+    to main) it loads a newer database dump into an older image and a newer settings layout
+    into older code. Refuse; the way forward is to update the console first. A version that
+    cannot be read is not refused: backups made before the manifest carried one still work."""
+    have = _console_version_tuple(running_version if running_version is not None else VERSION)
+    made = _console_version_tuple(backup_version)
+    if made and have and made > have:
+        return (f'this backup was made by infra-TAK {backup_version}, which is newer than this '
+                f'console ({running_version if running_version is not None else VERSION}). '
+                'Update the console first, then restore it — nothing was changed')
+    return ''
+
+
 def _stack_restore(label, plog=None):
     """Restore a full-stack backup onto this box. (True, summary) or (False, error/summary)."""
     import io as _io
@@ -106027,6 +106095,9 @@ def _stack_restore(label, plog=None):
         return False, 'manifest label does not match the backup'
     if not manifest.get('ok'):
         return False, f"this backup is incomplete ({', '.join(manifest.get('failed') or [])}) — refusing to restore it"
+    _too_new = _stack_restore_too_new(manifest.get('infratak_version'))
+    if _too_new:
+        return False, _too_new
     parts = {p['name']: p for p in manifest.get('parts') or []}
     plog(f"  restore [{label}]: backup from {manifest.get('created')} on {manifest.get('os')} "
          f"(infra-TAK {manifest.get('infratak_version')})")
@@ -118494,6 +118565,22 @@ def _java_alternative_state(fam=None):
         return '', ''
 
 
+# ops #1343: TAK Server releases the JDK 17 pin below is known to be right for (5.x). A newer
+# major may need a newer Java, so the pin is left alone for it rather than forced.
+_TAK_JVM_PIN_MAX_MAJOR = 5
+
+
+def _tak_jvm_pin_applies(version):
+    """(True, '') when the JDK 17 pin is right for this TAK Server version string, else
+    (False, why). An unreadable version still pins: that is what every box did before."""
+    t = _os_upgrade_tak_version_tuple(version)
+    if t is None:
+        return True, ''
+    if t[0] > _TAK_JVM_PIN_MAX_MAJOR:
+        return False, f'TAK Server {t[0]}.{t[1]} is newer than the 5.x line JDK 17 is known to suit'
+    return True, ''
+
+
 def _pin_takserver_jvm(plog=None):
     """Pin native TAK Server to its own JDK 17. Idempotent; safe to re-run every startup.
 
@@ -118537,6 +118624,13 @@ def _pin_takserver_jvm(plog=None):
         return {'skipped': 'no native TAK on this host'}
     if _tak_is_container():
         return {'skipped': 'container TAK — JVM lives in the image'}
+    try:
+        _pin_ok, _pin_why = _tak_jvm_pin_applies(_get_takserver_version_info().get('version'))
+    except Exception:
+        _pin_ok, _pin_why = True, ''
+    if not _pin_ok:
+        _log(f"JDK 17 pin skipped, no change made: {_pin_why}")
+        return {'skipped': _pin_why}
 
     home, jbin = _resolve_java17_home()
     if not home:
@@ -118869,6 +118963,38 @@ def _gd_refresh_mtx_cert_sync():
     return changed
 
 
+_GD_VERSION_KEY = 'guarddog_rendered_by'
+
+
+def _gd_console_downgrade(prev, current=None):
+    """True when the scripts on the box were last rendered by a NEWER console than this one."""
+    p = _console_version_tuple(prev)
+    c = _console_version_tuple(current if current is not None else VERSION)
+    return bool(p and c and p > c)
+
+
+def _gd_stamp_console_version():
+    """Record which console rendered the Guard Dog scripts, and say so in the journal when
+    this console is OLDER than the one that rendered them (ops #1343). A console that is
+    rolled back, or moved from dev to main, re-renders every script from its own templates,
+    on purpose: the scripts then match the console that runs them. Until now nothing on the
+    box said it had happened. The stamp is a settings key: the broker refuses console writes
+    into /opt/tak-guarddog (root installs those scripts itself), so a stamp file there never
+    landed on a non-root box (nuc, 2026-11-27). Never raises."""
+    try:
+        s = load_settings()
+        prev = str(s.get(_GD_VERSION_KEY) or '').strip()
+        if _gd_console_downgrade(prev):
+            print(f"Guard Dog: scripts were last rendered by infra-TAK {prev}; this console is "
+                  f"{VERSION} (older: a rollback or a channel change). They now match this console.",
+                  flush=True)
+        if prev != VERSION:
+            s[_GD_VERSION_KEY] = VERSION
+            save_settings(s)
+    except Exception as _e:
+        print(f"Guard Dog: console version stamp not written (non-fatal): {_e}", flush=True)
+
+
 def _auto_update_guarddog():
     """If Guard Dog is installed, re-copy scripts and reload timers so updates take effect on console restart."""
     if not os.path.exists('/opt/tak-guarddog'):
@@ -118962,6 +119088,7 @@ def _auto_update_guarddog():
                 updated += 1
                 if name == _GD_HEALTH_SCRIPT:
                     _gd_restart_health_endpoint()   # ops #815
+        _gd_stamp_console_version()
         # ops #845: the SMS scripts are optional (installed when SMS is saved), so the loop
         # above skips them. A box that already had SMS set up then kept the old sms_send.py
         # (plain HTTP to a console that answers HTTPS only, so no alert text was ever sent)
@@ -120280,6 +120407,23 @@ for _rh_sub, _rh_ctr in (
     _startup_rehome_module(_rh_sub, _rh_ctr)
 
 
+def _tree_has_files_or_unreadable(d):
+    """True when the folder holds a file, OR when any part of it could not be read.
+
+    os.walk() skips a folder it cannot list unless told otherwise, so a tree whose files sit in
+    an unreadable folder read as empty, and the Cesium re-home then removed it as an "empty
+    stub" (ops #1343). Not being able to look is not the same as nothing being there: when in
+    doubt the caller must leave the folder alone."""
+    unreadable = []
+    try:
+        for _r, _dd, _ff in os.walk(d, onerror=unreadable.append):
+            if _ff:
+                return True
+    except Exception:
+        return True
+    return bool(unreadable)
+
+
 def _startup_rehome_cesium():
     """v10.0.5: re-home the Cesium 3D-Tiles static dir on a FLIPPED Ubuntu box. The tiles are served
     by Caddy (file_server root ~/cesium-tiles) and managed by the console, but a root-era install
@@ -120300,15 +120444,7 @@ def _startup_rehome_cesium():
                 time.sleep(0.25)
         if subprocess.run(_sudo_wrap(['test', '-d', src]), capture_output=True, timeout=10).returncode != 0:
             return  # no root-era tiles to migrate
-        def _has_files(d):
-            try:
-                for _r, _dd, _ff in os.walk(d):
-                    if _ff:
-                        return True
-            except Exception:
-                pass
-            return False
-        if os.path.isdir(home) and _has_files(home):
+        if os.path.isdir(home) and _tree_has_files_or_unreadable(home):
             return  # ~/cesium-tiles already holds real tiles — don't clobber
         if os.path.isdir(home):
             subprocess.run(_sudo_wrap(['rm', '-rf', home]), capture_output=True, timeout=30)  # clear empty stub
@@ -126382,7 +126518,10 @@ def _startup_migrations():
                       "migrations may fail and will retry on the next console restart", flush=True)
 
         # v10.2.2 W2: was a side effect of every detect_modules() call.
-        _cleanup_caddy_leftovers()
+        try:
+            _cleanup_caddy_leftovers()
+        except Exception as _step_e:
+            print(f'Startup migration: step "_cleanup_caddy_leftovers()" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         s = load_settings()
         settings_dirty = False
@@ -126556,22 +126695,25 @@ def _startup_migrations():
 
         # ops #630 — a remote MediaMTX box's firewall may be off. SSH to another box can take
         # minutes, so in the background: it must never hold up the console's start.
-        _mtx_remote_fw_t = threading.Thread(target=_startup_converge_mediamtx_remote_firewall, daemon=True,
-                                            name='startup-mediamtx-remote-fw')
-        _mtx_remote_fw_t.start()
-        # ops #1107 — the stream site file (and the editor's Authentik token and address) on a
-        # remote MediaMTX box, the same pass _startup_converge_mediamtx_overlay() does for a
-        # local one. After the firewall check, never beside it: that check may stop the editor.
-        # ops #1110 — then the video road: once the editor there serves /hls-proxy/, Caddy
-        # sends video through the sign-in (_startup_converge_mediamtx_remote_hls_road runs
-        # _startup_converge_mediamtx_overlay_remote first, in the same thread).
-        _mtx_remote_road_t = threading.Thread(target=_startup_converge_mediamtx_remote_hls_road, args=(_mtx_remote_fw_t,),
-                                              daemon=True, name='startup-mediamtx-remote-overlay')
-        _mtx_remote_road_t.start()
-        # ops #1149 — then the HLS port on that box: closed to the console once the running
-        # Caddy no longer reads it. After the road pass, never beside it.
-        threading.Thread(target=_startup_converge_mediamtx_remote_hls_port, args=(_mtx_remote_road_t,),
-                         daemon=True, name='startup-mediamtx-remote-hls-port').start()
+        try:
+            _mtx_remote_fw_t = threading.Thread(target=_startup_converge_mediamtx_remote_firewall, daemon=True,
+                                                name='startup-mediamtx-remote-fw')
+            _mtx_remote_fw_t.start()
+            # ops #1107 — the stream site file (and the editor's Authentik token and address) on a
+            # remote MediaMTX box, the same pass _startup_converge_mediamtx_overlay() does for a
+            # local one. After the firewall check, never beside it: that check may stop the editor.
+            # ops #1110 — then the video road: once the editor there serves /hls-proxy/, Caddy
+            # sends video through the sign-in (_startup_converge_mediamtx_remote_hls_road runs
+            # _startup_converge_mediamtx_overlay_remote first, in the same thread).
+            _mtx_remote_road_t = threading.Thread(target=_startup_converge_mediamtx_remote_hls_road, args=(_mtx_remote_fw_t,),
+                                                  daemon=True, name='startup-mediamtx-remote-overlay')
+            _mtx_remote_road_t.start()
+            # ops #1149 — then the HLS port on that box: closed to the console once the running
+            # Caddy no longer reads it. After the road pass, never beside it.
+            threading.Thread(target=_startup_converge_mediamtx_remote_hls_port, args=(_mtx_remote_road_t,),
+                             daemon=True, name='startup-mediamtx-remote-hls-port').start()
+        except Exception as _step_e:
+            print(f'Startup migration: step "_mtx_remote_fw_t = threading.Thread(target=_startu" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         try:
             _startup_converge_mediamtx_ssl()
@@ -126744,27 +126886,30 @@ def _startup_migrations():
             print(f"Startup migration: split DB keepalive launch error (non-fatal): {_sdk_e}", flush=True)
 
         # Fix fedhub web_ui_port default for Caddy upstream (remote hub HTTP web UI is 8080)
-        fh_raw = s.get('fedhub_deployment', {})
-        if fh_raw.get('deployed') or fh_raw.get('web_ui_port') in (8446, '8446', None):
-            wp = fh_raw.get('web_ui_port')
-            if wp in (8446, '8446', None):
-                fh_raw['web_ui_port'] = 8080
-                s['fedhub_deployment'] = fh_raw
-                settings_dirty = True
-                print("Startup migration: fixed fedhub web_ui_port → 8080")
+        try:
+            fh_raw = s.get('fedhub_deployment', {})
+            if fh_raw.get('deployed') or fh_raw.get('web_ui_port') in (8446, '8446', None):
+                wp = fh_raw.get('web_ui_port')
+                if wp in (8446, '8446', None):
+                    fh_raw['web_ui_port'] = 8080
+                    s['fedhub_deployment'] = fh_raw
+                    settings_dirty = True
+                    print("Startup migration: fixed fedhub web_ui_port → 8080")
 
-        if settings_dirty:
-            save_settings(s)
-            s = load_settings()
+            if settings_dirty:
+                save_settings(s)
+                s = load_settings()
 
-        # Build normalized cfg after settings normalization
-        fh_cfg = _get_fedhub_deployment_config(s)
+            # Build normalized cfg after settings normalization
+            fh_cfg = _get_fedhub_deployment_config(s)
 
-        # Always regenerate Caddyfile when Fed Hub is deployed (port fixes, Fed Hub vhost, etc.)
-        if fh_cfg.get('deployed') and (s.get('fqdn') or '').strip():
-            generate_caddyfile(s)
-            _caddy_reload()
-            print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+            # Always regenerate Caddyfile when Fed Hub is deployed (port fixes, Fed Hub vhost, etc.)
+            if fh_cfg.get('deployed') and (s.get('fqdn') or '').strip():
+                generate_caddyfile(s)
+                _caddy_reload()
+                print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+        except Exception as _step_e:
+            print(f'Startup migration: step "fh_raw = s.get(fedhub_deployment )" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.1.1 (one-time per box): heal the /hls-proxy TLS upstream fleet-wide.
         # The non-root console computed hls_encrypted=False (it can't traverse
@@ -126802,30 +126947,33 @@ def _startup_migrations():
         # retry with a short backoff, VERIFY the strip is actually in generate's returned
         # content (a successful return means the file write succeeded too — generate raises
         # if the broker write fails), and only stamp the flag on a confirmed application.
-        if (s.get('fqdn') or '').strip() and not s.get('caddy_xauth_strip_v1'):
-            _applied = False
-            _last_err = None
-            for _xs_attempt in range(6):
-                try:
-                    _cf = generate_caddyfile(s)
-                    if _cf and 'request_header -X-Authentik' in _cf:
-                        _caddy_reload()
-                        _applied = True
-                        break
-                    _last_err = 'strip absent from generated Caddyfile'
-                except Exception as _xs_e:
-                    _last_err = str(_xs_e)[:160]
-                time.sleep(4)
-            if _applied:
-                s['caddy_xauth_strip_v1'] = True
-                save_settings(s)
-                s = load_settings()
-                print("Startup migration: Caddyfile regenerated to strip client X-Authentik-* (auth-bypass fix)")
-            else:
-                # Flag intentionally NOT set → retries on the next restart. Loud, so the
-                # box being left exposed is visible in the journal.
-                print(f"Startup migration: ⚠ SECURITY: X-Authentik strip NOT applied after retries "
-                      f"(box may be exposed until next restart): {_last_err}", flush=True)
+        try:
+            if (s.get('fqdn') or '').strip() and not s.get('caddy_xauth_strip_v1'):
+                _applied = False
+                _last_err = None
+                for _xs_attempt in range(6):
+                    try:
+                        _cf = generate_caddyfile(s)
+                        if _cf and 'request_header -X-Authentik' in _cf:
+                            _caddy_reload()
+                            _applied = True
+                            break
+                        _last_err = 'strip absent from generated Caddyfile'
+                    except Exception as _xs_e:
+                        _last_err = str(_xs_e)[:160]
+                    time.sleep(4)
+                if _applied:
+                    s['caddy_xauth_strip_v1'] = True
+                    save_settings(s)
+                    s = load_settings()
+                    print("Startup migration: Caddyfile regenerated to strip client X-Authentik-* (auth-bypass fix)")
+                else:
+                    # Flag intentionally NOT set → retries on the next restart. Loud, so the
+                    # box being left exposed is visible in the journal.
+                    print(f"Startup migration: ⚠ SECURITY: X-Authentik strip NOT applied after retries "
+                          f"(box may be exposed until next restart): {_last_err}", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if (s.get(fqdn) or ).strip() and not s.get(caddy_x" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.2.6 SECURITY (one-time per box, retry-until-applied): the MediaMTX vhost strips
         # client X-Authentik-* on every route — a forged admin group header used to earn an
@@ -126833,40 +126981,43 @@ def _startup_migrations():
         # editor overlay so logged-in viewers can play. See _emit_mediamtx_site. MUST stay
         # after _startup_converge_mediamtx_overlay(): only the overlay it ships forwards
         # MediaMTX's ?session= query, and the old one cannot play past the first playlist.
-        if (s.get('fqdn') or '').strip() and not s.get('caddy_mtx_hls_overlay_v1'):
-            _applied = False
-            _last_err = None
-            for _mh_attempt in range(6):
-                try:
-                    _mh_mods = detect_modules(fresh=True)
-                    if not (_mh_mods.get('mediamtx', {}).get('installed')
-                            and _mh_mods.get('authentik', {}).get('installed')):
-                        # Nothing to converge; a later deploy regenerates with the new vhost.
-                        _applied = True
-                        break
-                    generate_caddyfile(s)
-                    # Read back the LIVE file: a Caddyfile Caddy rejects is restored to the
-                    # previous one (_caddy_validate_or_restore) while generate still returns
-                    # the new text, so checking that would stamp a box that never changed.
-                    _cf = _read_priv(CADDYFILE_PATH) or ''
-                    _mtx_blk = _cf.split('# MediaMTX Web Console', 1)[-1].split('\n}\n', 1)[0]
-                    if '# MediaMTX Web Console' in _cf and 'request_header -X-Authentik-Groups' in _mtx_blk:
-                        _caddy_reload()
-                        _applied = True
-                        break
-                    _last_err = 'MediaMTX vhost header strip absent from the live Caddyfile (rejected and restored?)'
-                except Exception as _mh_e:
-                    _last_err = str(_mh_e)[:160]
-                time.sleep(4)
-            if _applied:
-                s['caddy_mtx_hls_overlay_v1'] = True
-                save_settings(s)
-                s = load_settings()
-                print("Startup migration: MediaMTX vhost — client X-Authentik-* stripped, "
-                      "/hls-proxy through the login to the editor overlay", flush=True)
-            else:
-                print(f"Startup migration: ⚠ SECURITY: MediaMTX vhost NOT regenerated after retries "
-                      f"(retries next restart): {_last_err}", flush=True)
+        try:
+            if (s.get('fqdn') or '').strip() and not s.get('caddy_mtx_hls_overlay_v1'):
+                _applied = False
+                _last_err = None
+                for _mh_attempt in range(6):
+                    try:
+                        _mh_mods = detect_modules(fresh=True)
+                        if not (_mh_mods.get('mediamtx', {}).get('installed')
+                                and _mh_mods.get('authentik', {}).get('installed')):
+                            # Nothing to converge; a later deploy regenerates with the new vhost.
+                            _applied = True
+                            break
+                        generate_caddyfile(s)
+                        # Read back the LIVE file: a Caddyfile Caddy rejects is restored to the
+                        # previous one (_caddy_validate_or_restore) while generate still returns
+                        # the new text, so checking that would stamp a box that never changed.
+                        _cf = _read_priv(CADDYFILE_PATH) or ''
+                        _mtx_blk = _cf.split('# MediaMTX Web Console', 1)[-1].split('\n}\n', 1)[0]
+                        if '# MediaMTX Web Console' in _cf and 'request_header -X-Authentik-Groups' in _mtx_blk:
+                            _caddy_reload()
+                            _applied = True
+                            break
+                        _last_err = 'MediaMTX vhost header strip absent from the live Caddyfile (rejected and restored?)'
+                    except Exception as _mh_e:
+                        _last_err = str(_mh_e)[:160]
+                    time.sleep(4)
+                if _applied:
+                    s['caddy_mtx_hls_overlay_v1'] = True
+                    save_settings(s)
+                    s = load_settings()
+                    print("Startup migration: MediaMTX vhost — client X-Authentik-* stripped, "
+                          "/hls-proxy through the login to the editor overlay", flush=True)
+                else:
+                    print(f"Startup migration: ⚠ SECURITY: MediaMTX vhost NOT regenerated after retries "
+                          f"(retries next restart): {_last_err}", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if (s.get(fqdn) or ).strip() and not s.get(caddy_m" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # ops #150: the NetBird vhost sent signal to :10000 (nothing listens there on the
         # combined server) and the relay WebSocket over h2c (502), so peers registered but
@@ -126894,90 +127045,96 @@ def _startup_migrations():
         # carry the X-Infratak-Proxy-Auth secret, VERIFY the generated content,
         # reload Caddy, and only then flip enforce on — so SSO never breaks from
         # the console requiring a header Caddy isn't injecting yet.
-        if not s.get('caddy_proxy_auth_gate_v1'):
-            if not (s.get('fqdn') or '').strip():
-                # No FQDN → no Caddy-fronted console → no legitimate forward_auth
-                # source for X-Authentik-* headers. Arm immediately: any loopback
-                # request bearing that header on this box is forged.
-                _pa = _proxy_auth_state(create=True)
-                _pa['enforce'] = True
-                _save_proxy_auth_state(_pa)
-                s['caddy_proxy_auth_gate_v1'] = True
-                save_settings(s)
-                s = load_settings()
-                print("Startup migration: proxy-auth gate armed (no FQDN — header SSO requires Caddy)", flush=True)
-            else:
-                _pa_applied = False
-                _pa_err = None
-                for _pa_try in range(6):
-                    try:
-                        _cf = generate_caddyfile(s)
-                        # Console forward_auth is uniquely 'forward_auth @needs_sso';
-                        # if it is emitted, the secret injection must be too. The
-                        # client strip must be present in every posture.
-                        _pa_ok = bool(_cf) and 'request_header -X-Infratak-Proxy-Auth' in _cf and \
-                            (('forward_auth @needs_sso' not in _cf
-                              and 'route @needs_sso' not in _cf)    # ops #1108 form
-                             or 'request_header @needs_sso X-Infratak-Proxy-Auth' in _cf) and \
-                            'route /api/console/restart-safe*' in _cf  # S2 edge block rides the same regen
-                        if _pa_ok:
-                            _caddy_reload()
-                            _pa_applied = True
-                            break
-                        _pa_err = 'proxy-auth directives absent from generated Caddyfile'
-                    except Exception as _pa_e:
-                        _pa_err = str(_pa_e)[:160]
-                    time.sleep(4)
-                if _pa_applied:
+        try:
+            if not s.get('caddy_proxy_auth_gate_v1'):
+                if not (s.get('fqdn') or '').strip():
+                    # No FQDN → no Caddy-fronted console → no legitimate forward_auth
+                    # source for X-Authentik-* headers. Arm immediately: any loopback
+                    # request bearing that header on this box is forged.
                     _pa = _proxy_auth_state(create=True)
                     _pa['enforce'] = True
                     _save_proxy_auth_state(_pa)
                     s['caddy_proxy_auth_gate_v1'] = True
                     save_settings(s)
                     s = load_settings()
-                    print("Startup migration: proxy-auth gate armed (Caddy injects X-Infratak-Proxy-Auth on forward_auth)", flush=True)
+                    print("Startup migration: proxy-auth gate armed (no FQDN — header SSO requires Caddy)", flush=True)
                 else:
-                    # Not armed → the 10.1.0 client-header strip remains the (sole)
-                    # defense; retry on the next restart. Loud on purpose.
-                    print(f"Startup migration: ⚠ SECURITY: proxy-auth gate NOT armed after retries "
-                          f"(strip-only defense until next restart): {_pa_err}", flush=True)
+                    _pa_applied = False
+                    _pa_err = None
+                    for _pa_try in range(6):
+                        try:
+                            _cf = generate_caddyfile(s)
+                            # Console forward_auth is uniquely 'forward_auth @needs_sso';
+                            # if it is emitted, the secret injection must be too. The
+                            # client strip must be present in every posture.
+                            _pa_ok = bool(_cf) and 'request_header -X-Infratak-Proxy-Auth' in _cf and \
+                                (('forward_auth @needs_sso' not in _cf
+                                  and 'route @needs_sso' not in _cf)    # ops #1108 form
+                                 or 'request_header @needs_sso X-Infratak-Proxy-Auth' in _cf) and \
+                                'route /api/console/restart-safe*' in _cf  # S2 edge block rides the same regen
+                            if _pa_ok:
+                                _caddy_reload()
+                                _pa_applied = True
+                                break
+                            _pa_err = 'proxy-auth directives absent from generated Caddyfile'
+                        except Exception as _pa_e:
+                            _pa_err = str(_pa_e)[:160]
+                        time.sleep(4)
+                    if _pa_applied:
+                        _pa = _proxy_auth_state(create=True)
+                        _pa['enforce'] = True
+                        _save_proxy_auth_state(_pa)
+                        s['caddy_proxy_auth_gate_v1'] = True
+                        save_settings(s)
+                        s = load_settings()
+                        print("Startup migration: proxy-auth gate armed (Caddy injects X-Infratak-Proxy-Auth on forward_auth)", flush=True)
+                    else:
+                        # Not armed → the 10.1.0 client-header strip remains the (sole)
+                        # defense; retry on the next restart. Loud on purpose.
+                        print(f"Startup migration: ⚠ SECURITY: proxy-auth gate NOT armed after retries "
+                              f"(strip-only defense until next restart): {_pa_err}", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if not s.get(caddy_proxy_auth_gate_v1)" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.1.28: outpost-callback rescue page (572f6c4). A code-only change to
         # generate_caddyfile does nothing until the file is regenerated, and a manual
         # git pull + restart skips the Update-Now regen path — so converge here, the
         # same one-shot-flag shape as the migrations above. Regenerate, verify the
         # rescue route is in the output, reload Caddy, stamp the flag.
-        if (s.get('fqdn') or '').strip() and not s.get('caddy_cb_rescue_v2'):
-            _cbr_applied = False
-            _cbr_err = None
-            for _cbr_try in range(6):
-                try:
-                    _cf = generate_caddyfile(s)
-                    if not _cf:
-                        _cbr_err = 'generate returned empty'
-                    elif 'reverse_proxy /outpost.goauthentik.io/' not in _cf:
-                        # No vhost proxies the outpost (Authentik not installed) — nothing
-                        # to rescue; the regen itself is still the converge. Stamp and stop.
-                        _cbr_applied = True
-                        break
-                    elif 'route /outpost.goauthentik.io/callback*' in _cf:
-                        _caddy_reload()
-                        _cbr_applied = True
-                        break
-                    else:
-                        _cbr_err = 'rescue route absent from generated Caddyfile'
-                except Exception as _cbr_e:
-                    _cbr_err = str(_cbr_e)[:160]
-                time.sleep(4)
-            if _cbr_applied:
-                s['caddy_cb_rescue_v2'] = True
-                save_settings(s)
-                s = load_settings()
-                print("Startup migration: Caddyfile regenerated with outpost-callback rescue page", flush=True)
-            else:
-                # Flag not set → retried on next restart. Non-security: the old behavior
-                # (bare 400 on a cross-browser reset landing) persists until then.
-                print(f"Startup migration: callback-rescue regen not applied: {_cbr_err}", flush=True)
+        try:
+            if (s.get('fqdn') or '').strip() and not s.get('caddy_cb_rescue_v2'):
+                _cbr_applied = False
+                _cbr_err = None
+                for _cbr_try in range(6):
+                    try:
+                        _cf = generate_caddyfile(s)
+                        if not _cf:
+                            _cbr_err = 'generate returned empty'
+                        elif 'reverse_proxy /outpost.goauthentik.io/' not in _cf:
+                            # No vhost proxies the outpost (Authentik not installed) — nothing
+                            # to rescue; the regen itself is still the converge. Stamp and stop.
+                            _cbr_applied = True
+                            break
+                        elif 'route /outpost.goauthentik.io/callback*' in _cf:
+                            _caddy_reload()
+                            _cbr_applied = True
+                            break
+                        else:
+                            _cbr_err = 'rescue route absent from generated Caddyfile'
+                    except Exception as _cbr_e:
+                        _cbr_err = str(_cbr_e)[:160]
+                    time.sleep(4)
+                if _cbr_applied:
+                    s['caddy_cb_rescue_v2'] = True
+                    save_settings(s)
+                    s = load_settings()
+                    print("Startup migration: Caddyfile regenerated with outpost-callback rescue page", flush=True)
+                else:
+                    # Flag not set → retried on next restart. Non-security: the old behavior
+                    # (bare 400 on a cross-browser reset landing) persists until then.
+                    print(f"Startup migration: callback-rescue regen not applied: {_cbr_err}", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if (s.get(fqdn) or ).strip() and not s.get(caddy_c" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.1.28: Authentik-side convergence, same one-button rule. The cookie_domain sweep
         # (2acf95f) and the recovery-flow changes (show-password field, dedicated identification
@@ -126990,40 +127147,43 @@ def _startup_migrations():
         # the v1 stamp set, so without a new key the recovery-flow change below (reset now
         # ends SIGNED OUT on every box, not just W1-hardened ones) would never reach them —
         # the exact "new code, still-broken flow" trap this block exists to prevent.
-        if not s.get('ak_cookie_recovery_converge_v2'):
-            _akc_done = False
-            _akc_err = None
-            try:
-                _ak_tok = (_get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
-                           or _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or '').strip()
-            except Exception:
-                _ak_tok = ''
-            if not _ak_tok:
-                # No Authentik on this box (or no token yet) → nothing to converge. Stamp:
-                # a later Authentik deploy runs both ensures itself as part of its own flow.
-                _akc_done = True
-            else:
-                _ak_hdr = {'Authorization': f'Bearer {_ak_tok}', 'Content-Type': 'application/json'}
-                for _akc_try in range(3):
-                    try:
-                        _ensure_proxy_providers_cookie_domain(
-                            'http://127.0.0.1:9090', _ak_hdr, (s.get('fqdn') or '').strip())
-                        _ensure_authentik_recovery_flow('http://127.0.0.1:9090', _ak_hdr)
-                        _akc_done = True
-                        break
-                    except Exception as _akc_e:
-                        _akc_err = str(_akc_e)[:160]
-                    time.sleep(5)
-            if _akc_done:
-                s['ak_cookie_recovery_converge_v2'] = True
-                save_settings(s)
-                s = load_settings()
-                print("Startup migration: Authentik proxy cookie_domain normalized + recovery flow "
-                      "converged (reset now ends signed-out on every box)", flush=True)
-            else:
-                # Authentik containers may still be starting on a fresh boot — leave the flag
-                # unset so the next restart retries rather than silently skipping forever.
-                print(f"Startup migration: Authentik converge deferred (retries next restart): {_akc_err}", flush=True)
+        try:
+            if not s.get('ak_cookie_recovery_converge_v2'):
+                _akc_done = False
+                _akc_err = None
+                try:
+                    _ak_tok = (_get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                               or _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or '').strip()
+                except Exception:
+                    _ak_tok = ''
+                if not _ak_tok:
+                    # No Authentik on this box (or no token yet) → nothing to converge. Stamp:
+                    # a later Authentik deploy runs both ensures itself as part of its own flow.
+                    _akc_done = True
+                else:
+                    _ak_hdr = {'Authorization': f'Bearer {_ak_tok}', 'Content-Type': 'application/json'}
+                    for _akc_try in range(3):
+                        try:
+                            _ensure_proxy_providers_cookie_domain(
+                                'http://127.0.0.1:9090', _ak_hdr, (s.get('fqdn') or '').strip())
+                            _ensure_authentik_recovery_flow('http://127.0.0.1:9090', _ak_hdr)
+                            _akc_done = True
+                            break
+                        except Exception as _akc_e:
+                            _akc_err = str(_akc_e)[:160]
+                        time.sleep(5)
+                if _akc_done:
+                    s['ak_cookie_recovery_converge_v2'] = True
+                    save_settings(s)
+                    s = load_settings()
+                    print("Startup migration: Authentik proxy cookie_domain normalized + recovery flow "
+                          "converged (reset now ends signed-out on every box)", flush=True)
+                else:
+                    # Authentik containers may still be starting on a fresh boot — leave the flag
+                    # unset so the next restart retries rather than silently skipping forever.
+                    print(f"Startup migration: Authentik converge deferred (retries next restart): {_akc_err}", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if not s.get(ak_cookie_recovery_converge_v2)" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.1.28: arm the Setup AP's offline dependencies on boxes that were already
         # configured before this fix. tak-setup-ap.sh installed hostapd/dnsmasq lazily at
@@ -127053,47 +127213,29 @@ def _startup_migrations():
             except Exception as _sae:
                 print('Startup migration: Setup AP arming error: %s' % str(_sae)[:160], flush=True)
 
-        # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
-        # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console
-        # Update/Uninstall buttons now target eud paths and can no longer see an old cfd stack,
-        # so a box that installed Remote Assist before the rename would be stranded (old
-        # containers hold ports 8767/8448 → a fresh eud deploy collides). We remove the old
-        # compose stack + DB volume, force-kill any lingering cfd-remote-assist-* containers,
-        # deregister the old Authentik app/provider, drop the source dir, and mark the module
-        # not-installed so the operator reinstalls fresh (= eud). Idempotent: the old dir is
-        # removed at the end, and the guard requires it present with no eud dir yet, so this
-        # runs at most once and is a no-op on fresh boxes.
+        # v10.0.1 renamed the Remote Assist module cfd -> eud. It used to tear the old install
+        # down here, with `docker compose down -v`, which deletes the Remote Assist database
+        # volume with no prompt. ops #1343: a startup migration must never delete data nobody
+        # asked it to. If the old folder is still there (and no eud one), leave everything as it
+        # is, say so in the journal and on a console bar, and let the operator decide.
         _ra_old_dir = os.path.expanduser('~/cfd-remote-assist')
         _ra_new_dir = os.path.expanduser('~/eud-remote-assist')
-        if os.path.isdir(_ra_old_dir) and not os.path.isdir(_ra_new_dir):
-            try:
-                print("Startup migration: tearing down legacy cfd-remote-assist install (renamed to eud)", flush=True)
-                _old_compose = os.path.join(_ra_old_dir, 'docker-compose.yml')
-                if os.path.exists(_old_compose):
-                    subprocess.run(_sudo_wrap(['docker', 'compose', '-f', _old_compose, 'down', '-v', '--remove-orphans']),
-                                   capture_output=True, timeout=120)
-                # Belt-and-suspenders: force-remove any container still named cfd-remote-assist-*
-                _ra_old_ids = subprocess.run(_sudo_wrap(['docker', 'ps', '-aq', '--filter', 'name=cfd-remote-assist']),
-                                             capture_output=True, text=True, timeout=15).stdout.split()
-                if _ra_old_ids:
-                    subprocess.run(_sudo_wrap(['docker', 'rm', '-f', *_ra_old_ids]), capture_output=True, timeout=60)
-                # Deregister the old Authentik application + provider (legacy slug/name).
-                try:
-                    _deregister_authentik_oauth2_app(s, 'cfd-remote-assist', 'CFD Remote Assist')
-                except Exception:
-                    pass
-                shutil.rmtree(_ra_old_dir, ignore_errors=True)
-                # Reflect reality: no RA install until the operator reinstalls fresh (= eud).
-                s['remote_assist_enabled'] = False
+        try:
+            if os.path.isdir(_ra_old_dir) and not os.path.isdir(_ra_new_dir):
+                if not s.get('legacy_remote_assist_notice'):
+                    print("Startup migration: legacy cfd-remote-assist install found. NOT removed: its "
+                          "database volume holds Remote Assist data. Back it up, then remove "
+                          "~/cfd-remote-assist yourself, and install EUD Remote Assist from the console.",
+                          flush=True)
+                    s['legacy_remote_assist_notice'] = True
+                    save_settings(s)
+                    s = load_settings()
+            elif s.get('legacy_remote_assist_notice'):
+                s.pop('legacy_remote_assist_notice', None)      # the operator dealt with it
                 save_settings(s)
                 s = load_settings()
-                # Drop the now-dead RA vhost from Caddy so its subdomain doesn't 502.
-                if (s.get('fqdn') or '').strip():
-                    generate_caddyfile(s)
-                    _caddy_reload()
-                print("Startup migration: legacy cfd-remote-assist removed — reinstall EUD Remote Assist from the console to recreate it", flush=True)
-            except Exception as e:
-                print(f"Startup migration: error tearing down legacy cfd-remote-assist: {e}", flush=True)
+        except Exception as e:
+            print(f"Startup migration: legacy cfd-remote-assist check failed: {e}", flush=True)
 
         # v0.9.61: inject OIDC_ADMIN_GROUP into existing remote assist .env
         if s.get('remote_assist_enabled') or 'remote_assist' in s.get('modules', {}):
@@ -127127,136 +127269,145 @@ def _startup_migrations():
                 print(f"Startup migration: error opening RA device port in firewalld: {e}", flush=True)
 
         # Ensure cesium-tiles dir exists + is servable when the module is enabled.
-        if s.get('cesium_tiles_enabled'):
-            _cesium_ensure_dir()  # idempotent: create + (RHEL) caddy-readable perms + SELinux label
-            # RHEL self-heal: a box enabled before the path move still has a Caddyfile
-            # pointing at the non-traversable ~/cesium-tiles (Caddy 403). If the cesium
-            # vhost root is stale, regenerate + reload so it serves the new dir.
-            if (s.get('fqdn') or '').strip():
-                try:
-                    with open(CADDYFILE_PATH) as _cf:
-                        _cad = _cf.read()
-                except Exception:
-                    _cad = ''
-                if 'cesium' in _cad.lower() and _cesium_dir() not in _cad:
-                    generate_caddyfile(s)
-                    _caddy_reload(timeout=60)
-                    print("Startup migration: cesium vhost repointed to caddy-readable dir + Caddy reloaded", flush=True)
+        try:
+            if s.get('cesium_tiles_enabled'):
+                _cesium_ensure_dir()  # idempotent: create + (RHEL) caddy-readable perms + SELinux label
+                # RHEL self-heal: a box enabled before the path move still has a Caddyfile
+                # pointing at the non-traversable ~/cesium-tiles (Caddy 403). If the cesium
+                # vhost root is stale, regenerate + reload so it serves the new dir.
+                if (s.get('fqdn') or '').strip():
+                    try:
+                        with open(CADDYFILE_PATH) as _cf:
+                            _cad = _cf.read()
+                    except Exception:
+                        _cad = ''
+                    if 'cesium' in _cad.lower() and _cesium_dir() not in _cad:
+                        generate_caddyfile(s)
+                        _caddy_reload(timeout=60)
+                        print("Startup migration: cesium vhost repointed to caddy-readable dir + Caddy reloaded", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if s.get(cesium_tiles_enabled)" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # Ensure webodm working directories exist when the module is enabled
-        if s.get('webodm_enabled'):
-            for _wo_sub in ['', 'plugins', 'media', 'db']:
-                _wo_path = os.path.expanduser(f'~/webodm/{_wo_sub}') if _wo_sub else os.path.expanduser('~/webodm')
-                if not os.path.isdir(_wo_path):
-                    os.makedirs(_wo_path, exist_ok=True)
-                    print(f"Startup migration: created ~/webodm/{_wo_sub}")
+        try:
+            if s.get('webodm_enabled'):
+                for _wo_sub in ['', 'plugins', 'media', 'db']:
+                    _wo_path = os.path.expanduser(f'~/webodm/{_wo_sub}') if _wo_sub else os.path.expanduser('~/webodm')
+                    if not os.path.isdir(_wo_path):
+                        os.makedirs(_wo_path, exist_ok=True)
+                        print(f"Startup migration: created ~/webodm/{_wo_sub}")
+        except Exception as _step_e:
+            print(f'Startup migration: step "if s.get(webodm_enabled)" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # Harden existing WebODM installs: patch compose port bindings + UFW deny
         # Fixes 0.0.0.0:{wo_port}:8000 → 127.0.0.1:{wo_port}:8000 per PORT-EXPOSURE-POLICY.md Tier 3
         # ops #92 / #101 W5: a box flipped from root keeps WebODM in /root/webodm, which the
         # console can't read or stat — resolve it with _webodm_dir() and go through the broker
         # there, or the flipped box is skipped and keeps EOL redis until someone presses Update.
-        _wo_dir = _webodm_dir()
-        # (on a root box ~/webodm IS /root/webodm: plain file I/O, and no WebODM = no file = skip)
-        _wo_priv = (_wo_dir == '/root/webodm'
-                    and _wo_dir != os.path.join(os.path.expanduser('~'), 'webodm'))
-        _wo_compose = os.path.join(_wo_dir, 'docker-compose.yml')
-        if _wo_priv or os.path.exists(_wo_compose):
-            try:
-                import re as _re_wo
-                if _wo_priv:
-                    _wo_txt = _read_priv(_wo_compose)
-                else:
-                    with open(_wo_compose) as _f:
-                        _wo_txt = _f.read()
-                # Patch webapp port binding if it's still 0.0.0.0 (no loopback prefix)
-                _wo_patched = _re_wo.sub(
-                    r'- "(\d+):8000"',
-                    r'- "127.0.0.1:\1:8000"',
-                    _wo_txt
-                )
-                # Remove any host-side nodeodm port mapping (Docker-internal only).
-                # Also strip the now-empty `ports:` key to avoid YAML validation errors.
-                _wo_patched = _re_wo.sub(
-                    r'[ \t]*- "127\.0\.0\.1:3001:3000"\n', '', _wo_patched
-                )
-                _wo_patched = _re_wo.sub(
-                    r'[ \t]+ports:\n(?=[ \t]+(restart:|oom_score_adj:))', '', _wo_patched
-                )
-                # Inject WO_DATABASE_HOST=wo_db if missing — fixes "could not translate host name db"
-                # when our compose uses wo_db as the container name instead of WebODM's default "db"
-                # (upstream settings.py reads os.environ.get('WO_DATABASE_HOST', 'db'))
-                if 'WO_DATABASE_HOST' not in _wo_patched:
-                    _wo_patched = _wo_patched.replace(
-                        '- WO_BROKER=redis://wo_broker',
-                        '- WO_DATABASE_HOST=wo_db\n      - WO_BROKER=redis://wo_broker'
-                    )
-                # GH #32 self-heal: normalize the wo_nodeodm block to the fleet ODM cap —
-                # cpus + mem_limit (host protection) + --max_concurrency (NodeODX thread cap
-                # so a job COMPLETES within the cap instead of spawning host-core-count
-                # threads and OOM-killing). Boxes deployed before the cap landed get it here
-                # on the next console restart — no redeploy. Idempotent: the regex rewrites
-                # the wo_nodeodm block to target, so an already-capped box produces no diff
-                # (the write+recreate below only fires when the file actually changed).
-                _wo_cap_changed = False
-                _wo_deploy_cfg = _get_module_deployment_config(s, 'webodm_deployment')
-                if _wo_deploy_cfg.get('target_mode') != 'remote' and '  wo_nodeodm:' in _wo_patched:
-                    _wo_cpus, _wo_mem = _webodm_odm_limits(os.cpu_count() or 4, _wo_deploy_cfg)
-
-                    def _wo_nodeodm_block(_m):
-                        # Keep the image the box already runs: moving NodeODX to the pin is a
-                        # large pull, so it happens on Update/redeploy, not on a console restart.
-                        _img = _re_wo.search(r'^    image: ([^\n]*)$', _m.group(0), _re_wo.M)
-                        return (
-                            '  wo_nodeodm:\n'
-                            f'    image: {_img.group(1) if _img else WEBODM_IMAGES["wo_nodeodm"]}\n'
-                            '    container_name: wo_nodeodm\n'
-                            f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
-                            f'    cpus: {_wo_cpus}\n'
-                            f'    mem_limit: {_wo_mem}g\n'
-                            '    restart: unless-stopped\n'
-                            '    oom_score_adj: 250\n'
-                        )
-                    _wo_before_cap = _wo_patched
+        try:
+            _wo_dir = _webodm_dir()
+            # (on a root box ~/webodm IS /root/webodm: plain file I/O, and no WebODM = no file = skip)
+            _wo_priv = (_wo_dir == '/root/webodm'
+                        and _wo_dir != os.path.join(os.path.expanduser('~'), 'webodm'))
+            _wo_compose = os.path.join(_wo_dir, 'docker-compose.yml')
+            if _wo_priv or os.path.exists(_wo_compose):
+                try:
+                    import re as _re_wo
+                    if _wo_priv:
+                        _wo_txt = _read_priv(_wo_compose)
+                    else:
+                        with open(_wo_compose) as _f:
+                            _wo_txt = _f.read()
+                    # Patch webapp port binding if it's still 0.0.0.0 (no loopback prefix)
                     _wo_patched = _re_wo.sub(
-                        r'  wo_nodeodm:\n(?:    [^\n]*\n)*',
-                        _wo_nodeodm_block,
-                        _wo_patched,
-                        count=1,
+                        r'- "(\d+):8000"',
+                        r'- "127.0.0.1:\1:8000"',
+                        _wo_txt
                     )
-                    _wo_cap_changed = (_wo_patched != _wo_before_cap)
-                # ops #92: move the Celery broker off EOL redis:7.0.10 on the next console
-                # restart — a small image, and only wo_broker is recreated. The WebODM images
-                # move to their pins on Update/redeploy (large pulls + DB migrations).
-                _wo_before_redis = _wo_patched
-                _wo_patched = _webodm_pin_images(_wo_patched, services=('wo_broker',))
-                _wo_redis_changed = (_wo_patched != _wo_before_redis)
-                # ops #206: security update — webapp/worker are recreated once, on this restart.
-                _wo_before_ole = _wo_patched
-                _wo_patched = _webodm_strip_olefile(_wo_patched)
-                _wo_ole_changed = (_wo_patched != _wo_before_ole)
-                if _wo_patched != _wo_txt:
-                    if _wo_priv:
-                        _write_priv(_wo_compose, _wo_patched)
-                    else:
-                        with open(_wo_compose, 'w') as _f:
-                            _f.write(_wo_patched)
-                    print(f"Startup migration: hardened {_wo_compose} port bindings + WO_DB_HOST (Tier 3/4)")
-                    if _wo_cap_changed:
-                        print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
-                    if _wo_redis_changed:
-                        print(f"Startup migration: ✓ WebODM broker pinned to {WEBODM_IMAGES['wo_broker']} (was EOL redis 7.0)")
-                    if _wo_ole_changed:
-                        print("Startup migration: ✓ WebODM security update applied to webapp/worker (ops #206)")
-                    if _wo_priv:
-                        # root's dir: no cwd into /root, so compose runs via the broker
-                        _webodm_compose(_wo_dir, 'up -d', timeout=120)
-                    else:
-                        import subprocess as _sp_wo
-                        _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
-                                   capture_output=True, timeout=120, cwd=_wo_dir)
-            except Exception as _wo_e:
-                print(f"Startup migration: webodm compose harden warning: {_wo_e}")
+                    # Remove any host-side nodeodm port mapping (Docker-internal only).
+                    # Also strip the now-empty `ports:` key to avoid YAML validation errors.
+                    _wo_patched = _re_wo.sub(
+                        r'[ \t]*- "127\.0\.0\.1:3001:3000"\n', '', _wo_patched
+                    )
+                    _wo_patched = _re_wo.sub(
+                        r'[ \t]+ports:\n(?=[ \t]+(restart:|oom_score_adj:))', '', _wo_patched
+                    )
+                    # Inject WO_DATABASE_HOST=wo_db if missing — fixes "could not translate host name db"
+                    # when our compose uses wo_db as the container name instead of WebODM's default "db"
+                    # (upstream settings.py reads os.environ.get('WO_DATABASE_HOST', 'db'))
+                    if 'WO_DATABASE_HOST' not in _wo_patched:
+                        _wo_patched = _wo_patched.replace(
+                            '- WO_BROKER=redis://wo_broker',
+                            '- WO_DATABASE_HOST=wo_db\n      - WO_BROKER=redis://wo_broker'
+                        )
+                    # GH #32 self-heal: normalize the wo_nodeodm block to the fleet ODM cap —
+                    # cpus + mem_limit (host protection) + --max_concurrency (NodeODX thread cap
+                    # so a job COMPLETES within the cap instead of spawning host-core-count
+                    # threads and OOM-killing). Boxes deployed before the cap landed get it here
+                    # on the next console restart — no redeploy. Idempotent: the regex rewrites
+                    # the wo_nodeodm block to target, so an already-capped box produces no diff
+                    # (the write+recreate below only fires when the file actually changed).
+                    _wo_cap_changed = False
+                    _wo_deploy_cfg = _get_module_deployment_config(s, 'webodm_deployment')
+                    if _wo_deploy_cfg.get('target_mode') != 'remote' and '  wo_nodeodm:' in _wo_patched:
+                        _wo_cpus, _wo_mem = _webodm_odm_limits(os.cpu_count() or 4, _wo_deploy_cfg)
+
+                        def _wo_nodeodm_block(_m):
+                            # Keep the image the box already runs: moving NodeODX to the pin is a
+                            # large pull, so it happens on Update/redeploy, not on a console restart.
+                            _img = _re_wo.search(r'^    image: ([^\n]*)$', _m.group(0), _re_wo.M)
+                            return (
+                                '  wo_nodeodm:\n'
+                                f'    image: {_img.group(1) if _img else WEBODM_IMAGES["wo_nodeodm"]}\n'
+                                '    container_name: wo_nodeodm\n'
+                                f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
+                                f'    cpus: {_wo_cpus}\n'
+                                f'    mem_limit: {_wo_mem}g\n'
+                                '    restart: unless-stopped\n'
+                                '    oom_score_adj: 250\n'
+                            )
+                        _wo_before_cap = _wo_patched
+                        _wo_patched = _re_wo.sub(
+                            r'  wo_nodeodm:\n(?:    [^\n]*\n)*',
+                            _wo_nodeodm_block,
+                            _wo_patched,
+                            count=1,
+                        )
+                        _wo_cap_changed = (_wo_patched != _wo_before_cap)
+                    # ops #92: move the Celery broker off EOL redis:7.0.10 on the next console
+                    # restart — a small image, and only wo_broker is recreated. The WebODM images
+                    # move to their pins on Update/redeploy (large pulls + DB migrations).
+                    _wo_before_redis = _wo_patched
+                    _wo_patched = _webodm_pin_images(_wo_patched, services=('wo_broker',))
+                    _wo_redis_changed = (_wo_patched != _wo_before_redis)
+                    # ops #206: security update — webapp/worker are recreated once, on this restart.
+                    _wo_before_ole = _wo_patched
+                    _wo_patched = _webodm_strip_olefile(_wo_patched)
+                    _wo_ole_changed = (_wo_patched != _wo_before_ole)
+                    if _wo_patched != _wo_txt:
+                        if _wo_priv:
+                            _write_priv(_wo_compose, _wo_patched)
+                        else:
+                            with open(_wo_compose, 'w') as _f:
+                                _f.write(_wo_patched)
+                        print(f"Startup migration: hardened {_wo_compose} port bindings + WO_DB_HOST (Tier 3/4)")
+                        if _wo_cap_changed:
+                            print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
+                        if _wo_redis_changed:
+                            print(f"Startup migration: ✓ WebODM broker pinned to {WEBODM_IMAGES['wo_broker']} (was EOL redis 7.0)")
+                        if _wo_ole_changed:
+                            print("Startup migration: ✓ WebODM security update applied to webapp/worker (ops #206)")
+                        if _wo_priv:
+                            # root's dir: no cwd into /root, so compose runs via the broker
+                            _webodm_compose(_wo_dir, 'up -d', timeout=120)
+                        else:
+                            import subprocess as _sp_wo
+                            _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
+                                       capture_output=True, timeout=120, cwd=_wo_dir)
+                except Exception as _wo_e:
+                    print(f"Startup migration: webodm compose harden warning: {_wo_e}")
+        except Exception as _step_e:
+            print(f'Startup migration: step "_wo_dir = _webodm_dir()" failed, next steps still run (ops #1343): {_step_e}', flush=True)
         # UFW deny belt-and-braces for WebODM ports
         if s.get('webodm_enabled'):
             try:
@@ -127268,20 +127419,23 @@ def _startup_migrations():
                 pass
 
         # Keep guarddog.conf in sync with settings.json DB host (prevents stale IP after migration)
-        tak_cfg = _get_tak_deployment_config(s)
-        if tak_cfg.get('mode') == 'two_server' and os.path.exists('/opt/tak-guarddog'):
-            sg_ok, sg_msg = _sync_guarddog_remote_db_from_settings(s)
-            if sg_ok and 'synced' in (sg_msg or ''):
-                print(f"Startup migration: guarddog.conf synced — {sg_msg}")
-        elif os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
-            # GH #101: every other box too. A split box whose settings don't say two_server
-            # never reached the sync above, so its guarddog.conf kept no database section
-            # through every update. The writer takes the topology from TAK's CoreConfig.
-            sg_ok, sg_msg = _write_guarddog_conf(s)
-            print(f"Startup migration: guarddog.conf {sg_msg}")
-            if sg_ok and sg_msg.startswith('written'):
-                subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'tak-health.service']),
-                               capture_output=True, timeout=20)
+        try:
+            tak_cfg = _get_tak_deployment_config(s)
+            if tak_cfg.get('mode') == 'two_server' and os.path.exists('/opt/tak-guarddog'):
+                sg_ok, sg_msg = _sync_guarddog_remote_db_from_settings(s)
+                if sg_ok and 'synced' in (sg_msg or ''):
+                    print(f"Startup migration: guarddog.conf synced — {sg_msg}")
+            elif os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
+                # GH #101: every other box too. A split box whose settings don't say two_server
+                # never reached the sync above, so its guarddog.conf kept no database section
+                # through every update. The writer takes the topology from TAK's CoreConfig.
+                sg_ok, sg_msg = _write_guarddog_conf(s)
+                print(f"Startup migration: guarddog.conf {sg_msg}")
+                if sg_ok and sg_msg.startswith('written'):
+                    subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'tak-health.service']),
+                                   capture_output=True, timeout=20)
+        except Exception as _step_e:
+            print(f'Startup migration: step "tak_cfg = _get_tak_deployment_config(s)" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # Ensure the shared infratak Docker network exists and containers are connected
         # (cheap idempotent check — runs every startup so restarts/recreates don't break Portal→Authentik)
@@ -127867,7 +128021,10 @@ def _startup_migrations():
 
         # ops #644 — restrict TAK Portal's SSH key line (written with no options before this
         # release) and keep its from= in step with the portal's Docker networks. Never adds trust.
-        _heal_takportal_ssh_key(lambda m: print(f"Startup migration: {m}", flush=True))
+        try:
+            _heal_takportal_ssh_key(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _step_e:
+            print(f'Startup migration: step "_heal_takportal_ssh_key(lambda m print(fStartup mi" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.1.4 (WS2): persist NetBird's store-encryption key BEFORE any image converge —
         # a 0.73+ server booted without server.store.encryptionKey mints an ephemeral key
@@ -128052,8 +128209,11 @@ def _startup_migrations():
 
         # ops #1159: the sign-in length infra-TAK always asked for (24 hours) never
         # reached Authentik, so existing providers sit on its one-hour default.
-        _ensure_authentik_proxy_session_length(
-            lambda m: print(f"Startup migration: {m}", flush=True))
+        try:
+            _ensure_authentik_proxy_session_length(
+                lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _step_e:
+            print(f'Startup migration: step "_ensure_authentik_proxy_session_length(" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v0.9.31: Fleet-uniform self-heal for the FULL Authentik forward_auth chain
         # (proxy provider + application + embedded-outpost membership) for every
@@ -128263,7 +128423,10 @@ def _startup_migrations():
             print(f"Startup migration: sign-in check converge error (non-fatal): {_fa_err}",
                   flush=True)
         # ops #1108: after the Authentik steps above, so the provider hosts are final.
-        _caddy_app_lock_converge()
+        try:
+            _caddy_app_lock_converge()
+        except Exception as _step_e:
+            print(f'Startup migration: step "_caddy_app_lock_converge()" failed, next steps still run (ops #1343): {_step_e}', flush=True)
         try:
             _startup_caddy_selfheal()
         except Exception as _cs_err:
@@ -129565,33 +129728,21 @@ def _post_update_auto_deploy():
                     changed = False
                     if 'editorTheme' not in content:
                         print("Post-update: adding editorTheme to Node-RED settings.js")
-                        content = content.replace(
-                            '};',
-                            """,
-  editorTheme: {
+                        content = _nr_settings_add_property(content, """  editorTheme: {
     header: {
       title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
     }
-  }
-};""",
-                            1
-                        )
+  }""")
                         changed = True
                     if 'httpStatic' not in content:
                         print("Post-update: adding httpStatic to Node-RED settings.js")
-                        content = content.replace('};', ",\n  httpStatic: '/data/public'\n};", 1)
+                        content = _nr_settings_add_property(content, "  httpStatic: '/data/public'")
                         changed = True
                     if 'functionGlobalContext' not in content:
                         print("Post-update: adding functionGlobalContext to Node-RED settings.js")
-                        content = content.replace(
-                            '};',
-                            """,
-  functionGlobalContext: {
+                        content = _nr_settings_add_property(content, """  functionGlobalContext: {
     nodeHttps: require('https')
-  }
-};""",
-                            1
-                        )
+  }""")
                         changed = True
                     if 'contextStorage' not in content:
                         print("Post-update: adding contextStorage (localfilesystem) to Node-RED settings.js")
@@ -129661,18 +129812,12 @@ def _post_update_auto_deploy():
                                 print("Post-update: in-memory context exported (normalised) to filesystem before migration")
                         except Exception as ctx_e:
                             print(f"Post-update: context pre-export warning (non-fatal): {ctx_e}")
-                        content = content.replace(
-                            '};',
-                            """,
-  contextStorage: {
+                        content = _nr_settings_add_property(content, """  contextStorage: {
     default: {
       module: 'localfilesystem',
       config: { flushInterval: 0 }
     }
-  }
-};""",
-                            1
-                        )
+  }""")
                         changed = True
                     if changed:
                         with open(settings_path, 'w') as f:
@@ -131175,9 +131320,24 @@ except Exception as _e:
 # "vipspng: libpng read error"). Rows that cannot be decoded have never rendered
 # and crash the API, so deleting them loses nothing. Boot-time so a console
 # Update Now is enough to heal an affected box — no SSH.
+def _nr_settings_add_property(content, prop):
+    """Node-RED settings.js text with `prop` (one `name: value` property) added to what the file
+    exports. It is appended as its own statement, `module.exports = Object.assign(module.exports
+    || {}, {...});`, which is valid wherever the file's own braces fall. The code used to put the
+    property in front of the FIRST `};` in the file, so an operator's settings.js with an earlier
+    `};` (a helper object, a function body) got the key in the wrong place and Node-RED could not
+    start (ops #1343). This is the same form nodered/deploy.sh already uses for contextStorage."""
+    return (content.rstrip('\n') + '\nmodule.exports = Object.assign(module.exports || {}, {\n'
+            + prop.strip('\n').rstrip(',') + '\n});\n')
+
+
+# ops #1343: a bad row is copied to icons_corrupt_backup before it is deleted, and nothing is
+# deleted at all when more than this many rows look bad: that is not a truncated upload, it is
+# a wrong test or a damaged table, and a person should look first.
+_CLOUDTAK_ICON_HEAL_MAX_ROWS = 5
 _CLOUDTAK_ICON_HEAL_SQL = r"""
 DO $heal$
-DECLARE r RECORD; bin bytea; bad boolean; n integer := 0;
+DECLARE r RECORD; bin bytea; bad boolean; n integer := 0; bads tid[] := '{}'; cap integer := __MAX_BAD_ROWS__;
 BEGIN
   FOR r IN SELECT ctid, iconset, name, data FROM icons LOOP
     bad := false;
@@ -131196,14 +131356,23 @@ BEGIN
       bad := true;
     END;
     IF bad THEN
-      RAISE NOTICE 'deleting undecodable icon % / %', r.iconset, r.name;
-      DELETE FROM icons WHERE ctid = r.ctid;
+      RAISE NOTICE 'undecodable icon % / %', r.iconset, r.name;
+      bads := bads || r.ctid;
       n := n + 1;
     END IF;
   END LOOP;
+  IF n > cap THEN
+    RAISE NOTICE 'icon heal: % rows look corrupt, more than %: deleted none', n, cap;
+    RETURN;
+  END IF;
+  IF n > 0 THEN
+    CREATE TABLE IF NOT EXISTS icons_corrupt_backup (LIKE icons);
+    INSERT INTO icons_corrupt_backup SELECT * FROM icons WHERE ctid = ANY(bads);
+    DELETE FROM icons WHERE ctid = ANY(bads);
+  END IF;
   RAISE NOTICE 'icon heal: % corrupt row(s) deleted', n;
 END $heal$;
-"""
+""".replace('__MAX_BAD_ROWS__', str(_CLOUDTAK_ICON_HEAL_MAX_ROWS))
 
 
 def _selfheal_cloudtak_corrupt_icons(plog=None):
