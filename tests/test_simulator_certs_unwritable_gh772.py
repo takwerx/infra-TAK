@@ -92,7 +92,7 @@ def _run_rebuild(env):
     return sim._rebuild_status
 
 
-def test_rebuild_fails_without_the_fix_conditions_is_the_reported_error(env):
+def test_unwritable_certs_write_error_says_what_to_do(env):
     """The reported failure, produced by the shipped write: lanes.json.tmp in a folder the
     console cannot write gives EACCES (here wrapped with the fix hint)."""
     env.make_unwritable()
