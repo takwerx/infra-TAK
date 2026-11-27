@@ -2778,6 +2778,9 @@ def _check_pkgmgr(argv):
             continue                     # -qq, -qy, -yq
         raise Denied(f'{argv[0]}: option not allowed: {a}')
     pos = [a for a in argv[1:] if not a.startswith('-')]
+    if any(a.startswith(('--enablerepo=', '--disablerepo=')) and 'wazuh' in a.lower() for a in argv[1:]):
+        raise Denied(f'{argv[0]}: a Wazuh repository cannot be enabled (ops #1421): '
+                     f'the agent is installed from a pinned file only')
     if sub == 'config-manager' and '--add-repo' in argv:
         for a in pos[1:]:
             if not a.startswith(_PKG_REPO_URL_PREFIXES) or '..' in a:
@@ -2794,6 +2797,12 @@ def _check_pkgmgr(argv):
     # matching Caddy's published SHA-512. Anything else is refused there.
     if sub in _PKG_INSTALL_SUBS:
         for a in pos[1:]:
+            # ops #1421 (Security #1422 C1): the Wazuh agent installs only as the pinned,
+            # SHA-256-checked file, through the wazuh_agent op. Never by package name,
+            # whatever repo the box might have.
+            if a.lower().startswith('wazuh') and not _pkg_arg_is_file(a) and '://' not in a:
+                raise Denied(f'{argv[0]} {sub}: the Wazuh agent is installed only from a pinned '
+                             f'package file through infra-TAK, never by package name: {a}')
             if '://' in a:
                 if not a.startswith(_PKG_URL_PREFIXES) or '..' in a or '@' in a.split('://', 1)[1].split('/', 1)[0]:
                     raise Denied(f'{argv[0]} {sub}: package URL not on the allow-list: {a}')
@@ -3161,7 +3170,9 @@ def _pkg_stage_verified(argv, cwd, timeout):
                     _pkg_refuse(name, _pkg_space_msg(None, None))
                 _pkg_refuse(name, f'{BROKER_USER} cannot read {src}: {err}')
             m = _CADDY_DEB_RE.fullmatch(name)
-            if m and os.path.basename(argv[0]) in ('apt', 'apt-get'):
+            if name.lower().startswith('wazuh'):
+                _verify_wazuh_pkg(dst, name)      # ops #1421 C1: pinned SHA-256, nothing else
+            elif m and os.path.basename(argv[0]) in ('apt', 'apt-get'):
                 _verify_caddy_deb(dst, name, m)
             elif name.endswith('.deb'):
                 _verify_tak_deb(dst, name, work)
@@ -6624,6 +6635,732 @@ def _do_caddy_reload(req):
             **({} if r.returncode == 0 else {'error': out or f'rc={r.returncode}'})}
 
 
+# ── Wazuh agent (ops #1421; Security review ops #1422, conditions C1 to C12) ──
+# ONE op, fixed actions, no generic exec. The console never sends config text: this
+# file builds ossec.conf from a fixed template and validated fields, so a hacked
+# console cannot turn active response, remote commands or remote config back on, and
+# `verify` reads the files back and says whether the lock-down is still intact.
+#   install        a pinned, SHA-256-checked package file (never a repo, never a name)
+#   configure      the five files below, at exact paths, nothing else
+#   service        start/stop/restart/enable/disable on the unit `wazuh-agent` only;
+#                  start, restart and enable are refused while the lock-down is not intact
+#   verify         lock-down problems, enrolled yes/no, last log lines (capped)
+#   drop_password  delete the enrollment password file
+#   uninstall      purge (Debian) or remove + rm /var/ossec (RPM), drop-in, SELinux module
+WAZUH_VERSION = '4.14.11'
+WAZUH_HOME = '/var/ossec'
+WAZUH_ETC = WAZUH_HOME + '/etc'
+WAZUH_OSSEC_CONF = WAZUH_ETC + '/ossec.conf'
+WAZUH_LOCAL_OPTS = WAZUH_ETC + '/local_internal_options.conf'
+WAZUH_CA_PEM = WAZUH_ETC + '/infratak-server-ca.pem'
+WAZUH_PASS = WAZUH_ETC + '/authd.pass'
+WAZUH_KEYS = WAZUH_ETC + '/client.keys'
+WAZUH_MARK = WAZUH_ETC + '/.infratak-managed'
+WAZUH_LOG = WAZUH_HOME + '/logs/ossec.log'
+WAZUH_DROPIN_DIR = '/etc/systemd/system/wazuh-agent.service.d'
+WAZUH_DROPIN = WAZUH_DROPIN_DIR + '/infratak.conf'
+WAZUH_UNIT = 'wazuh-agent'
+WAZUH_GROUP = 'wazuh'
+# C1: the four files Security hashed (Nov 27, 2026). Anything else named wazuh* is refused.
+WAZUH_PKG_PINS = {
+    'wazuh-agent_4.14.11-1_amd64.deb':
+        'af1dd6e83350ecdb3e9c26a6467e3cc701766bf5519f63b3f213148dd5e8e89d',
+    'wazuh-agent_4.14.11-1_arm64.deb':
+        '28a57d4bb7cb0c441f7b8046b8f15afd37819f0d768663326b4367dd8a8e0318',
+    'wazuh-agent-4.14.11-1.x86_64.rpm':
+        '17362b1e88be0e53704c9c98664c5a92c560ab0abee8e08fcf6c95d6b7f4f316',
+    'wazuh-agent-4.14.11-1.aarch64.rpm':
+        '6e53002ecb212d35d13714c4efe87bf37d2ec1f8725852aad2f59346ded82684',
+}
+# C7: the only log sources that can be ticked. Key -> (log_format, {family: exact file}).
+WAZUH_SOURCES = {
+    'ssh_auth': ('syslog', {'debian': '/var/log/auth.log', 'rhel': '/var/log/secure'}),
+    'fail2ban': ('syslog', {'*': '/var/log/fail2ban.log'}),
+    'caddy_access': ('json', {'*': '/var/log/caddy/takportal-access.log'}),
+    'takserver_api': ('syslog', {'*': '/opt/tak/logs/takserver-api.log'}),
+    'takserver_messaging': ('syslog', {'*': '/opt/tak/logs/takserver-messaging.log'}),
+    'broker_audit': ('syslog', {'*': '/var/log/takwerx-broker/audit.log'}),
+}
+# C5: written whole, never merged. These four lines are the lock-down.
+WAZUH_LOCAL_OPTS_TEXT = (
+    '# local_internal_options.conf - written by infra-TAK. Do not edit: it is rewritten.\n'
+    'agent.remote_conf=0\n'
+    'logcollector.remote_commands=0\n'
+    'wazuh_command.remote_commands=0\n'
+    'sca.remote_commands=0\n')
+# C9: resource keys only. Fleet constants (CLAUDE.md: no per-customer tiers).
+WAZUH_DROPIN_KEYS = (
+    ('MemoryMax', '256M'), ('CPUQuota', '50%'), ('TasksMax', '256'),
+    ('OOMScoreAdjust', '500'), ('Nice', '10'), ('CPUWeight', '20'))
+WAZUH_DROPIN_TEXT = ('# Written by infra-TAK. Resource limits only: the kernel stops the agent '
+                     'before TAK Server.\n[Service]\n'
+                     + ''.join(f'{k}={v}\n' for k, v in WAZUH_DROPIN_KEYS))
+# FIM must not alert on files infra-TAK itself rewrites (C5).
+WAZUH_FIM_IGNORES = ('/etc/caddy/Caddyfile', '/etc/fail2ban/jail.d', '/etc/fail2ban/action.d',
+                     '/etc/ufw/user.rules', '/etc/ufw/user6.rules', '/etc/postfix/generic',
+                     '/etc/postfix/generic.db', '/etc/resolv.conf')
+_WAZUH_ACTIONS = {
+    'install': ({'file'}, {'upgrade'}),
+    'configure': ({'server', 'agent_name', 'sources'}, {'ca_pem', 'password'}),
+    'service': ({'verb'}, set()),
+    'verify': (set(), set()),
+    'drop_password': (set(), set()),
+    'uninstall': (set(), set()),
+}
+_WAZUH_VERBS = ('start', 'stop', 'restart', 'enable', 'disable')
+_WAZUH_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$')
+_WAZUH_DNS_RE = re.compile(
+    r'^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$')
+_WAZUH_PW_RE = re.compile(r'^[\x21-\x7e]([\x20-\x7e]{0,126}[\x21-\x7e])?$')
+_WAZUH_PEM_RE = re.compile(r'-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END CERTIFICATE-----')
+_WAZUH_OPTS_REQUIRED = ('agent.remote_conf', 'logcollector.remote_commands',
+                        'wazuh_command.remote_commands', 'sca.remote_commands')
+
+
+def _wazuh_family():
+    if shutil.which('apt-get', path=BROKER_TRUSTED_PATH) and shutil.which('dpkg', path=BROKER_TRUSTED_PATH):
+        return 'debian'
+    if shutil.which('dnf', path=BROKER_TRUSTED_PATH) or shutil.which('yum', path=BROKER_TRUSTED_PATH):
+        return 'rhel'
+    return ''
+
+
+def _wazuh_arch():
+    m = os.uname().machine
+    return {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64'}.get(m, '')
+
+
+def _wazuh_pkg_name_for(family, arch):
+    """The one pinned file name for this box, or ''."""
+    for name in WAZUH_PKG_PINS:
+        if family == 'debian' and name.endswith(f'_{arch}.deb'):
+            return name
+        if family == 'rhel' and name.endswith('.rpm') and name.endswith(
+                {'amd64': '.x86_64.rpm', 'arm64': '.aarch64.rpm'}.get(arch, '.none')):
+            return name
+    return ''
+
+
+def _verify_wazuh_pkg(path, name):
+    """C1: SHA-256 of the staged copy must equal the pinned constant for this exact name."""
+    want = WAZUH_PKG_PINS.get(name)
+    if not want:
+        _pkg_refuse(name, f'it is not one of the pinned Wazuh agent {WAZUH_VERSION} files. '
+                          f'infra-TAK installs only those exact files, never a Wazuh repository.')
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for b in iter(lambda: f.read(1 << 20), b''):
+            h.update(b)
+    if h.hexdigest() != want:
+        _pkg_refuse(name, 'its SHA-256 does not match the pinned value (damaged, or changed '
+                          'after Wazuh published it). Download it again, then try again.')
+
+
+def _wazuh_valid_server(v):
+    if not isinstance(v, str) or not v or len(v) > 253:
+        return False
+    try:
+        ip = ipaddress.ip_address(v)
+        return not (ip.is_unspecified or ip.is_multicast)
+    except ValueError:
+        pass
+    return bool(_WAZUH_DNS_RE.fullmatch(v)) and not v.replace('.', '').isdigit()
+
+
+def _wazuh_xml(v):
+    return (str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            .replace('"', '&quot;').replace("'", '&apos;'))
+
+
+def _wazuh_source_path(key, family):
+    fmt, paths = WAZUH_SOURCES[key]
+    return fmt, paths.get(family) or paths.get('*')
+
+
+def _wazuh_render_ossec(server, agent_name, sources, family):
+    """The whole ossec.conf. Fixed template; only server, agent_name and the ticked
+    sources vary, and each is validated before it gets here."""
+    s, n = _wazuh_xml(server), _wazuh_xml(agent_name)
+    out = [
+        '<!-- Written by infra-TAK. Rewritten on every install, Update Now and console start: '
+        'edits are lost. -->',
+        '<ossec_config>',
+        '  <client>',
+        '    <server>',
+        f'      <address>{s}</address>',
+        '      <port>1514</port>',
+        '      <protocol>tcp</protocol>',
+        '    </server>',
+        '    <enrollment>',
+        '      <enabled>yes</enabled>',
+        f'      <manager_address>{s}</manager_address>',
+        '      <port>1515</port>',
+        f'      <agent_name>{n}</agent_name>',
+        f'      <server_ca_path>{WAZUH_CA_PEM}</server_ca_path>',
+        f'      <authorization_pass_path>{WAZUH_PASS}</authorization_pass_path>',
+        '    </enrollment>',
+        '    <notify_time>20</notify_time>',
+        '    <time-reconnect>60</time-reconnect>',
+        '    <auto_restart>yes</auto_restart>',
+        '    <crypto_method>aes</crypto_method>',
+        '  </client>',
+        '  <client_buffer>',
+        '    <disabled>no</disabled>',
+        '    <queue_size>5000</queue_size>',
+        '    <events_per_second>500</events_per_second>',
+        '  </client_buffer>',
+        '  <rootcheck>',
+        '    <disabled>yes</disabled>',
+        '  </rootcheck>',
+        '  <wodle name="cis-cat">',
+        '    <disabled>yes</disabled>',
+        '  </wodle>',
+        '  <wodle name="osquery">',
+        '    <disabled>yes</disabled>',
+        '  </wodle>',
+        '  <wodle name="syscollector">',
+        '    <disabled>no</disabled>',
+        '    <interval>1h</interval>',
+        '    <scan_on_start>yes</scan_on_start>',
+        '    <hardware>yes</hardware>',
+        '    <os>yes</os>',
+        '    <network>yes</network>',
+        '    <packages>yes</packages>',
+        '    <ports all="yes">yes</ports>',
+        '    <processes>no</processes>',
+        '    <users>no</users>',
+        '    <groups>no</groups>',
+        '    <services>no</services>',
+        '    <browser_extensions>no</browser_extensions>',
+        '    <synchronization>',
+        '      <max_eps>10</max_eps>',
+        '    </synchronization>',
+        '  </wodle>',
+        '  <sca>',
+        '    <enabled>no</enabled>',
+        '  </sca>',
+        '  <syscheck>',
+        '    <disabled>no</disabled>',
+        '    <frequency>43200</frequency>',
+        '    <scan_on_start>yes</scan_on_start>',
+        '    <directories>/etc,/usr/bin,/usr/sbin</directories>',
+        '    <directories>/bin,/sbin,/boot</directories>',
+    ]
+    for p in ('/etc/mtab', '/etc/hosts.deny', '/etc/mail/statistics', '/etc/random-seed',
+              '/etc/random.seed', '/etc/adjtime', '/etc/httpd/logs', '/etc/utmpx', '/etc/wtmpx',
+              '/etc/cups/certs', '/etc/dumpdates', '/etc/svc/volatile') + WAZUH_FIM_IGNORES:
+        out.append(f'    <ignore>{p}</ignore>')
+    out += [
+        '    <ignore type="sregex">.log$|.swp$</ignore>',
+        '    <nodiff type="sregex">^/etc/ssl/private/|^/etc/pki/tls/private/</nodiff>',
+        '    <nodiff>/etc/shadow</nodiff>',
+        '    <nodiff>/etc/shadow-</nodiff>',
+        '    <nodiff>/etc/gshadow</nodiff>',
+        '    <nodiff>/etc/gshadow-</nodiff>',
+        '    <skip_nfs>yes</skip_nfs>',
+        '    <skip_dev>yes</skip_dev>',
+        '    <skip_proc>yes</skip_proc>',
+        '    <skip_sys>yes</skip_sys>',
+        '    <process_priority>10</process_priority>',
+        '    <max_eps>50</max_eps>',
+        '    <synchronization>',
+        '      <enabled>yes</enabled>',
+        '      <interval>5m</interval>',
+        '      <max_eps>10</max_eps>',
+        '    </synchronization>',
+        '  </syscheck>',
+    ]
+    for key in sources:
+        fmt, path = _wazuh_source_path(key, family)
+        out += ['  <localfile>', f'    <log_format>{fmt}</log_format>',
+                f'    <location>{path}</location>', '  </localfile>']
+    out += [
+        '  <active-response>',
+        '    <disabled>yes</disabled>',
+        '    <ca_store>etc/wpk_root.pem</ca_store>',
+        '    <ca_verification>yes</ca_verification>',
+        '  </active-response>',
+        '  <logging>',
+        '    <log_format>plain</log_format>',
+        '  </logging>',
+        '</ossec_config>',
+        '']
+    return '\n'.join(out)
+
+
+def _wazuh_conf_problems(ossec_text, opts_text, dropin_text=None):
+    """C3/C5/C6: every way ossec.conf, local_internal_options.conf and the unit drop-in can be
+    out of the lock-down. [] = intact. Works on text, so it judges a hostile file the same
+    way it judges ours."""
+    import xml.etree.ElementTree as ET
+    p = []
+    try:
+        root = ET.fromstring(ossec_text)
+    except ET.ParseError:
+        return ['ossec.conf is not the single-block file infra-TAK writes (it does not parse)']
+    if root.tag != 'ossec_config':
+        return ['ossec.conf has no ossec_config root']
+    allowed_top = {'client', 'client_buffer', 'rootcheck', 'wodle', 'sca', 'syscheck',
+                   'localfile', 'active-response', 'logging'}
+    for el in root:
+        if el.tag not in allowed_top:
+            p.append(f'<{el.tag}> is not allowed')
+    ars = root.findall('active-response')
+    if not ars or any((a.findtext('disabled') or '').strip().lower() != 'yes' for a in ars):
+        p.append('active response is not disabled')
+    if any((a.findtext('ca_verification') or '').strip().lower() != 'yes' for a in ars):
+        p.append('active-response ca_verification is not yes')
+    rcs = root.findall('rootcheck')
+    if not rcs or any((r.findtext('disabled') or '').strip().lower() != 'yes' for r in rcs):
+        p.append('rootcheck is not disabled')
+    scas = root.findall('sca')
+    if any((s.findtext('enabled') or '').strip().lower() != 'no' for s in scas):
+        p.append('sca is not disabled')
+    for w in root.findall('wodle'):
+        name = w.get('name')
+        if name in ('cis-cat', 'osquery'):
+            if (w.findtext('disabled') or '').strip().lower() != 'yes':
+                p.append(f'wodle {name} is not disabled')
+        elif name == 'syscollector':
+            for k in ('processes', 'users', 'groups', 'services', 'browser_extensions'):
+                if (w.findtext(k) or '').strip().lower() != 'no':
+                    p.append(f'syscollector {k} is not off')
+        else:
+            p.append(f'wodle {name!r} is not allowed')
+    paths = set()
+    for key in WAZUH_SOURCES:
+        for fam in ('debian', 'rhel'):
+            paths.add(_wazuh_source_path(key, fam)[1])
+    for lf in root.findall('localfile'):
+        fmt = (lf.findtext('log_format') or '').strip()
+        loc = (lf.findtext('location') or '').strip()
+        if lf.find('command') is not None or lf.find('alias') is not None or lf.find('frequency') is not None \
+                or fmt not in ('syslog', 'json'):
+            p.append(f'localfile {loc or fmt!r} runs a command or has a format that is not allowed')
+        elif loc not in paths:
+            p.append(f'localfile {loc!r} is not one of the log sources infra-TAK offers')
+    for sc in root.findall('syscheck'):
+        for d in sc.iter('directories'):
+            for att in ('report_changes', 'whodata'):
+                if (d.get(att) or '').lower() == 'yes':
+                    p.append(f'syscheck {att} is on')
+        if sc.find('audit') is not None:
+            p.append('syscheck audit is on')
+    cl = root.findall('client')
+    if len(cl) != 1 or len(cl[0].findall('server')) != 1:
+        p.append('there must be exactly one server')
+    else:
+        proto = (cl[0].find('server').findtext('protocol') or 'tcp').strip().lower()
+        if proto != 'tcp':
+            p.append('server protocol is not tcp')
+        enr = cl[0].find('enrollment')
+        if enr is None or (enr.findtext('server_ca_path') or '').strip() != WAZUH_CA_PEM:
+            p.append('server certificate check (server_ca_path) is not set')
+    opts = {}
+    for ln in (opts_text or '').splitlines():
+        ln = ln.strip()
+        if ln and not ln.startswith('#') and '=' in ln:
+            k, v = ln.split('=', 1)
+            opts[k.strip()] = v.strip()
+    for k in _WAZUH_OPTS_REQUIRED:
+        if opts.get(k) != '0':
+            p.append(f'{k} is not 0')
+    for k, v in opts.items():
+        if k not in _WAZUH_OPTS_REQUIRED and ('remote_commands' in k or 'remote_conf' in k) and v != '0':
+            p.append(f'{k} is not 0')
+    if dropin_text is not None:
+        want = dict(WAZUH_DROPIN_KEYS)
+        got, section_ok = {}, True
+        for ln in dropin_text.splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith('#'):
+                continue
+            if ln.startswith('['):
+                section_ok = section_ok and ln == '[Service]'
+            elif '=' in ln:
+                k, v = ln.split('=', 1)
+                got[k.strip()] = v.strip()
+        if not section_ok or got != want:
+            p.append('systemd drop-in is not the resource-limit file infra-TAK writes')
+    return p
+
+
+def _wazuh_read(path, limit=1 << 20):
+    try:
+        return _read_small_nofollow(path, limit).decode('utf-8', 'replace')
+    except OSError:
+        return None
+
+
+def _wazuh_root_dir(path):
+    """A real (not symlinked), root-owned directory."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == 0
+
+
+def _wazuh_home_ok():
+    """/var/ossec must be a real, root-owned directory nobody else can write to, and
+    /var/ossec/etc a real directory owned by root or by the `wazuh` account. The 4.14.11
+    package makes etc `wazuh:wazuh 770` (read on a real box, ops #1421), so "root-owned"
+    would refuse every install. Root only writes below /var/ossec through mkstemp + rename,
+    which never follows a link, and `wazuh` cannot replace /var/ossec/etc itself (it has
+    no write access to /var/ossec)."""
+    try:
+        home, etc = os.lstat(WAZUH_HOME), os.lstat(WAZUH_ETC)
+    except OSError:
+        return False
+    try:
+        wazuh_uid = pwd.getpwnam(WAZUH_GROUP).pw_uid
+    except KeyError:
+        wazuh_uid = 0
+    return (stat.S_ISDIR(home.st_mode) and home.st_uid == 0 and not (home.st_mode & 0o022)
+            and stat.S_ISDIR(etc.st_mode) and etc.st_uid in (0, wazuh_uid))
+
+
+def _wazuh_write(path, data, mode):
+    """Atomic write of one of OUR exact paths, root:wazuh `mode`. Never follows a symlink."""
+    if path not in (WAZUH_OSSEC_CONF, WAZUH_LOCAL_OPTS, WAZUH_CA_PEM, WAZUH_PASS, WAZUH_MARK):
+        raise Denied(f'wazuh_agent: {path} is not a file this op writes')
+    if not _wazuh_home_ok():
+        raise Denied('wazuh_agent: /var/ossec is missing or not a root-owned directory')
+    gid = grp.getgrnam(WAZUH_GROUP).gr_gid
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.infratak-')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            os.fchown(f.fileno(), 0, gid)
+            os.fchmod(f.fileno(), mode)
+            f.write(data if isinstance(data, bytes) else data.encode())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        tmp = None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _wazuh_clean_pem(pem):
+    """One certificate, not expired, rebuilt from its base64 body. Returns (pem_text, why)."""
+    if not isinstance(pem, str) or not pem.strip() or len(pem) > 16384:
+        return None, 'the server certificate is empty or larger than 16 KB'
+    blocks = _WAZUH_PEM_RE.findall(pem)
+    if len(blocks) != 1 or pem.count('BEGIN') != 1:
+        return None, 'the file must hold exactly one certificate'
+    body = ''.join(blocks[0].split())
+    if not re.fullmatch(r'[A-Za-z0-9+/]+={0,2}', body):
+        return None, 'the certificate is not valid PEM'
+    clean = '-----BEGIN CERTIFICATE-----\n' + '\n'.join(
+        body[i:i + 64] for i in range(0, len(body), 64)) + '\n-----END CERTIFICATE-----\n'
+    openssl = shutil.which('openssl', path=BROKER_TRUSTED_PATH)
+    if not openssl:
+        return None, 'openssl is not installed, so the certificate cannot be checked'
+    r = subprocess.run([openssl, 'x509', '-noout', '-checkend', '0'], input=clean.encode(),
+                       capture_output=True, timeout=30, cwd='/', env={'PATH': BROKER_TRUSTED_PATH, 'LC_ALL': 'C'})
+    if r.returncode != 0:
+        out = (r.stdout + r.stderr).decode('utf-8', 'replace')
+        return None, ('the certificate has expired' if 'will expire' in out
+                      else 'the certificate does not parse')
+    return clean, ''
+
+
+def _check_wazuh_agent(req):
+    action = req.get('action')
+    if action not in _WAZUH_ACTIONS:
+        raise Denied(f'wazuh_agent: unknown action {str(action)[:40]!r}')
+    need, opt = _WAZUH_ACTIONS[action]
+    got = set(req) - {'op', 'action', 'timeout'}
+    if got - need - opt:
+        raise Denied(f'wazuh_agent {action}: fields not allowed: {sorted(got - need - opt)}')
+    if need - got:
+        raise Denied(f'wazuh_agent {action}: missing fields: {sorted(need - got)}')
+    if action == 'install':
+        f = req.get('file')
+        if not (isinstance(f, str) and f.startswith('/') and os.path.basename(f) in WAZUH_PKG_PINS):
+            raise Denied('wazuh_agent install: file must be an absolute path to one of the pinned '
+                         f'Wazuh agent {WAZUH_VERSION} package files')
+        if 'upgrade' in req and not isinstance(req['upgrade'], bool):
+            raise Denied('wazuh_agent install: upgrade must be true or false')
+    elif action == 'configure':
+        if not _wazuh_valid_server(req.get('server')):
+            raise Denied('wazuh_agent configure: the server must be a host name or IP address')
+        if not (isinstance(req.get('agent_name'), str) and _WAZUH_NAME_RE.fullmatch(req['agent_name'])):
+            raise Denied('wazuh_agent configure: agent_name may use letters, digits, . _ - '
+                         '(2 to 63 characters)')
+        src = req.get('sources')
+        if not (isinstance(src, list) and len(src) <= len(WAZUH_SOURCES)
+                and all(isinstance(k, str) and k in WAZUH_SOURCES for k in src)
+                and len(set(src)) == len(src)):
+            raise Denied('wazuh_agent configure: sources must be a list of offered log sources')
+        if 'password' in req and not (isinstance(req['password'], str)
+                                      and _WAZUH_PW_RE.fullmatch(req['password'])):
+            raise Denied('wazuh_agent configure: the password must be 1 to 128 printable '
+                         'characters on one line')
+        if 'ca_pem' in req:
+            _clean, why = _wazuh_clean_pem(req['ca_pem'])
+            if why:
+                raise Denied(f'wazuh_agent configure: {why}')
+    elif action == 'service':
+        if req.get('verb') not in _WAZUH_VERBS:
+            raise Denied(f'wazuh_agent service: verb must be one of {", ".join(_WAZUH_VERBS)}')
+
+
+def _wazuh_run(argv, timeout=120):
+    exe = shutil.which(os.path.basename(argv[0]), path=BROKER_TRUSTED_PATH)
+    if not exe:
+        return None, f'{argv[0]} not found'
+    env = {'PATH': BROKER_TRUSTED_PATH, 'LC_ALL': 'C'}
+    try:
+        r = subprocess.run([exe] + list(argv[1:]), capture_output=True, text=True, timeout=timeout,
+                           cwd='/', env=env)
+    except subprocess.TimeoutExpired:
+        return None, f'{argv[0]} did not finish in {timeout}s'
+    except OSError as e:
+        return None, f'{argv[0]} could not run: {e}'
+    return r, ''
+
+
+def _wazuh_pkg_installed(family):
+    """True when the wazuh-agent package is installed."""
+    if family == 'debian':
+        r, _ = _wazuh_run(['dpkg-query', '-W', '-f', '${db:Status-Abbrev}', 'wazuh-agent'])
+        return bool(r and r.returncode == 0 and r.stdout[:2] in ('ii', 'hi'))
+    r, _ = _wazuh_run(['rpm', '-q', 'wazuh-agent'])
+    return bool(r and r.returncode == 0)
+
+
+def _wazuh_existing_wazuh(family):
+    """Why a fresh install must refuse: something Wazuh is already on this box."""
+    if os.path.lexists(WAZUH_HOME):
+        return f'{WAZUH_HOME} already exists. It may be an agent someone installed by hand, so infra-TAK leaves it alone.'
+    if family == 'debian':
+        r, _ = _wazuh_run(['dpkg-query', '-W', '-f', '${Package} ${db:Status-Abbrev}\n', 'wazuh*'])
+        lines = [ln for ln in ((r.stdout if r else '') or '').splitlines() if ln.strip()]
+        if any(ln.rstrip()[-3:].strip() != 'un' for ln in lines):
+            return 'a Wazuh package is already installed or has left files on this server'
+    else:
+        r, _ = _wazuh_run(['rpm', '-qa', 'wazuh*'])
+        if r and r.stdout.strip():
+            return 'a Wazuh package is already installed on this server'
+    return ''
+
+
+_WAZUH_UP_RE = re.compile(r'Connected to the server')
+_WAZUH_DOWN_RE = re.compile(r'Unable to connect to any server|Lost connection|Server unavailable')
+
+
+def _wazuh_read_log(path, window=65536):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return ''
+    try:
+        size = os.fstat(fd).st_size
+        os.lseek(fd, max(0, size - window), os.SEEK_SET)
+        return os.read(fd, window).decode('utf-8', 'replace')
+    finally:
+        os.close(fd)
+
+
+def _wazuh_connected(text):
+    """True when the newest 'Connected to the server' is newer than the newest loss. Read from a
+    64 KB window, not the 40-line tail: the file-scan start-up writes hundreds of lines after it
+    (found on the first update test, Nov 27: the card said not connected while the server saw the agent)."""
+    up = max((m.start() for m in _WAZUH_UP_RE.finditer(text)), default=-1)
+    down = max((m.start() for m in _WAZUH_DOWN_RE.finditer(text)), default=-1)
+    return up > down
+
+
+def _wazuh_tail(path, lines=40, cap=4096):
+    return '\n'.join(_wazuh_read_log(path).splitlines()[-lines:])[-cap:]
+
+
+def _wazuh_state():
+    keys = 0
+    try:
+        keys = os.lstat(WAZUH_KEYS).st_size
+    except OSError:
+        pass
+    ossec = _wazuh_read(WAZUH_OSSEC_CONF)
+    problems = (['ossec.conf is missing'] if ossec is None else
+                _wazuh_conf_problems(ossec, _wazuh_read(WAZUH_LOCAL_OPTS) or '',
+                                     _wazuh_read(WAZUH_DROPIN)))
+    if ossec is not None and _wazuh_read(WAZUH_DROPIN) is None:
+        problems.append('systemd drop-in is missing')
+    if ossec is not None and _wazuh_read(WAZUH_CA_PEM) is None:
+        problems.append('server certificate file is missing')
+    return {'enrolled': keys > 0, 'problems': problems,
+            'password_file': os.path.lexists(WAZUH_PASS), 'managed': os.path.lexists(WAZUH_MARK)}
+
+
+def _do_wazuh_agent(req):
+    action = req['action']
+    family = _wazuh_family()
+    if not family:
+        return {'ok': False, 'error': 'this server has neither apt-get nor dnf'}
+    if action == 'install':
+        return _wazuh_install(req, family)
+    if action == 'configure':
+        return _wazuh_configure(req, family)
+    if action == 'service':
+        return _wazuh_service(req)
+    if action == 'verify':
+        st = _wazuh_state()
+        window = _wazuh_read_log(WAZUH_LOG)
+        st.update(ok=True, log='\n'.join(window.splitlines()[-40:])[-4096:], connected=_wazuh_connected(window))
+        return st
+    if action == 'drop_password':
+        try:
+            os.unlink(WAZUH_PASS)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            return {'ok': False, 'error': f'could not remove the password file: {e}'}
+        return {'ok': True}
+    return _wazuh_uninstall(family)
+
+
+def _wazuh_install(req, family):
+    arch = _wazuh_arch()
+    name = _wazuh_pkg_name_for(family, arch)
+    if not name or os.path.basename(req['file']) != name:
+        return {'ok': False, 'error': f'the pinned Wazuh file for this server is {name or "none (unsupported CPU)"}'}
+    upgrade = bool(req.get('upgrade'))
+    if upgrade:
+        if not (os.path.lexists(WAZUH_MARK) and _wazuh_pkg_installed(family)):
+            return {'ok': False, 'error': 'upgrade refused: this is not an agent infra-TAK installed'}
+    else:
+        why = _wazuh_existing_wazuh(family)
+        if why:
+            return {'ok': False, 'error': why}
+    was_enabled = False
+    if upgrade:
+        r0, _ = _wazuh_run(['systemctl', 'is-enabled', WAZUH_UNIT], 30)
+        was_enabled = bool(r0 and (r0.stdout or '').strip() == 'enabled')
+    tool = ['apt-get', 'install', '-y'] if family == 'debian' else ['dnf', 'install', '-y']
+    if upgrade and family == 'debian':
+        tool.append('--allow-downgrades')
+    try:
+        res = _do_exec({'op': 'exec', 'argv': tool + [req['file']], 'timeout': 900, 'cwd': '/'})
+    except Denied as d:
+        return {'ok': False, 'error': str(d)}
+    rc = res.get('returncode')
+    out = (base64.b64decode(res.get('stderr_b64') or b'') + base64.b64decode(res.get('stdout_b64') or b'')
+           ).decode('utf-8', 'replace').strip()[-600:]
+    # C2: nothing runs until we say so. Whatever the package scripts did, stop it now.
+    for verb in ('stop', 'disable'):
+        _wazuh_run(['systemctl', verb, WAZUH_UNIT], 60)
+    _wazuh_run(['systemctl', 'daemon-reload'], 60)
+    if upgrade and was_enabled and rc == 0:
+        # an update must not turn off start-at-boot (found on the reboot test, Nov 27)
+        _wazuh_run(['systemctl', 'enable', WAZUH_UNIT], 60)
+    return {'ok': rc == 0, 'rc': rc, **({} if rc == 0 else {'error': out or f'rc={rc}'})}
+
+
+def _wazuh_configure(req, family):
+    if not _wazuh_home_ok():
+        return {'ok': False, 'error': 'the Wazuh agent is not installed (no /var/ossec)'}
+    if 'ca_pem' in req:
+        pem, why = _wazuh_clean_pem(req['ca_pem'])
+        if why:
+            return {'ok': False, 'error': why}
+        _wazuh_write(WAZUH_CA_PEM, pem, 0o644)
+    else:
+        pem, why = _wazuh_clean_pem(_wazuh_read(WAZUH_CA_PEM, 20000) or '')
+        if why:
+            return {'ok': False, 'error': f'no usable server certificate on file: {why}'}
+    if 'password' in req:
+        # A new enrollment (new server, new name, retry): an agent that already holds keys
+        # does not enroll again, and the old keys belong to the old server. Stop the agent
+        # and empty client.keys first (Wazuh's own way to re-register an agent).
+        _wazuh_run(['systemctl', 'stop', WAZUH_UNIT], 90)
+        try:
+            fd = os.open(WAZUH_KEYS, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                if stat.S_ISREG(os.fstat(fd).st_mode):
+                    os.ftruncate(fd, 0)
+            finally:
+                os.close(fd)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            return {'ok': False, 'error': f'could not reset the old agent keys: {e}'}
+        _wazuh_write(WAZUH_PASS, req['password'] + '\n', 0o640)
+    _wazuh_write(WAZUH_OSSEC_CONF, _wazuh_render_ossec(req['server'], req['agent_name'],
+                                                       req['sources'], family), 0o640)
+    _wazuh_write(WAZUH_LOCAL_OPTS, WAZUH_LOCAL_OPTS_TEXT, 0o640)
+    _wazuh_write(WAZUH_MARK, 'managed by infra-TAK\n', 0o640)
+    # the drop-in: root-owned, 0644, in a root-owned directory
+    os.makedirs(WAZUH_DROPIN_DIR, mode=0o755, exist_ok=True)
+    if not _wazuh_root_dir(WAZUH_DROPIN_DIR):
+        return {'ok': False, 'error': f'{WAZUH_DROPIN_DIR} is not a root-owned directory'}
+    fd, tmp = tempfile.mkstemp(dir=WAZUH_DROPIN_DIR, prefix='.infratak-')
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            os.fchown(f.fileno(), 0, 0)
+            os.fchmod(f.fileno(), 0o644)
+            f.write(WAZUH_DROPIN_TEXT.encode())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, WAZUH_DROPIN)
+        tmp = None
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    _wazuh_run(['systemctl', 'daemon-reload'], 60)
+    st = _wazuh_state()
+    return {'ok': not st['problems'], 'problems': st['problems'], 'enrolled': st['enrolled'],
+            **({} if not st['problems'] else {'error': 'lock-down check failed: ' + '; '.join(st['problems'])[:300]})}
+
+
+def _wazuh_service(req):
+    verb = req['verb']
+    if verb in ('start', 'restart', 'enable'):
+        st = _wazuh_state()
+        if st['problems']:
+            return {'ok': False, 'error': 'refused: the lock-down is not intact: '
+                    + '; '.join(st['problems'])[:300]}
+    r, err = _wazuh_run(['systemctl', verb, WAZUH_UNIT], 90)
+    if r is None:
+        return {'ok': False, 'error': err}
+    out = ((r.stdout or '') + (r.stderr or '')).strip()[-400:]
+    return {'ok': r.returncode == 0, 'rc': r.returncode, **({} if r.returncode == 0 else {'error': out})}
+
+
+def _wazuh_uninstall(family):
+    for verb in ('stop', 'disable'):
+        _wazuh_run(['systemctl', verb, WAZUH_UNIT], 60)
+    if family == 'debian':
+        r, err = _wazuh_run(['apt-get', 'purge', '-y', 'wazuh-agent'], 600)
+    else:
+        r, err = _wazuh_run(['dnf', 'remove', '-y', 'wazuh-agent'], 600)
+        if r is not None and r.returncode == 0:
+            sm, _ = _wazuh_run(['semodule', '-l'], 60)
+            if sm is not None and re.search(r'^wazuh\b', sm.stdout or '', re.M):
+                _wazuh_run(['semodule', '-r', 'wazuh'], 120)
+    if r is None:
+        return {'ok': False, 'error': err}
+    if r.returncode != 0 and _wazuh_pkg_installed(family):
+        return {'ok': False, 'error': ((r.stderr or '') + (r.stdout or '')).strip()[-400:]}
+    try:
+        if _wazuh_root_dir(WAZUH_HOME):          # exact path, a real root-owned directory, never a link
+            shutil.rmtree(WAZUH_HOME)
+    except OSError as e:
+        return {'ok': False, 'error': f'could not remove {WAZUH_HOME}: {e}'}
+    shutil.rmtree(WAZUH_DROPIN_DIR, ignore_errors=True)
+    _wazuh_run(['systemctl', 'daemon-reload'], 60)
+    return {'ok': not os.path.lexists(WAZUH_HOME) and not _wazuh_pkg_installed(family)}
+
+
 # ── Leftover PostgreSQL 15 cluster after the TAK 5.8 migration (GH #273) ──────
 # upgrade-db.sh runs pg_upgrade in COPY mode, so the 15 cluster stays on disk,
 # stopped, as the rollback. Nothing ever removes it: the reporter's sat at 15 GB for
@@ -7516,6 +8253,8 @@ def _evaluate(req):
             _check_gd_remove(req)           # ops #645 W2 part 2b
         elif op == 'caddy_reload':
             _check_caddy_reload(req)        # ops #814
+        elif op == 'wazuh_agent':
+            _check_wazuh_agent(req)         # ops #1421
         else:
             return ('DENY', f'unknown op: {op}')
         return ('ALLOW', '')
@@ -7628,7 +8367,8 @@ def _dispatch(req, peer):
         return {'ok': True, 'verdict': verdict, 'reason': reason, 'enforce': ENFORCE}
     if op in ('pg_dump', 'stack_pg_dump', 'stack_nodered_tar', 'stack_pg_restore', 'pg_restore', 'pgminer_scan', 'disk_reclaim',
               'takportal_sudoers', 'tak58_upgrade_db', 'tak58_setup_db', 'java_cacerts_sync', 'certifi_upgrade',
-              'pg_old_cluster', 'mediamtx_account', 'meshrelay_account', 'gd_render', 'gd_remove', 'caddy_reload'):
+              'pg_old_cluster', 'mediamtx_account', 'meshrelay_account', 'gd_render', 'gd_remove', 'caddy_reload',
+              'wazuh_agent'):
         verdict, reason = _evaluate(req)
         if op == 'pgminer_scan':
             summary = req.get('container', '')
@@ -7660,6 +8400,9 @@ def _dispatch(req, peer):
             summary = f"{GD_DIR}/{str(req.get('name'))[:80]}"
         elif op == 'caddy_reload':
             summary = CADDY_RELOAD_FILE
+        elif op == 'wazuh_agent':
+            # never the password, the certificate text or any file text (ops #1421 C3)
+            summary = f"action={str(req.get('action'))[:20]} server={str(req.get('server', '-'))[:80]}"
         else:
             summary = _summary(req)
         if verdict == 'DENY':
@@ -7704,6 +8447,8 @@ def _dispatch(req, peer):
             return _do_gd_remove(req)
         if op == 'caddy_reload':
             return _do_caddy_reload(req)
+        if op == 'wazuh_agent':
+            return _do_wazuh_agent(req)
         return _do_pgminer_scan(req)
     if op == 'etl':
         # The console reaches the same verb on the main socket (status, uninstall
