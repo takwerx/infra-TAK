@@ -278,7 +278,8 @@ class FakeBroker:
         self.calls.append(dict(req))
         a = req.get('action')
         if a == 'verify':
-            return {'ok': True, 'enrolled': True, 'problems': list(self.problems), 'log': self.enrolled_log}
+            return {'ok': True, 'enrolled': True, 'problems': list(self.problems), 'log': self.enrolled_log,
+                    'connected': B._wazuh_connected(self.enrolled_log)}
         if a == 'install':
             return {'ok': self.installed_ok, **({} if self.installed_ok else {'error': 'refused: file'})}
         return {'ok': True, 'problems': []}

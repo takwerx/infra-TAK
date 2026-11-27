@@ -299,7 +299,7 @@ def status(ctx):
         out['enrolled'] = bool(v.get('enrolled'))
         out['problems'] = list(v.get('problems') or [])
         out['lockdown_ok'] = not out['problems']
-        out['connected'] = out['running'] and _connected(v.get('log', ''))
+        out['connected'] = bool(out['running'] and v.get('connected'))
         out['log'] = v.get('log', '')[-2000:]
     return out
 
@@ -412,7 +412,7 @@ def _wait_connected(ctx, plog, seconds=120):
     last = {}
     while time.time() < end:
         last = op(ctx, {'action': 'verify'}, 60)
-        if last.get('ok') and last.get('enrolled') and _connected(last.get('log', '')):
+        if last.get('ok') and last.get('enrolled') and last.get('connected'):
             return True, ''
         time.sleep(4)
     return False, _why_not(last.get('log', ''))

@@ -7151,18 +7151,34 @@ def _wazuh_existing_wazuh(family):
     return ''
 
 
-def _wazuh_tail(path, lines=40, cap=4096):
+_WAZUH_UP_RE = re.compile(r'Connected to the server')
+_WAZUH_DOWN_RE = re.compile(r'Unable to connect to any server|Lost connection|Server unavailable')
+
+
+def _wazuh_read_log(path, window=65536):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError:
         return ''
     try:
         size = os.fstat(fd).st_size
-        os.lseek(fd, max(0, size - 65536), os.SEEK_SET)
-        data = os.read(fd, 65536).decode('utf-8', 'replace')
+        os.lseek(fd, max(0, size - window), os.SEEK_SET)
+        return os.read(fd, window).decode('utf-8', 'replace')
     finally:
         os.close(fd)
-    return '\n'.join(data.splitlines()[-lines:])[-cap:]
+
+
+def _wazuh_connected(text):
+    """True when the newest 'Connected to the server' is newer than the newest loss. Read from a
+    64 KB window, not the 40-line tail: the file-scan start-up writes hundreds of lines after it
+    (found on the first update test, Nov 27: the card said not connected while the server saw the agent)."""
+    up = max((m.start() for m in _WAZUH_UP_RE.finditer(text)), default=-1)
+    down = max((m.start() for m in _WAZUH_DOWN_RE.finditer(text)), default=-1)
+    return up > down
+
+
+def _wazuh_tail(path, lines=40, cap=4096):
+    return '\n'.join(_wazuh_read_log(path).splitlines()[-lines:])[-cap:]
 
 
 def _wazuh_state():
@@ -7196,7 +7212,8 @@ def _do_wazuh_agent(req):
         return _wazuh_service(req)
     if action == 'verify':
         st = _wazuh_state()
-        st.update(ok=True, log=_wazuh_tail(WAZUH_LOG))
+        window = _wazuh_read_log(WAZUH_LOG)
+        st.update(ok=True, log='\n'.join(window.splitlines()[-40:])[-4096:], connected=_wazuh_connected(window))
         return st
     if action == 'drop_password':
         try:

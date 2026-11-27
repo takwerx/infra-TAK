@@ -584,3 +584,17 @@ def test_the_key_reset_never_follows_a_link(tree):
     r = B._do_wazuh_agent(dict(GOOD, ca_pem=_make_cert(tree.tmp), password='pw'))
     assert r['ok'] is False and 'agent keys' in r['error']
     assert victim.read_text() == 'keep me'
+
+
+def test_connected_is_read_from_a_big_window_not_the_40_line_tail(tree):
+    """First update test: 'Connected to the server' was followed by ~60 start-up lines of the file scan."""
+    lines = ['2026/11/27 22:32:16 wazuh-agentd: INFO: (4102): Connected to the server ([10.0.0.5]:1514/tcp).']
+    lines += [f'2026/11/27 22:32:17 wazuh-syscheckd: INFO: (6206): Ignore file entry {i}' for i in range(300)]
+    (tree.home / 'logs' / 'ossec.log').write_text('\n'.join(lines) + '\n')
+    v = B._do_wazuh_agent({'op': 'wazuh_agent', 'action': 'verify'})
+    assert v['connected'] is True and 'Connected to the server' not in v['log']
+    with open(tree.home / 'logs' / 'ossec.log', 'a') as f:
+        f.write('2026/11/27 22:40:00 wazuh-agentd: ERROR: Unable to connect to any server.\n')
+    assert B._do_wazuh_agent({'op': 'wazuh_agent', 'action': 'verify'})['connected'] is False
+    (tree.home / 'logs' / 'ossec.log').write_text('')
+    assert B._do_wazuh_agent({'op': 'wazuh_agent', 'action': 'verify'})['connected'] is False
