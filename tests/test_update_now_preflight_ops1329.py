@@ -495,6 +495,19 @@ def test_the_real_tree_compiles_under_the_checker():
     assert r.returncode == 0, r.stderr[-500:]
     res = json.loads(r.stdout.strip().splitlines()[-1])
     assert res['compile_errors'] == []
-    # libraries the CI test environment may not carry are not a verdict on the repo; the names must
-    # at least be real top-level imports, never one of our own packages
-    assert not {'modules', 'broker'} & set(res['missing_imports'])
+    # Libraries this test environment lacks are not a verdict on the repo. But a name that is one of
+    # the repo's own files or folders must never be called missing: the first box test (Nov 27) said
+    # "missing library: takwerx_broker (needed by broker/convert_compound_calls.py)" about a real tree,
+    # which would have refused every real update.
+    own = {p.stem for d in ('.', 'modules', 'broker') for p in (REPO / d).glob('*.py')}
+    own |= {p.name for p in REPO.iterdir() if p.is_dir()}
+    assert not own & set(res['missing_imports']), res['missing_imports']
+
+
+def test_a_script_importing_its_neighbour_by_plain_name_is_not_a_missing_library(box):
+    box.write_release('v1.0.2-alpha', app='VERSION = "1.0.2-alpha"\nimport os\n',
+                      req=f'pytest=={_installed("pytest")}\n',
+                      extra={'broker/daemon.py': 'from helper_ops1329 import thing\n',
+                             'broker/helper_ops1329.py': 'thing = 1\n'})
+    out, _, _ = box.click(_fetch_latest_tag_name=lambda: 'v1.0.2-alpha')
+    assert out['success'] is True, out

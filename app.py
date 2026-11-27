@@ -12381,6 +12381,14 @@ for sub in ('modules', 'broker'):
     d = os.path.join(tree_dir, sub)
     if os.path.isdir(d):
         files += [os.path.join(sub, f) for f in sorted(os.listdir(d)) if f.endswith('.py')]
+# Names that are the tree's own files (broker/ and modules/ scripts import their neighbours by plain
+# name, e.g. `from takwerx_broker import ...`): never a missing library.
+local = set()
+for rel in files:
+    local.add(os.path.splitext(os.path.basename(rel))[0])
+for e in os.listdir(tree_dir):
+    if os.path.isdir(os.path.join(tree_dir, e)):
+        local.add(e)
 bad, missing = [], {}
 for rel in files:
     try:
@@ -12399,7 +12407,7 @@ for rel in files:
             names = [node.module]
         for n in names:
             top = n.split('.')[0]
-            if top == '__future__':
+            if top == '__future__' or top in local:
                 continue
             try:
                 found = importlib.util.find_spec(top) is not None
