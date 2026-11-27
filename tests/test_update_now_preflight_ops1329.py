@@ -314,7 +314,7 @@ def test_a_broken_check_does_not_block_an_update(box):
 # --- item 4: the first rollback tag survives an interrupted update ----------------------------
 
 def test_item4_second_click_keeps_the_first_rollback_tag(box):
-    box.restart_argv = ['false']          # click one moves HEAD, the restart never comes
+    box.restart_argv = ['sh', '-c', 'echo "Unit takwerx-console.service is masked." >&2; exit 1']  # restart never comes
     out1, _, _ = box.click()
     assert out1['success'] is False and out1.get('restart_failed') is True
     assert box.head_tag() == NEW
@@ -433,6 +433,19 @@ def test_item7_a_failed_restart_is_returned_and_frees_the_lock(box):
     assert out['success'] is False and out['restart_failed'] is True
     assert 'Failed to connect to bus' in out['error']
     assert not box.update_lock.exists(), 'a retry must not wait 20 minutes'
+
+
+def test_item7_a_restart_that_kills_its_own_command_is_not_a_failure(box):
+    """First box test (Nov 27): a working restart stops the console, which kills the brokered
+    command with SIGTERM (code -15). That was reported as 'could not restart' while the restart
+    was happening. A signal death, or a bare non-zero code with no message, is a restart under way."""
+    for argv in (['sh', '-c', 'kill -TERM $$'], ['sh', '-c', 'exit 1']):
+        box.restart_argv = argv
+        if box.update_lock.exists():
+            box.update_lock.unlink()
+        out, _, _ = box.click()
+        assert out['success'] is True, (argv, out)
+        assert 'restart_failed' not in out
 
 
 def test_item7_a_restart_that_works_still_answers_success(box):

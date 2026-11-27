@@ -790,14 +790,20 @@ def _detached_console_restart(delay=2, result=None):
             rc, err = r.returncode, (r.stderr or '').strip()
         except Exception as e:
             rc, err = 1, str(e)
-        if rc != 0:
-            err = (err.splitlines() or ['systemctl restart failed'])[-1][:200]
+        # Only a command that ran, ended with a positive exit code AND said why is a failed restart
+        # (a masked unit, an unreachable broker). A restart that WORKS stops this very process: the
+        # command is killed by the stop (negative code, -15 on the first box test, Nov 27) or ends
+        # with no message. That is a restart under way, never an error to show the customer.
+        if rc > 0 and err:
+            err = err.splitlines()[-1][:200]
             print(f"Console restart FAILED (rc={rc}): {err}", flush=True)
             if result is not None:
                 result.update({'ok': False, 'error': err})
                 ev = result.get('event')
                 if ev is not None:
                     ev.set()
+        elif rc != 0:
+            print(f"Console restart command ended rc={rc} with no message: restart under way", flush=True)
     threading.Thread(target=_go, daemon=True).start()
 
 
