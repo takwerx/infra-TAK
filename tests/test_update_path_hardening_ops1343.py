@@ -340,33 +340,40 @@ def test_restore_checks_the_version_before_anything_is_verified_or_stopped():
 
 # ── 7. Guard Dog: say so when an older console re-renders newer scripts ─────────────────────
 
-def _gd_ns(disk, version='10.4.9-alpha'):
-    logs = []
-    ns = _load(['_console_version_tuple', '_GD_VERSION_STAMP', '_gd_console_downgrade',
+def _gd_ns(settings, version='10.4.9-alpha'):
+    logs, saved = [], []
+    ns = _load(['_console_version_tuple', '_GD_VERSION_KEY', '_gd_console_downgrade',
                 '_gd_stamp_console_version'],
-               {'VERSION': version, '_read_priv': disk.read, '_write_priv': disk.write,
+               {'VERSION': version, 'load_settings': lambda: dict(settings),
+                'save_settings': lambda s: (saved.append(dict(s)), settings.update(s)),
                 'print': lambda *a, **k: logs.append(' '.join(str(x) for x in a))})
-    return ns, logs
+    return ns, logs, saved
 
 
 def test_guarddog_a_downgrade_is_logged_and_the_stamp_follows_this_console():
-    disk = _Disk({'/opt/tak-guarddog/.console-version': '10.5.1-alpha\n'})
-    ns, logs = _gd_ns(disk)
+    settings = {'guarddog_rendered_by': '10.5.1-alpha', 'fqdn': 'x'}
+    ns, logs, saved = _gd_ns(settings)
     ns['_gd_stamp_console_version']()
     assert any('10.5.1-alpha' in m and 'older' in m for m in logs), logs
-    assert disk.files['/opt/tak-guarddog/.console-version'] == '10.4.9-alpha\n'
+    assert settings['guarddog_rendered_by'] == '10.4.9-alpha' and settings['fqdn'] == 'x'
 
 
 def test_guarddog_same_version_or_first_boot_is_silent_and_a_failed_stamp_never_raises():
-    disk = _Disk()
-    ns, logs = _gd_ns(disk)
+    settings = {}
+    ns, logs, saved = _gd_ns(settings)
     ns['_gd_stamp_console_version']()
     assert not logs
     ns['_gd_stamp_console_version']()
-    assert disk.writes == ['/opt/tak-guarddog/.console-version']        # written once
-    ns['_write_priv'] = lambda *a, **k: (_ for _ in ()).throw(OSError('x'))
-    ns['_read_priv'] = lambda p: (_ for _ in ()).throw(OSError('x'))
-    ns['_gd_stamp_console_version']()
+    assert len(saved) == 1                                      # saved once, not on every boot
+    ns['save_settings'] = lambda s: (_ for _ in ()).throw(OSError('x'))
+    settings.clear()
+    ns['_gd_stamp_console_version']()                           # logs, does not raise
+
+
+def test_guarddog_the_stamp_is_not_a_file_under_the_root_owned_script_folder():
+    """The broker refuses console writes into /opt/tak-guarddog: a file there never landed on nuc."""
+    assert '.console-version' not in _segment('_gd_stamp_console_version')
+    assert '/opt/tak-guarddog' not in _segment('_gd_stamp_console_version').split('"""')[2]
 
 
 def test_guarddog_startup_refresh_stamps_after_the_scripts_are_installed():

@@ -116504,7 +116504,7 @@ def _gd_refresh_mtx_cert_sync():
     return changed
 
 
-_GD_VERSION_STAMP = '/opt/tak-guarddog/.console-version'
+_GD_VERSION_KEY = 'guarddog_rendered_by'
 
 
 def _gd_console_downgrade(prev, current=None):
@@ -116519,18 +116519,19 @@ def _gd_stamp_console_version():
     this console is OLDER than the one that rendered them (ops #1343). A console that is
     rolled back, or moved from dev to main, re-renders every script from its own templates,
     on purpose: the scripts then match the console that runs them. Until now nothing on the
-    box said it had happened. Never raises."""
+    box said it had happened. The stamp is a settings key: the broker refuses console writes
+    into /opt/tak-guarddog (root installs those scripts itself), so a stamp file there never
+    landed on a non-root box (nuc, 2026-11-27). Never raises."""
     try:
-        try:
-            prev = (_read_priv(_GD_VERSION_STAMP) or '').strip()
-        except Exception:
-            prev = ''
+        s = load_settings()
+        prev = str(s.get(_GD_VERSION_KEY) or '').strip()
         if _gd_console_downgrade(prev):
             print(f"Guard Dog: scripts were last rendered by infra-TAK {prev}; this console is "
                   f"{VERSION} (older: a rollback or a channel change). They now match this console.",
                   flush=True)
         if prev != VERSION:
-            _write_priv(_GD_VERSION_STAMP, VERSION + '\n', perm=0o644)
+            s[_GD_VERSION_KEY] = VERSION
+            save_settings(s)
     except Exception as _e:
         print(f"Guard Dog: console version stamp not written (non-fatal): {_e}", flush=True)
 
