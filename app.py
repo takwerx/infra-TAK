@@ -34552,6 +34552,105 @@ def _fedhub_copy_file(cfg, src, dst_dir, timeout=300):
         return False, str(e)
 
 
+_FEDHUB_KEEP_UPDATE_BACKUPS = 3      # ops #1339: newest pre-update backups kept on the hub host
+
+
+def _fedhub_cert_files_present(names):
+    """ops #1339 — the names in a hub's certs/files that mean "this hub already has certificates".
+
+    Any keystore (.jks), PKCS12 (.p12) or CA file (ca.pem, root-ca.pem) counts. The old test
+    looked only for <hostname>.jks, so a hub whose keystore has another name (a manual install
+    keeps the vendor name takserver.jks; a renamed host keeps the old host name) was taken for a
+    hub with no certificates and its CA was made again."""
+    return sorted(n for n in names if n.lower().endswith(('.jks', '.p12')) or n in ('ca.pem', 'root-ca.pem'))
+
+
+def _fedhub_read_state(cfg, fh_dir):
+    """ops #1339 — read what a Federation Hub host already holds, before anything is changed.
+
+    Returns a dict: `error` (text, empty when fine), `has_hub` (the folder exists and is not
+    empty), `cert_names` (files in certs/files that are certificates, see
+    _fedhub_cert_files_present), `keystores` (keystoreFile names the hub config points at),
+    `oauth` ('true', 'false' or None: the hub's own allowOauth), `sources` (which of
+    certs/files, certs/cert-metadata.sh, configs, policies exist, for the backup).
+    A listing that fails for a reason other than "no such folder" is an error: the caller stops
+    rather than guess that the hub has no certificates."""
+    st = {'error': '', 'has_hub': False, 'cert_names': [], 'keystores': [], 'oauth': None, 'sources': []}
+    q = shlex.quote
+
+    def _ls(path):
+        ok, out = _module_run(cfg, f'sudo ls -1A {q(path)} 2>&1', timeout=30)
+        text = (out or '').strip()
+        if ok:
+            return [n for n in text.splitlines() if n and not n.startswith('ls: ')], ''
+        if 'No such file or directory' in text:
+            return [], ''
+        if _fedhub_sudo_refused(text):
+            return None, 'sudo asked for a password'
+        return None, (text.splitlines()[-1] if text else 'listing failed')[:200]
+
+    top, err = _ls(fh_dir)
+    if top is None:
+        st['error'] = f'could not read {fh_dir}: {err}'
+        return st
+    st['has_hub'] = bool(top)
+    if not top:
+        return st
+    if 'certs' in top:
+        certs, err = _ls(f'{fh_dir}/certs')
+        if certs is None:
+            st['error'] = f'could not read {fh_dir}/certs: {err}'
+            return st
+        if 'cert-metadata.sh' in certs:
+            st['sources'].append('certs/cert-metadata.sh')
+        if 'files' in certs:
+            files, err = _ls(f'{fh_dir}/certs/files')
+            if files is None:
+                st['error'] = f'could not read {fh_dir}/certs/files: {err}'
+                return st
+            st['sources'].append('certs/files')
+            st['cert_names'] = _fedhub_cert_files_present(files)
+    if 'configs' in top:
+        st['sources'].append('configs')
+        ok, out = _module_run(
+            cfg, f'sudo grep -hE "^(keystoreFile|allowOauth):" '
+                 f'{q(fh_dir + "/configs/federation-hub-broker.yml")} '
+                 f'{q(fh_dir + "/configs/federation-hub-ui.yml")} 2>&1', timeout=30)
+        for ln in (out or '').splitlines():
+            m = re.match(r'^keystoreFile:\s*(\S+)', ln)
+            if m:
+                st['keystores'].append(os.path.basename(m.group(1).strip('"\'')))
+                continue
+            m = re.match(r'^allowOauth:\s*(\S+)', ln)
+            if m:
+                st['oauth'] = m.group(1).strip('"\'').lower()
+            elif 'Permission denied' in ln:
+                st['error'] = f'could not read the hub config: {ln[:160]}'
+                return st
+    if 'policies' in top:
+        st['sources'].append('policies')
+    return st
+
+
+def _fedhub_backup_cmd(fh_dir, ts, sources):
+    """ops #1339 — shell command: copy the hub's certificates, config and policies aside before an
+    Update. The folder is root-only (it holds the CA keys). Only the newest few are kept.
+    certs/backups is not copied (older Rotate CA sets live there and would grow without end).
+    Uses cp -a, mkdir and chmod, the commands the non-root console's broker already routes."""
+    q = shlex.quote
+    dest = f'backups/pre-update-{ts}'
+    parts = [f'cd {q(fh_dir)}', 'sudo mkdir -p backups', 'sudo chmod 700 backups',
+             f'sudo mkdir {dest}', f'sudo chmod 700 {dest}']
+    if any(s.startswith('certs/') for s in sources):
+        parts.append(f'sudo mkdir {dest}/certs')
+    for s in sources:
+        parts.append(f'sudo cp -a {q(s)} {dest}/{"certs/" if s.startswith("certs/") else ""}')
+    # best effort: a failed prune must never fail the update
+    parts.append(f'(sudo sh -c "ls -1dr backups/pre-update-* 2>/dev/null | tail -n +{_FEDHUB_KEEP_UPDATE_BACKUPS + 1}'
+                 f' | xargs -r rm -rf" || true)')
+    return ' && '.join(parts)
+
+
 def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deploy'):
     """Install/update Federation Hub .deb on local or remote target; register console when successful."""
     def plog(msg):
@@ -34600,6 +34699,33 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
         plog(f'Package: {deb_fn}')
+        # ops #1339 — look at what the hub already holds BEFORE the package or any script touches it:
+        # (1) a hub that has certificates keeps them (the old test knew only <hostname>.jks),
+        # (2) the operator's allowOauth stays as set, (3) certificates, config and policies are
+        # copied aside first. If the host cannot be read, stop: nothing has changed yet.
+        fh_dir = '/opt/tak/federation-hub'
+        hub_was_registered = bool(cfg.get('deployed'))
+        hub_state = _fedhub_read_state(cfg, fh_dir)
+        # A registered hub keeps its own allowOauth unless it is already on (then the Authentik
+        # client details are re-synced as before). Only a first deploy turns it on by itself.
+        oauth_left_alone = hub_was_registered and hub_state['has_hub'] and hub_state['oauth'] != 'true'
+        if hub_state['error']:
+            plog(f"✗ {hub_state['error']}")
+            plog('✗ Stopped before any change: the update will not guess whether this hub has certificates.')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        if hub_state['has_hub']:
+            if hub_state['cert_names']:
+                plog(f"  Certificates found on the hub ({len(hub_state['cert_names'])} files): they stay as they are.")
+            if hub_state['sources']:
+                bk_ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+                ok_bk, bk_out = _module_run(cfg, _fedhub_backup_cmd(fh_dir, bk_ts, hub_state['sources']), timeout=120)
+                if not ok_bk:
+                    plog(f'✗ Could not copy the hub certificates and config aside: {(bk_out or "")[-300:].strip()}')
+                    plog('✗ Stopped before any change. Free disk space on the hub host and try again.')
+                    status_dict.update({'running': False, 'complete': True, 'error': True})
+                    return
+                plog(f'✓ Backup of {", ".join(hub_state["sources"])} saved in {fh_dir}/backups/pre-update-{bk_ts} (root only)')
         if is_remote:
             plog('━━━ Apt lock cleanup on target ━━━')
             _ok_u, out_u = _module_run(cfg, _fedhub_remote_apt_unlock_cmd(), timeout=90)
@@ -34769,7 +34895,17 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             f'sudo -u tak ./makeCert.sh server {shlex.quote(remote_hostname)} 2>&1 && '
             f'echo y | sudo -u tak ./makeCert.sh client webadmin-fed 2>&1'
         )
-        ok_cert, cert_out = _module_run(cfg, cert_cmds, timeout=120)
+        if hub_state['cert_names']:
+            # ops #1339: the hub already has certificates (any keystore or CA file, whatever its
+            # name). Making them again would replace the hub's CA and break federation trust.
+            ok_cert, cert_out = True, 'CERTS_EXIST'
+            _kn = [k for k in hub_state['keystores'] if k]
+            _missing = [k for k in _kn if k not in hub_state['cert_names']]
+            if _missing:
+                plog(f"⚠ The hub config names keystore {', '.join(sorted(set(_missing)))} but it is not in "
+                     f"{fh_dir}/certs/files. Nothing was regenerated; use Rotate CA to make a new set.")
+        else:
+            ok_cert, cert_out = _module_run(cfg, cert_cmds, timeout=120)
         if cert_out:
             plog(cert_out[-3000:] if len(cert_out) > 3000 else cert_out)
         if not ok_cert:
@@ -34854,9 +34990,14 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                 if not reachable:
                     plog(f'⚠ Skipping auto OAuth enable: Authentik API unreachable ({ak_err})')
                 else:
-                    client_id, client_secret, _auth_url, _token_url = _ensure_authentik_fedhub_oauth_app(
-                        settings, plog=plog
-                    )
+                    if oauth_left_alone:
+                        client_id = client_secret = None
+                        plog(f"✓ Hub sign-in with Authentik left as it was set on the hub (allowOauth: {hub_state['oauth'] or 'not set'}). "
+                             f'Use "Enable Authentik login" to turn it on.')
+                    else:
+                        client_id, client_secret, _auth_url, _token_url = _ensure_authentik_fedhub_oauth_app(
+                            settings, plog=plog
+                        )
                     fh_domain = _get_service_domain(settings, 'fedhub')
                     fh_host = fh_domain or (remote.get('host') or '').strip() or 'localhost'
                     redirect_uri = (
@@ -34877,11 +35018,14 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                         f'chown tak:tak /opt/tak/certs/keycloak.der && '
                         f'chmod 644 /opt/tak/certs/keycloak.der'
                     )
-                    ok_der, _ = _module_run(cfg, der_cmd, timeout=30)
-                    if ok_der:
-                        plog(f'✓ keycloak.der generated from {ak_host}')
+                    if oauth_left_alone:
+                        pass
                     else:
-                        plog('⚠ keycloak.der generation failed (OAuth may fail until fixed)')
+                        ok_der, _ = _module_run(cfg, der_cmd, timeout=30)
+                        if ok_der:
+                            plog(f'✓ keycloak.der generated from {ak_host}')
+                        else:
+                            plog('⚠ keycloak.der generation failed (OAuth may fail until fixed)')
 
                     if client_id and client_secret:
                         patch_cmd = (
