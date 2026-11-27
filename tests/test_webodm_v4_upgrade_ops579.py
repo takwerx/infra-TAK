@@ -51,7 +51,8 @@ OLD = '''services:
     container_name: wo_nodeodm
 '''
 
-WANT = {'WEBODM_VERSION', 'WEBODM_IMAGES', '_webodm_pin_images', 'WEBODM_OLEFILE_STRIP',
+WANT = {'_IMAGE_EXACT_TAG_RE', '_image_ref_parts', '_image_exact_version', '_image_ahead_of_pin',
+        'WEBODM_VERSION', 'WEBODM_IMAGES', '_webodm_pin_images', 'WEBODM_OLEFILE_STRIP',
         '_webodm_strip_olefile', 'WEBODM_DB_VOLUME', 'WEBODM_DB_DUMP_PREFIX', 'WEBODM_UPGRADE_WAIT_S', 'WEBODM_PULL_TIMEOUT_S',
         '_webodm_db_sh', '_webodm_db_needs_upgrade', '_webodm_answers', '_webodm_db_room_check', '_webodm_backup_db_95',
         '_webodm_wait_upgraded', '_webodm_restore_95', '_run_webodm_update',

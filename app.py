@@ -64063,13 +64063,113 @@ WEBODM_UPGRADE_WAIT_S = 1200   # DB upgrade + first 4.x start; WebODM DBs are sm
 WEBODM_PULL_TIMEOUT_S = 1800   # 3.x → 4.x pulls about 6 GB; 300 s ran out on test6 (10.3.10 T&E)
 
 
-def _webodm_pin_images(compose_txt, services=None):
+# Never move a box DOWN onto a pin (ops #1307, same trap as ops #1306). A pin move that goes
+# backwards is only safe while the new version wrote nothing the old one cannot read, and an
+# image whose data is a one-way format (a database schema, a flow store, a saved data file)
+# fails at the next start, in a loop, once the data has moved on. A box can be ahead of a pin
+# two ways: its compose names a newer exact tag, or it names a floating tag (`latest`, `alpine`,
+# `4`) that Docker pulled forward after the pin was written. The second is invisible in the
+# compose file, so the version Docker really ran is read from the container.
+_IMAGE_EXACT_TAG_RE = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)(?:-(\d+))?(?:-[A-Za-z][\w.]*)?$')
+
+
+def _image_ref_parts(ref):
+    """('nodered/node-red', '4.1.18-22') from an image reference. A registry host, the
+    docker.io/library/ prefix and a digest are dropped; no tag means `latest`."""
+    r = str(ref or '').strip().strip('\'"').split('@', 1)[0]
+    r = re.sub(r'^(?:docker\.io/)?(?:library/)?', '', r)
+    head, sep, tag = r.rpartition(':')
+    if not sep or '/' in tag:
+        return r, 'latest'
+    return head, tag or 'latest'
+
+
+def _image_exact_version(tag):
+    """(major, minor, patch, build) of an exact release tag such as `4.1.18-22`, `8.10.3-alpine`
+    or `v0.83.2`, or None for a floating tag (`latest`, `alpine`, `4`, `4.1`)."""
+    m = _IMAGE_EXACT_TAG_RE.match(str(tag or ''))
+    return tuple(int(x or 0) for x in m.groups()) if m else None
+
+
+def _image_ahead_of_pin(current_ref, pin_ref, running_lookup=None):
+    """True when the box already runs something newer than `pin_ref`, so moving it onto the pin
+    would be a downgrade (ops #1307). Only the same image is judged: a mirror or a fork is the
+    operator's. `running_lookup` is called, only for a floating tag, and returns the (major,
+    minor, patch) Docker really ran, or None when that is unknown (then the pin move goes ahead,
+    as before)."""
+    cur_repo, cur_tag = _image_ref_parts(current_ref)
+    pin_repo, pin_tag = _image_ref_parts(pin_ref)
+    pin_ver = _image_exact_version(pin_tag)
+    if cur_repo != pin_repo or pin_ver is None:
+        return False
+    cur_ver = _image_exact_version(cur_tag)
+    if cur_ver is not None:
+        return cur_ver > pin_ver
+    if running_lookup is None:
+        return False
+    try:
+        ran = running_lookup()
+    except Exception:
+        return False
+    return bool(ran) and tuple(ran[:3]) > pin_ver[:3]
+
+
+def _docker_env_version(*targets, env_name, timeout=20):
+    """(major, minor, patch) that `env_name` (for example NODE_RED_VERSION) holds in the first of
+    `targets` Docker knows, a container name or an image reference, or None. A container's
+    environment is the one of the image it was created from, so this is the version that ran,
+    not the one a later pull put on disk. Best-effort; never raises.
+
+    The Go template prints only the one variable asked for: a container's environment holds
+    secrets (Node-RED's .env, database passwords), and they must not pass through this process."""
+    if not re.fullmatch(r'[A-Z][A-Z0-9_]*', env_name or ''):
+        return None
+    fmt = ('{{range .Config.Env}}{{$p := split . "="}}{{if eq (index $p 0) "' + env_name + '"}}'
+           '{{println .}}{{end}}{{end}}')
+    for target in targets:
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', fmt, target]),
+                               capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            continue
+        if r.returncode != 0:
+            continue
+        m = re.search(rf'^{re.escape(env_name)}=v?(\d+)\.(\d+)\.(\d+)', r.stdout or '', re.M)
+        if m:
+            return tuple(int(x) for x in m.groups())
+    return None
+
+
+def _webodm_pin_images(compose_txt, services=None, kept=None):
     """Point each WebODM service's `image:` line at its WEBODM_IMAGES pin (every service, or
     only those in `services`). Installs from before the pins carry the floating refs they were
     deployed with; deploy writes the pins fresh, Update and the startup migration rewrite them
-    in place. Idempotent — an already-pinned file comes back unchanged."""
+    in place. Idempotent — an already-pinned file comes back unchanged.
+
+    ops #1307: the webapp and worker (one image, run twice) are left alone when either one is
+    NEWER than the pin, because the database behind them is migrated by the newer WebODM and the
+    older one is not built to read it; the database image is left alone when it is a newer
+    PostgreSQL major than the pin, because a data directory only opens on the major that made
+    it. Each service left alone is appended to `kept` as (service, image). The Celery broker and
+    nodeodx keep nothing on disk, so they always move to their pins."""
+    def _image_line(svc):
+        m = re.search(rf'^  {svc}:\n(?:    [^\n]*\n)*?    image: ([^\n]*)', compose_txt, re.M)
+        return m.group(1).strip() if m else ''
+
+    def _ahead(svc):
+        if svc in ('wo_webapp', 'wo_worker'):
+            return any(_image_ahead_of_pin(_image_line(s), WEBODM_IMAGES[s]) for s in ('wo_webapp', 'wo_worker'))
+        if svc == 'wo_db':
+            cur = re.search(r'webodm_db:(\d+)(?:@|$)', _image_line(svc))
+            return bool(cur) and int(cur.group(1)) > int(re.search(r'webodm_db:(\d+)', WEBODM_IMAGES[svc]).group(1))
+        return False
+
     for svc, image in WEBODM_IMAGES.items():
         if services and svc not in services:
+            continue
+        if _ahead(svc):
+            if kept is not None:
+                kept.append((svc, _image_line(svc)))
             continue
         compose_txt = re.sub(rf'(^  {svc}:\n(?:    [^\n]*\n)*?    image: )[^\n]*',
                              lambda m: m.group(1) + image, compose_txt, count=1, flags=re.M)
@@ -65062,9 +65162,13 @@ def _run_webodm_update():
         # Update means "move to the tested pins", not "pull whatever :latest is today" (ops #92).
         compose_path = os.path.join(wo_dir, 'docker-compose.yml')
         compose_txt = _read_priv(compose_path)
-        pinned = _webodm_pin_images(compose_txt)
+        kept = []   # ops #1307: services already newer than their pin are never moved back
+        pinned = _webodm_pin_images(compose_txt, kept=kept)
         if pinned != compose_txt:
             plog(f'Pinned WebODM images to the tested set (WebODM {WEBODM_VERSION}, {WEBODM_IMAGES["wo_broker"]})')
+        for _svc, _cur in kept:
+            plog(f'Kept {_svc} on {_cur}: it is newer than the tested pin ({WEBODM_IMAGES[_svc]}), '
+                 'and an older version cannot read the data the newer one already wrote')
         stripped = _webodm_strip_olefile(pinned)
         if stripped != pinned:
             plog('Applied WebODM security update to the webapp/worker entrypoints (ops #206)')
@@ -68232,6 +68336,14 @@ def _heal_netbird_pinned_image(plog=None):
             return False  # already on this channel's target — healthy, no-op
         _pin_kind = 'dev' if _srv_img == NETBIRD_SERVER_DEV_IMAGE and NETBIRD_SERVER_DEV_IMAGE != NETBIRD_SERVER_IMAGE else 'vetted'
         _log(f"  netbird: compose off the {_pin_kind} pin — restoring {_srv_img} + recreating")
+        # ops #1307: this heal goes DOWN on purpose (it pulls a box off a bad newer image, and
+        # 0.83.2 -> 0.82.1 on a migrated store was drilled, ops #1088). When it does, say so once
+        # in plain words, so nobody reads a version going back as a fault.
+        _cur_srv = re.search(r'netbirdio/netbird-server:[^\s\'"]+', txt)
+        if _cur_srv and _image_ahead_of_pin(_cur_srv.group(0), _srv_img):
+            _log(f"  netbird: moved NetBird down from {_cur_srv.group(0).rsplit(':', 1)[-1]} to "
+                 f"{_srv_img.rsplit(':', 1)[-1]}: this box ran a newer version than the tested "
+                 f"one for its update channel, so it goes back to the tested one")
         _netbird_sync_compose_image_tags(nb_dir)
         subprocess.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
                        capture_output=True, text=True, cwd=nb_dir, timeout=600)
@@ -69889,6 +70001,41 @@ def _nodered_port_holders_as_conflicts(port=1880):
 # on Node 24, a bigger change.
 NODERED_IMAGE = 'nodered/node-red:4.1.18-22'
 _NODERED_IMAGE_LINE_RE = re.compile(r'^(\s*image:\s*)nodered/node-red:\S+[ \t]*$', re.M)
+
+
+def _nodered_remote_image_cmd():
+    """The shell script that moves a REMOTE Node-RED onto NODERED_IMAGE (run over ssh in the
+    post-update step). It mirrors the local rule in _auto_nodered (ops #1307): a compose that
+    already names a newer exact tag, or a floating tag whose container ran a newer Node-RED, is
+    left alone, because an older Node-RED is not built to open flows a newer one saved.
+
+    Versions are compared with `sort -V` (GNU coreutils, on every host we deploy to) after
+    turning `4.1.18-22` into `4.1.18.22` (a floating tag's container version has no build part,
+    so `4.1.18` sorts below the pin and `5.0.10` above it, the same as the Python helper)."""
+    _pin_key = NODERED_IMAGE.split(':', 1)[1].replace('-', '.')
+    return (
+        'cd ~/node-red 2>/dev/null && test -f docker-compose.yml || '
+        '{ echo "[remote-nr] no compose — skipped"; exit 0; }; '
+        f'if grep -qF "image: {NODERED_IMAGE}" docker-compose.yml; '
+        f'then echo "[remote-nr] already on {NODERED_IMAGE}"; exit 0; fi; '
+        # the tag the compose names now; an exact tag is its own version, a floating one is
+        # judged by the Node-RED its container really ran
+        'cur=$(sed -n -E "s#^[[:space:]]*image:[[:space:]]*nodered/node-red:([^[:space:]]+).*#\\1#p" '
+        'docker-compose.yml | head -n 1); '
+        'if printf "%s" "$cur" | grep -qE "^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9]+)?(-[A-Za-z][A-Za-z0-9._]*)?$"; '
+        'then key=$(printf "%s" "$cur" | sed -E "s/^v//; s/-[A-Za-z][A-Za-z0-9._]*$//; s/-/./g"); '
+        # only NODE_RED_VERSION is printed: the container's environment holds its .env secrets
+        "else key=$(docker inspect nodered --format '{{range .Config.Env}}{{$p := split . \"=\"}}"
+        "{{if eq (index $p 0) \"NODE_RED_VERSION\"}}{{println .}}{{end}}{{end}}' 2>/dev/null "
+        '| sed -n -E "s/^NODE_RED_VERSION=v?([0-9]+\\.[0-9]+\\.[0-9]+).*/\\1/p" | head -n 1); fi; '
+        f'if [ -n "$key" ] && [ "$key" != "{_pin_key}" ] '
+        f'&& [ "$(printf "%s\\n%s\\n" "$key" "{_pin_key}" | sort -V | tail -n 1)" = "$key" ]; '
+        'then echo "[remote-nr] $cur (version $key) is newer than the pin — left alone (never a downgrade)"; exit 0; fi; '
+        'sed -i -E "s#^([[:space:]]*image:[[:space:]]*)nodered/node-red:[^[:space:]]+[[:space:]]*\\$'
+        f'#\\1{NODERED_IMAGE}#" docker-compose.yml && '
+        'docker compose pull --quiet 2>&1 && '
+        'docker compose up -d 2>&1'
+    )
 
 
 def _nodered_foreign_listener_lines(domain, port=1880, pulled=False):
@@ -126939,7 +127086,19 @@ def _post_update_auto_deploy():
                         # Every box converges on NODERED_IMAGE (the same tag a Redeploy
                         # writes) — :latest, the old 4.0 pin, or any other tag.
                         _nr_img_m = _NODERED_IMAGE_LINE_RE.search(content)
-                        _nr_img_changed = bool(_nr_img_m) and \
+                        # ops #1307: never move a box DOWN onto the pin. A newer exact tag, or a
+                        # floating tag (`latest`) whose container ran a newer Node-RED (5.x on
+                        # Node 24 today), keeps its image: flows saved by the newer Node-RED are
+                        # not guaranteed to open on the older one.
+                        _nr_cur_img = (_nr_img_m.group(0).strip()[len('image:'):].strip()
+                                       if _nr_img_m else '')
+                        _nr_keep_img = bool(_nr_img_m) and _image_ahead_of_pin(
+                            _nr_cur_img, NODERED_IMAGE,
+                            lambda: _docker_env_version('nodered', _nr_cur_img, env_name='NODE_RED_VERSION'))
+                        if _nr_keep_img:
+                            print(f"Post-update: Node-RED image {_nr_cur_img} is newer than the pin "
+                                  f"{NODERED_IMAGE} — left alone (never a downgrade)")
+                        _nr_img_changed = bool(_nr_img_m) and not _nr_keep_img and \
                             _nr_img_m.group(0).strip() != f'image: {NODERED_IMAGE}'
                         if _nr_img_changed:
                             content = _NODERED_IMAGE_LINE_RE.sub(
@@ -127655,16 +127814,7 @@ def _post_update_auto_deploy():
                         return
                     if not (_nr_cfg.get('remote', {}).get('host') or '').strip():
                         return
-                    _cmd = (
-                        'cd ~/node-red 2>/dev/null && test -f docker-compose.yml || '
-                        '{ echo "[remote-nr] no compose — skipped"; exit 0; }; '
-                        f'if grep -qF "image: {NODERED_IMAGE}" docker-compose.yml; '
-                        f'then echo "[remote-nr] already on {NODERED_IMAGE}"; exit 0; fi; '
-                        'sed -i -E "s#^([[:space:]]*image:[[:space:]]*)nodered/node-red:[^[:space:]]+[[:space:]]*\\$'
-                        f'#\\1{NODERED_IMAGE}#" docker-compose.yml && '
-                        'docker compose pull --quiet 2>&1 && '
-                        'docker compose up -d 2>&1'
-                    )
+                    _cmd = _nodered_remote_image_cmd()
                     print(f"Post-update: moving remote Node-RED to {NODERED_IMAGE}...")
                     _ok, _out = _module_run(_nr_cfg, _cmd, timeout=1800)
                     for _line in (_out or '').strip().splitlines()[:10]:
