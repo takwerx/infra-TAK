@@ -104136,6 +104136,137 @@ def _cot_stall_report():
     return out
 
 
+# ── ops #1337: a rollback must not destroy what it cannot put back ───────────────────────────
+def _tak_pg_major_local():
+    """PostgreSQL major (15, 18, …) of the cluster that holds the cot database on this box,
+    or None when it cannot be read. Fixed SQL only (see _pg_exec)."""
+    try:
+        r = _pg_exec(['psql', '-tAX', '-d', 'postgres', '-c', 'show server_version_num'], timeout=30)
+        v = (r.stdout or '').strip() if (r is not None and r.returncode == 0) else ''
+        return int(v) // 10000 if v.isdigit() else None
+    except Exception:
+        return None
+
+
+def _tak_cot_table_oid():
+    """pg_class oid of the cot table `schema_version`, or None when it is not there.
+
+    `pg_restore --clean` drops and creates every table, so after a restore that really ran
+    this oid is a new one. The same oid after pg_restore means it restored nothing (it
+    refused the archive and exited 1, the same code it uses for harmless warnings)."""
+    try:
+        r = _pg_exec(['psql', '-tAX', '-d', 'cot', '-c',
+                      "select oid from pg_class where relname = 'schema_version' "
+                      "and relkind = 'r' and relnamespace = 'public'::regnamespace"], timeout=30)
+        v = (r.stdout or '').strip() if (r is not None and r.returncode == 0) else ''
+        return int(v) if v.isdigit() else None
+    except Exception:
+        return None
+
+
+_PG_RESTORE_REFUSED_RE = re.compile(
+    r'unsupported version|archive was made by a newer|input file is too short|'
+    r'does not appear to be a valid archive|not a valid archive', re.I)
+
+
+def _tak_pg_restore_refused(stderr):
+    """True when pg_restore's own words say it refused the archive. Its exit code cannot say
+    so: 1 is both "refused" and "restored with ignorable warnings"."""
+    return bool(stderr and _PG_RESTORE_REFUSED_RE.search(stderr))
+
+
+def _tak_rollback_dump_too_new(snap_meta, installed_major):
+    """Text that refuses a rollback when the snapshot's database dump came from a NEWER
+    PostgreSQL major than the one installed here, else ''. An older dump into a newer server
+    is fine (and gets the schema update afterwards). Nothing is known for a snapshot made
+    before this check, or for a remote database: then the after-restore check decides."""
+    try:
+        dumped = int((snap_meta or {}).get('db_pg_major'))
+        here = int(installed_major)
+    except (TypeError, ValueError):
+        return ''
+    if dumped > here:
+        return (f"This snapshot's database was dumped from PostgreSQL {dumped}, but this server runs "
+                f"PostgreSQL {here}. A newer dump cannot be restored into an older server. "
+                f"Nothing was changed.")
+    return ''
+
+
+def _tak_swap_certs(certs_src, certs_dst):
+    """Put the snapshot's certificate folder in place of the live one without a gap.
+
+    The old code ran `rm -rf` on the live folder first and copied after. A copy that failed
+    (disk full) left the box with no certificates, and the log still ended "restored".
+    Now: copy beside the live folder, and only when that landed move the live folder aside,
+    move the copy in and remove the old one. Any failure puts the old folder back.
+    Returns (True, '') or (False, reason); on False the live certificates are untouched."""
+    new_dir, old_dir = certs_dst + '.rb-new', certs_dst + '.rb-old'
+
+    def _run(argv, timeout=300):
+        r = subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout)
+        return r.returncode, ((r.stderr or r.stdout or '').strip()[:200])
+
+    _run(['rm', '-rf', new_dir], 60)
+    _run(['rm', '-rf', old_dir], 60)
+    rc, err = _run(['cp', '-rp', certs_src, new_dir])
+    if rc != 0:
+        _run(['rm', '-rf', new_dir], 60)
+        return False, f"could not copy the snapshot's certificates ({err or 'cp failed'})"
+    had_live = _run(['test', '-e', certs_dst], 15)[0] == 0
+    if had_live:
+        rc, err = _run(['mv', certs_dst, old_dir], 60)
+        if rc != 0:
+            _run(['rm', '-rf', new_dir], 60)
+            return False, f"could not move the current certificates aside ({err or 'mv failed'})"
+    rc, err = _run(['mv', new_dir, certs_dst], 60)
+    if rc != 0:
+        if had_live:
+            _run(['mv', old_dir, certs_dst], 60)
+        _run(['rm', '-rf', new_dir], 60)
+        return False, f"could not move the restored certificates into place ({err or 'mv failed'})"
+    if had_live:
+        _run(['rm', '-rf', old_dir], 60)
+    return True, ''
+
+
+def _tak_prune_snapshots(source, keep):
+    """Keep the newest `keep` snapshots whose settings source is `source`; delete the rest."""
+    try:
+        s = load_settings()
+        sn = s.get('tak_snapshots') or []
+        mine = sorted([x for x in sn if x.get('source') == source],
+                      key=lambda x: x.get('taken_at', ''), reverse=True)
+        for victim in mine[keep:]:
+            ok, lab = _validate_snapshot_label(victim.get('label', ''))
+            if not ok:
+                continue
+            subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(SNAPSHOT_DIR, lab)]),
+                           capture_output=True, timeout=60)
+            sn = [x for x in sn if x.get('label') != lab]
+        s['tak_snapshots'] = sn
+        save_settings(s)
+    except Exception:
+        pass
+
+
+def _tak_downgrade_needs_dump(pkg_filename, snap_result):
+    """Text that refuses an update when the package is OLDER than the installed TAK Server and
+    the snapshot just taken holds no database dump (ops #1337), else ''.
+
+    An older package runs on a database a newer one has already migrated; the dump is the only
+    way back. A normal upgrade with no dump keeps its warning; a downgrade does not go ahead."""
+    try:
+        if not _tak_package_downgrade(pkg_filename):
+            return ''
+    except Exception:
+        return ''
+    if isinstance(snap_result, dict) and snap_result.get('db_dump'):
+        return ''
+    return ("This update installs an OLDER TAK Server than the one installed, and the snapshot taken "
+            "first holds no database dump, so the database could not be put back. Nothing was changed. "
+            "Fix the database backup first (see the snapshot log), then run the update again.")
+
+
 def _tak_snapshot(label, plog=None):
     """Create a TAK Server snapshot at /opt/tak/snapshots/<label>/.
 
@@ -104439,6 +104570,22 @@ def _tak_snapshot(label, plog=None):
     except Exception as e:
         plog(f"  snapshot: pg_dump exception: {e}")
 
+    # ops #1337: what the dump holds, so a rollback can refuse a dump from a newer PostgreSQL
+    # and prove afterwards that the restore really changed the database. Local database only
+    # (a remote one is not read with these helpers). A value that cannot be read is left out.
+    try:
+        if meta.get('db_dump'):
+            _sn_cfg = _get_tak_deployment_config(load_settings())
+            if _sn_cfg.get('mode') not in ('two_server', 'external_db'):
+                _m = _tak_pg_major_local()
+                _v = _tak58_schema_version()
+                if _m:
+                    meta['db_pg_major'] = _m
+                if _v is not None:
+                    meta['db_schema_version'] = _v
+    except Exception as _me:
+        plog(f"  snapshot: could not record the database version ({str(_me)[:120]})")
+
     # 5. Certificates
     certs_src = '/opt/tak/certs/files'
     certs_dst = os.path.join(snap_path, 'certs')
@@ -104587,6 +104734,46 @@ def _tak_rollback(label, plog=None):
         if not _via_broker:
             return False, f"Snapshot '{label}' has no cot.pgdump — cannot restore database"
 
+    # ops #1337: refuse, before anything is touched, a dump from a newer PostgreSQL than the one
+    # here (pg_restore exits 1 for that, which this function used to read as "warnings").
+    _rb_meta = {}
+    try:
+        _rb_meta = next((sn for sn in (load_settings().get('tak_snapshots') or [])
+                         if sn.get('label') == label), {}) or {}
+    except Exception:
+        _rb_meta = {}
+    _rb_cfg0 = _get_tak_deployment_config(load_settings())
+    _rb_local_db = _rb_cfg0.get('mode') not in ('two_server', 'external_db')
+    if _rb_local_db and _rb_meta.get('db_pg_major'):
+        _too_new = _tak_rollback_dump_too_new(_rb_meta, _tak_pg_major_local())
+        if _too_new:
+            plog(f"  rollback [{label}]: refused — {_too_new}")
+            return False, _too_new
+
+    # ops #1337: a rollback is the one action that deletes the current state. Take a snapshot of
+    # it first, so a bad rollback can itself be undone. Best effort: a database that cannot be
+    # dumped (the reason for many rollbacks) must not stop the rollback, so a failure only warns.
+    _safety = 'pre-rollback-' + datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    plog(f"  rollback: saving the current state first [{_safety}]…")
+    try:
+        _sf_ok, _sf_res = _tak_snapshot(_safety, plog)
+        if _sf_ok:
+            try:
+                _ss = load_settings()
+                for sn in (_ss.get('tak_snapshots') or []):
+                    if sn.get('label') == _safety:
+                        sn['source'] = 'pre-rollback'
+                save_settings(_ss)
+            except Exception:
+                pass
+            _tak_prune_snapshots('pre-rollback', 2)
+            if not (isinstance(_sf_res, dict) and _sf_res.get('db_dump')):
+                plog("  ⚠ rollback: the saved current state has NO database dump — the database cannot be undone")
+        else:
+            plog(f"  ⚠ rollback: could not save the current state first ({str(_sf_res)[:160]}) — going on")
+    except Exception as _sf_e:
+        plog(f"  ⚠ rollback: could not save the current state first ({str(_sf_e)[:160]}) — going on")
+
     # ops #839: the container's user ids are read while it is still running. A stopped
     # container cannot be asked with `docker exec`; the restore used to chown the whole
     # certificate folder to a made-up uid 1000 then.
@@ -104608,6 +104795,10 @@ def _tak_rollback(label, plog=None):
             plog(f"  rollback: could not start takserver: {str(_e)[:200]}")
         return False, 'takserver did not stop within 180 s — nothing was restored'
 
+    # ops #1337: files that did not come back are reported at the end; "restored" is no longer
+    # printed over a copy that failed.
+    _file_errs = []
+
     # 3. Restore CoreConfig.xml
     cc_src = os.path.join(snap_path, 'CoreConfig.xml')
     if os.path.exists(cc_src):
@@ -104616,6 +104807,7 @@ def _tak_rollback(label, plog=None):
             plog("  rollback: CoreConfig.xml restored")
         except Exception as e:
             plog(f"  rollback: CoreConfig restore failed: {e}")
+            _file_errs.append('CoreConfig.xml')
 
     # 3b. Restore UserAuthenticationFile.xml (flat-file users incl. optional Phase 1A nodered).
     uaf_src = os.path.join(snap_path, 'UserAuthenticationFile.xml')
@@ -104636,6 +104828,7 @@ def _tak_rollback(label, plog=None):
             plog("  rollback: UserAuthenticationFile.xml restored")
         except Exception as e:
             plog(f"  rollback: UserAuthenticationFile.xml restore failed: {e}")
+            _file_errs.append('UserAuthenticationFile.xml')
     else:
         plog("  rollback: snapshot has no UserAuthenticationFile.xml — leaving current file in place")
 
@@ -104647,14 +104840,17 @@ def _tak_rollback(label, plog=None):
             plog("  rollback: takserver.default restored")
         except Exception as e:
             plog(f"  rollback: takserver.default restore failed: {e}")
+            _file_errs.append('takserver.default')
 
     # 5. Restore certs
     certs_src = os.path.join(snap_path, 'certs')
     certs_dst = '/opt/tak/certs/files'
     if os.path.isdir(certs_src):
         try:
-            subprocess.run(_sudo_wrap(['rm','-rf',certs_dst]), capture_output=True)
-            subprocess.run(_sudo_wrap(['cp','-rp',certs_src,certs_dst]), capture_output=True, check=True)
+            # ops #1337: copy beside the live folder and swap; a failed copy keeps the old certs.
+            _sw_ok, _sw_err = _tak_swap_certs(certs_src, certs_dst)
+            if not _sw_ok:
+                raise RuntimeError(_sw_err + ' — the current certificates are still in place')
             # Restore ownership (tak:tak) on certs
             # v10.1.67: same — a recursive chown to a hardcoded 1000 would leave the LE p12
             # (mode 0640) unreadable by a hardened container and break the next renewal.
@@ -104679,6 +104875,7 @@ def _tak_rollback(label, plog=None):
                 plog(f"  rollback: CA key lockdown skipped: {str(_lk_e)[:120]}")
         except Exception as e:
             plog(f"  rollback: certs restore failed: {e}")
+            _file_errs.append('certificates')
 
     # 6. pg_restore
     # In two-server mode stream the dump to Server One and restore there.
@@ -104711,6 +104908,8 @@ def _tak_rollback(label, plog=None):
     _db_err = None
     if not _rb_two_server and not _tak_rollback_prepare_local_db(plog):
         _db_err = 'the local database could not be prepared for the restore (see above)'
+    # ops #1337: the id of one table, read before the restore. pg_restore --clean makes a new one.
+    _rb_oid_before = _tak_cot_table_oid() if (not _rb_two_server and not _db_err) else None
     plog("  rollback: restoring PostgreSQL cot database…")
     try:
         _rb_s1 = _rb_tak_cfg.get('server_one', {})
@@ -104732,12 +104931,15 @@ def _tak_rollback(label, plog=None):
                 r2 = subprocess.run(_rb_ssh, stdin=_f, capture_output=True, timeout=300)
             if r2.returncode in (0, 1):
                 stderr = (r2.stderr or b'').decode()[:200]
+                if _tak_pg_restore_refused(stderr):
+                    _db_err = 'pg_restore on Server One refused the dump (see above)'
                 if stderr:
                     plog(f"  rollback: pg_restore (remote) warnings (non-fatal): {stderr}")
                 else:
                     plog("  rollback: pg_restore (remote) successful")
             else:
                 plog(f"  rollback: remote pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
+                _db_err = 'pg_restore on Server One failed (see above)'
         elif _broker_should_route() and _broker_available():
             # v10.0.8 non-root single-server: broker pg_restore op — the broker
             # opens the dump as root and feeds pg_restore/docker-exec itself, so
@@ -104748,6 +104950,8 @@ def _tak_rollback(label, plog=None):
                                     'timeout': 600}, timeout=630)
             if resp.get('ok') and resp.get('returncode') in (0, 1):
                 stderr = (resp.get('stderr') or '')[:200]
+                if _tak_pg_restore_refused(stderr):
+                    _db_err = 'pg_restore refused the dump (see above)'
                 if stderr:
                     plog(f"  rollback: pg_restore warnings (non-fatal): {stderr}")
                 else:
@@ -104770,6 +104974,8 @@ def _tak_rollback(label, plog=None):
                 )
                 if r2.returncode in (0, 1):
                     stderr = (r2.stderr or b'').decode()[:400]
+                    if _tak_pg_restore_refused(stderr):
+                        _db_err = 'pg_restore refused the dump (see above)'
                     if stderr:
                         plog(f"  rollback: pg_restore warnings (non-fatal): {stderr[:200]}")
                     else:
@@ -104792,6 +104998,8 @@ def _tak_rollback(label, plog=None):
                                     stdin=_f, capture_output=True, timeout=600)
             if r2.returncode in (0, 1):
                 stderr = (r2.stderr or b'').decode()[:400]
+                if _tak_pg_restore_refused(stderr):
+                    _db_err = 'pg_restore refused the dump (see above)'
                 if stderr:
                     plog(f"  rollback: pg_restore warnings (non-fatal): {stderr[:200]}")
                 else:
@@ -104815,8 +105023,18 @@ def _tak_rollback(label, plog=None):
     # migration does.
     if not _rb_two_server and not _db_err:
         _sv = _tak58_schema_version()
+        _want_sv = _rb_meta.get('db_schema_version')
+        _oid_after = _tak_cot_table_oid()
         if _sv is None:
             _db_err = 'the cot database has no TAK schema after pg_restore — nothing was restored'
+        elif isinstance(_want_sv, int) and _sv != _want_sv:
+            # ops #1337: the snapshot says which schema its dump held. A different one now means
+            # the dump did not land (old data left in place passes the "has a schema" check).
+            _db_err = (f"the cot database is on schema version {_sv}, but the snapshot's dump held "
+                       f"{_want_sv} — the dump was not restored")
+        elif _rb_oid_before is not None and _oid_after is not None and _oid_after == _rb_oid_before:
+            _db_err = ('pg_restore changed nothing in the cot database (its tables are the same ones '
+                       'as before) — the dump was not restored')
         else:
             plog(f"  rollback: cot database restored (schema_version {_sv})")
             _inst = _tak_artifact_version('takserver_' + (_get_takserver_version_info().get('version') or ''))
@@ -104851,6 +105069,14 @@ def _tak_rollback(label, plog=None):
         plog(f"  rollback: Node-RED restart error (non-fatal): {_e_nr}")
 
     _pkg_note = _tak_rollback_package_note(label)
+    if _file_errs:
+        # ops #1337: never print "restored" over a copy that failed.
+        _fe = ', '.join(_file_errs)
+        if _db_err:
+            plog(f"  ✗ rollback [{label}]: NOT fully restored. Files not restored: {_fe}. Database NOT restored. {_pkg_note}")
+            return False, f"{_fe} were not restored, and the database was not restored: {_db_err}"
+        plog(f"  ✗ rollback [{label}]: database restored, but these files were NOT restored: {_fe}. {_pkg_note}")
+        return False, f"these files were not restored: {_fe} (see the log above)"
     if _db_err:
         plog(f"  ✗ rollback [{label}]: config files and certs restored, database NOT restored. {_pkg_note}")
         return False, _db_err
@@ -106378,6 +106604,12 @@ def run_takserver_upgrade(pkg_path):
             ulog(f"  Detail: {snap_result}")
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
+        # ops #1337: an OLDER package with no database dump to go back to does not go ahead.
+        _dg_msg = _tak_downgrade_needs_dump(pkg_name, snap_result)
+        if _dg_msg:
+            ulog(f"✗ {_dg_msg}")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
 
         wait_for_unattended_upgrade_worker(ulog, upgrade_log)
         wait_for_apt_lock(ulog, upgrade_log)
@@ -106490,6 +106722,11 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
                 if sn.get('label') == snap_label: sn['source'] = 'pre-upgrade'
             save_settings(_s)
         except Exception: pass
+        # ops #1337: an OLDER package with no database dump to go back to does not go ahead.
+        _dg_msg = _tak_downgrade_needs_dump(os.path.basename(rpm_path), snap_result)
+        if _dg_msg:
+            ulog(f"✗ {_dg_msg}")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
 
         # Ensure the build repo + postgres module state the guide requires (idempotent on an
         # already-installed box; powertools/CRB on Rocky, codeready-builder on RHEL).
@@ -107763,6 +108000,11 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
                 if sn.get('label') == snap_label: sn['source'] = 'pre-upgrade'
             save_settings(_s)
         except Exception: pass
+        # ops #1337: an OLDER package with no database dump to go back to does not go ahead.
+        _dg_msg = _tak_downgrade_needs_dump(os.path.basename(core_rpm_path), snap_result)
+        if _dg_msg:
+            ulog(f"✗ {_dg_msg}")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
 
         # heap backup (native RHEL keeps JVM heap in /etc/default/takserver, same as .deb)
         heap_backup = None
@@ -124749,6 +124991,27 @@ def _ensure_console_restart_timer(settings=None):
         return f'console-restart timer warning: {str(_e)[:120]}'
 
 
+def _takserver_started_before_package():
+    """ops #1337: True when TAK Server was last STARTED before the package's files were last
+    unpacked (so what runs is still the OLD code), False when it started after, None when that
+    cannot be told. The unit is a SysV init script (Type=forking, MainPID 0), so there is no
+    process to read: use the time systemd says the unit became active, against dpkg's file list
+    (rewritten at every unpack)."""
+    try:
+        for unit in ('takserver', 'takserver-noplugins'):
+            r = subprocess.run(['systemctl', 'show', '-p', 'ActiveEnterTimestampMonotonic', '--value', unit],
+                               capture_output=True, text=True, timeout=5)
+            v = (r.stdout or '').strip()
+            if not (v.isdigit() and int(v) > 0):
+                continue
+            uptime = float(open('/proc/uptime').read().split()[0])
+            active_since = time.time() - (uptime - int(v) / 1e6)
+            return active_since < os.path.getmtime('/var/lib/dpkg/info/takserver.list')
+        return None
+    except Exception:
+        return None
+
+
 def _selfheal_takserver_half_configured(plog=None):
     """v0.9.44: silently clear a `takserver` dpkg 'half-configured' state WITHOUT
     running the .deb postinstall.
@@ -124801,6 +125064,17 @@ def _selfheal_takserver_half_configured(plog=None):
         _log('takserver self-heal: half-configured but service not active — leaving for manual review.')
         return
 
+    # ops #1337: `run_takserver_upgrade` runs apt while the OLD TAK Server is still running, so
+    # after a postinst that failed the unit is active too. Skipping the postinst then also skips
+    # its database setup and schema step, and the next restart runs the new code on the old
+    # schema. A TAK Server that started before the package was unpacked is the old code: do not
+    # clear the state; the update has to be run again.
+    if _takserver_started_before_package():
+        _log('takserver self-heal: the running TAK Server started before this package was unpacked, '
+             'so the package postinstall (database setup) never finished — NOT clearing the '
+             'half-configured state. Run the TAK Server update again.')
+        return
+
     postinst = '/var/lib/dpkg/info/takserver.postinst'
     if not os.path.isfile(postinst):
         return
@@ -124830,6 +125104,22 @@ def _selfheal_takserver_half_configured(plog=None):
         if st == 'install ok installed':
             _log('takserver self-heal: cleared dpkg half-configured state '
                  '(TAK Server untouched, apt unblocked).')
+            # ops #1337: the postinst was skipped, and with it TAK's database setup. Run that
+            # setup now (SchemaManager; it changes nothing on a schema that is current) and
+            # read the schema back, so new code never runs on an old schema unnoticed.
+            # Local cot database only; a remote one is not read here.
+            try:
+                if _tak58_schema_version() is not None:
+                    _before = _tak58_schema_version()
+                    _rc = _tak58_run_setup_db()
+                    _after = _tak58_schema_version()
+                    _log(f'takserver self-heal: TAK database setup exit {_rc}, '
+                         f'schema_version {_before} -> {_after}.')
+                    if _rc != 0 or _after is None:
+                        _log('takserver self-heal: ⚠ the database setup did not finish cleanly — '
+                             'run the TAK Server update again.')
+            except Exception as _se:
+                _log(f'takserver self-heal: database setup check error ({str(_se)[:120]}).')
         else:
             _log(f'takserver self-heal: state still "{st}" after configure — manual review.')
     except Exception:
