@@ -48402,20 +48402,19 @@ def _gh_json_cached(url, timeout=15, ttl=_GH_JSON_TTL):
         return hit['data'] if hit else None
 
 
-def _get_mediamtx_editor_version_info(deploy_cfg):
-    """Return {version: str, update_available: bool, latest: str|None} for MediaMTX web editor (takwerx/mediamtx-installer).
-    Current from CURRENT_VERSION in /opt/mediamtx-webeditor/mediamtx_config_editor.py on target."""
+def _mediamtx_editor_installed_version(deploy_cfg):
+    """CURRENT_VERSION of the web editor on the target, without a leading v ('2.1.17'), or ''
+    when it cannot be read. Local: through the broker when the console cannot read the file
+    (ops #643). Remote: grep over SSH. Never raises."""
     import re as _re
-    import urllib.request as _ur
-    out = {'version': '', 'update_available': False, 'latest': None}
-    # Current: grep CURRENT_VERSION from editor script on target
+    version = ''
     cmd = 'grep -oE \'CURRENT_VERSION = "[^"]+"\' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null | head -1'
     if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
         ok, raw = _module_run(deploy_cfg, cmd, timeout=10)
         if ok and raw:
             m = _re.search(r'"([^"]+)"', raw)
             if m:
-                out['version'] = m.group(1).lstrip('vV')
+                version = m.group(1).lstrip('vV')
     else:
         editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
         if os.path.isfile(editor_path):
@@ -48426,10 +48425,21 @@ def _get_mediamtx_editor_version_info(deploy_cfg):
                     if 'CURRENT_VERSION' in line:
                         m = _re.search(r'["\']([vV]?[^"\']+)["\']', line)
                         if m:
-                            out['version'] = m.group(1).lstrip('vV')
+                            version = m.group(1).lstrip('vV')
                         break
             except Exception:
                 pass
+    return version
+
+
+def _get_mediamtx_editor_version_info(deploy_cfg):
+    """Return {version: str, update_available: bool, latest: str|None} for MediaMTX web editor (takwerx/mediamtx-installer).
+    Current from CURRENT_VERSION in /opt/mediamtx-webeditor/mediamtx_config_editor.py on target."""
+    import re as _re
+    import urllib.request as _ur
+    out = {'version': '', 'update_available': False, 'latest': None}
+    # Current: CURRENT_VERSION in the editor script on target (ops #1341: shared reader)
+    out['version'] = _mediamtx_editor_installed_version(deploy_cfg)
     # Latest from takwerx/mediamtx-installer, via TWO independent sources.
     # The releases API is the authority, but it shares one 60/hour unauthenticated
     # budget with 16 other call sites in this file. raw.githubusercontent.com is a
@@ -52199,12 +52209,22 @@ def mediamtx_deploy_api():
     # marketplace greys the card, but this route is reachable by direct curl.
     # Fails OPEN: a transient detection error must never brick a deploy.
     try:
-        _tvr_installed = detect_modules(fresh=True).get('tak_video_restreamer', {}).get('installed')
+        _mods = detect_modules(fresh=True)
     except Exception:
-        _tvr_installed = False
+        _mods = {}
+    _tvr_installed = _mods.get('tak_video_restreamer', {}).get('installed')
     if _tvr_installed:
         return jsonify({'error': 'Conflicts with TAK Video Restreamer, which is already '
                                  'installed — uninstall it first, then return here.'}), 409
+    # ops #1341: the UI hides Deploy once MediaMTX is installed, but a direct POST still ran the
+    # whole deploy over the live install: a new mediamtx.yml and the pinned binary over the
+    # operator's paths, users and share links. Same fail-open rule: an unreadable detection
+    # never blocks a first deploy. The answer is written before any setting is saved.
+    if _mods.get('mediamtx', {}).get('installed'):
+        return jsonify({'error': 'MediaMTX is already installed, so Deploy is refused: it would '
+                                 'overwrite your live configuration. To repair the web editor use '
+                                 '"Patch web editor" on this page; to start over, remove MediaMTX '
+                                 'first, then deploy again.'}), 409
     data = request.get_json() or {}
     if data.get('config'):
         settings = load_settings()
@@ -52267,6 +52287,94 @@ def _mediamtx_editor_clone_cmd(dest):
             f'[ "$(git -C {d} rev-parse HEAD)" = {shlex.quote(MEDIAMTX_EDITOR_SHA)} ]')
 
 
+def _mediamtx_version_tuple(v):
+    """'v2.1.17', '2.1.17' -> (2, 1, 17). None when it is not a plain x.y.z (a branch name,
+    an empty string, a text we cannot read)."""
+    m = re.fullmatch(r'\s*[vV]?(\d+)\.(\d+)\.(\d+)\s*', str(v or ''))
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _mediamtx_editor_newer_than_pin(installed):
+    """ops #1341: True when the editor on the box (`installed`, from CURRENT_VERSION) is newer
+    than the release this console pins (MEDIAMTX_EDITOR_REF). Patch web editor must leave such
+    an editor alone: it came from the editor's own Upgrade, and the editor owns users.json
+    (hashed since 2.1.15), the share links and the stream visibility. An unreadable version
+    says nothing, so it is False and Patch refreshes the file as it always did."""
+    have, pin = _mediamtx_version_tuple(installed), _mediamtx_version_tuple(MEDIAMTX_EDITOR_REF)
+    return bool(have and pin and have > pin)
+
+
+def _mediamtx_editor_body_problem(body):
+    """None when `body` is a whole web editor file; else a short reason. A 404 page, a captive
+    portal page and a download cut short all fail here (the cut one at the Python parse)."""
+    import ast as _ast
+    if not isinstance(body, str) or not body.strip():
+        return 'the download was empty'
+    try:
+        _ast.parse(body)
+    except (SyntaxError, ValueError):
+        return 'the download was cut short or is not the editor'
+    if 'app = Flask(' not in body or not re.search(r'CURRENT_VERSION\s*=', body):
+        return 'the download is not the MediaMTX web editor'
+    return None
+
+
+_MEDIAMTX_EDITOR_REMOTE_CHECK = ('import ast,sys; s=open(sys.argv[1]).read(); ast.parse(s); '
+                                 'sys.exit(0 if "app = Flask(" in s and "CURRENT_VERSION" in s else 1)')
+
+
+def _mediamtx_editor_remote_fetch_cmd(dest='/opt/mediamtx-webeditor/mediamtx_config_editor.py'):
+    """Shell text (run as root on the remote host): download the pinned editor to a temp file,
+    check it is the whole editor, and only then copy it over the live file. `cat >` keeps the
+    live file's owner and mode. Exit status is the check's: non-zero leaves the old file."""
+    return (f'mkdir -p {shlex.quote(os.path.dirname(dest))} && t=$(mktemp) && {{ '
+            f"curl -fsSL --retry 1 --max-time 40 {shlex.quote(MEDIAMTX_EDITOR_RAW_URL)} -o \"$t\" "
+            f"&& python3 -c {shlex.quote(_MEDIAMTX_EDITOR_REMOTE_CHECK)} \"$t\" "
+            f'&& cat "$t" > {shlex.quote(dest)}; rc=$?; rm -f "$t"; exit $rc; }}')
+
+
+def _mediamtx_editor_refresh(deploy_cfg, is_remote):
+    """Step 1 of Patch web editor (ops #1341): put the pinned editor on the box.
+
+    Returns (refreshed, note, installed_version). `note` is '' when the file was refreshed, else
+    one plain sentence for the operator. It never raises and never leaves a broken file:
+      * an editor NEWER than the pin is kept (the downgrade the old code did);
+      * the download is checked as a whole editor before it replaces anything (the old code
+        wrote a 404 page into the editor file on a remote host, and kept going on a local
+        failure without saying so)."""
+    import urllib.request
+    editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+    installed = _mediamtx_editor_installed_version(deploy_cfg)
+    pin = MEDIAMTX_EDITOR_REF.lstrip('vV')
+    if _mediamtx_editor_newer_than_pin(installed):
+        return False, (f'The web editor was left at v{installed}: it is newer than the v{pin} that '
+                       'this console ships, and refreshing it would take it back. '), installed
+    if is_remote:
+        ok, out = _module_run_root(deploy_cfg, _mediamtx_editor_remote_fetch_cmd(), timeout=100)
+        if ok:
+            return True, '', installed
+        why = ' '.join((out or '').split())[-120:]
+        return False, ('The web editor could not be downloaded and checked, so the file on the box '
+                       'was kept' + (f' ({why})' if why else '') + '. '), installed
+    try:
+        with urllib.request.urlopen(MEDIAMTX_EDITOR_RAW_URL, timeout=60) as r:
+            content = r.read().decode('utf-8')
+        problem = _mediamtx_editor_body_problem(content)
+        if problem:
+            return False, f'The web editor was not refreshed: {problem}. The file on the box was kept. ', installed
+        # v10.0.5 non-root: apply the bind-hardening patches in Python, then write via the
+        # broker (/opt/mediamtx-webeditor is root-owned on root-era installs; the old
+        # open('w') + `sed -i` failed as takwerx, leaving the editor bound to 0.0.0.0).
+        content = (content.replace('port=5000', 'port=5080')
+                          .replace('9997', '9898')
+                          .replace("host='0.0.0.0'", "host='127.0.0.1'"))
+        _write_priv(editor_path, content)
+        return True, '', installed
+    except Exception as e:
+        return False, ('The web editor could not be downloaded (' + type(e).__name__ +
+                       '), so the file on the box was kept. '), installed
+
+
 @app.route('/api/mediamtx/recovery', methods=['POST'])
 @login_required
 def mediamtx_recovery():
@@ -52286,13 +52394,13 @@ def mediamtx_recovery():
         if not _is_remote:
             _restart_after = _mediamtx_editor_reclaim() or []
         # 1) Refresh editor from upstream so we fix corruption / duplicate UI from old or patched copies
-        if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+        # ops #1341: but never over a newer editor (the editor's own Upgrade), and never from a
+        # download that is not a whole editor. The packages, unit, overlay and restart below
+        # still run either way: this button is also how a box missing Flask is repaired.
+        if _is_remote:
             _mediamtx_remote_clear_staging(deploy_cfg)   # ops #890: before any scp into /tmp
-            _module_run_root(
-                deploy_cfg,
-                "mkdir -p /opt/mediamtx-webeditor && curl -sL '" + MEDIAMTX_EDITOR_RAW_URL + "' -o /opt/mediamtx-webeditor/mediamtx_config_editor.py",
-                timeout=90,
-            )
+        _refreshed, _note, _installed = _mediamtx_editor_refresh(deploy_cfg, bool(_is_remote))
+        if _is_remote:
             # v0.9.12: also bind webedit Flask app to 127.0.0.1 (Tier 3 — Caddy
             # is the only legitimate consumer; upstream defaults to 0.0.0.0).
             _module_run_root(
@@ -52302,19 +52410,6 @@ def mediamtx_recovery():
                 "sed -i \"s/host='0\\.0\\.0\\.0'/host='127.0.0.1'/\" /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null",
                 timeout=10,
             )
-        else:
-            try:
-                with urllib.request.urlopen(MEDIAMTX_EDITOR_RAW_URL, timeout=60) as r:
-                    content = r.read().decode('utf-8')
-                # v10.0.5 non-root: apply the bind-hardening patches in Python, then write via the
-                # broker (/opt/mediamtx-webeditor is root-owned on root-era installs; the old
-                # open('w') + `sed -i` failed as takwerx, leaving the editor bound to 0.0.0.0).
-                content = (content.replace('port=5000', 'port=5080')
-                                  .replace('9997', '9898')
-                                  .replace("host='0.0.0.0'", "host='127.0.0.1'"))
-                _write_priv(editor_path, content)
-            except Exception:
-                pass  # keep existing file and just re-apply patches
         # 2) Apply endpoint patch only (keep core External Sources rendering unchanged)
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
             for name, script in [
@@ -52430,7 +52525,12 @@ def mediamtx_recovery():
         else:
             msg = ('Patch applied and service restarted, but mediamtx-webeditor may still be down. '
                    'Click **Web editor logs** on this page to see why.')
-        return jsonify({'success': True, 'message': msg, 'webeditor_running': active})
+        # ops #1341: say what was NOT done. A kept newer editor or a failed download is a
+        # success of the other steps, but the operator must not read "patched" as "refreshed".
+        if _note:
+            msg = (_note + msg).strip()
+        return jsonify({'success': True, 'message': msg, 'webeditor_running': active,
+                        'editor_refreshed': bool(_refreshed), 'editor_version': _installed})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
     finally:
