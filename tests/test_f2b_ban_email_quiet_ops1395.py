@@ -431,3 +431,9 @@ def test_the_state_file_sits_in_fail2bans_own_folder_so_selinux_lets_fail2ban_wr
 def test_uninstall_removes_the_state_files():
     assert "'/var/lib/fail2ban/infratak-f2b-notify-state.json'" in APP
     assert "'/var/lib/fail2ban/infratak-f2b-notify-state.json.lock'" in APP
+
+
+def test_the_page_no_longer_promises_an_email_for_every_ban():
+    assert 'email alert fires on ban' not in TEMPLATE
+    assert 'sends Guard Dog email alerts' not in TEMPLATE
+    assert 'routine bans are <strong>not emailed</strong>' in TEMPLATE
