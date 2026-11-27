@@ -44,6 +44,14 @@ Each entry says where the fact comes from. `✅ verified <date> on <box>` means 
 - ✅ verified 2026-11-26 on fresh-install boxes (ubuntu-22.04, rocky-9, ubuntu-22.04-arm64): a console on this code with Authentik 2026.2.7 (and 2026.2.1 on ARM) takes the Authentik page's Update to 2026.5.9 in about 75 seconds, and a second press to 2026.8.7 in about 100 to 120 seconds. After each press: sign-in, LDAP groups on TAK Server clients and QR enrollment (HTTP 200, wrong password 401) work. A hand re-pin 2026.5.9 to 2026.5.7 inside the family works and the next Update goes straight to 2026.8.7.
 - ✅ verified 2026-11-26: on Authentik 2026.2.x the embedded outpost loads a new proxy application only at its 5 minute refresh (log line `Loaded application` at 5 minute steps). A TAK Portal deployed on such a box answers Authentik's 404 page for up to 5 minutes, then redirects to sign-in. Authentik 2026.8.7 was not measured the same way.
 
+## Authentik: no going back after a newer release has migrated the database
+
+**Source (official):** upstream `lifecycle/migrate.py` `ensure_allowed_version` (the same check that stops a family skip, see above); upgrade guide https://docs.goauthentik.io/install-config/upgrade/ . Authentik migrations only go forward. infra-TAK's Update never moves a host to an older version than the one it runs: the local branch since v10.1.39, the remote-host branch since ops #1322 (it reads the running image, else the `.env` pin, else the compose default, and answers 409 or 500 before it changes anything).
+
+- ✅ verified 2026-11-26 on a fresh-install two-VM cell (console on ubuntu-22.04, Authentik on a second ubuntu-22.04 host, SSH user not root, in the docker group): with the host on 2026.11.0-rc2 (the newest upstream, image `ghcr.io/goauthentik/server:2026.11.0-rc2`, database migrated by it, a user written to it), the unfixed Update pinned the host to 2026.8.7. The 2026.8.7 server restarted in a loop with `RuntimeError: Major version skips are not allowed. See: https://docs.goauthentik.io/install-config/upgrade/?from=2026.11.0rc2&to=2026.8.7` from `ensure_allowed_version`. Authentik was down.
+- ✅ verified 2026-11-26 on the same cell: that refusal left the database alone. Pinning 2026.11.0-rc2 again in `.env` and `docker-compose.yml` and running `docker compose up -d` brought server, worker and LDAP outpost back healthy on rc2, and the user written before was still there.
+- ✅ verified 2026-11-26 on the same cell: image tags on ghcr. `ghcr.io/goauthentik/server:latest` does not exist (a `latest` pin fails to pull and the old container keeps running). `2026.8` (a floating family tag) does exist; a host running it reports its image tag as `2026.8`, which does not say which patch runs. The real version is `version_current` from `GET /api/v3/admin/version/`.
+
 ## Redis (Authentik's legacy `redis` service): no downgrade over a newer dump
 
 **Source (official):** https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/ (RDB snapshots; with save points set, Redis also saves on shutdown). Authentik stopped using Redis in 2025.10: https://docs.goauthentik.io/releases/2025.10/. The official image sets `REDIS_VERSION` in its environment, so `docker inspect` tells which Redis a floating tag really is.
@@ -51,6 +59,15 @@ Each entry says where the fact comes from. `✅ verified <date> on <box>` means 
 - ✅ verified 2026-11-26 on nuc (Rocky 9, non-root console, Authentik compose `--save 60 1`): Redis 8.12.0 saves an 89-byte RDB v17 `dump.rdb` on stop even with no keys. Redis 8.10.3 started on that volume exits at once with `Can't handle RDB format version 17` and restarts in a loop. Moving `dump.rdb` aside starts 8.10.3 empty and healthy. Authentik server, worker and LDAP stay healthy the whole time.
 - ✅ verified 2026-11-26 on nuc: with a file other than `dump.rdb` in `/data`, the image's entrypoint logs `Unknown file ... found in data dir. Permissions will not be modified.` Redis starts normally.
 - So infra-TAK never pins a floating Redis tag to a version older than the one the box ran (ops #1306, infra-TAK #759).
+
+## TAK Server Docker bundle: database volume layout and the update order (ops #1326)
+
+**Source (official):** the TAK Server docker bundle itself: `docker/Dockerfile.hardened-takserver-db` (5.8: `postgresql18-server`, `VOLUME /var/lib/postgresql/data`, `ENV PGDATA=/var/lib/postgresql/data`) and the older `docker/Dockerfile.takserver-db` (`FROM postgres:15.1`, cluster under `/var/lib/postgresql/<N>/data`).
+
+- ✅ verified 2026-11-26 on fresh-install ubuntu-22.04-arm64 (TAK Server 5.8 R104 and R105 hardened bundles, non-root console): the `takserver_pgsql` volume holds `PG_VERSION` (value 18) at the volume ROOT, read with `docker run --rm --user 0 -v takserver_pgsql:/from --entrypoint sh takserver -c 'cat /from/PG_VERSION'` through the console's broker. A 5.7-era image mounts the volume one level higher and looks for `<volume>/15/data`, so it finds nothing in that volume and starts an EMPTY cluster. The update reads the volume in the layout of the NEW zip and refuses when the data is not there.
+- ✅ verified 2026-11-26 on the same box: the new images build while the old containers keep running; `docker tag` of the old image under a spare tag and a retag back put the old version in place again after a failed start (failed on purpose by holding host port 8446).
+- ✅ verified 2026-11-26: `pg_dump` of the `cot` database as `martiuser` refuses (`permission denied for table`) when a table in it belongs to `postgres`; the update treats a failed dump as a stop before any change.
+- Not verified on a box: the 5.7 layout (`<volume>/15/data`): no 5.7 Docker bundle is in our files folder. It is read from the Dockerfile only.
 
 ## CloudTAK: documentation site
 

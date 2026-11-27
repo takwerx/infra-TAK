@@ -157,5 +157,5 @@ def test_console_restart_patches_an_existing_install_and_recreates_it():
 def test_update_applies_it_before_pulling():
     body = ast.get_source_segment(APP, next(
         n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == '_run_webodm_update'))
-    assert body.index('_webodm_strip_olefile(') < body.index("_webodm_compose(wo_dir, 'pull'")
-    assert '_write_priv(compose_path, stripped)' in body
+    assert body.index('_webodm_strip_olefile(') < body.index('_webodm_move_to_new_images(')
+    assert 'stripped, db_upgrade' in body   # the stripped text is what the routine pulls and writes

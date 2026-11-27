@@ -2824,6 +2824,11 @@ _PKGMGR_FLAGS = frozenset({
     '--assumeno', '--assume-no', '-C', '--cacheonly', '-v', '--verbose',
     '-s', '--simulate', '--dry-run', '--just-print', '--refresh',
     '--allow-downgrades', '--reinstall', '--purge', '--auto-remove', '--autoremove',
+    # GH #761: run_takserver_58_migration always sends this on Ubuntu (the OS patch job
+    # holds takserver, #117). Left off this list, the broker refused every 5.8 update
+    # from a non-root console after TAK Server was already stopped. It only lets apt
+    # change a held package its own plan needs; it names no file, URL, config or hook.
+    '--allow-change-held-packages',
     '--no-install-recommends', '--no-install-suggests', '-f', '--fix-broken',
     '-m', '--fix-missing', '--only-upgrade', '--no-remove', '--with-new-pkgs',
     '--upgradable', '--installed', '--all', '--available', '--enabled', '--disabled',
