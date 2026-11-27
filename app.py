@@ -769,19 +769,41 @@ def _priv_pipe(argv, filter_argv, timeout=60, **kw):
                           capture_output=True, text=True, timeout=timeout)
 
 
-def _detached_console_restart(delay=2):
+def _detached_console_restart(delay=2, result=None):
     """Restart the console itself after a short delay, detached, so the current
     HTTP response returns before the worker is bounced. Replaces the shell
     `Popen('sleep 2 && systemctl restart takwerx-console')` (sleep isn't broker-
     allowed). systemd owns the restart, so it completes even though this thread is
-    killed mid-restart."""
+    killed mid-restart.
+
+    ops #1329: a failed restart used to vanish (`except: pass`, output to /dev/null): the page
+    said "restarting", nothing restarted, and the Update Now lock blocked retries for 20
+    minutes. Pass `result` (a dict holding an `event`, a threading.Event) to learn the outcome: a
+    restart that works kills this process before it reports, so only a FAILURE ever sets the
+    event, with `ok` False and `error` holding the reason. A failure is also written to the
+    journal."""
     def _go():
         time.sleep(delay)
         try:
-            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-console']),
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+            r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-console']),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            rc, err = r.returncode, (r.stderr or '').strip()
+        except Exception as e:
+            rc, err = 1, str(e)
+        # Only a command that ran, ended with a positive exit code AND said why is a failed restart
+        # (a masked unit, an unreachable broker). A restart that WORKS stops this very process: the
+        # command is killed by the stop (negative code, -15 on the first box test, Nov 27) or ends
+        # with no message. That is a restart under way, never an error to show the customer.
+        if rc > 0 and err:
+            err = err.splitlines()[-1][:200]
+            print(f"Console restart FAILED (rc={rc}): {err}", flush=True)
+            if result is not None:
+                result.update({'ok': False, 'error': err})
+                ev = result.get('event')
+                if ev is not None:
+                    ev.set()
+        elif rc != 0:
+            print(f"Console restart command ended rc={rc} with no message: restart under way", flush=True)
     threading.Thread(target=_go, daemon=True).start()
 
 
@@ -12170,29 +12192,12 @@ def update_check():
             return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No tags found', 'body': '', 'update_available': False, 'check_failed': True})
         # Only surface tags that are actually on the main branch so that tags
         # pushed on dev before a merge-to-main don't show as "update available".
-        try:
-            main_req = urllib.request.Request(
-                f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=main&per_page=100',
-                headers=gh_headers
-            )
-            main_resp = urllib.request.urlopen(main_req, timeout=5)
-            main_commits = {c['sha'] for c in json.loads(main_resp.read().decode())}
-        except Exception:
-            main_commits = None  # fall back: don't filter if we can't reach main
-        versions = []
-        for tag in data:
-            if main_commits is not None and tag.get('commit', {}).get('sha') not in main_commits:
-                continue
-            name = tag.get('name', '').lstrip('v').replace('-alpha','').replace('-beta','')
-            parts = name.split('.')
-            try:
-                versions.append((tuple(int(p) for p in parts), tag))
-            except (ValueError, IndexError):
-                continue
-        if not versions:
+        # ops #1329: Update Now (_fetch_latest_tag_name) uses the SAME rule, so the tag it
+        # installs is the tag this check offers. None = main unreadable: tags are not filtered.
+        main_commits = _main_commit_shas(gh_headers)
+        latest_tag = _select_latest_release_tag(data, main_commits)
+        if latest_tag is None:
             return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No version tags', 'body': '', 'update_available': False, 'check_failed': True})
-        versions.sort(key=lambda x: x[0], reverse=True)
-        latest_tag = versions[0][1]
         latest = latest_tag.get('name', '').lstrip('v')
         try:
             latest_tuple = _parse_version_tuple(latest)
@@ -12248,18 +12253,10 @@ def _fetch_latest_tag_name():
         data = json.loads(resp.read().decode())
         if not data:
             return None
-        versions = []
-        for tag in data:
-            name = tag.get('name', '').lstrip('v').replace('-alpha', '').replace('-beta', '')
-            parts = name.split('.')
-            try:
-                versions.append((tuple(int(p) for p in parts), tag.get('name', '')))
-            except (ValueError, IndexError):
-                continue
-        if not versions:
-            return None
-        versions.sort(key=lambda x: x[0], reverse=True)
-        return versions[0][1]  # full tag name e.g. v0.2.3-alpha
+        # ops #1329: the same main-channel rule as update_check (a tag counts only when its
+        # commit is on main). Before, this took the highest tag whatever branch it sat on.
+        tag = _select_latest_release_tag(data, _main_commit_shas())
+        return tag.get('name', '') if tag else None  # full tag name e.g. v0.2.3-alpha
     except Exception:
         # ops #1217: the API refused (60 an hour per IP). Update Now used to fall back to
         # origin/main here, i.e. to something other than the newest release. git is not limited.
@@ -12348,6 +12345,336 @@ def _repo_ownership_selfheal(trigger=''):
     return offenders
 
 
+# ops #1329: Update Now checks the NEW release before it moves the console's own tree.
+#
+# Until now the click fetched, moved HEAD (`git checkout --force`), and only then ran a pip call
+# for gunicorn and PyYAML. A release that bumped any other pinned library (requirements.txt) was
+# never installed, so the console crash-looped after the restart (Restart=always, and the
+# Rollback button needs a working console). A pip error or timeout after HEAD moved left a new
+# tree under old code with no restart scheduled. Now, with HEAD still where it was:
+#   1. read the new tree out of git into a scratch folder (`git archive`, nothing is checked out),
+#   2. install its requirements.txt into the console venv (skipped when every pin is already
+#      installed, so a healthy or offline box needs no network and no write access),
+#   3. compile every .py file of the new tree and check that each library imported at the top of
+#      app.py and modules/ can be found.
+# A failure in 2 or 3 stops the click with HEAD where it was. The check itself breaking (git
+# archive fails, the checker times out) is logged and does NOT stop the update: it can only add
+# protection, never remove the ability to update.
+_UPDATE_PIP_TIMEOUT_S = 300
+_UPDATE_RESTART_DELAY_S = 2
+_UPDATE_RESTART_WAIT_S = 6
+_UPDATE_TREE_CHECK_TIMEOUT_S = 240
+
+# Run with the venv python. argv: requirements file. Prints a JSON list of the pins that are not met.
+_UPDATE_REQ_CHECK_PY = r'''
+import json, re, sys
+from importlib import metadata
+try:
+    from packaging.requirements import Requirement
+except Exception:
+    from pip._vendor.packaging.requirements import Requirement
+text = open(sys.argv[1], encoding='utf-8').read().replace('\\\n', ' ')
+unmet = []
+for raw in text.splitlines():
+    line = re.sub(r'\s--hash=\S+', '', raw.split('#', 1)[0]).strip()
+    if not line or line.startswith('-'):
+        continue
+    req = Requirement(line)
+    if req.marker is not None and not req.marker.evaluate():
+        continue
+    pins = [s.version for s in req.specifier if s.operator == '==']
+    try:
+        have = metadata.version(req.name)
+    except metadata.PackageNotFoundError:
+        unmet.append(req.name + ' (missing)')
+        continue
+    if pins and have != pins[0]:
+        unmet.append('%s %s, wanted %s' % (req.name, have, pins[0]))
+print(json.dumps(unmet))
+'''
+
+# Run with the venv python, cwd = the new tree. Compiles every .py file there and lists the libraries
+# imported at module level (not inside try/def) that this python cannot find.
+_UPDATE_TREE_CHECK_PY = r'''
+import ast, importlib.util, json, os, sys
+tree_dir = os.getcwd()
+sys.path.insert(0, tree_dir)
+files = [f for f in sorted(os.listdir(tree_dir)) if f.endswith('.py')]
+for sub in ('modules', 'broker'):
+    d = os.path.join(tree_dir, sub)
+    if os.path.isdir(d):
+        files += [os.path.join(sub, f) for f in sorted(os.listdir(d)) if f.endswith('.py')]
+# Names that are the tree's own files (broker/ and modules/ scripts import their neighbours by plain
+# name, e.g. `from takwerx_broker import ...`): never a missing library.
+local = set()
+for rel in files:
+    local.add(os.path.splitext(os.path.basename(rel))[0])
+for e in os.listdir(tree_dir):
+    if os.path.isdir(os.path.join(tree_dir, e)):
+        local.add(e)
+bad, missing = [], {}
+for rel in files:
+    try:
+        with open(os.path.join(tree_dir, rel), encoding='utf-8') as fh:
+            src = fh.read()
+        mod = ast.parse(src, rel)
+        compile(mod, rel, 'exec')
+    except (SyntaxError, ValueError, RecursionError, MemoryError) as e:
+        bad.append('%s: %s' % (rel, str(e)[:160]))
+        continue
+    for node in mod.body:
+        names = []
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            names = [node.module]
+        for n in names:
+            top = n.split('.')[0]
+            if top == '__future__' or top in local:
+                continue
+            try:
+                found = importlib.util.find_spec(top) is not None
+            except (ImportError, ValueError):
+                found = False
+            if not found:
+                missing.setdefault(top, rel)
+print(json.dumps({'compile_errors': bad, 'missing_imports': missing}))
+'''
+
+
+def _update_console_python(console_dir):
+    """(python, pip) of the console venv, or (sys.executable, None) on a box with no venv."""
+    py = os.path.join(console_dir, '.venv', 'bin', 'python')
+    pip = os.path.join(console_dir, '.venv', 'bin', 'pip')
+    if os.path.exists(py) and os.path.exists(pip):
+        return py, pip
+    return _sys.executable, None
+
+
+def _update_safe_extract(tar_path, dest):
+    """Unpack a `git archive` tar into dest. Refuses absolute paths, '..', links that leave dest."""
+    import tarfile
+    root = os.path.realpath(dest)
+    with tarfile.open(tar_path) as tf:
+        members = tf.getmembers()
+        for m in members:
+            target = os.path.realpath(os.path.join(root, m.name))
+            if not (target == root or target.startswith(root + os.sep)):
+                raise ValueError(f'unsafe path in archive: {m.name}')
+            if m.issym() or m.islnk():
+                link = os.path.realpath(os.path.join(os.path.dirname(target), m.linkname))
+                if not (link == root or link.startswith(root + os.sep)):
+                    raise ValueError(f'unsafe link in archive: {m.name}')
+        for m in members:
+            try:
+                tf.extract(m, root, filter='data')    # Python 3.12+ (and later 3.9-3.11 patches)
+            except TypeError:
+                tf.extract(m, root)
+
+
+def _update_preflight_tree(console_dir, target_ref, git_cfg=None, scratch_parent=None, log=None):
+    """Steps 1 to 3 above, on the tree `target_ref` points at, BEFORE HEAD moves.
+
+    Returns (ok, message). ok=False only for a real verdict (a pin that cannot be installed, a
+    file that does not compile, a library nobody can import); message is plain words for the
+    customer and says nothing was changed."""
+    log = log or (lambda m: print(m, flush=True))
+    git_cfg = git_cfg or ['git', '-c', f'safe.directory={console_dir}']
+    py, pip = _update_console_python(console_dir)
+    parent = scratch_parent
+    if not parent:
+        _p = '/var/lib/takwerx-console'
+        parent = _p if os.path.isdir(_p) and os.access(_p, os.W_OK) else None
+    scratch = None
+    try:
+        scratch = tempfile.mkdtemp(prefix='update-tree-', dir=parent)
+        tar = os.path.join(scratch, 'tree.tar')
+        tree = os.path.join(scratch, 'tree')
+        os.makedirs(tree)
+        a = subprocess.run(git_cfg + ['archive', '--format=tar', '-o', tar, target_ref],
+                           cwd=console_dir, capture_output=True, text=True, timeout=180,
+                           env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+        if a.returncode != 0:
+            log(f"Update Now: pre-check skipped, git archive failed: {(a.stderr or '').strip()[:200]}")
+            shutil.rmtree(scratch, ignore_errors=True)
+            return True, ''
+        _update_safe_extract(tar, tree)
+        os.unlink(tar)
+    except Exception as e:
+        log(f"Update Now: pre-check skipped, could not read the new tree: {str(e)[:200]}")
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+        return True, ''
+    try:
+        req = os.path.join(tree, 'requirements.txt')
+        if pip and os.path.exists(req):
+            unmet = None
+            try:
+                c = subprocess.run([py, '-I', '-c', _UPDATE_REQ_CHECK_PY, req], capture_output=True,
+                                   text=True, timeout=60)
+                if c.returncode == 0:
+                    unmet = json.loads((c.stdout or '').strip().splitlines()[-1])
+            except Exception as e:
+                log(f"Update Now: could not compare the installed libraries with the new pins ({str(e)[:120]}); installing them")
+            if unmet == []:
+                log('Update Now: every library the new release pins is already installed')
+            else:
+                if unmet:
+                    log('Update Now: installing the new release pins: ' + ', '.join(unmet)[:300])
+                try:
+                    p = subprocess.run([pip, 'install', '--quiet', '--disable-pip-version-check', '-r', req],
+                                       capture_output=True, text=True, timeout=_UPDATE_PIP_TIMEOUT_S)
+                    rc, err = p.returncode, (p.stderr or p.stdout or '')
+                except subprocess.TimeoutExpired:
+                    rc, err = 124, f'pip did not finish in {_UPDATE_PIP_TIMEOUT_S} seconds'
+                except Exception as e:
+                    rc, err = 1, str(e)
+                if rc != 0:
+                    last = ([ln for ln in err.strip().splitlines() if ln.strip()] or [''])[-1][:200]
+                    log(f'Update Now: pip install of the new pins failed (rc={rc}): {last}')
+                    return False, (
+                        'Update stopped before anything was changed: the new release needs software '
+                        'libraries that could not be installed on this server'
+                        + (f' ({last})' if last else '') + '. Check that this server can reach '
+                        'pypi.org, then click Update Now again.')
+        try:
+            c = subprocess.run([py, '-I', '-c', _UPDATE_TREE_CHECK_PY], cwd=tree, capture_output=True,
+                               text=True, timeout=_UPDATE_TREE_CHECK_TIMEOUT_S)
+            res = json.loads((c.stdout or '').strip().splitlines()[-1]) if c.returncode == 0 else None
+        except Exception as e:
+            res = None
+            log(f"Update Now: pre-check of the new tree skipped ({str(e)[:160]})")
+        if res is None:
+            return True, ''
+        if res.get('compile_errors') or res.get('missing_imports'):
+            what = '; '.join(res.get('compile_errors') or [])
+            if res.get('missing_imports'):
+                what += ('; ' if what else '') + 'missing library: ' + ', '.join(
+                    f'{k} (needed by {v})' for k, v in sorted(res['missing_imports'].items()))
+            log(f'Update Now: the new release failed its pre-check: {what[:500]}')
+            return False, (
+                'Update stopped before anything was changed: the new release failed its safety check '
+                f'({what[:240]}). This is a fault in the release, not on your server. Your console is '
+                'unchanged. Please report it on GitHub.')
+        return True, ''
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _update_clear_stale_git_locks(console_dir, now=None, max_age_s=600):
+    """Remove a leftover .git/index.lock (or HEAD.lock) from a cut-off checkout. Returns the names
+    removed. Only locks older than max_age_s go: a git command of ours finishes well inside that,
+    and Update Now holds its own single-flight lock, so no checkout of ours is running."""
+    now = time.time() if now is None else now
+    removed = []
+    for name in ('index.lock', 'HEAD.lock'):
+        p = os.path.join(console_dir, '.git', name)
+        try:
+            age = now - os.path.getmtime(p)
+        except OSError:
+            continue
+        if age < max_age_s:
+            continue
+        try:
+            os.unlink(p)
+            removed.append(name)
+            print(f"Update Now: removed a stale .git/{name} (age {int(age)}s)", flush=True)
+        except OSError as e:
+            print(f"Update Now: could not remove .git/{name}: {e}", flush=True)
+    return removed
+
+
+def _update_plain_git_error(err):
+    """Customer words for the git lock error Update Now used to show raw."""
+    low = (err or '').lower()
+    if '.lock' in low and ('file exists' in low or 'unable to create' in low or 'another git process' in low):
+        return ('Another git command is still running on this server, so the update was not applied. '
+                'Nothing was changed. Wait a few minutes and click Update Now again.')
+    return err
+
+
+def _update_rollback_snapshot(prev, running_version, head_tag, now_utc):
+    """The `console_rollback` record to save at the start of an Update Now click.
+
+    ops #1329: if an earlier click already recorded this RUNNING version and it is still the
+    version running, keep that record. Click one moves HEAD; when the restart never comes,
+    click two used to read the NEW tag from HEAD and make it the rollback target."""
+    prev = prev if isinstance(prev, dict) else {}
+    if prev.get('available') and prev.get('tag') and prev.get('version') == running_version:
+        return prev
+    return {
+        'available': True,
+        'version': running_version,
+        'tag': head_tag or f'v{running_version}',
+        'snapshot_at': now_utc,
+    }
+
+
+def _tag_version_tuple(name):
+    n = (name or '').lstrip('v').replace('-alpha', '').replace('-beta', '')
+    return tuple(int(p) for p in n.split('.'))
+
+
+def _main_commit_shas(gh_headers=None):
+    """SHAs of the last 100 commits on main (GitHub API), or None when they cannot be read."""
+    try:
+        req = urllib.request.Request(
+            f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=main&per_page=100',
+            headers=gh_headers or {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
+        resp = urllib.request.urlopen(req, timeout=5)
+        return {c['sha'] for c in json.loads(resp.read().decode())}
+    except Exception:
+        return None
+
+
+def _select_latest_release_tag(tags, main_commits):
+    """The newest tag (API tag dict) on the main channel. ops #1329: ONE rule for the update check
+    and for Update Now. A tag counts only when its commit is on main (`main_commits`, None when
+    main could not be read: then the list is trusted, as the check always did). Update Now used
+    to take the highest tag with no such filter, so a tag pushed on dev could be installed on the
+    main channel that the check never offered."""
+    best = None
+    for tag in tags or []:
+        if main_commits is not None and (tag.get('commit') or {}).get('sha') not in main_commits:
+            continue
+        try:
+            vt = _tag_version_tuple(tag.get('name', ''))
+        except (ValueError, IndexError):
+            continue
+        if best is None or vt > best[0]:
+            best = (vt, tag)
+    return best[1] if best else None
+
+
+def _post_update_in_progress(lock_path='/tmp/takwerx-post-update.lock', now=None, max_age_s=1800,
+                             pid_alive=None):
+    """Seconds the post-update auto-deploy has been running, or None when it is not running.
+
+    ops #1329: the Update Now lock is deleted when the console starts, so it no longer covers the
+    minutes the new console spends re-deploying Guard Dog, Authentik and Node-RED. That thread
+    keeps its own lock file (pid and version) from before it starts until it ends; a second
+    Update Now click during that time checked out the next release and killed the deploy half
+    way. Same staleness rule as the thread's own check: holder dead, or older than 30 minutes."""
+    now = time.time() if now is None else now
+    if pid_alive is None:
+        def pid_alive(pid):
+            try:
+                os.kill(pid, 0)
+                return True
+            except (ProcessLookupError, PermissionError):
+                return False
+    try:
+        age = now - os.path.getmtime(lock_path)
+        with open(lock_path) as fh:
+            parts = fh.read().split()
+        pid = int(parts[0]) if parts else 0
+    except (OSError, ValueError, IndexError):
+        return None
+    if age > max_age_s or pid <= 0 or not pid_alive(pid):
+        return None
+    return int(age)
+
+
 # ops #489: Update Now's `git fetch` ran with one fixed 60 s limit and, when it expired, showed
 # the customer Python's raw "Command [...] timed out after 60 seconds". Boxes on slow or shared
 # links (small teams behind one NAT, satellite, government proxies) hit that, and the same click
@@ -12425,6 +12752,21 @@ def update_apply():
                       f'has {_free_b // (1024 * 1024)} MB. Free disk first — see Guard Dog '
                       '> Database maintenance (CoT) > Diagnose. ' + _FREE_SPACE_BACKUPS_HINT),
         }), 400
+
+    # ops #1329 (item 8): the Update Now lock below is deleted when the console starts, so it does
+    # not cover the minutes the NEW console spends re-deploying Guard Dog, Authentik and Node-RED.
+    # A second click then checked out the next release and killed that deploy half way. Refuse
+    # until it ends (it keeps its own lock; stale after 30 minutes, same as its own rule).
+    _pu_age = _post_update_in_progress()
+    if _pu_age is not None:
+        return jsonify({
+            'success': False,
+            'in_progress': True,
+            'started_seconds_ago': _pu_age,
+            'error': ('The last update is still finishing its setup on this server (about '
+                      f'{max(1, _pu_age // 60)} min so far). Nothing was changed. Wait a few minutes '
+                      'and click Update Now again.'),
+        }), 409
 
     # v0.9.24 Item 1: Update Now single-flight lock.
     # Field incident on test8 (2026-05-16): operator double-clicked "Update Now"
@@ -12550,12 +12892,12 @@ def update_apply():
             capture_output=True, text=True, timeout=10
         )
         _cur_tag = (_cur_tag_r.stdout or '').strip() if _cur_tag_r.returncode == 0 else f'v{VERSION}'
-        _s['console_rollback'] = {
-            'available':   True,
-            'version':     VERSION,
-            'tag':         _cur_tag,
-            'snapshot_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-        }
+        # ops #1329 (item 4): after an interrupted click (HEAD moved, restart never came) HEAD
+        # names the NEW tag; a second click used to record that as the rollback target. Keep
+        # the record the first click made for the version that is actually running.
+        _s['console_rollback'] = _update_rollback_snapshot(
+            _s.get('console_rollback'), VERSION, _cur_tag,
+            datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'))
         save_settings(_s)
     except Exception:
         pass
@@ -12601,13 +12943,20 @@ def update_apply():
                 if verify_tag.returncode == 0:
                     target_ref = f'refs/tags/{tag_name}'
 
-            # Fallback: track origin/main if tag lookup fails.
+            # ops #1329 (item 6): no fallback to the tip of origin/main. The check offers only a
+            # release tag on main; main's tip is not always one. Say so and change nothing.
             if not target_ref:
-                fetch_main = _git_fetch_retry(_git, ['fetch', 'origin', '+main:refs/remotes/origin/main'])
-                if fetch_main.returncode != 0:
-                    return _fail_release_lock(_error_payload(_git_err(fetch_main)))
-                target_ref = 'refs/remotes/origin/main'
-            target_label = tag_name or 'origin/main'
+                return _fail_release_lock({
+                    'success': False,
+                    'error': ('Could not find the newest release on GitHub. Nothing was changed. '
+                              'Click Update Now again in a minute or two.')})
+            target_label = tag_name
+
+        # ops #1329 (items 1-3): with HEAD still where it was, read the new tree, install the
+        # libraries it pins and compile-check it. A verdict of "no" stops here, nothing changed.
+        _pf_ok, _pf_msg = _update_preflight_tree(console_dir, target_ref, git_cfg=git_cfg)
+        if not _pf_ok:
+            return _fail_release_lock({'success': False, 'error': _pf_msg})
 
         # v10.1.4 WS13: heal foreign-owned repo entries BEFORE the checkout — a
         # past root-shell git op leaves root-owned dirs that make the checkout
@@ -12615,7 +12964,14 @@ def update_apply():
         # HEAD still moves → box runs mixed versions).
         _repo_ownership_selfheal('update-apply')
 
+        # ops #1329 (item 5): a checkout cut off by a power loss or a kill leaves .git/index.lock,
+        # and every later click returned raw git text until someone cleared it over SSH.
+        _update_clear_stale_git_locks(console_dir)
+
         checkout = _git(['checkout', '--force', target_ref], timeout=30)
+        if checkout.returncode != 0 and '.lock' in _git_err(checkout).lower():
+            if _update_clear_stale_git_locks(console_dir):
+                checkout = _git(['checkout', '--force', target_ref], timeout=30)
         if checkout.returncode != 0 and 'unable to unlink' in _git_err(checkout).lower():
             # Ownership poisoning surfaced mid-checkout (pre-checkout heal missed
             # or could not complete — e.g. broker briefly unreachable). Heal and
@@ -12624,7 +12980,7 @@ def update_apply():
             checkout = _git(['checkout', '--force', target_ref], timeout=30)
         if checkout.returncode != 0:
             err = _git_err(checkout)
-            payload = _error_payload(err)
+            payload = _error_payload(_update_plain_git_error(err))
             if 'unable to unlink' in err.lower():
                 # WS13: never show a customer raw git stderr with no next step.
                 # HEAD has moved and the new app.py is staged; the startup heal
@@ -12639,8 +12995,25 @@ def update_apply():
             return _fail_release_lock(payload)
 
         update_cache.update({'latest': None, 'checked': 0, 'notes': '', 'body': ''})
-        _ensure_gunicorn_upgrade(console_dir)
-        _detached_console_restart()
+        # HEAD has moved: nothing below may stop the restart. The pins are installed already (the
+        # pre-check above); this keeps the systemd unit upgrade and the gunicorn/PyYAML top-up.
+        # ops #1329 (item 2): a pip timeout here used to raise, leaving a new tree under old code
+        # with no restart scheduled.
+        try:
+            _ensure_gunicorn_upgrade(console_dir)
+        except Exception as _eg:
+            print(f"Update Now: venv top-up failed (non-fatal, restarting anyway): {str(_eg)[:200]}", flush=True)
+        # ops #1329 (item 7): learn whether the restart command itself failed. A restart that
+        # works kills this process first, so waiting here costs a few seconds and nothing else.
+        _restart = {'event': threading.Event(), 'ok': None, 'error': ''}
+        _detached_console_restart(delay=_UPDATE_RESTART_DELAY_S, result=_restart)
+        if _restart['event'].wait(timeout=_UPDATE_RESTART_WAIT_S) and _restart['ok'] is False:
+            return _fail_release_lock({
+                'success': False,
+                'restart_failed': True,
+                'error': (f'The update to {target_label} is installed, but this console could not restart '
+                          f'itself ({_restart["error"]}). Click Update Now again to retry the restart, or '
+                          'use the Reboot button on the Console page.')})
         return jsonify({
             'success': True,
             'output': f'Updated to {target_label}',
