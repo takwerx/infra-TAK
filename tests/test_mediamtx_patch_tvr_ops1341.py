@@ -130,6 +130,11 @@ class Host:
             'jsonify': lambda d: d,
             'load_settings': lambda: {}, '_get_module_deployment_config': lambda s, k: host.cfg,
             '_mediamtx_editor_reclaim': lambda plog=None: [], '_mediamtx_hand_over_files': lambda o: None,
+            # ops #1387: these tests are about what Patch writes, so they run the full path
+            # (MediaMTX stopped, folder taken back). The no-stop path has its own test file.
+            '_mediamtx_editor_reclaim_applies': lambda: False, '_mediamtx_editor_dir_has_links': lambda: False,
+            '_mediamtx_editor_put': lambda *a, **k: None,
+            '_MtxReclaimNeeded': type('_MtxReclaimNeeded', (BaseException,), {}),
             '_mediamtx_owner': lambda: 'takwerx', '_sudo_wrap': lambda c: c,
             '_mediamtx_remote_clear_staging': lambda c: None,
             '_module_run': module_run, '_module_run_root': module_run_root,

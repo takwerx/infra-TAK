@@ -51359,8 +51359,13 @@ def _mediamtx_editor_refresh(deploy_cfg, is_remote):
 
 @app.route('/api/mediamtx/recovery', methods=['POST'])
 @login_required
-def mediamtx_recovery():
-    """Patch web editor: refresh editor, apply endpoint patch, sync overlay file, install prestart script, restart."""
+def mediamtx_recovery(_try_guarded=True):
+    """Patch web editor: refresh editor, apply endpoint patch, sync overlay file, install prestart script, restart.
+
+    ops #1387: when nothing in the editor's folder needs writing (an editor kept because it is
+    newer than the pin, overlay and prestart script already current), MediaMTX is not stopped
+    and no stream drops. The first file that does need writing sends the route back to the top
+    on the full path (`_try_guarded=False`): stop both services, take the folder back, write."""
     import tempfile
     import urllib.request
     settings = load_settings()
@@ -51370,17 +51375,32 @@ def mediamtx_recovery():
     _is_remote = (deploy_cfg.get('target_mode') == 'remote'
                   and (deploy_cfg.get('remote', {}).get('host') or '').strip())
     _restart_after = []
+    _guarded = False   # True: MediaMTX is left running and this pass may not write into its folder
+
+    def _put(path, content, perm=None):
+        if _guarded:
+            _mediamtx_editor_put(path, content, perm)    # returns only when nothing would change
+        elif perm is None:
+            _write_priv(path, content)
+        else:
+            _write_priv(path, content, perm=perm)
     try:
         # ops #643: the editor dir belongs to the editor's own account here. Take it back
         # (services stopped, planted links dropped) before writing into it.
         if not _is_remote:
-            _restart_after = _mediamtx_editor_reclaim() or []
+            if (_try_guarded and _mediamtx_editor_reclaim_applies()
+                    and not _mediamtx_editor_dir_has_links()):
+                _guarded = True      # ops #1387: look first; stop MediaMTX only if a write is needed
+            else:
+                _restart_after = _mediamtx_editor_reclaim() or []
         # 1) Refresh editor from upstream so we fix corruption / duplicate UI from old or patched copies
         # ops #1341: but never over a newer editor (the editor's own Upgrade), and never from a
         # download that is not a whole editor. The packages, unit, overlay and restart below
         # still run either way: this button is also how a box missing Flask is repaired.
         if _is_remote:
             _mediamtx_remote_clear_staging(deploy_cfg)   # ops #890: before any scp into /tmp
+        if _guarded and not _mediamtx_editor_newer_than_pin(_mediamtx_editor_installed_version(deploy_cfg)):
+            raise _MtxReclaimNeeded('editor refresh')    # ops #1387: the refresh writes the file
         _refreshed, _note, _installed = _mediamtx_editor_refresh(deploy_cfg, bool(_is_remote))
         if _is_remote:
             # v0.9.12: also bind webedit Flask app to 127.0.0.1 (Tier 3 — Caddy
@@ -51414,7 +51434,7 @@ def mediamtx_recovery():
                     src = _mediamtx_editor_endpoint_patch(src)
                     src = _mediamtx_editor_broker_deps_patch(src)   # v10.1.65 W3 (GH #67)
                     src = _mediamtx_editor_logstream_patch(src)     # v10.1.68 Live Logs
-                    _write_priv(editor_path, src)
+                    _put(editor_path, src)
             except Exception:
                 pass
         # 3) Always sync live overlay file from current infra-TAK repo to target.
@@ -51423,7 +51443,7 @@ def mediamtx_recovery():
             overlay_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mediamtx_ldap_overlay.py')
             if os.path.exists(overlay_src) and not _is_remote:
                 with open(overlay_src) as _of:
-                    _write_priv('/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', _of.read())
+                    _put('/opt/mediamtx-webeditor/mediamtx_ldap_overlay.py', _of.read())
             elif os.path.exists(overlay_src):
                 # ops #890: scp runs as the SSH user and cannot write into root's /opt: stage in
                 # /tmp, then move into place as root (same two steps as the deploy).
@@ -51443,8 +51463,8 @@ def mediamtx_recovery():
         else:
             # ops #643: straight into place through the broker (no link followed), no
             # fixed /tmp name another local account could take first.
-            _write_priv('/opt/mediamtx-webeditor/ensure_overlay.py', MEDIAMTX_ENSURE_OVERLAY_SCRIPT,
-                        perm=0o755)
+            _put('/opt/mediamtx-webeditor/ensure_overlay.py', MEDIAMTX_ENSURE_OVERLAY_SCRIPT,
+                 perm=0o755)
         # Install script, make ExecStartPre best-effort so a failing pre-step cannot block start, then restart
         # v10.1.48: this path ships a new overlay but used to leave the unit alone.
         # The overlay now refuses X-Authentik-* from an unpinned peer, so on a SPLIT
@@ -51511,8 +51531,16 @@ def mediamtx_recovery():
         # success of the other steps, but the operator must not read "patched" as "refreshed".
         if _note:
             msg = (_note + msg).strip()
+        if _guarded:
+            # ops #1387: nothing in the folder needed writing, so MediaMTX itself was left alone.
+            msg += ' MediaMTX was not stopped, so no stream was interrupted.'
         return jsonify({'success': True, 'message': msg, 'webeditor_running': active,
-                        'editor_refreshed': bool(_refreshed), 'editor_version': _installed})
+                        'editor_refreshed': bool(_refreshed), 'editor_version': _installed,
+                        'mediamtx_stopped': bool(_restart_after) and 'mediamtx' in _restart_after})
+    except _MtxReclaimNeeded:
+        # ops #1387: a file in the folder must be written after all. Nothing has been written
+        # or stopped yet; run the whole route again on the full path (stop, take back, write).
+        return mediamtx_recovery(_try_guarded=False)
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
     finally:
@@ -123421,6 +123449,61 @@ def _mediamtx_hand_over_files(user, plog=None):
             _run(['chown', '-h', f'{user}:{group}', os.path.join(_MEDIAMTX_CONF_DIR, name)])
 
 
+class _MtxReclaimNeeded(BaseException):
+    """Patch web editor (ops #1387) tried to leave MediaMTX running and found a file it must
+    write. Deliberately NOT an Exception: the Patch steps wrap their writes in
+    `except Exception: pass`, and this signal must get through them to the route, which then
+    runs the full path (stop, take the dir back, write) from the start."""
+
+
+def _mediamtx_editor_reclaim_applies():
+    """True when `_mediamtx_editor_reclaim` has anything to do on this box: the editor dir
+    exists and belongs (or is about to belong) to the `mediamtx` account."""
+    if not os.path.isdir(_MEDIAMTX_EDITOR_DIR):
+        return False
+    if _mediamtx_owner() == 'takwerx' and not _mediamtx_account_ready():
+        return False                # never moved: nothing else ever owned it
+    return True
+
+
+def _mediamtx_editor_dir_has_links():
+    """True when the editor's dir (or /usr/local/etc/mediamtx.yml) holds a link or special
+    file, or cannot be listed. Looks only: it changes nothing. The reclaim drops these; a Patch
+    that skips the reclaim must not skip that clean-up, so it takes the full path instead.
+    Mirrors the reclaim's own walk (lstat, links never followed)."""
+    unreadable = []
+    try:
+        if os.path.islink(os.path.join(_MEDIAMTX_CONF_DIR, 'mediamtx.yml')):
+            return True
+        for root, dirs, files in os.walk(_MEDIAMTX_EDITOR_DIR, followlinks=False,
+                                         onerror=unreadable.append):
+            for name in dirs + files:
+                st = os.lstat(os.path.join(root, name))
+                if _stat.S_ISLNK(st.st_mode) or not (_stat.S_ISREG(st.st_mode) or _stat.S_ISDIR(st.st_mode)):
+                    return True
+    except Exception:
+        return True                 # cannot see inside: the full path decides
+    return bool(unreadable)         # a folder os.walk could not open
+
+
+def _mediamtx_editor_put(path, content, perm=None):
+    """Patch web editor with MediaMTX still running (ops #1387): NEVER writes. Returns when
+    `path` already is exactly `content` (a regular file, not a link, same text, same mode when
+    `perm` is given). Otherwise raises _MtxReclaimNeeded, and the route starts again on the
+    full path. Nothing computed from a read made before the dir was taken back is ever written:
+    the retry reads everything again after the take-back (the broker's read follows links)."""
+    try:
+        st = os.lstat(path)
+        same = _stat.S_ISREG(st.st_mode)
+        if same and perm is not None:
+            same = _stat.S_IMODE(st.st_mode) == int(perm)
+        same = same and _read_priv(path) == content
+    except Exception:
+        same = False
+    if not same:
+        raise _MtxReclaimNeeded(path)
+
+
 def _mediamtx_editor_reclaim(plog=None):
     """Before the console writes into the editor's dir itself (deploy, Patch web editor):
     stop both services, take the dir back, and drop every link or special file in it.
@@ -123430,10 +123513,8 @@ def _mediamtx_editor_reclaim(plog=None):
     planted at e.g. mediamtx_config_editor.py would turn the console's own `open(..., 'w')`
     into a write to wherever it points — the console's code included. With both services
     stopped nothing can plant a new one; the deploy hands the dir back when it is done."""
-    if not os.path.isdir(_MEDIAMTX_EDITOR_DIR):
+    if not _mediamtx_editor_reclaim_applies():
         return []
-    if _mediamtx_owner() == 'takwerx' and not _mediamtx_account_ready():
-        return []                   # never moved: nothing else ever owned it
     stopped = []
     for svc in ('mediamtx-webeditor', 'mediamtx'):
         if (subprocess.run(_sudo_wrap(['systemctl', 'is-active', svc]), capture_output=True,
