@@ -32503,6 +32503,10 @@ def _collect_pending_updates(settings, seen=None, unknown=None, etl=None):
         if c:
             pending.append(_apply_security_identity({**c, 'key': 'console'}))
     except Exception as e:
+        # ops #1305: GitHub that does not answer is "unknown", not "no update". Without this
+        # the sweep forgot it had mailed the console target and mailed it a second time later
+        # (test8 got the 10.4.7 mail twice), and the sweep after a failure looked like a quiet one.
+        unknown.add('console')
         print(f"[update-notify] console check failed: {e}", flush=True)
     try:
         if os.path.isdir(os.path.expanduser('~/CloudTAK')):
@@ -32814,7 +32818,13 @@ def _update_notify_check_once(fast=False):
         new_state['_patch_now_feed'] = feed
     if (emailed or not new_items) and new_state != state:
         _update_notify_state_save(new_state)
-    return {'pending': pending, 'emailed': emailed}
+    result = {'pending': pending, 'emailed': emailed}
+    # ops #1305: a full sweep that could not read the newest console release, or that could not
+    # send what it found, is looked at again in an hour. Before this the next look was six hours
+    # away, so a security release could go unmentioned for most of a day.
+    if not fast and ('console' in unknown or (new_items and not emailed)):
+        result['retry_soon'] = True
+    return result
 
 
 def _startup_retire_updates_timer():
@@ -32852,9 +32862,13 @@ def _startup_retire_updates_timer():
     return True
 
 
+UPDATE_NOTIFY_QUICK_RETRIES = 6        # ops #1305: hourly retries after a failed full sweep, then back to 6 h
+
+
 def _update_notify_loop():
     time.sleep(UPDATE_NOTIFY_FIRST_DELAY_S)
     next_full = 0.0
+    quick_retries = 0
     while True:
         # ops #377: a full sweep every 6 h, and between them an hourly patch-now check.
         wait = PATCH_NOW_CHECK_INTERVAL_S
@@ -32864,6 +32878,18 @@ def _update_notify_loop():
                 next_full = time.time() + UPDATE_NOTIFY_INTERVAL_S
             with _update_notify_lock:
                 r = _update_notify_check_once(fast=not full) or {}
+            if full:
+                # ops #1305: GitHub or the mail relay failed: the next hourly look is a full sweep
+                # again (at most UPDATE_NOTIFY_QUICK_RETRIES times in a row, so a box with no
+                # route to GitHub does not run a full sweep every hour for ever).
+                if r.get('retry_soon') and quick_retries < UPDATE_NOTIFY_QUICK_RETRIES:
+                    quick_retries += 1
+                    next_full = 0.0
+                    print(f"[update-notify] full sweep incomplete (GitHub unreadable or mail not sent): "
+                          f"again in {PATCH_NOW_CHECK_INTERVAL_S // 60} min "
+                          f"(retry {quick_retries} of {UPDATE_NOTIFY_QUICK_RETRIES})", flush=True)
+                else:
+                    quick_retries = 0
             if r.get('quiet_until'):
                 # ops #228: deferred by a quiet window — look again once it has settled,
                 # not six hours later, and make that look the full sweep.
@@ -32875,6 +32901,14 @@ def _update_notify_loop():
                 print(f"[update-notify] sweep failed: {e}", flush=True)
             except Exception:
                 pass
+            if full and quick_retries < UPDATE_NOTIFY_QUICK_RETRIES:
+                quick_retries += 1      # ops #1305: a full sweep that died is tried again in an hour
+                next_full = 0.0
+                try:
+                    print(f"[update-notify] full sweep again in {PATCH_NOW_CHECK_INTERVAL_S // 60} min "
+                          f"(retry {quick_retries} of {UPDATE_NOTIFY_QUICK_RETRIES})", flush=True)
+                except Exception:
+                    pass
         time.sleep(wait)
 
 
