@@ -125419,8 +125419,11 @@ def _line_time(line, now, naive_utc=False):
 
 def _ssh_watch_text():
     for p in ('/var/log/auth.log', '/var/log/secure'):
-        if os.path.exists(p):
-            return _tail_text(p, 4 * 1024 * 1024)
+        try:
+            if os.path.getsize(p) > 0:   # an empty leftover file must not hide the real one
+                return _tail_text(p, 4 * 1024 * 1024)
+        except OSError:
+            continue
     try:   # no auth file (journal only)
         r = subprocess.run(['journalctl', '-t', 'sshd', '--since', '2 hours ago',
                             '--no-pager', '-o', 'short-iso'],

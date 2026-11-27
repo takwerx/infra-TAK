@@ -215,6 +215,27 @@ def test_pam_keyboard_interactive_failures_count_once_each(tmp_path):
     assert twice.sent == []
 
 
+def test_an_empty_auth_log_does_not_hide_the_real_ssh_log(tmp_path):
+    """Found on a real Rocky 9 box: an empty /var/log/auth.log (left by an operator or a script)
+    came first in the list, so the watch read nothing and never saw /var/log/secure."""
+    mod = types.ModuleType('infratak_f2b_notify')
+    exec(compile(_const('_F2B_NOTIFY_SCRIPT'), 'infratak-f2b-notify', 'exec'), mod.__dict__)
+    auth, secure = tmp_path / 'auth.log', tmp_path / 'secure'
+    auth.write_text('')
+    secure.write_text('Nov 27 20:10:08 h sshd[1]: Accepted password for bob from 198.51.100.4 port 1 ssh2\n')
+    real_exists = os.path.exists
+    paths = {'/var/log/auth.log': str(auth), '/var/log/secure': str(secure)}
+    real_getsize, real_open = os.path.getsize, open
+    mod.os = types.SimpleNamespace(**{k: getattr(os, k) for k in dir(os) if not k.startswith('__')})
+    mod.os.path = types.SimpleNamespace(exists=lambda p: real_exists(paths.get(p, p)),
+                                        getsize=lambda p: real_getsize(paths.get(p, p)),
+                                        join=os.path.join)
+    mod.open = lambda p, *a, **k: real_open(paths.get(p, p), *a, **k)
+    assert 'Accepted password for bob' in mod._ssh_watch_text()
+    auth.write_text('Nov 27 20:11:00 h sshd[1]: Accepted password for amy from 198.51.100.5 port 1 ssh2\n')
+    assert 'for amy' in mod._ssh_watch_text()          # a log with content still wins, as before
+
+
 def test_console_and_authentik_logins_after_failures_each_send_one(tmp_path):
     box = _Box(tmp_path)
     for i in range(3):
