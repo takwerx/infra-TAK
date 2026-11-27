@@ -46992,7 +46992,7 @@ _AK_REMOTE_TAG_RE = re.compile(r'^(\d{4})\.(\d{1,2})\.(\d{1,3})(?:-[0-9A-Za-z][0
 def _ak_remote_current_version(remote):
     """Which Authentik a REMOTE host runs now, read before Update changes anything (ops #1322).
 
-    Returns {'ok': True, 'tag', 'tuple': (year, month, patch), 'what'} or {'ok': False, 'error'}.
+    Returns {'ok': True, 'tag', 'tuple': (year, month, patch), 'what'} or {'ok': False, 'error', 'hint'?}.
     The RUNNING authentik-server image wins: it is what wrote the database, and a half-finished
     earlier update (new pin written, old container still up) must still be able to retry. With no
     container running, what compose would start decides: the `.env` pin when there is one (it
@@ -47031,8 +47031,9 @@ def _ak_remote_current_version(remote):
             return {'ok': False, 'error': f'{_host} has no Authentik tag in {_what}'}
         return {'ok': False,
                 'error': (f'{_what} on {_host} names "{_tag[:40]}", which is not a version number, so '
-                          f'infra-TAK cannot tell whether the update would go backwards. Set it to the '
-                          f'version that is really running')}
+                          f'infra-TAK cannot tell whether the update would go backwards'),
+                'hint': 'Set AUTHENTIK_TAG on the host to the version that is really running, '
+                        'then press Update again.'}
     return {'ok': True, 'tag': _tag.lstrip('vV'), 'tuple': tuple(int(_x) for _x in _m.groups()),
             'what': _what}
 
@@ -71853,8 +71854,9 @@ def authentik_control():
             _rh = (remote.get('host') or '').strip()
             _cur = _ak_remote_current_version(remote)
             if not _cur['ok']:
+                _hint = _cur.get('hint') or 'Fix that, then press Update again.'
                 return jsonify({'error': f'Refusing to update {_rh}: {_cur["error"]}. '
-                                         f'Nothing was changed. Fix that, then press Update again.'}), 500
+                                         f'Nothing was changed. {_hint}'}), 500
             _cur_t = (_cur['tuple'] + (0, 0, 0))[:3]
             _tgt_t = (_ak_ver_tuple(latest) + (0, 0, 0))[:3]
             if _cur_t > _tgt_t:

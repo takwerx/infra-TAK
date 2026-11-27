@@ -251,6 +251,7 @@ def test_floating_tag_message_says_what_to_do():
     body, status, _ = run_update(FakeRemote(running='latest', compose='latest'))
     assert status == 500
     assert 'not a version number' in body['error'] and 'really running' in body['error']
+    assert 'Nothing was changed' in body['error'] and 'Fix that' not in body['error']
 
 
 def test_errors_never_use_the_codes_the_page_reads_as_still_running():
