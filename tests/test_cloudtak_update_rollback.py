@@ -506,8 +506,8 @@ def test_remote_update_pins_before_the_build_and_puts_tags_back_on_every_failure
     i_build = r.index('_ssh_probe(remote_cfg, build_cmd, timeout=5400)')
     assert i_snap < i_build
     tail = r[i_build:]
-    # build failed, Garage step failed
-    assert tail.count('_cloudtak_restore_images(_ct_snap, plog, remote_cfg=remote_cfg)') == 2
+    # build failed, the database copy failed (ops #1325), Garage step failed
+    assert tail.count('_cloudtak_restore_images(_ct_snap, plog, remote_cfg=remote_cfg)') == 3
     i_gr = tail.index('_cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog)')
     assert tail.index('_cloudtak_restore_images(', i_gr) > i_gr
 
