@@ -627,8 +627,8 @@ async function loadCAInfo(){
             var caCn=(d.old_ca_names||{})[alias]||'';
             var caLabel=(caCn&&caCn.toLowerCase()!==alias.toLowerCase())?alias+' ('+caCn+')':alias;
             rh+='<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">';
-            rh+='<span style="color:var(--yellow)">'+caLabel.replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];})+'</span>';
-            rh+='<button type="button" onclick="revokeOldCA(\''+alias.replace(/'/g,"\\'")+'\')" style="padding:6px 14px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Revoke</button>';
+            rh+='<span style="color:var(--yellow)">'+escapeHtml(caLabel)+'</span>';
+            rh+='<button type="button" onclick="revokeOldCA('+jsArg(alias)+')" style="padding:6px 14px;background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-family:\'JetBrains Mono\',monospace;font-size:11px;cursor:pointer">Revoke</button>';
             rh+='</div>';
           }
           listEl.innerHTML=rh;
@@ -1183,6 +1183,9 @@ async function togglePkgLock(){
 }
 /* ops #827: escapes & < > " ' so the result is safe in text and in a quoted attribute */
 function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+// ops #897: a value as an argument of an inline handler (onclick="f(...)"). JSON makes the
+// JavaScript string, escapeHtml makes it safe in the attribute. Never build the quotes by hand.
+function jsArg(v){return escapeHtml(JSON.stringify(v==null?'':String(v)));}
 function renderPkgLock(){
     var btn=document.getElementById('pkg-lock-btn');
     var label=document.getElementById('pkg-lock-status-label');
@@ -2653,7 +2656,65 @@ function toggleFedFirewall(){
     loadFederationInfo();
   }).catch(function(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;});
 }
-if(document.getElementById('federation-body')){loadFederationInfo();}
+/* gh #755: federate groups saved as cn=tak_<channel> match no user, so data flows one way. */
+function fedGroupsView(fixed){
+  var box=document.getElementById('fed-groups-box');
+  var t=document.getElementById('fed-groups-title');
+  var why=document.getElementById('fed-groups-why');
+  var list=document.getElementById('fed-groups-list');
+  var btn=document.getElementById('fed-groups-btn');
+  var msg=document.getElementById('fed-groups-msg');
+  if(box){box.style.borderColor=fixed?'var(--green)':'var(--yellow, #eab308)';box.style.background=fixed?'rgba(34,197,94,0.08)':'rgba(234,179,8,0.08)';}
+  if(t){t.textContent=fixed?'Federation group names fixed':'Federation group names need fixing';t.style.color=fixed?'var(--green)':'var(--yellow, #eab308)';}
+  if(why)why.style.display=fixed?'none':'';
+  if(list)list.style.display=fixed?'none':'';
+  if(btn){btn.style.display=fixed?'none':'';btn.disabled=false;}
+  if(msg){msg.textContent=fixed?'Done. The federate groups now use the plain channel names. TAK Server did not restart.':'';msg.style.color=fixed?'var(--green)':'var(--text-dim)';}
+}
+function loadFedGroupsCheck(afterFix){
+  var box=document.getElementById('fed-groups-box');
+  if(!box)return;
+  fetch('/api/takserver/federation-groups-check',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var list=document.getElementById('fed-groups-list');
+    if(!d||!d.supported||!d.count||!d.federates||!d.federates.length){
+      if(afterFix===true){fedGroupsView(true);box.style.display='block';}else{box.style.display='none';}
+      return;
+    }
+    fedGroupsView(false);
+    if(list){
+      list.textContent='';
+      d.federates.forEach(function(f){
+        (f.groups||[]).forEach(function(g){
+          var li=document.createElement('li');
+          li.textContent=f.name+': '+g.group+' \u2192 '+g.plain+' ('+g.directions.join(', ').toLowerCase()+')';
+          list.appendChild(li);
+        });
+        (f.maps||[]).forEach(function(m){
+          var li=document.createElement('li');
+          li.textContent=f.name+': mapping '+m.remote+' \u2192 '+m.local+' becomes '+m.plain;
+          list.appendChild(li);
+        });
+      });
+    }
+    box.style.display='block';
+  }).catch(function(){});
+}
+function fixFedGroups(){
+  var btn=document.getElementById('fed-groups-btn');
+  var msg=document.getElementById('fed-groups-msg');
+  if(btn)btn.disabled=true;
+  if(msg){msg.textContent='Fixing...';msg.style.color='var(--text-dim)';}
+  fetch('/api/takserver/federation-groups-fix',{method:'POST',credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(d&&d.success){
+      if(msg){msg.textContent='Fixed. Checking again...';msg.style.color='var(--green)';}
+      setTimeout(function(){loadFedGroupsCheck(true);},1500);
+    }else{
+      if(msg){msg.textContent=(d&&(d.error||(d.errors&&d.errors[0])))||'Failed';msg.style.color='var(--red)';}
+      if(btn)btn.disabled=false;
+    }
+  }).catch(function(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;});
+}
+if(document.getElementById('federation-body')){loadFederationInfo();loadFedGroupsCheck();}
 
 /* ── TAK Server Plugins ─────────────────────────────────────────────── */
 var _takPluginPendingFiles=[],_takPluginLogIdx=0,_takPluginLogInterval=null;
@@ -2685,24 +2746,24 @@ function loadPlugins(){
       var classKey=p.classname||'';
       var jarKey=p.jar||'';
       var configBtn=classKey
-        ?'<button type="button" onclick="takPluginToggleConfig(\''+classKey+'\')" style="padding:4px 10px;background:transparent;color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Edit config</button>'
+        ?'<button type="button" onclick="takPluginToggleConfig('+jsArg(classKey)+')" style="padding:4px 10px;background:transparent;color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Edit config</button>'
         :'';
       var removeBtn=jarKey
-        ?'<button type="button" onclick="takPluginRemove(\''+jarKey+'\')" style="padding:4px 10px;background:transparent;color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Remove</button>'
+        ?'<button type="button" onclick="takPluginRemove('+jsArg(jarKey)+')" style="padding:4px 10px;background:transparent;color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Remove</button>'
         :'';
       var configSection=classKey
-        ?'<div id="tak-plugin-cfg-'+classKey+'" style="display:none;margin-top:10px;padding:12px;background:rgba(6,182,212,0.04);border:1px solid var(--border);border-radius:8px">'
-          +'<div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-family:\'JetBrains Mono\',monospace">'+classKey+'.yaml</div>'
-          +'<textarea id="tak-plugin-cfg-txt-'+classKey+'" style="width:100%;min-height:140px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:11px;padding:10px;box-sizing:border-box;resize:vertical" spellcheck="false"></textarea>'
+        ?'<div id="tak-plugin-cfg-'+escapeHtml(classKey)+'" style="display:none;margin-top:10px;padding:12px;background:rgba(6,182,212,0.04);border:1px solid var(--border);border-radius:8px">'
+          +'<div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-family:\'JetBrains Mono\',monospace">'+escapeHtml(classKey)+'.yaml</div>'
+          +'<textarea id="tak-plugin-cfg-txt-'+escapeHtml(classKey)+'" style="width:100%;min-height:140px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:11px;padding:10px;box-sizing:border-box;resize:vertical" spellcheck="false"></textarea>'
           +'<div style="display:flex;align-items:center;gap:10px;margin-top:8px">'
-          +'<button type="button" onclick="takPluginSaveConfig(\''+classKey+'\')" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Save</button>'
-          +'<span id="tak-plugin-cfg-msg-'+classKey+'" style="font-size:11px;color:var(--text-dim)"></span>'
+          +'<button type="button" onclick="takPluginSaveConfig('+jsArg(classKey)+')" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Save</button>'
+          +'<span id="tak-plugin-cfg-msg-'+escapeHtml(classKey)+'" style="font-size:11px;color:var(--text-dim)"></span>'
           +'</div>'
           +'</div>'
         :'';
       return '<div style="padding:10px 14px;background:rgba(6,182,212,0.03);border:1px solid var(--border);border-radius:8px;margin-bottom:8px">'
         +'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">'
-        +'<div><span style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-primary)">'+name+'</span> '+configLabel+'</div>'
+        +'<div><span style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-primary)">'+escapeHtml(name)+'</span> '+configLabel+'</div>'
         +'<div style="display:flex;gap:6px">'+configBtn+' '+removeBtn+'</div>'
         +'</div>'
         +configSection

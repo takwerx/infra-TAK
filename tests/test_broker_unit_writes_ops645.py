@@ -48,7 +48,8 @@ def _broker():
 
 B = _broker()
 APP = (REPO / 'app.py').read_text()
-CONSOLE_SRC = APP + (REPO / 'start.sh').read_text()
+CONSOLE_SRC = (APP + (REPO / 'start.sh').read_text()
+               + ''.join(p.read_text() for p in sorted((REPO / 'modules').glob('*.py'))))   # ops #973: modules write units too
 
 
 def write(rel, text, mode='w'):

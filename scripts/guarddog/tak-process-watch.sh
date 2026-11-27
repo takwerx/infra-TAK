@@ -129,6 +129,17 @@ if ! gd_tak_pgrep "takserver-retention.jar"; then
   MISSING_PROCESSES+=("retention")
 fi
 
+# GH #739 / ops #1273: when `api` is the ONLY missing process on a native install, restart just
+# takserver-api. A full restart drops every device on 8089 and takes minutes; the API JVM
+# dying alone (OOM under load) does not need that. Anything else missing, a container TAK
+# (no separate API unit) or a box without the unit keeps the full clean restart. Same 3
+# failures in a row, same daily cap, same lock, same alert mail.
+_api_only=0
+if [ ${#MISSING_PROCESSES[@]} -eq 1 ] && [ "${MISSING_PROCESSES[0]}" = "api" ] \
+   && ! gd_is_container && systemctl cat takserver-api.service >/dev/null 2>&1; then
+  _api_only=1
+fi
+
 if [ ${#MISSING_PROCESSES[@]} -gt 0 ]; then
   if [ -f "$FAIL_COUNT_FILE" ]; then
     FAIL_COUNT=$(cat "$FAIL_COUNT_FILE")
@@ -148,7 +159,12 @@ if [ ${#MISSING_PROCESSES[@]} -gt 0 ]; then
       
       TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       MISSING_LIST=$(IFS=,; echo "${MISSING_PROCESSES[*]}")
-      
+      if [ "$_api_only" = 1 ]; then
+        _action="Restarting only the TAK Server API process (takserver-api). Devices connected on 8089 stay connected."
+      else
+        _action="Restarting TAK Server"
+      fi
+
       SUBJ="TAK Server Process Alert on $SERVER_IDENTIFIER"
       BODY="TAK Server processes are missing - RESTARTING.
 
@@ -166,7 +182,7 @@ Expected 5 processes:
 - plugins (plugin manager)
 - retention (data cleanup)
 
-Action taken: Restarting TAK Server
+Action taken: $_action
 
 Check logs after restart:
   tail -100 /opt/tak/logs/takserver-messaging.log
@@ -187,15 +203,26 @@ Check logs after restart:
         exit 0
       fi
 
-      echo "$(date): TAK Server missing processes: $MISSING_LIST ($FAIL_COUNT failures) - restarting" >> /var/log/takguard/restarts.log
-      
+      if [ "$_api_only" = 1 ]; then
+        echo "$(date): TAK Server missing processes: $MISSING_LIST ($FAIL_COUNT failures) - restarting only takserver-api" >> /var/log/takguard/restarts.log
+      else
+        echo "$(date): TAK Server missing processes: $MISSING_LIST ($FAIL_COUNT failures) - restarting" >> /var/log/takguard/restarts.log
+      fi
+
       touch "$RESTART_LOCK"
       date +%s > "$LAST_RESTART_FILE"
       echo $((_daily + 1)) > "$DAILY_COUNT_FILE"
 
-      # Clean restart: native → stop, kill orphan Java (tak user), clear Ignite,
-      # start; container → docker restart (handled by gd_tak_restart).
-      gd_tak_restart
+      if [ "$_api_only" = 1 ] && systemctl restart takserver-api; then
+        :
+      else
+        if [ "$_api_only" = 1 ]; then
+          echo "$(date): systemctl restart takserver-api failed - falling back to the full restart" >> /var/log/takguard/restarts.log
+        fi
+        # Clean restart: native → stop, kill orphan Java (tak user), clear Ignite,
+        # start; container → docker restart (handled by gd_tak_restart).
+        gd_tak_restart
+      fi
 
       sleep 30
       rm -f "$RESTART_LOCK"

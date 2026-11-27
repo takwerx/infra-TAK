@@ -28,10 +28,13 @@ Patches the vanilla MediaMTX config editor Flask app to:
 import base64
 import hashlib
 import hmac
+import io
 import os
 import re
 import json
 import math
+import socket
+import ssl
 import threading
 import time
 import urllib.parse
@@ -70,8 +73,49 @@ TRUSTED_PROXIES = frozenset(
 VID_GROUPS = ('vid_private', 'vid_public')
 ADMIN_GROUPS = frozenset({'authentik Admins'})
 VIEWER_GROUPS = frozenset({'vid_private', 'vid_public'})
+# The longest a link made by a viewer lasts (seconds). Admins may make links that never end.
+SHARE_LINK_VIEWER_MAX_SECONDS = 86400
+# Links made before this update that never end end 24 hours after the first start on it. Same
+# files and same rule as the editor's own cap (mediamtx-installer), so whichever starts first
+# does it and the other finds the marker.
+SHARE_LINK_LEGACY_CAP_SECONDS = 86400
 
 VISIBILITY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'stream_visibility.json')
+SHARE_LINKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'share_links.json')
+SHARE_LINKS_CAP_MARKER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'share_links_capped.json')
+
+
+def cap_never_ending_share_links(now=None):
+    """Once per box: give every share link that never ends an end time 24 hours from now.
+    A link an admin makes later that never ends is kept, because the marker says this ran.
+    Returns how many were capped, or None when it could not run (nothing is changed)."""
+    if os.path.exists(SHARE_LINKS_CAP_MARKER_FILE):
+        return 0
+    now = time.time() if now is None else now
+    links = {}
+    if os.path.exists(SHARE_LINKS_FILE):
+        try:
+            with open(SHARE_LINKS_FILE, 'r') as f:
+                links = json.load(f)
+        except (ValueError, IOError):
+            return None  # unreadable: never write over it, try again at the next start
+        if not isinstance(links, dict):
+            return None
+    capped = 0
+    for info in links.values():
+        if isinstance(info, dict) and not info.get('expires'):
+            info['expires'] = now + SHARE_LINK_LEGACY_CAP_SECONDS
+            info['ttl_label'] = '24 hours (set by the update)'
+            capped += 1
+    try:
+        if capped:
+            with open(SHARE_LINKS_FILE, 'w') as f:
+                json.dump(links, f, indent=2)
+        with open(SHARE_LINKS_CAP_MARKER_FILE, 'w') as f:
+            json.dump({'capped': capped, 'at': int(now)}, f)
+    except (IOError, OSError):
+        return None
+    return capped
 
 # Which groups a signed-in person is in (ops #1082).
 #
@@ -440,10 +484,121 @@ def _ak_delete(path):
     urllib.request.urlopen(r, timeout=15)
 
 
+# ── TLS on the editor's own port (ops #1149) ─────────────────────────────────────────────
+# On a remote MediaMTX host, Caddy on the console reaches this editor over the network. The
+# stream certificate is on such a host already (RTSPS and HLS use it), so the editor takes
+# TLS with it on its one port and still takes plain http there. Caddy of a console that does
+# not know about this (an older release, a rollback) keeps working, and the console changes
+# its Caddy to https only after it saw this port answer TLS. The first byte of a connection
+# tells the two apart: 0x16 is a TLS handshake record, and no HTTP request starts with it.
+EDITOR_TLS_CERT = os.environ.get('INFRATAK_EDITOR_TLS_CERT', '/etc/mediamtx/certs/stream.crt')
+EDITOR_TLS_KEY = os.environ.get('INFRATAK_EDITOR_TLS_KEY', '/etc/mediamtx/certs/stream.key')
+EDITOR_TLS_HANDSHAKE_SECONDS = 20
+_editor_tls_lock = threading.Lock()
+_editor_tls_state = {'stamp': None, 'ctx': None}
+
+
+def _editor_tls_context():
+    """The TLS context for the two files above, or None when there is no usable pair. The
+    files are read again when one of them changes (a renewed certificate needs no restart)."""
+    try:
+        stamp = tuple((st.st_mtime_ns, st.st_size, st.st_ino)
+                      for st in (os.stat(EDITOR_TLS_CERT), os.stat(EDITOR_TLS_KEY)))
+    except OSError:
+        return None
+    with _editor_tls_lock:
+        if _editor_tls_state['stamp'] != stamp:
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                ctx.load_cert_chain(EDITOR_TLS_CERT, EDITOR_TLS_KEY)
+            except Exception:
+                ctx = None
+            _editor_tls_state.update(stamp=stamp, ctx=ctx)
+        return _editor_tls_state['ctx']
+
+
+def _editor_tls_handler(base):
+    """A request handler like `base` (werkzeug's) that takes TLS or plain http on one port.
+    All of it runs in the connection's own thread: a slow peer holds up nobody else."""
+
+    class TlsOrPlainHandler(base):
+        _tls_sock = None
+        _dropped = False
+
+        def setup(self):
+            sock = self.request
+            if isinstance(sock, ssl.SSLSocket):   # a server that does TLS itself: nothing to tell apart
+                super().setup()
+                return
+            try:
+                if sock.recv(1, socket.MSG_PEEK) == b'\x16':
+                    ctx = _editor_tls_context()
+                    if ctx is None:
+                        self._dropped = True      # TLS asked for and no certificate: no answer
+                    else:
+                        sock.settimeout(EDITOR_TLS_HANDSHAKE_SECONDS)
+                        self._tls_sock = ctx.wrap_socket(sock, server_side=True)
+                        self._tls_sock.settimeout(None)
+                        self.request = self._tls_sock
+            except Exception:
+                self._dropped = True
+            if self._dropped:
+                # wrap_socket has taken the socket away on a failed handshake: nothing to read
+                self.connection = self.request
+                self.rfile, self.wfile = io.BytesIO(), io.BytesIO()
+                return
+            try:
+                super().setup()
+            except Exception:
+                if self._tls_sock is not None:
+                    self._tls_sock.close()
+                raise
+
+        def handle(self):
+            if not self._dropped:
+                super().handle()
+
+        def finish(self):
+            try:
+                super().finish()
+            finally:
+                if self._tls_sock is not None:
+                    try:
+                        self._tls_sock.close()
+                    except OSError:
+                        pass
+
+    return TlsOrPlainHandler
+
+
+def _editor_tls_install(app):
+    """Make app.run() serve TLS and plain http on its port. Never raises: an editor that
+    cannot do this starts as before, on plain http."""
+    try:
+        from werkzeug.serving import WSGIRequestHandler
+        handler = _editor_tls_handler(WSGIRequestHandler)
+        run = app.run
+
+        def run_tls_or_plain(*args, **kwargs):
+            if not kwargs.get('ssl_context'):     # an editor that does TLS itself keeps its own way
+                kwargs.setdefault('request_handler', handler)
+            return run(*args, **kwargs)
+
+        app.run = run_tls_or_plain
+    except Exception:
+        pass
+
+
 def apply_ldap_overlay(app):
     """Patch the Flask app for Authentik/LDAP mode."""
+    _editor_tls_install(app)
+    try:
+        cap_never_ending_share_links()
+    except Exception:
+        pass  # never stop the editor from starting over this
 
-    VIEWER_ALLOWED = ('/viewer', '/api/viewer/streams', '/api/share-links', '/api/share-links/generate', '/api/theme/logo')
+    VIEWER_ALLOWED =('/viewer', '/api/viewer/streams', '/api/share-links/generate', '/api/theme/logo')
     VIEWER_PREFIXES = ('/watch/', '/hls-proxy/', '/shared/', '/shared-hls/')
 
     _untrusted_seen = set()
@@ -528,6 +683,36 @@ def apply_ldap_overlay(app):
             p = request.path
             if p not in VIEWER_ALLOWED and not p.startswith('/static') and not any(p.startswith(px) for px in VIEWER_PREFIXES):
                 return redirect('/viewer')
+
+    # ── Share links made by viewers ─────────────────────────────────────
+    # A viewer makes a link only for a stream they may watch themselves, and the
+    # link ends within a day. Only an admin lists links or makes one that never ends.
+
+    @app.before_request
+    def _viewer_share_link_policy():
+        if session.get('role') != 'viewer':
+            return
+        if request.path == '/api/share-links':
+            return jsonify({'error': 'Only an administrator can list share links'}), 403
+        if request.path != '/api/share-links/generate' or request.method != 'POST':
+            return
+        groups = set(session.get('ldap_groups') or [])
+        if not (groups & VIEWER_GROUPS):
+            return jsonify({'error': 'No video access. Contact your administrator.'}), 403
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'error': 'Stream name required'}), 400
+        stream = str(data.get('stream') or '').strip()
+        if not _valid_path(stream):
+            return jsonify({'error': 'Invalid stream name'}), 400
+        # Same lookup as /hls-proxy/: a private parent path makes the stream private.
+        names = {stream, stream.rsplit('/', 1)[0]} if '/' in stream else {stream}
+        vis = _load_visibility()
+        if any(vis.get(n, 'public') == 'private' for n in names) and 'vid_private' not in groups:
+            return jsonify({'error': 'You do not have access to this stream'}), 403
+        ttl = data.get('ttl')
+        if isinstance(ttl, bool) or not isinstance(ttl, int) or not (1 <= ttl <= SHARE_LINK_VIEWER_MAX_SECONDS):
+            return jsonify({'error': 'A link you make lasts at most 24 hours'}), 400
 
     # ── HLS helpers ─────────────────────────────────────────────────────
 

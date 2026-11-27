@@ -39,10 +39,13 @@ APP = (REPO / 'app.py').read_text(encoding='utf-8')
 TREE = ast.parse(APP)
 
 _CONSTS = ('_PORT_GUARD_NAME_RE', 'REMOTE_AUTHENTIK_GUARD_PORTS', 'REMOTE_CLOUDTAK_GUARD_PORTS',
-           '_REMOTE_MODULE_DEPLOYMENT_KEYS', 'SERVICE_DOMAIN_DEFAULTS')
+           '_REMOTE_MODULE_DEPLOYMENT_KEYS', 'SERVICE_DOMAIN_DEFAULTS', '_DOCKER_SOCKET_PATHS',
+           'AUTHENTIK_REDIS_IMAGE')
 _FUNCS = ('_docker_port_guard_files', '_remote_docker_port_guard', '_remote_module_peer_ips',
           '_remote_authentik_port_guard', '_remote_cloudtak_port_guard', '_authentik_loopback_port',
-          '_ensure_authentik_compose_patches', '_remote_cloudtak_guard_ports', '_get_service_domain')
+          '_ensure_authentik_compose_patches', '_remote_cloudtak_guard_ports', '_get_service_domain',
+          '_authentik_volume_is_docker_socket', '_authentik_strip_docker_socket',   # ops #1103
+          '_authentik_redis_image_target')   # ops #1147: the patcher pins an existing redis service
 
 
 def _ns(module_run=None, server_ip=None):
@@ -54,7 +57,8 @@ def _ns(module_run=None, server_ip=None):
               'remote': {'host': ((s.get(k) or {}).get('remote') or {}).get('host', '')}},
           '_local_ram_mb': lambda: 8192,
           '_authentik_pg_command_for_ram': lambda mb: ('postgres -c max_connections=200', 'standard'),
-          '_yaml_duplicate_keys': lambda raw, y: []}
+          '_yaml_duplicate_keys': lambda raw, y: [],
+          '_authentik_redis_seen_version': lambda image: ''}   # ops #1306: no newer redis on this box
     for node in TREE.body:
         if isinstance(node, ast.FunctionDef) and node.name in _FUNCS:
             exec(ast.get_source_segment(APP, node), ns)

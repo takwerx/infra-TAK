@@ -95,6 +95,7 @@ def test_takserver_jail_is_written_reading_its_file():
     ns.update(_makedirs_priv=lambda *a, **k: None,
               _write_priv=lambda p, c, **k: written.__setitem__(p, c),
               _f2b_trusted_ignoreip=lambda extra='': '127.0.0.1/8 ::1',
+              _f2b_docker_twin=lambda primary: '',   # #736, its own test
               _f2b_write_tak_badcert_jail_config=lambda ignoreip='': None)   # its own test
     ns['_f2b_write_tak_jail_config'](20, 300, 3600, '')
     sec = _section(written['/etc/fail2ban/jail.d/infratak-takserver.conf'])
@@ -197,6 +198,7 @@ def test_sshd_falling_back_to_the_journal_names_one_backend(tmp_path):
         '[sshd]\nenabled  = true\nfilter   = sshd\nlogpath  = /nonexistent/auth.log\n'
         'backend  = auto\nmaxretry = 5\n')
     ns = {'re': re, 'os': os, 'subprocess': types.SimpleNamespace(run=_Run())}
+    exec(_func('_f2b_sshd_section_logpath_to_journal'), ns)      # ops #1342: the section-scoped rewrite
     exec(_func('_f2b_selfheal_sshd_backend').replace("'/etc/fail2ban/jail.d'", repr(str(jaild))), ns)
     ns.update(_f2b_is_available=lambda: True, _sudo_wrap=lambda c: c,
               _write_priv=lambda p, c, **k: pathlib.Path(p).write_text(c))

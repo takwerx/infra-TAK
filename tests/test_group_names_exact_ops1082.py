@@ -437,9 +437,11 @@ def test_findings_name_the_group_and_what_it_reads_as(checker):
         'tak_z,vid_private': ['vid_private'],
         'tak_a|b': [],                       # holds the header's own separator
         'tak_Fire;tak_Police': ['tak_Fire'],
+        # ops #1294: every name with a separator is listed (TAK Portal 2.0.42 still
+        # splits on all three), but only a name that reads as another group has reads_as.
+        'tak_Rescue, Station 1': [],
+        'Smith, John': [],
     }
-    # A comma or semicolon in an ordinary name is not reported.
-    assert 'tak_Rescue, Station 1' not in got and 'Smith, John' not in got
 
 
 def test_the_admin_group_is_watched_even_before_it_is_listed(checker):

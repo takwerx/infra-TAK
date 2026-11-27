@@ -1161,7 +1161,11 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
     # ⚠️ Asked with the same project set, so one docker call answers both.
     stranded = instance_is_stranded(ctx, inst, projects)
     running = False
-    if built:
+    # ⚠️ **A stranded deployment is asked too (ops #1266).** Its files are out
+    # of reach, its containers are not, and Docker answers the console exactly
+    # as it does for a built one. Skipping the probe made `running` False for a
+    # deployment that was serving, and the tile read "Stopped" over it.
+    if built or stranded:
         try:
             r = ctx['probe_run'](
                 ['docker', 'inspect', '--format', '{{.State.Running}}',
@@ -2085,7 +2089,8 @@ def agency_admin_group_outcome(ctx, inst, ak_url, ak_headers, plog=None):
     # --- and its way in ----------------------------------------------------- #
     result = atlas_access.ensure(atlas_access.Api(ak_url, ak_headers),
                                  names['authentik_slug'], add=[group_name],
-                                 plog=log)
+                                 plog=log,
+                                 admin_group=global_admin_group(ak_url, ak_headers))
     if result['status'] == 'failed':
         return outcome('failed', 'Could not admit the agency admin group: %s'
                        % result['detail'])
@@ -2141,6 +2146,80 @@ def agency_group_problem(settings, inst):
             'deployment\'s application.' % (group, why))
 
 
+#: Written above `TAKMDM_ADMIN_GROUP`: the groups infra-TAK put there itself, so
+#: the next update can tell them from groups the operator added (issue #14).
+_MANAGED_ADMIN_MARK = '# infra-TAK manages these admin groups: '
+
+
+def merged_admin_groups(current, managed, previously_managed=(), never=()):
+    """The admin groups to write: the managed ones first, then the operator's.
+
+    `current` is what the line holds now. A name from it stays unless infra-TAK
+    put it there before (`previously_managed`) or it may never be an admin
+    group (`never`). Pure, so the rule is tested without a `.env`.
+
+    ⚠️ **`previously_managed` is what makes a rename safe.** When Authentik's
+    superuser group is renamed, the old name is still on the line. Kept as if
+    the operator had added it, a name that no longer means "administrator"
+    would admit whoever is later put in a group of that name.
+    """
+    out = list(managed)
+    drop = set(previously_managed) | set(never)
+    for name in current:
+        if name and name not in out and name not in drop:
+            out.append(name)
+    return out
+
+
+def _last_env_value(body, key):
+    """The value of the last `KEY=` line (the one docker compose uses), or ''."""
+    value = ''
+    for line in body.splitlines():
+        if line.startswith(key + '='):
+            value = line[len(key) + 1:]
+    return value.strip().strip('"').strip("'")
+
+
+def _last_marked(body, mark):
+    value = ''
+    for line in body.splitlines():
+        if line.startswith(mark):
+            value = line[len(mark):]
+    return value
+
+
+def _admin_group_names(value):
+    return [n.strip() for n in (value or '').split(',') if n.strip()]
+
+
+def _previously_managed_admin_groups(body, inst):
+    """The names infra-TAK wrote before: the recorded ones, plus the defaults.
+
+    A `.env` from before the record existed holds only what infra-TAK wrote or
+    what the operator wrote, and the default names are the former.
+    """
+    names = set(_admin_group_names(_last_marked(body, _MANAGED_ADMIN_MARK)))
+    names.add(ADMIN_GROUP)
+    derived = atlas_instances.derive(inst)
+    if derived['slug']:
+        names.add(derived['admin_group'])
+    return names
+
+
+def _never_admin_groups(body, inst):
+    """Groups that must not be on the admin line, whoever put them there.
+
+    ⚠️ The renewal group locked every administrator out once (ops #510): only
+    its service account is in it. A standard-admin group on the admin line
+    makes its members full administrators, which ATLAS warns about.
+    """
+    names = {atlas_renewal.GROUP_NAME, atlas_roster.names(inst)['standard_group']}
+    standard = _last_env_value(body, atlas_roster.ENV_GROUP)
+    if standard:
+        names.add(standard)
+    return names
+
+
 def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
     """Turn on ATLAS's own two admin checks, once it is safe to.
 
@@ -2173,23 +2252,41 @@ def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
     # the agency's administrators with a 403 *after* Authentik had let them
     # through — the confusing half of a lockout, where the proxy says yes and
     # the application says no.
-    wanted = ','.join(admin_groups_for(inst, global_group))
-    if 'TAKMDM_ADMIN_GROUP=' + wanted not in body:
+    #
+    # ⚠️ **Merged, not replaced (ATLAS issue #14).** This used to write exactly
+    # the managed groups, so a group the operator had added (`ATLAS-Admins`)
+    # was dropped on every update — while `atlas_access` kept that group in
+    # the Authentik policy. Authentik let those administrators in and ATLAS
+    # refused them: the same lockout as above, made by an update.
+    managed = admin_groups_for(inst, global_group)
+    current = _admin_group_names(_last_env_value(body, 'TAKMDM_ADMIN_GROUP'))
+    wanted_names = merged_admin_groups(
+        current, managed,
+        previously_managed=_previously_managed_admin_groups(body, inst),
+        never=_never_admin_groups(body, inst))
+    wanted = ','.join(wanted_names)
+    lines_now = [l for l in body.splitlines() if l.startswith('TAKMDM_ADMIN_GROUP=')]
+    if current != wanted_names or len(lines_now) != 1:
         lines = [l for l in body.splitlines()
-                 if not l.startswith('TAKMDM_ADMIN_GROUP=')]
-        lines.append('')
-        lines.append('# SEC_AUDIT (ATLAS) H-1. The Authentik application binding is the')
-        lines.append('# first gate; this makes ATLAS check as well, so the binding being')
-        lines.append('# removed is a lockout rather than a silent promotion of everyone.')
-        lines.append('#')
-        lines.append('# Any one of these is sufficient (ATLAS >= 1.49.0). The agency\'s own')
-        lines.append('# administrators and the global ones are alternatives, never the')
-        lines.append('# same person.')
+                 if not l.startswith('TAKMDM_ADMIN_GROUP=')
+                 and not l.startswith(_MANAGED_ADMIN_MARK)]
+        if not any(l.startswith('# SEC_AUDIT (ATLAS) H-1.') for l in lines):
+            lines.append('')
+            lines.append('# SEC_AUDIT (ATLAS) H-1. The Authentik application binding is the')
+            lines.append('# first gate; this makes ATLAS check as well, so the binding being')
+            lines.append('# removed is a lockout rather than a silent promotion of everyone.')
+            lines.append('#')
+            lines.append('# Any one of these is sufficient (ATLAS >= 1.49.0). The agency\'s own')
+            lines.append('# administrators and the global ones are alternatives, never the')
+            lines.append('# same person. Groups you add to this line are kept on update.')
+        lines.append(_MANAGED_ADMIN_MARK + ','.join(managed))
         lines.append('TAKMDM_ADMIN_GROUP=' + wanted)
         body = '\n'.join(lines) + '\n'
         changed = True
-        plog('✓ ATLAS will require membership of %s'
-             % ' or '.join('"%s"' % n for n in admin_groups_for(inst, global_group)))
+        kept = [n for n in wanted_names if n not in managed]
+        plog('✓ ATLAS will require membership of %s%s'
+             % (' or '.join('"%s"' % n for n in wanted_names),
+                (' (kept your %s)' % ', '.join('"%s"' % n for n in kept)) if kept else ''))
 
     # --- S-1: prove the identity headers came through Caddy -----------------
     if 'TAKMDM_PROXY_AUTH_SECRET=' not in body:
@@ -3010,6 +3107,306 @@ def stranded_deployments(ctx):
             if instance_is_stranded(ctx, inst, projects)]
 
 
+# --------------------------------------------------------------------------- #
+# Re-homing a root-era deployment (ops #1266)
+# --------------------------------------------------------------------------- #
+
+#: Where a box that was flipped from a root console to a non-root one still has
+#: its deployments. `/root` is `drwx------`, so the console cannot enter it.
+ROOT_ERA_DIR = posixpath.join('/root', KEY)
+
+#: One nested deployment: `/root/atlas/<slug>` (the plain one is `default`).
+#: ⚠️ The older sibling layout (`/root/atlas-corona`) is not matched on purpose.
+#: The broker allowlists `/root/atlas/` and nothing beside it, so it could not
+#: move those directories, and it says so in the log rather than guessing.
+_ROOT_ERA_UNIT = re.compile(r'^/root/%s/([a-z]{1,32})$' % KEY)
+
+_COMPOSE_FILE_NAMES = ('docker-compose.yml', 'compose.yaml')
+
+
+def root_era_units():
+    """`[(compose_project, directory)]` for every deployment still under /root.
+
+    ⚠️ **Asked of Docker, not of the filesystem.** The console cannot list
+    `/root`, which is the whole problem. Docker records the directory each
+    compose project was started from, and answers the console exactly as it
+    answers root. A deployment with no containers at all has no record here;
+    it has no stack to manage either.
+    """
+    rc, out = _run_root([
+        'docker', 'ps', '-a', '--format',
+        '{{.Label "com.docker.compose.project"}}\t'
+        '{{.Label "com.docker.compose.project.working_dir"}}'])
+    if rc != 0:
+        return []
+    seen, units = set(), []
+    for line in (out or '').splitlines():
+        project, _, workdir = line.partition('\t')
+        project, workdir = project.strip(), workdir.strip()
+        if (project and workdir and (project, workdir) not in seen
+                and re.fullmatch(r'[a-z0-9][a-z0-9_-]*', project)):
+            seen.add((project, workdir))
+            if _ROOT_ERA_UNIT.match(workdir):
+                units.append((project, workdir))
+    return sorted(units)
+
+
+def _running_containers(project):
+    rc, out = _run_root(['docker', 'ps', '--filter',
+                         'label=com.docker.compose.project=%s' % project,
+                         '--format', '{{.Names}}'])
+    return {n.strip() for n in (out or '').splitlines() if n.strip()} if rc == 0 else set()
+
+
+def _running_services(project):
+    """Compose service names of the containers that are up.
+
+    ⚠️ **Why the move starts these by name and never a bare `up -d`.** ATLAS's
+    compose file also defines its own nginx (`proxy`), which publishes port 80.
+    The module has always started `up -d api` and left it out, because Caddy
+    owns 80 and 443. A bare `up -d` after a move would start it: it fails to
+    bind where Caddy holds the port, and where the port is free it opens a
+    second public listener that nobody asked for. Measured on nuc, ops #1266.
+    """
+    rc, out = _run_root(['docker', 'ps', '--filter',
+                         'label=com.docker.compose.project=%s' % project,
+                         '--format',
+                         '{{.Label "com.docker.compose.service"}}'])
+    names = {n.strip() for n in (out or '').splitlines() if n.strip()} if rc == 0 else set()
+    return sorted(n for n in names if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', n))
+
+
+def _anonymous_volumes(project):
+    """Anonymous volumes held by a project's containers (a 64-hex name).
+
+    ⚠️ **They are why this never runs `compose down`, and why a project that has
+    one is not moved at all.** Removing the container orphans an anonymous
+    volume and the next `up` makes a fresh empty one. ops #346 lost CloudTAK's
+    profiles that way. ATLAS puts its database in a *named* volume, so there
+    should be none; if there is one, something else changed and a person looks.
+    """
+    rc, ids = _run_root(['docker', 'ps', '-a', '--filter',
+                         'label=com.docker.compose.project=%s' % project,
+                         '--format', '{{.ID}}'])
+    if rc != 0:
+        return ['could not list the containers']
+    found = []
+    for cid in ids.split():
+        rc, out = _run_root(['docker', 'inspect', '--format',
+                             '{{range .Mounts}}{{.Type}} {{.Name}}\n{{end}}', cid])
+        for line in (out or '').splitlines():
+            kind, _, name = line.partition(' ')
+            if kind == 'volume' and re.fullmatch(r'[0-9a-f]{64}', name.strip()):
+                found.append(name.strip()[:12])
+    return found
+
+
+def _mounted_under(path, mounts_file='/proc/mounts'):
+    """Whether anything is mounted at or below `path`.
+
+    ⚠️ A deployment from before W230 keeps its store on a loop-mounted image.
+    Moving the directory out from under a mount would break it, so such a
+    deployment is left where it is.
+    """
+    try:
+        with open(mounts_file, encoding='utf-8') as fh:
+            points = [ln.split()[1] for ln in fh if len(ln.split()) > 1]
+    except OSError:
+        return False
+    return any(pt == path or pt.startswith(path + '/') for pt in points)
+
+
+def _volume_device(volume):
+    """`None` = no such volume, `''` = Docker keeps the data itself, else the
+    host directory it is bound to."""
+    rc, out = _run_root(['docker', 'volume', 'inspect', volume,
+                         '--format', '{{.Options.device}}'])
+    if rc != 0:
+        return None
+    dev = (out or '').strip()
+    return '' if dev in ('', '<no value>') else dev
+
+
+def rehome_root_era(ctx, log=None, wait_healthy=90, sleep=time.sleep):
+    """Move every deployment left under /root into the console's home.
+
+    ⚠️ **The startup re-home list in `app.py` did not include ATLAS (ops #1266).**
+    A box flipped to non-root moved TAK Portal, CloudTAK, NetBird, Node-RED,
+    Remote Assist and Authentik, and left ATLAS under `/root/atlas` serving
+    but unmanageable: no update, restart or logs, a tile that said Stopped, and
+    a Deploy button one wrong click from building a second copy.
+
+    ⚠️ **It cannot reuse `_startup_rehome_module`, for two reasons.** That
+    function moves one directory with a compose file in its top level; ATLAS
+    nests one stack per deployment (`/root/atlas/<slug>`), each with its own
+    project and its own key container. And ATLAS's database volume is a
+    *bind* volume whose `device` is `<deployment>/store/pgdata`: a moved
+    directory leaves the volume pointing at the old path, and the next `up`
+    would start Postgres on an empty directory. So the volume is removed
+    (its data is the directory, and `docker volume rm` does not touch it) and
+    made again at the new path, between `stop` and `up`.
+
+    Safety, in the order it matters:
+      * Stop, never `down`, so nothing a container owns is dropped.
+      * Verify before moving, and again after: every container that was up
+        must be up again within `wait_healthy` seconds, or the move is undone.
+      * One deployment at a time, each with its own undo.
+      * Nothing is touched where it cannot be proved safe (a mount inside,
+        an anonymous volume, a volume pointing somewhere unexpected).
+
+    Idempotent: a deployment already under the home is not asked about again.
+    Returns `[(directory, outcome)]`; it never raises.
+    """
+    def _log(msg):
+        if log:
+            log(msg)
+        else:
+            print('[rehome:atlas] %s' % msg, flush=True)
+
+    try:
+        if os.getuid() == 0:
+            return []
+        units = root_era_units()
+        if not units:
+            return []
+        dst_root = posixpath.join(os.path.expanduser('~').rstrip('/'),
+                                  ATLAS_ROOT_DIRNAME)
+        os.makedirs(dst_root, exist_ok=True)
+        results = []
+        for project, src in units:
+            dst = posixpath.join(dst_root, posixpath.basename(src))
+            try:
+                outcome = _rehome_unit(ctx, project, src, dst, _log,
+                                       wait_healthy, sleep)
+            except Exception as exc:  # one deployment must not stop the rest
+                outcome = 'error: %s' % str(exc)[:160]
+            _log('%s: %s' % (src, outcome))
+            results.append((src, outcome))
+        # An empty /root/atlas is only clutter; anything else in it is not ours.
+        if any(o.startswith('moved') for _, o in results):
+            subprocess.run(ctx['_sudo_wrap'](['rmdir', ROOT_ERA_DIR]),
+                           capture_output=True, text=True, timeout=30)
+        return results
+    except Exception as exc:
+        print('[rehome:atlas] skipped (non-fatal): %s' % str(exc)[:160],
+              flush=True)
+        return []
+
+
+def _rehome_unit(ctx, project, src, dst, log, wait_healthy, sleep):
+    sudo = ctx['_sudo_wrap']
+
+    def compose(where, action, timeout=300):
+        # ⚠️ **`-p <project>` on every call (found on test6, ops #1266).** ATLAS's
+        # compose file names its project `takmdm`, so a bare `--project-directory`
+        # addresses the plain deployment whatever directory it is given. An
+        # agency (`takmdm-corona`) was "stopped" in the wrong project, still
+        # running, and the move refused. `_compose` passes `-p` the same way.
+        return ctx['_broker_compose'](where, '-p %s %s' % (project, action),
+                                      timeout=timeout)
+
+    def priv(argv, timeout=300):
+        return subprocess.run(sudo(argv), capture_output=True, text=True,
+                              timeout=timeout)
+
+    if os.path.exists(dst):
+        return 'left alone: %s already exists' % dst
+    if not any(priv(['test', '-f', posixpath.join(src, cf)], 30).returncode == 0
+               for cf in _COMPOSE_FILE_NAMES):
+        return 'left alone: no compose file in it'
+    if _mounted_under(src):
+        return 'left alone: a filesystem is mounted inside it'
+    anon = _anonymous_volumes(project)
+    if anon:
+        return 'left alone: anonymous volume(s) %s would be orphaned' % ', '.join(anon)
+
+    volume = '%s_pgdata' % project
+    old_pg = posixpath.join(src, STORE_DIRNAME, 'pgdata')
+    new_pg = posixpath.join(dst, STORE_DIRNAME, 'pgdata')
+    device = _volume_device(volume)
+    if device and device != old_pg:
+        return 'left alone: %s is bound to %s, not to this deployment' % (volume, device)
+    rebind = bool(device)
+
+    was_up = _running_containers(project)
+    services = _running_services(project)
+    # Only the services that were up, so `proxy` (nginx on port 80) stays off;
+    # `init` is pulled in by `depends_on` as it is for a deploy.
+    up_cmd = 'up -d ' + (' '.join(services) if services else 'api')
+    log('%s: re-homing %s -> %s (%s)' % (
+        project, src, dst,
+        'database volume is re-pointed' if rebind else 'database volume is Docker-managed'))
+
+    def restore(where, bind_dir):
+        """Put the stack back the way it was found, at `where`."""
+        if rebind:
+            _bind_pg_volume(bind_dir, log, volume=volume)
+        if was_up:
+            compose(where, up_cmd)
+
+    # 1) Stop (keeps containers and volumes).
+    compose(src, 'stop')
+    if _running_containers(project):
+        compose(src, up_cmd)
+        return 'left alone: the stack would not stop (nothing was moved)'
+
+    # 2) A bind volume cannot be re-pointed while a container still names it.
+    if rebind:
+        compose(src, 'rm -f')
+        rc, out = _run_root(['docker', 'volume', 'rm', volume])
+        if rc != 0:
+            compose(src, up_cmd)
+            return 'left alone: could not release %s (%s)' % (volume, out.strip()[:100])
+
+    # 3) Move, hand over what root made, relabel.
+    mv = priv(['mv', src, dst], 180)
+    if mv.returncode != 0 or not os.path.isdir(dst):
+        restore(src, old_pg)
+        return 'left alone: move failed (%s)' % (mv.stderr or '')[:100]
+    priv(['chown', '-R', '-h', '--from=root:root', 'takwerx:takwerx', dst])
+    if (ctx.get('os_type') and ctx['os_type']() == 'rhel'):
+        priv(['restorecon', '-R', dst])
+    fixed = ctx['_rehome_rewrite_paths'](dst, src, dst)
+    if fixed:
+        log('rewrote %s -> %s in %s' % (src, dst, ', '.join(fixed)))
+
+    def undo(why):
+        log('%s: ROLLING BACK (%s)' % (project, why))
+        compose(dst, 'stop')
+        if rebind:
+            compose(dst, 'rm -f')
+            _run_root(['docker', 'volume', 'rm', volume])
+        ctx['_rehome_rewrite_paths'](dst, dst, src)
+        back = priv(['mv', dst, src], 180)
+        if back.returncode == 0:
+            priv(['chown', '-R', '-h', '--from=takwerx:takwerx', 'root:root', src])
+            if (ctx.get('os_type') and ctx['os_type']() == 'rhel'):
+                priv(['restorecon', '-R', src])
+            restore(src, old_pg)
+            return 'rolled back: %s' % why
+        return 'CRITICAL: %s and the move back failed; check %s and %s by hand' % (
+            why, src, dst)
+
+    # 4) Point the database volume at its new directory.
+    if rebind:
+        err = _bind_pg_volume(new_pg, log, volume=volume)
+        if err:
+            return undo(err[:120])
+
+    # 5) Up from the new home, and prove it: everything that was up is up.
+    if was_up:
+        compose(dst, up_cmd)
+        for _ in range(max(1, int(wait_healthy // 3))):
+            if was_up <= _running_containers(project):
+                break
+            sleep(3)
+        missing = was_up - _running_containers(project)
+        if missing:
+            return undo('%s did not come back within %ss' % (
+                ', '.join(sorted(missing)), wait_healthy))
+    return 'moved (non-root manageable)'
+
+
 #: The one directory every deployment lives inside.
 #:
 #: ⚠️ The name matters: it is what the broker allowlists, and what its
@@ -3130,9 +3527,16 @@ def detect(ctx):
     # ⚠️ No `probe_version` here. See `instance_status`: this must answer in
     # under a second, and an HTTP round-trip per deployment would make ATLAS's
     # tile report its own containers' latency.
-    statuses = [instance_status(ctx, i, compose_projects_present(ctx))
-                for i in load_instances(ctx)]
-    live = [st for st in statuses if st['built']]
+    projects = compose_projects_present(ctx)
+    statuses = [instance_status(ctx, i, projects) for i in load_instances(ctx)]
+    # ⚠️ **Built, or stranded (ops #1266).** A box flipped from root to non-root
+    # whose ATLAS was not re-homed has containers the console cannot see files
+    # for: `built` is False (it asks the filesystem) and `stranded` is True (it
+    # asks Docker). Counting only `built` left `live` empty, so `running` was
+    # False and the tile said Stopped over a deployment that was serving. A
+    # stranded deployment that is really down still holds the tile down, which
+    # is the honest reading; one that is up no longer does.
+    live = [st for st in statuses if st['built'] or st['stranded']]
     running = bool(live) and all(st['running'] for st in live)
 
     # Self-heal: the container is up but the flag was lost (a settings file
@@ -3711,6 +4115,19 @@ def deploy(ctx, job, params):
                 refusal[1].strip() + ' Nothing was changed. Switch the ATLAS '
                 'channel back to the one this deployment came from, then press '
                 'Update.')
+
+        # ⚠️ **A dump before the checkout moves, as Update takes one (ops #1340).** Deploy on a
+        # built deployment checks out the release and rebuilds `api`, which migrates the database
+        # forward, and until now it took no dump: the one button that rebuilds on top of data had
+        # no way back. Only for a deployment that finished a deploy before (its commit is
+        # recorded after the containers are up) and whose containers exist: a first deploy that
+        # failed halfway holds no data worth keeping, and refusing its repair would trap it.
+        if (_built and settings.get(f'{_prefix}commit_sha') and
+                os.path.isdir(os.path.join(dirpath, '.git')) and
+                instance_is_built(ctx, _inst)):
+            plog('')
+            plog('━━━ Backing up the database first ━━━')
+            backup_database(ctx, _inst, _dump_version(ctx, _inst, _built, plog), plog)
 
         if os.path.isdir(os.path.join(dirpath, '.git')):
             plog(f'  Already cloned at {dirpath} — fetching {tag}')
@@ -5062,7 +5479,8 @@ def _reconcile_roster(ctx, inst, plog):
         except Exception as exc:
             plog('  ⚠ ATLAS version not read: %s' % str(exc)[:80])
         atlas_roster.admit(ctx, inst, dirpath, installed, running, plog,
-                           restarted=restarted, container_group=container_group)
+                           restarted=restarted, container_group=container_group,
+                           admin_group=_global_admin_group(ctx))
     except Exception as exc:
         plog('  ⚠ Could not check the standard admins\' access: %s' % str(exc)[:80])
 
@@ -5446,7 +5864,8 @@ def _run_update(ctx, inst=None):
         slot['log'] = list(log)
         print('[' + _me['name'] + '] update: ' + msg, flush=True)
 
-    slot.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    slot.update({'running': True, 'complete': False, 'error': False, 'log': [],
+                 'refused': False})
     try:
         dirpath = _me['dir']
         if not os.path.isdir(os.path.join(dirpath, '.git')):
@@ -5475,7 +5894,8 @@ def _run_update(ctx, inst=None):
             for line in refusal:
                 plog(line)
             _reconcile_access(ctx, inst, plog)
-            slot.update({'running': False, 'complete': True, 'error': False})
+            # ops #1340: complete, but NOT updated. Update All reads this flag.
+            slot.update({'running': False, 'complete': True, 'error': False, 'refused': True})
             return
         if here and there and there == here:
             unfinished = _unfinished_update(ctx, inst, dirpath, _prefix, target)
@@ -5534,7 +5954,7 @@ def _run_update(ctx, inst=None):
         # ops #864: a database backup BEFORE anything changes. ATLAS 2.x migrates forward only, so
         # without a dump an update that goes wrong has no way back. No backup, no update.
         plog('━━━ Backing up the database first ━━━')
-        backup_database(ctx, inst, current, plog)
+        backup_database(ctx, inst, _dump_version(ctx, inst, current, plog), plog)
 
         tag = 'v' + target
         plog('━━━ Step 1/3: Fetching ' + tag + ' ━━━')
@@ -5694,6 +6114,28 @@ def _run_pg_dump(cid):
     return p.returncode, p.stdout or b'', (p.stderr or b'').decode('utf-8', 'replace')
 
 
+def _dump_version(ctx, inst, installed, plog=None):
+    """The release the database was last written by, for naming a dump (ops #1340).
+
+    ⚠️ **The checkout moves first and proves nothing about the data.** After an update died
+    mid-rebuild the VERSION file already reads the NEW release, so a retry named its dump (and
+    its "go back to" commands) for the new release while the data was still the old one's.
+    The running container is the witness: ATLAS migrates its database when the new api starts,
+    so a container still answering with an OLDER release has not migrated anything. Anything
+    else (no answer, or the same release) keeps the on-disk version: restoring a dump onto the
+    newer release is the safe direction, onto an older one it is not.
+    """
+    here = _parse_version(installed)
+    running = _running_version(ctx, inst)
+    there = _parse_version(running)
+    if here and there and there < here:
+        if plog:
+            plog('  The running container is still on v%s (the source on disk is v%s), so this '
+                 'backup is named for v%s.' % (running, installed, running))
+        return running
+    return installed
+
+
 def backup_paths(ctx, inst):
     """(folder holding this deployment's dumps, compose `-p` flag or '')."""
     paths = instance_paths(ctx, inst)
@@ -5738,6 +6180,12 @@ def backup_database(ctx, inst, version, plog):
             'to 1.x without a backup.' % exc)
     size = os.path.getsize(path)
     plog('✓ Database backed up (%.1f MB) before the update' % (size / 1048576.0))
+    # ops #1340: on a retry, say the dump from before the interrupted attempt is still there.
+    _mine = atlas_backup._clean_version(version or 'unknown')
+    _earlier = [b for b in atlas_backup.list_backups(folder) if b['version'] != _mine]
+    if _earlier:
+        plog('  The backup from the earlier release v%s is kept too: %s'
+             % (_earlier[0]['version'], _earlier[0]['path']))
     for line in atlas_backup.describe(paths['dir'], flag, path, version or ''):
         plog(line)
     return path
@@ -5902,6 +6350,10 @@ def converge_access(ctx, ak_url, ak_headers, log):
         log('ATLAS access: could not read the deployments: %s' % str(exc)[:80])
         return out
     api = atlas_access.Api(ak_url, ak_headers)
+    # ⚠️ The superuser group as Authentik has it (ops #1289), asked once and
+    # only when a deployment's application is there: a box with no ATLAS makes
+    # no Authentik call here at all.
+    admin_group = None
     for inst in instances:
         names = atlas_instances.derive(inst)
         name = names['name']
@@ -5919,8 +6371,10 @@ def converge_access(ctx, ak_url, ak_headers, log):
                 out[name] = 'skipped'
                 continue
             add = [names['admin_group']] if names['slug'] else []
-            out[name] = atlas_access.ensure(api, app_slug, add=add,
-                                            plog=say)['status']
+            if admin_group is None:
+                admin_group = global_admin_group(ak_url, ak_headers)
+            out[name] = atlas_access.ensure(api, app_slug, add=add, plog=say,
+                                            admin_group=admin_group)['status']
         except Exception as exc:
             say('⚠ access policy not checked: %s' % str(exc)[:80])
             out[name] = 'failed'
@@ -6023,6 +6477,7 @@ def _run_update_all(ctx):
     _update_all_status.update({'running': True, 'complete': False,
                                'error': False, 'log': [], 'results': []})
     results = []
+    refused = []
     try:
         found = load_instances(ctx)
         projects = compose_projects_present(ctx)
@@ -6042,6 +6497,16 @@ def _run_update_all(ctx):
                 log.append('    ' + line)
             _update_all_status['log'] = list(log)
             ok = bool(slot['complete']) and not slot['error']
+            if ok and slot.get('refused'):
+                # ops #1340: a refused downgrade is not an update. It was reported "updated
+                # to <the newer version it already had>", which read as a success.
+                refused.append(name)
+                results.append({
+                    'name': name, 'slug': inst.get('slug'), 'ok': None,
+                    'detail': 'not updated: it is newer than the channel offers (see the log above)',
+                })
+                _update_all_status['results'] = list(results)
+                continue
             results.append({
                 'name': name, 'slug': inst.get('slug'), 'ok': ok,
                 'detail': ('updated to ' + (_installed_version(ctx, inst) or '?')
@@ -6053,6 +6518,9 @@ def _run_update_all(ctx):
             plog('✗ %d of %d deployment(s) failed: %s'
                  % (len(failed), len(results),
                     ', '.join(r['name'] for r in failed)))
+        elif refused:
+            plog('— %d deployment(s) not updated, newer than the channel offers: %s'
+                 % (len(refused), ', '.join(refused)))
         else:
             plog('✓ Every finished deployment is on the newest release')
         # ⚠️ `complete` is true either way: the run finished. `error` says
