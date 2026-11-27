@@ -125872,7 +125872,7 @@ def _startup_converge_f2b_watch():
     except PermissionError:
         pass
     except Exception as _e:
-        print('Startup migration: fail2ban watch converge warning (non-fatal): %s' % _e,
+        print('Startup migration: fail2ban watch converge warning (non-fatal, %s)' % type(_e).__name__,
               flush=True)
 
 
@@ -125930,7 +125930,8 @@ def _fail2ban_add_guarddog_hook(plog):
         if _f2b_watch_ensure():
             plog("fail2ban guarddog hook: watch timer (login after failed guesses, fail2ban failing) started")
     except Exception as _we:
-        plog(f"fail2ban guarddog hook: watch timer not started (non-fatal): {_we}")
+        plog(f"fail2ban guarddog hook: watch timer not started (non-fatal, {type(_we).__name__}); "
+             "the console start-up check will try again")
 
     # ── Step 2: fail2ban action definition ────────────────────────────────────
     # %% in ini = literal % after ConfigParser interpolation → shell %
