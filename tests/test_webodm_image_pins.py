@@ -175,8 +175,9 @@ def test_startup_migration_skips_a_root_box_without_webodm():
 def test_update_writes_the_pins_before_pulling():
     body = ast.get_source_segment(APP, next(
         n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == '_run_webodm_update'))
-    assert body.index('_webodm_pin_images(') < body.index("_webodm_compose(wo_dir, 'pull'")
-    assert '_write_priv(compose_path' in body
+    # ops #1328: the pins go to the shared routine, which pulls them from a side file and writes
+    # the compose last (see test_webodm_v4_upgrade_ops579.py for the order on a box)
+    assert body.index('_webodm_pin_images(') < body.index('_webodm_move_to_new_images(')
 
 
 def test_update_offered_against_the_pin_not_upstream_latest():

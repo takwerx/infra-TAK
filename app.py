@@ -65162,6 +65162,7 @@ WEBODM_DB_VOLUME = '/var/lib/postgresql/data'   # the db/ bind mount inside wo_d
 WEBODM_DB_DUMP_PREFIX = 'backup-infratak-'
 WEBODM_UPGRADE_WAIT_S = 1200   # DB upgrade + first 4.x start; WebODM DBs are small (metadata only)
 WEBODM_PULL_TIMEOUT_S = 1800   # 3.x → 4.x pulls about 6 GB; 300 s ran out on test6 (10.3.10 T&E)
+WEBODM_PENDING_COMPOSE = 'docker-compose.pending.yml'   # the new compose, until its images are pulled and the 9.5 dump is made (ops #1328)
 
 
 # Never move a box DOWN onto a pin (ops #1307, same trap as ops #1306). A pin move that goes
@@ -65675,6 +65676,27 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     plog(f'  {(dv or "").strip()}')
     _remote_docker_group(deploy_cfg, plog)
 
+    # ops #1328: a redeploy on a remote host that still runs WebODM 3.x (database on PostgreSQL
+    # 9.5) starts the one-way upgrade with the 4.x images. Same room check and dump as Update,
+    # before anything on the host changes; a data version we do not know stops it here.
+    old_compose = None
+    db_upgrade = False
+    try:
+        has_compose, _ = _module_run(deploy_cfg, f'test -f {compose_path_remote}', timeout=15)
+        if has_compose:
+            ok, old_compose = _module_run(deploy_cfg, f'cat {compose_path_remote}', timeout=15)
+            if not ok or not (old_compose or '').strip():
+                raise RuntimeError(f'could not read {compose_path_remote} on the remote host. Nothing was changed.')
+            plog('━━━ Checking the WebODM database version (remote) ━━━')
+            db_upgrade = _webodm_db_needs_upgrade(wo_dir_remote, cfg=deploy_cfg)
+            if db_upgrade:
+                plog('  This redeploy upgrades the WebODM database (PostgreSQL 9.5 → 18). A backup is made first.')
+                _webodm_prepare_db_upgrade(wo_dir_remote, old_compose, plog, cfg=deploy_cfg)
+    except Exception as e:
+        plog(f'✗ {e}')
+        _webodm_deploy_status.update({'running': False, 'error': str(e)})
+        return
+
     # Create directory structure on remote
     plog('━━━ Creating directories (remote) ━━━')
     # local_settings.py must exist before `compose up` — Docker would otherwise
@@ -65734,20 +65756,7 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         f'      - "0.0.0.0:{wo_port}:8000"',
     )
     compose_content = wo_compose
-    import tempfile as _tf
-    with _tf.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as tf:
-        tf.write(compose_content)
-        tmp_compose = tf.name
-    ok1, _ = _module_copy(deploy_cfg, tmp_compose, compose_path_remote, log_fn=plog)
-    try:
-        os.unlink(tmp_compose)
-    except Exception:
-        pass
-    if not ok1:
-        plog('✗ Failed to copy docker-compose.yml to remote')
-        _webodm_deploy_status.update({'running': False, 'error': True})
-        return
-    plog('✓ docker-compose.yml written')
+    plog('✓ docker-compose.yml ready (written after the images are pulled)')
 
     # ops #629: lock the WebODM port to the console BEFORE the container publishes it. The ufw
     # lines further down never applied (Docker's published ports skip ufw), so the port was
@@ -65760,18 +65769,16 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         _webodm_deploy_status.update({'running': False, 'error': True})
         return
 
-    # Pull images on remote
-    plog('━━━ Pulling WebODM images (remote — may take several minutes) ━━━')
-    ok, out = _module_run(deploy_cfg, f'docker compose -f {compose_path_remote} pull 2>&1', timeout=600, log_fn=plog)
-    if not ok:
-        plog(f'  Pull warning (non-fatal): {(out or "")[-200:]}')
-
-    # Start containers on remote
-    plog('━━━ Starting WebODM containers (remote) ━━━')
-    ok, out = _module_run(deploy_cfg, f'docker compose -f {compose_path_remote} up -d 2>&1', timeout=120, log_fn=plog)
-    if not ok:
-        plog(f'✗ docker compose up failed: {(out or "")[-300:]}')
-        _webodm_deploy_status.update({'running': False, 'error': True})
+    # ops #1328: pull from a side file, dump a 3.x database, then write the compose and start,
+    # in the one routine Update uses. The pull is no longer non-fatal and no longer cut at 600 s
+    # (a 3.x to 4.x pull is about 6 GB), and `up -d` no longer runs on a half-pulled set.
+    plog('━━━ Pulling WebODM images and starting the containers (remote — may take several minutes) ━━━')
+    try:
+        _webodm_move_to_new_images(wo_dir_remote, compose_path_remote, old_compose, compose_content,
+                                   db_upgrade, plog, cfg=deploy_cfg)
+    except Exception as e:
+        plog(f'✗ {e}')
+        _webodm_deploy_status.update({'running': False, 'error': str(e)})
         return
     plog('✓ WebODM containers started')
 
@@ -65874,6 +65881,19 @@ def _run_webodm_deploy(settings):
         _webodm_deploy_status.update({'running': False, 'error': True})
         return
     try:
+        # ops #1328: a Reapply on a 3.x box (database on PostgreSQL 9.5) starts the one-way upgrade
+        # to 18 with the 4.x images, so it gets the same room check and dump as Update, before
+        # anything on the box changes. A data version this console does not know stops it here.
+        old_compose = None
+        db_upgrade = False
+        if os.path.exists(compose_path):
+            old_compose = _read_priv(compose_path)
+            plog('Checking the WebODM database version…')
+            db_upgrade = _webodm_db_needs_upgrade(wo_dir)
+            if db_upgrade:
+                plog('This Reapply upgrades the WebODM database (PostgreSQL 9.5 → 18). A backup is made first.')
+                _webodm_prepare_db_upgrade(wo_dir, old_compose, plog)
+
         plog('Creating directories…')
         for sub in ['', 'plugins', 'media', 'db']:
             os.makedirs(os.path.join(wo_dir, sub) if sub else wo_dir, exist_ok=True)
@@ -65932,15 +65952,6 @@ def _run_webodm_deploy(settings):
             wo_odm_mem=_odm_mem,
             images=WEBODM_IMAGES,
         )
-        with open(compose_path, 'w') as f:
-            f.write(compose_content)
-
-        plog('Pulling images (this may take several minutes)…')
-        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'pull']),
-                    capture_output=True, text=True, timeout=300,
-                    cwd=wo_dir)
-        if r.returncode != 0:
-            plog(f'Pull warning (non-fatal): {r.stderr[:200]}')
 
         plog('Hardening firewall — blocking direct access to WebODM ports…')
         if _distro_family() == 'rhel':
@@ -65954,11 +65965,10 @@ def _run_webodm_deploy(settings):
             for _wo_ufw_port in [wo_port, 3001]:
                 _sp.run(_sudo_wrap(['ufw', 'deny', f'{_wo_ufw_port}/tcp']), capture_output=True)
 
-        plog('Starting WebODM containers…')
-        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'up', '-d']),
-                    capture_output=True, text=True, timeout=120, cwd=wo_dir)
-        if r.returncode != 0:
-            raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
+        # ops #1328: pull, dump (3.x data) and only then write the compose and start, in the one
+        # routine Update uses. A pull that fails or times out stops the deploy with the old compose
+        # still on disk.
+        _webodm_move_to_new_images(wo_dir, compose_path, old_compose, compose_content, db_upgrade, plog)
 
         plog('Waiting for WebODM to become ready (up to 90 s)…')
         import time as _time
@@ -66141,38 +66151,101 @@ def _webodm_dir():
         pass
     return home
 
-def _webodm_compose(wo_dir, action, timeout=300):
+class _WebodmResult:
+    """What a WebODM command gave back, the same shape for a local run and an SSH run."""
+    def __init__(self, returncode=0, stdout='', stderr=''):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def _webodm_remote(cfg):
+    return bool(cfg) and cfg.get('target_mode') == 'remote'
+
+
+def _webodm_run(cfg, argv, timeout=60):
+    """Run one command on the WebODM host: this box (through the broker on a non-root console),
+    or the remote host of a remote deploy (cfg = its deployment config, over SSH)."""
+    if _webodm_remote(cfg):
+        ok, out = _module_run(cfg, ' '.join(shlex.quote(a) for a in argv), timeout=timeout)
+        return _WebodmResult(0 if ok else 1, out or '', '')
+    return subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout)
+
+
+def _webodm_compose(wo_dir, action, timeout=300, cfg=None):
     """Run `docker compose <action>` in the WebODM dir via the broker — root reaches /root on a
-    flipped box (takwerx can't); --project-directory replaces the old bash-cd (denied)."""
+    flipped box (takwerx can't); --project-directory replaces the old bash-cd (denied). With
+    `cfg` of a remote deploy it runs on the remote host."""
+    if _webodm_remote(cfg):
+        return _webodm_run(cfg, ['docker', 'compose', '--project-directory', wo_dir] + shlex.split(action),
+                           timeout=timeout)
     return _broker_compose(wo_dir, action, timeout=timeout)
 
-def _webodm_db_sh(cmd, timeout=60):
+
+def _webodm_put_file(cfg, path, content):
+    """Write a file on the WebODM host (the remote host over scp for a remote deploy)."""
+    if not _webodm_remote(cfg):
+        _write_priv(path, content)
+        return
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as tf:
+        tf.write(content)
+        tmp = tf.name
+    try:
+        ok, _ = _module_copy(cfg, tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if not ok:
+        raise RuntimeError(f'could not write {path} on the remote host')
+
+
+def _webodm_db_sh(cmd, timeout=60, cfg=None):
     """Run `sh -c cmd` as postgres inside wo_db (through the broker on a non-root box)."""
-    return subprocess.run(_sudo_wrap(['docker', 'exec', '-u', 'postgres', 'wo_db', 'sh', '-c', cmd]),
-                          capture_output=True, text=True, timeout=timeout)
+    return _webodm_run(cfg, ['docker', 'exec', '-u', 'postgres', 'wo_db', 'sh', '-c', cmd], timeout=timeout)
 
 
-def _webodm_db_needs_upgrade(wo_dir):
-    """True when wo_db holds a PostgreSQL 9.5 data dir (WebODM 3.x) that the 4.x image will
-    upgrade, False when it is already on 18. Starts wo_db first if it is down. Raises when the
-    database can't be read: Update must not start a one-way upgrade it can't back up."""
+def _webodm_db_data_probe():
+    """Shell text that prints what the db volume holds: `18`, `9.5` (or another version read from
+    PG_VERSION), the numbers of any other version folders, or `none` for an empty volume."""
     v = WEBODM_DB_VOLUME
-    probe = f'if [ -s {v}/18/PG_VERSION ]; then echo 18; else cat {v}/PG_VERSION; fi'
-    for attempt in range(13):
-        r = _webodm_db_sh(probe, timeout=15)
-        ver = (r.stdout or '').strip()
-        if r.returncode == 0 and ver:
-            return ver == '9.5'
-        if attempt == 0:
-            _webodm_compose(wo_dir, 'up -d wo_db', timeout=120)
-        time.sleep(5)
-    raise RuntimeError('could not read the WebODM database version (is wo_db running?). Nothing was changed.')
+    return (f'if [ -s {v}/18/PG_VERSION ]; then echo 18; elif [ -s {v}/PG_VERSION ]; then cat {v}/PG_VERSION; '
+            f'else o=$(cd {v} && for d in [0-9]*; do [ -s "$d/PG_VERSION" ] && printf "%s " "$d"; done); '
+            f'echo "${{o:-none}}"; fi')
 
 
-def _webodm_db_room_check(plog):
+def _webodm_db_needs_upgrade(wo_dir, cfg=None):
+    """True when the WebODM database is PostgreSQL 9.5 (WebODM 3.x), which the 4.x image upgrades
+    one way on its first start; False when it is already on 18 or the volume is empty. Raises when
+    the data can't be read or holds any other version: Deploy and Update must not start a one-way
+    upgrade they can't back up, and a version we don't know would start under the 18 image.
+    Reads the volume inside the running wo_db, else in a one-off container with a shell as its
+    entrypoint (no database start, so no upgrade, whatever image the compose file names)."""
+    probe = _webodm_db_data_probe()
+    ver = ''
+    r = _webodm_db_sh(probe, timeout=30, cfg=cfg)
+    if r.returncode == 0 and (r.stdout or '').strip():
+        ver = (r.stdout or '').strip().splitlines()[-1].strip()
+    else:
+        script = probe.replace("'", "'\\''")
+        r = _webodm_compose(wo_dir, f"run --rm --no-deps -T --entrypoint sh wo_db -c '{script}'",
+                            timeout=600, cfg=cfg)
+        if r.returncode == 0 and (r.stdout or '').strip():
+            ver = (r.stdout or '').strip().splitlines()[-1].strip()
+    if not ver:
+        raise RuntimeError('could not read the WebODM database version. Nothing was changed.')
+    if ver == '9.5':
+        return True
+    if ver in ('18', 'none'):
+        return False
+    raise RuntimeError(f'the WebODM database holds PostgreSQL data this console does not know how to move '
+                       f'(version {ver[:20]}). Nothing was changed. Ask for help on GitHub before pressing '
+                       f'Update or Reapply again.')
+
+
+def _webodm_db_room_check(plog, cfg=None):
     """Before the 9.5 → 18 upgrade: raise (nothing changed yet) unless the db volume has room."""
     v = WEBODM_DB_VOLUME
-    r = _webodm_db_sh(f'du -sk {v}; df -Pk {v}', timeout=120)
+    r = _webodm_db_sh(f'du -sk {v}; df -Pk {v}', timeout=120, cfg=cfg)
     try:
         lines = r.stdout.strip().splitlines()
         used_kb, free_kb = int(lines[0].split()[0]), int(lines[-1].split()[3])
@@ -66188,50 +66261,72 @@ def _webodm_db_room_check(plog):
                            + _FREE_SPACE_BACKUPS_HINT)
 
 
-def _webodm_backup_db_95():
+def _webodm_prepare_db_upgrade(wo_dir, old_compose, plog, cfg=None):
+    """Before the 9.5 → 18 move, with nothing changed yet: make sure the 9.5 database is running
+    (the room check and the dump run inside it), then check there is room. A stopped wo_db is
+    started from the compose file on disk, but only while that file still names the old image:
+    started from a compose that names the 4.x image it would begin the one-way upgrade itself,
+    with no dump (a half-finished earlier update leaves that state)."""
+    for attempt in range(13):
+        r = _webodm_db_sh('true', timeout=15, cfg=cfg)
+        if r.returncode == 0:
+            break
+        if attempt == 0:
+            if re.search(r'^    image: webodm/webodm_db:18', old_compose or '', re.M):
+                raise RuntimeError('WebODM\'s database is stopped and its compose file already names the new '
+                                   'WebODM version (an earlier update did not finish). Nothing was changed. '
+                                   'Start it with: docker start wo_db, then press Update or Reapply again.')
+            _webodm_compose(wo_dir, 'up -d wo_db', timeout=120, cfg=cfg)
+        time.sleep(5)
+    else:
+        raise RuntimeError('could not start the WebODM database to back it up. Nothing was changed.')
+    _webodm_db_room_check(plog, cfg)
+
+
+def _webodm_backup_db_95(cfg=None):
     """pg_dumpall the 9.5 database into the db volume root (the upgrade leaves `backup-*` names
     in place) and check the dump holds WebODM's database. Returns its path under the WebODM dir."""
     v = WEBODM_DB_VOLUME
     name =f'{WEBODM_DB_DUMP_PREFIX}{time.strftime("%Y%m%d-%H%M%S")}-pg95.sql'
     r = _webodm_db_sh(f'pg_dumpall -U postgres -f {v}/{name} && gzip {v}/{name} && '
-                      f'gzip -cd {v}/{name}.gz | grep -c "^CREATE DATABASE webodm_dev"', timeout=1800)
-    if r.returncode != 0 or (r.stdout or '').strip() != '1':
+                      f'gzip -cd {v}/{name}.gz | grep -c "^CREATE DATABASE webodm_dev"', timeout=1800, cfg=cfg)
+    if r.returncode != 0 or (r.stdout or '').strip().splitlines()[-1:] != ['1']:
         raise RuntimeError(f'database backup failed: {(r.stderr or r.stdout or "")[:300]}')
     return f'db/{name}.gz'
 
 
-def _webodm_answers():
+def _webodm_answers(cfg=None):
     """True when Django in the webapp container answers HTTP. WebODM 4.x answers /api/ with
     403 to a caller that isn't signed in (3.x: 200), so `curl -f` reads a healthy 4.x as down."""
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'webapp', 'curl', '-s', '-o', '/dev/null',
-                                       '-w', '%{http_code}', '--max-time', '5', 'http://localhost:8000/api/']),
-                           capture_output=True, text=True, timeout=20)
+        r = _webodm_run(cfg, ['docker', 'exec', 'webapp', 'curl', '-s', '-o', '/dev/null',
+                              '-w', '%{http_code}', '--max-time', '5', 'http://localhost:8000/api/'], timeout=20)
     except Exception:
         return False
-    return r.returncode == 0 and (r.stdout or '').strip()[:1] in ('2', '3', '4')
+    out = (r.stdout or '').strip().splitlines()[-1:]
+    return r.returncode == 0 and bool(out) and out[0][:1] in ('2', '3', '4')
 
 
-def _webodm_wait_upgraded(deadline_s):
+def _webodm_wait_upgraded(deadline_s, cfg=None):
     """Wait for the first 4.x start: (True, '') once the webapp answers, (False, why) when the
     DB upgrade reports a failure or the time runs out."""
     end = time.time() + deadline_s
     while time.time() < end:
-        r = subprocess.run(_sudo_wrap(['docker', 'logs', 'wo_db']), capture_output=True, text=True, timeout=30)
+        r = _webodm_run(cfg, ['docker', 'logs', 'wo_db'], timeout=30)
         if 'UPGRADE FAILED' in (r.stdout or '') + (r.stderr or ''):
             return False, 'the database upgrade failed (details: db/upgrade.log)'
-        if _webodm_answers():
+        if _webodm_answers(cfg):
             return True, ''
         time.sleep(15)
     return False, f'WebODM did not answer within {deadline_s // 60} minutes'
 
 
-def _webodm_restore_95(wo_dir, compose_path, old_compose, plog):
-    """Undo a failed 3.x → 4.x Update: put the untouched 9.5 copy (db/backup-9.5) back in the
+def _webodm_restore_95(wo_dir, compose_path, old_compose, plog, cfg=None):
+    """Undo a failed 3.x → 4.x move: put the untouched 9.5 copy (db/backup-9.5) back in the
     volume root, rewrite the old compose and start 3.x again. Runs in a one-off wo_db container
     (the 18 image has bash) so the console never touches the uid-999 data dir itself."""
     plog('Putting the previous WebODM version back…')
-    _webodm_compose(wo_dir, 'stop', timeout=180)
+    _webodm_compose(wo_dir, 'stop', timeout=180, cfg=cfg)
     v = WEBODM_DB_VOLUME
     # The copy is renamed once restored: the next upgrade reuses a `backup-9.5` it finds instead
     # of copying again, and this one would miss whatever 3.x writes from now on.
@@ -66239,17 +66334,81 @@ def _webodm_restore_95(wo_dir, compose_path, old_compose, plog):
               f'find . -mindepth 1 -maxdepth 1 ! -name "backup-*" ! -name upgrade.log ! -name lost+found '
               f'-exec rm -rf {{}} +; cp -a backup-9.5/. .; mv backup-9.5 backup-9.5-restored-$(date +%Y%m%d%H%M%S); '
               f'fi; test "$(cat PG_VERSION)" = 9.5')
-    r = _webodm_compose(wo_dir, f"run --rm --no-deps -T --entrypoint bash wo_db -c '{script}'", timeout=1800)
+    r = _webodm_compose(wo_dir, f"run --rm --no-deps -T --entrypoint bash wo_db -c '{script}'", timeout=1800, cfg=cfg)
     if r.returncode != 0:
-        raise RuntimeError(f'could not put the 9.5 database back: {(r.stderr or "")[:300]}. '
+        raise RuntimeError(f'could not put the 9.5 database back: {(r.stderr or r.stdout or "")[:300]}. '
                            f'The untouched copy is in db/backup-9.5 and the dump in db/{WEBODM_DB_DUMP_PREFIX}*.')
-    _write_priv(compose_path, old_compose)
-    r = _webodm_compose(wo_dir, 'up -d', timeout=180)
+    _webodm_put_file(cfg, compose_path, old_compose)
+    r = _webodm_compose(wo_dir, 'up -d', timeout=180, cfg=cfg)
     if r.returncode != 0:
-        raise RuntimeError(f'docker compose up failed: {(r.stderr or "")[:300]}')
-    ok, _why = _webodm_wait_upgraded(300)
+        raise RuntimeError(f'docker compose up failed: {(r.stderr or r.stdout or "")[:300]}')
+    ok, _why = _webodm_wait_upgraded(300, cfg)
     plog('  ✓ Previous WebODM version is running again with its data' if ok else
          '  ⚠ Previous WebODM version started but does not answer yet — check: docker logs webapp')
+
+
+def _webodm_move_to_new_images(wo_dir, compose_path, old_compose, new_compose, db_upgrade, plog, cfg=None):
+    """The one way every path (Update, Deploy/Reapply, remote deploy) puts the new WebODM images
+    on a box (ops #1328). The compose file on disk is written LAST: the new images are pulled
+    from a side file, and the 9.5 database is dumped, before it changes. A console that dies
+    during the pull or the dump leaves the compose on what the box runs, so no later `up -d`
+    (Reapply, restart) can start the one-way upgrade with no room check and no backup.
+    `old_compose` is None on a fresh install. Raises with plain words; the previous version and
+    its data are back before it does, when the failure came after the upgrade could have begun."""
+    pending = f'{wo_dir}/{WEBODM_PENDING_COMPOSE}'
+
+    def _drop_pending():
+        try:
+            _webodm_run(cfg, ['rm', '-f', pending], timeout=30)
+        except Exception:
+            pass
+
+    plog(f'Pulling WebODM {WEBODM_VERSION} images (this may take several minutes)…')
+    try:
+        _webodm_put_file(cfg, pending, new_compose)
+        r = _webodm_compose(wo_dir, f'-f {shlex.quote(pending)} pull', timeout=WEBODM_PULL_TIMEOUT_S, cfg=cfg)
+    except BaseException:
+        _drop_pending()   # a time limit too: the compose on disk was never touched
+        raise
+    plog((r.stdout or '')[-500:] or '(no output)')
+    if r.returncode != 0:
+        _drop_pending()
+        raise RuntimeError(f'docker compose pull failed: {(r.stderr or r.stdout or "")[-300:]}')   # the end holds the error, the start holds compose warnings
+    if db_upgrade:
+        plog('Stopping WebODM and backing up its database…')
+        try:
+            _webodm_run(cfg, ['docker', 'stop', 'webapp', 'wo_worker'], timeout=180)
+            dump = _webodm_backup_db_95(cfg)
+        except BaseException:
+            _drop_pending()
+            _webodm_compose(wo_dir, 'up -d', timeout=180, cfg=cfg)   # the compose on disk is still 3.x
+            raise
+        plog(f'  ✓ Database backed up to {wo_dir}/{dump}')
+    try:
+        _webodm_put_file(cfg, compose_path, new_compose)
+    finally:
+        _drop_pending()
+    plog('Restarting containers with new images…')
+    try:
+        r = _webodm_compose(wo_dir, 'up -d', timeout=180, cfg=cfg)
+        plog((r.stdout or '')[-300:] or '(no output)')
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose up failed: {(r.stderr or r.stdout or "")[-300:]}')
+        if db_upgrade:
+            plog('Upgrading the database and starting WebODM (a few minutes)…')
+            ok, why = _webodm_wait_upgraded(WEBODM_UPGRADE_WAIT_S, cfg)
+            if not ok:
+                raise RuntimeError(why)
+    except Exception as e:
+        if not db_upgrade:
+            raise
+        # 4.x may already be upgrading the 9.5 data: any failure from here on, a time limit
+        # too, goes back to 3.x and the untouched 9.5 copy (upstream writes it atomically).
+        plog(f'  ✗ {e}')
+        _webodm_restore_95(wo_dir, compose_path, old_compose, plog, cfg)
+        raise RuntimeError(f'WebODM {WEBODM_VERSION} update failed ({e}); the previous version and its data are back.')
+    if db_upgrade:
+        plog('  ✓ Database upgraded. The old 9.5 copy is kept in db/backup-9.5.')
 
 
 def _run_webodm_update():
@@ -66277,55 +66436,8 @@ def _run_webodm_update():
         db_upgrade = _webodm_db_needs_upgrade(wo_dir)
         if db_upgrade:
             plog('This update upgrades the WebODM database (PostgreSQL 9.5 → 18). A backup is made first.')
-            _webodm_db_room_check(plog)
-        if stripped != compose_txt:
-            _write_priv(compose_path, stripped)
-        plog(f'Pulling WebODM {WEBODM_VERSION} images…')
-        # However the pull ends short of success (a non-zero exit, or TimeoutExpired: test6 in
-        # the 10.3.10 T&E), the old compose goes back. Left on the new pins, the next `up -d`
-        # in this dir would start 4.x on the 9.5 data with no room check and no backup.
-        pulled = False
-        try:
-            r = _webodm_compose(wo_dir, 'pull', timeout=WEBODM_PULL_TIMEOUT_S)
-            pulled = r.returncode == 0
-        finally:
-            if not pulled and stripped != compose_txt:
-                _write_priv(compose_path, compose_txt)   # leave the box on what it runs
-        plog(r.stdout[-500:] if r.stdout else '(no output)')
-        if not pulled:
-            raise RuntimeError(f'docker compose pull failed: {(r.stderr or "")[:300]}')
-        if db_upgrade:
-            plog('Stopping WebODM and backing up its database…')
-            try:
-                subprocess.run(_sudo_wrap(['docker', 'stop', 'webapp', 'wo_worker']),
-                               capture_output=True, text=True, timeout=180)
-                dump = _webodm_backup_db_95()
-            except Exception:
-                _write_priv(compose_path, compose_txt)
-                _webodm_compose(wo_dir, 'up -d', timeout=180)
-                raise
-            plog(f'  ✓ Database backed up to {os.path.join(wo_dir, dump)}')
-        plog('Restarting containers with new images…')
-        try:
-            r = _webodm_compose(wo_dir, 'up -d', timeout=180)
-            plog(r.stdout[-300:] if r.stdout else '(no output)')
-            if r.returncode != 0:
-                raise RuntimeError(f'docker compose up failed: {(r.stderr or "")[:300]}')
-            if db_upgrade:
-                plog('Upgrading the database and starting WebODM (a few minutes)…')
-                ok, why = _webodm_wait_upgraded(WEBODM_UPGRADE_WAIT_S)
-                if not ok:
-                    raise RuntimeError(why)
-        except Exception as e:
-            if not db_upgrade:
-                raise
-            # 4.x may already be upgrading the 9.5 data: any failure from here on, a time limit
-            # too, goes back to 3.x and the untouched 9.5 copy (upstream writes it atomically).
-            plog(f'  ✗ {e}')
-            _webodm_restore_95(wo_dir, compose_path, compose_txt, plog)
-            raise RuntimeError(f'WebODM {WEBODM_VERSION} update failed ({e}); the previous version and its data are back.')
-        if db_upgrade:
-            plog('  ✓ Database upgraded. The old 9.5 copy is kept in db/backup-9.5.')
+            _webodm_prepare_db_upgrade(wo_dir, compose_txt, plog)
+        _webodm_move_to_new_images(wo_dir, compose_path, compose_txt, stripped, db_upgrade, plog)
         plog('Update complete.')
         _webodm_update_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
