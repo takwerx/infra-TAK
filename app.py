@@ -15647,7 +15647,12 @@ def _split_db_keepalives_state():
     return (load_settings().get('split_db_keepalives_state') or '').strip()
 
 
-SPLIT_DB_KEEPALIVE_FIX_VERSION = 1
+# 2 (ops #1336): the 5.8 split migration builds a NEW PostgreSQL 18 cluster whose postgresql.conf has
+# the stock tcp_keepalives_idle=7200, and the marker said done:1 from the PostgreSQL 15 cluster, so
+# the retrofit never ran again. Every split box migrated to 5.8 by an older release re-converges
+# once, by reload, at its next console start. Re-running on a box that already has the lines is
+# a no-op by design (delete-then-append).
+SPLIT_DB_KEEPALIVE_FIX_VERSION = 2
 
 
 def _split_db_keepalives_complete(state=None):
@@ -15658,6 +15663,48 @@ def _split_db_keepalives_complete(state=None):
         return int(st.split(':', 1)[1]) >= SPLIT_DB_KEEPALIVE_FIX_VERSION
     except (IndexError, ValueError):
         return False
+
+
+def _split_db_keepalives_converge(s1):
+    """Put tcp_keepalives_* on the PostgreSQL cluster that is SERVING on Server One, then reload.
+
+    Returns (status, output) with status 'ok' (the file has the lines AND the running server
+    reports idle=60), 'no_pgconf' (no postgresql.conf found) or 'fail'. One function for the
+    boot retrofit and the 5.8 split migration (ops #1336): the migration builds a new cluster
+    with the stock 7200 s idle time, which is what dropped the 16-hour test8 link.
+
+    The conf is found with `sort -V | tail -1` over /etc/postgresql/*/main, so after
+    pg_upgradecluster the NEW (higher) cluster wins over the old one that stays on disk.
+    """
+    # Find postgresql.conf on either family: Debian /etc/postgresql/*/main first, then
+    # the RHEL data dir (same discovery the deploy path uses).
+    cmd = (
+        'PGCONF=""; '
+        'PGM=$(find /etc/postgresql -type d -name main 2>/dev/null | sort -V | tail -1); '
+        '[ -n "$PGM" ] && [ -f "$PGM/postgresql.conf" ] && PGCONF="$PGM/postgresql.conf"; '
+        'if [ -z "$PGCONF" ]; then ' + _PG_REMOTE_PGDATA_SH + '; '
+        '  [ -n "$PGDATA" ] && sudo test -f "$PGDATA/postgresql.conf" && PGCONF="$PGDATA/postgresql.conf"; '
+        'fi; '
+        '[ -z "$PGCONF" ] && { echo NO_PGCONF; exit 0; }; '
+        + _pg_keepalive_sh('"$PGCONF"') + '; '
+        # SIGHUP only. Try every reload spelling; a unit that does not exist is a no-op.
+        'sudo pg_ctlcluster 15 main reload 2>/dev/null; '
+        'sudo systemctl reload postgresql 2>/dev/null; '
+        + ''.join('sudo systemctl reload postgresql-%d 2>/dev/null; ' % _m
+                  for _m in sorted(set(TAK_PG_MAJORS) | {16})) +
+        'echo "PGCONF=$PGCONF"; '
+        'echo "IDLE=$(sudo grep -c \'^tcp_keepalives_idle = 60\' \"$PGCONF\")"; '
+        # what the RUNNING server says (pg_settings shows seconds; SHOW prints "1min")
+        'sleep 2; echo "LIVE=$(cd /tmp && sudo -u postgres psql -tAX -c '
+        '"select setting from pg_settings where name=\'tcp_keepalives_idle\'" 2>/dev/null | tail -1)"'
+    )
+    ok, out = _ssh_probe(s1, cmd, timeout=90)
+    out = out or ''
+    if 'NO_PGCONF' in out:
+        return 'no_pgconf', out
+    if not ok or 'IDLE=1' not in out:
+        return 'fail', out
+    return 'ok', out
 
 
 def _migrate_split_db_keepalives():
@@ -15705,32 +15752,12 @@ def _migrate_split_db_keepalives():
             _p("Server One SSH unreachable — will retry next boot: " + (out or '')[:200])
             return
 
-        # Find postgresql.conf on either family: Debian /etc/postgresql/*/main first, then
-        # the RHEL data dir (same discovery the deploy path uses).
-        cmd = (
-            'PGCONF=""; '
-            'PGM=$(find /etc/postgresql -type d -name main 2>/dev/null | sort -V | tail -1); '
-            '[ -n "$PGM" ] && [ -f "$PGM/postgresql.conf" ] && PGCONF="$PGM/postgresql.conf"; '
-            'if [ -z "$PGCONF" ]; then ' + _PG_REMOTE_PGDATA_SH + '; '
-            '  [ -n "$PGDATA" ] && sudo test -f "$PGDATA/postgresql.conf" && PGCONF="$PGDATA/postgresql.conf"; '
-            'fi; '
-            '[ -z "$PGCONF" ] && { echo NO_PGCONF; exit 0; }; '
-            + _pg_keepalive_sh('"$PGCONF"') + '; '
-            # SIGHUP only. Try every reload spelling; a unit that does not exist is a no-op.
-            'sudo pg_ctlcluster 15 main reload 2>/dev/null; '
-            'sudo systemctl reload postgresql 2>/dev/null; '
-            + ''.join('sudo systemctl reload postgresql-%d 2>/dev/null; ' % _m
-                      for _m in sorted(set(TAK_PG_MAJORS) | {16})) +
-            'echo "PGCONF=$PGCONF"; '
-            'echo "IDLE=$(sudo grep -c \'^tcp_keepalives_idle = 60\' \"$PGCONF\")"'
-        )
-        ok, out = _ssh_probe(s1, cmd, timeout=60)
-        out = out or ''
-        if 'NO_PGCONF' in out:
+        status, out = _split_db_keepalives_converge(s1)
+        if status == 'no_pgconf':
             _p("no postgresql.conf found on Server One — nothing to converge (is the DB "
                "really on this host?). Not retried as a failure.")
             return
-        if not ok or 'IDLE=1' not in out:
+        if status != 'ok':
             attempts += 1
             s = load_settings()
             s['split_db_keepalives_state'] = f'attempts:{attempts}'
@@ -100718,6 +100745,78 @@ def _tak58_volume_copy(src, dst, say):
     return True
 
 
+_TAK58_RESUME_NAME = 'RESUME.json'
+
+
+def _tak58_file_size(path):
+    """Size in bytes of a file the console may not be able to see (root-owned export folder),
+    or -1 when it is missing."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        pass
+    try:
+        r = subprocess.run(_sudo_wrap(['stat', '-c', '%s', path]), capture_output=True,
+                           text=True, timeout=30)
+        v = (r.stdout or '').strip()
+        return int(v) if r.returncode == 0 and v.isdigit() else -1
+    except Exception:
+        return -1
+
+
+def _tak58_container_resume_write(export_path, **state):
+    """Record where a container migration is, next to its export (ops #1336).
+
+    Why: after `docker volume rm` the old database is gone from the live volume. If the
+    rebuild or the import then failed, the only copy was the export, and nothing told the
+    next press of Update to use it (it said "nothing to migrate from"). This small file is
+    what lets Update continue from the saved export. Never holds the database password."""
+    try:
+        path = os.path.join(os.path.dirname(export_path), _TAK58_RESUME_NAME)
+        cur = {}
+        try:
+            cur = json.loads(_read_priv(path) or '{}')
+        except Exception:
+            cur = {}
+        cur.update(state)
+        cur['export_path'] = export_path
+        _write_priv(path, json.dumps(cur, sort_keys=True), perm=0o600)
+        return True
+    except Exception as e:
+        print('[tak58] could not write the resume marker: %s' % str(e)[:160], flush=True)
+        return False
+
+
+def _tak58_container_resume_find():
+    """The newest container migration that stopped AFTER the old database volume was removed,
+    as its saved-state dict, else None. A saved export that is missing or the wrong size is not
+    resumable (the caller reports that instead of importing a damaged file)."""
+    root = os.path.join(TAK_DOCKER_ROOT, 'snapshots')
+    try:
+        names = sorted((n for n in os.listdir(root) if n.startswith('pre-58-container-')), reverse=True)
+    except OSError:
+        return None
+    for n in names:
+        try:
+            st = json.loads(_read_priv(os.path.join(root, n, _TAK58_RESUME_NAME)) or '{}')
+        except Exception:
+            continue
+        if st.get('phase') in ('volume_removed', 'rebuilt') and st.get('export_path'):
+            st['dir'] = os.path.join(root, n)
+            return st
+        if st.get('phase') == 'done':
+            return None        # the newest migration finished: nothing is waiting
+    return None
+
+
+def _tak58_container_restore_note(export_path, old_vol):
+    """What a failed container migration says after the old database volume was removed."""
+    return ('Your data is safe. It is in two places: the saved export at %s, and the PostgreSQL 15 '
+            'data in the Docker volume %s. Press Update again with the same 5.8 bundle: it '
+            'continues from the saved export and does not start over. Do not delete either '
+            'copy until TAK Server 5.8 is serving your data again.' % (export_path, old_vol))
+
+
 def run_takserver_58_container_migration(zip_path, log=None, status=None):
     """Container 5.8 migration: export from the PG15 container, rebuild, import into PG18.
 
@@ -100777,83 +100876,120 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
         if not pw:
             return fail('Could not read the database password from CoreConfig.xml.')
         pg15 = _tak58_container_pgbin(TAK_DB_CONTAINER, 15)
+        resume = None
         if not pg15:
-            return fail(f'{TAK_DB_CONTAINER} is not running PostgreSQL 15 — nothing to migrate '
-                        f'from, or the container is down.')
+            # ops #1336: after `docker volume rm` the live volume holds no PostgreSQL 15 data. If a
+            # run stopped there, the export it saved is the way forward. This used to say
+            # "nothing to migrate from" and leave the customer with no button that worked.
+            resume = _tak58_container_resume_find()
+            if not resume:
+                return fail(f'{TAK_DB_CONTAINER} is not running PostgreSQL 15 — nothing to migrate '
+                            f'from, or the container is down.')
+            export_path = resume['export_path']
+            old_vol = resume.get('old_vol') or old_vol
+            before = {k: int(v) for k, v in (resume.get('before') or {}).items()}
+            _say('An earlier 5.8 migration stopped after the old database volume was removed.')
+            _say(f'Continuing from its saved export: {export_path}')
+            _hs = _tak58_file_size(export_path)
+            if not before or _hs != int(resume.get('export_bytes') or -2):
+                return fail('The saved export is missing or is not the size it was when it was '
+                            'taken, so it will not be imported.',
+                            f'The PostgreSQL 15 data is still in the Docker volume {old_vol} if it '
+                            f'was not deleted. Nothing has been changed by this attempt.')
+            total_before = sum(before.values())
+            _say(f'  {len(before)} tables, {total_before:,} rows expected from the export.')
 
-        # Row counts BEFORE, from the live database. This is the only thing that can
-        # prove the import later; a psql exit code cannot.
-        before = _tak58_container_counts(TAK_DB_CONTAINER, pg15, pw)
-        if not before:
-            return fail('Could not read row counts from the current database — refusing to '
-                        'migrate without a baseline to verify against.')
-        total_before = sum(before.values())
-        _say(f'  {len(before)} tables, {total_before:,} rows to move.')
+        if resume is None:
+            # Row counts BEFORE, from the live database. This is the only thing that can
+            # prove the import later; a psql exit code cannot.
+            before = _tak58_container_counts(TAK_DB_CONTAINER, pg15, pw)
+            if not before:
+                return fail('Could not read row counts from the current database — refusing to '
+                            'migrate without a baseline to verify against.')
+            total_before = sum(before.values())
+            _say(f'  {len(before)} tables, {total_before:,} rows to move.')
 
-        # 1. Export — this IS the backup, and it is verified before anything is touched.
-        #    TAK keeps serving while it runs; downtime has not started yet.
-        _say('')
-        _say('Backing up before anything is changed (TAK Server stays up for this)…')
-        t0 = time.time()
-        if not _tak58_container_export(TAK_DB_CONTAINER, export_path, pw, _say):
-            return fail('Backup/export failed — refusing to migrate without one.')
-        export_secs = int(time.time() - t0)
-        _say(f'  Backup: {export_path}')
+            # 1. Export — this IS the backup, and it is verified before anything is touched.
+            #    TAK keeps serving while it runs; downtime has not started yet.
+            _say('')
+            _say('Backing up before anything is changed (TAK Server stays up for this)…')
+            t0 = time.time()
+            if not _tak58_container_export(TAK_DB_CONTAINER, export_path, pw, _say):
+                return fail('Backup/export failed — refusing to migrate without one.')
+            export_secs = int(time.time() - t0)
+            _say(f'  Backup: {export_path}')
+            _tak58_container_resume_write(
+                export_path, phase='exported', old_vol=old_vol, stamp=stamp, before=before,
+                export_bytes=max(_tak58_file_size(export_path), 0))
 
-        # 2. Stop TAK. Downtime starts here. The database is stopped too so the volume
-        #    copy below is a cleanly-shut-down cluster, not a torn copy of a live one.
-        _say('')
-        _say('Stopping TAK Server — downtime starts now…')
-        t_down = time.time()
-        subprocess.run(_sudo_wrap(['docker', 'stop', TAK_CONTAINER, TAK_DB_CONTAINER]),
-                       capture_output=True, timeout=300)
-
-        # 3. Preserve the old volume. PG18 cannot start on a PG15 data dir, so the live
-        #    volume must be emptied — the copy is what makes that reversible.
-        _say('Preserving the PostgreSQL 15 data…')
-        if not _tak58_volume_copy(TAK_DB_VOLUME, old_vol, _say):
-            subprocess.run(_sudo_wrap(['docker', 'start', TAK_DB_CONTAINER, TAK_CONTAINER]),
+            # 2. Stop TAK. Downtime starts here. The database is stopped too so the volume
+            #    copy below is a cleanly-shut-down cluster, not a torn copy of a live one.
+            _say('')
+            _say('Stopping TAK Server — downtime starts now…')
+            t_down = time.time()
+            subprocess.run(_sudo_wrap(['docker', 'stop', TAK_CONTAINER, TAK_DB_CONTAINER]),
                            capture_output=True, timeout=300)
-            return fail('Could not preserve the PostgreSQL 15 volume — refusing to continue, '
-                        'because emptying it would then be irreversible. TAK Server has been '
-                        'started again on 5.7.')
 
-        # 4. Empty the live volume so the new PG18 container initialises cleanly and
-        #    creates the 5.8 schema.
-        _say('')
-        _say('Rebuilding on TAK Server 5.8…')
-        subprocess.run(_sudo_wrap(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER]),
-                       capture_output=True, timeout=120)
-        subprocess.run(_sudo_wrap(['docker', 'volume', 'rm', TAK_DB_VOLUME]),
-                       capture_output=True, timeout=60)
+            # 3. Preserve the old volume. PG18 cannot start on a PG15 data dir, so the live
+            #    volume must be emptied — the copy is what makes that reversible.
+            _say('Preserving the PostgreSQL 15 data…')
+            if not _tak58_volume_copy(TAK_DB_VOLUME, old_vol, _say):
+                subprocess.run(_sudo_wrap(['docker', 'start', TAK_DB_CONTAINER, TAK_CONTAINER]),
+                               capture_output=True, timeout=300)
+                return fail('Could not preserve the PostgreSQL 15 volume — refusing to continue, '
+                            'because emptying it would then be irreversible. TAK Server has been '
+                            'started again on 5.7.')
+
+            # 4. Empty the live volume so the new PG18 container initialises cleanly and
+            #    creates the 5.8 schema.
+            _say('')
+            _say('Rebuilding on TAK Server 5.8…')
+            # Written BEFORE the volume goes: a marker that says "removed" while the volume is
+            # still there is harmless (a live PostgreSQL 15 container wins), the reverse is not.
+            _tak58_container_resume_write(export_path, phase='volume_removed')
+            subprocess.run(_sudo_wrap(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER]),
+                           capture_output=True, timeout=120)
+            subprocess.run(_sudo_wrap(['docker', 'volume', 'rm', TAK_DB_VOLUME]),
+                           capture_output=True, timeout=60)
 
         # 5. Reuse the existing container upgrade to unpack, build and start. It preserves
         #    certs / CoreConfig / UserAuthenticationFile, which is what we want; the volume
         #    it would have preserved is already gone, so its fresh init builds 5.8's schema.
         #    It writes the SAME status dict the Update panel polls, so it is told not to
         #    mark the job complete — the data has not moved yet.
-        run_takserver_upgrade_container(zip_path, mark_complete=False)
-        if upgrade_status.get('error'):
-            return fail('The container rebuild failed — see the output above.',
-                        f'Your PostgreSQL 15 data is intact in volume {old_vol} and the export '
-                        f'is at {export_path}.')
+        if t_down is None:
+            t_down = time.time()      # resumed run: downtime is counted from here
+        _note = _tak58_container_restore_note(export_path, old_vol)
+        _have18 = bool(resume) and bool(_tak58_container_pgbin(TAK_DB_CONTAINER, TAK_PG_MAJOR))
+        if _have18:
+            _say('The new database container is already up on PostgreSQL %d — not rebuilding.'
+                 % TAK_PG_MAJOR)
+        elif not zip_path:
+            return fail('The new TAK Server 5.8 is not built yet, and no takserver-docker 5.8 '
+                        'bundle is uploaded. Upload the same hardened 5.8 .zip, then press Update again.',
+                        _note)
+        else:
+            run_takserver_upgrade_container(zip_path, mark_complete=False)
+            if upgrade_status.get('error'):
+                return fail('The container rebuild failed — see the output above.', _note)
         _status.update({'running': True, 'complete': False, 'error': False})
 
         # 6. The new DB container must be up, on 18, with the 5.8 schema already applied.
         pg18 = _tak58_container_pgbin(TAK_DB_CONTAINER, TAK_PG_MAJOR)
         if not pg18:
             return fail(f'The new {TAK_DB_CONTAINER} is not running PostgreSQL {TAK_PG_MAJOR}.',
-                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+                        _note)
         sv = _tak58_container_schema_version(TAK_DB_CONTAINER, pg18, pw)
         if sv is None:
             return fail('Could not read schema_version from the new database — cannot confirm '
                         'the 5.8 schema exists, so refusing to import into it.',
-                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+                        _note)
         if sv < _TAK58_MIN_SCHEMA_VERSION:
             return fail(f'The new database did not build the 5.8 schema (schema_version {sv}) — '
                         f'importing data into a pre-5.8 schema would corrupt it.',
-                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+                        _note)
         _say(f'  New database: PostgreSQL {TAK_PG_MAJOR}, schema_version {sv}.')
+        _tak58_container_resume_write(export_path, phase='rebuilt')
 
         # 7. Import with TAK stopped: it must not write to the database mid-import, and it
         #    has to re-read everything afterwards — its caches were built on an empty schema.
@@ -100863,14 +100999,12 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
         subprocess.run(_sudo_wrap(['docker', 'stop', TAK_CONTAINER]), capture_output=True,
                        timeout=300)
         if not _tak58_container_import(TAK_DB_CONTAINER, export_path, pw, _say):
-            return fail('The data import failed.',
-                        f'Your PostgreSQL 15 data is intact in volume {old_vol} and the export '
-                        f'is at {export_path}.')
+            return fail('The data import failed.', _note)
         after = _tak58_container_counts(TAK_DB_CONTAINER, pg18, pw)
         if not after:
             return fail('Could not read row counts after the import — cannot confirm the data '
                         'arrived, so this is being treated as a failure.',
-                        f'PostgreSQL 15 data is intact in volume {old_vol}.')
+                        _note)
         total_after = sum(after.values())
         missing = {t: (before[t], after.get(t, 0)) for t in before
                    if after.get(t, 0) < before[t]}
@@ -100878,8 +101012,7 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
             detail = ', '.join(f'{t} {a:,}/{b:,}' for t, (b, a) in list(missing.items())[:6])
             return fail(f'The import lost rows: {detail}. '
                         f'{total_after:,} of {total_before:,} rows arrived.',
-                        f'PostgreSQL 15 data is intact in volume {old_vol} and the export is at '
-                        f'{export_path}. Do NOT put this server into service.')
+                        _note + ' Do NOT put this server into service.')
         _say(f'  Import verified: {total_after:,} rows across {len(after)} tables '
              f'(source had {total_before:,} across {len(before)}).')
         # Counts match, so the in-container copy of the dump has served its purpose.
@@ -100908,13 +101041,15 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
                         f'{TAK_CONTAINER}`.')
         down_secs = int(time.time() - t_down)
         _say(f'  TAK Server is serving again. Downtime {down_secs} s '
-             f'(the {export_secs} s export ran before it, live); '
-             f'{int(time.time() - t_all)} s end to end.')
+             + (f'(the {export_secs} s export ran before it, live); ' if not resume else
+                '(continued from the saved export); ')
+             + f'{int(time.time() - t_all)} s end to end.')
 
         _say('')
         _say(f'Migration complete. The PostgreSQL 15 data is kept in volume {old_vol} and can be '
              f'removed once you are satisfied — it is your rollback until then.')
         _say(f'Backup kept at {export_path}')
+        _tak58_container_resume_write(export_path, phase='done')
         _status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
         fail(f'Unexpected error: {str(e)[:400]}',
@@ -101633,6 +101768,11 @@ def _tak_package_downgrade(pkg_filename, installed_version=None):
             installed_version = _get_takserver_version_info().get('version') or ''
         except Exception:
             installed_version = ''
+        if not installed_version:
+            try:
+                installed_version = _tak_installed_core_release()   # ops #1336: RHEL split core
+            except Exception:
+                installed_version = ''
     inst, pkg = _tak_release_key(installed_version), _tak_release_key(pkg_filename)
     if not inst or not pkg or pkg >= inst:
         return None
@@ -101663,6 +101803,47 @@ def _tak_cross_minor_downgrade_message(*pkg_filenames):
                     % (os.path.basename(str(fn)), _tak_fmt_release(d['installed']),
                        d['installed'][0], d['installed'][1]))
     return None
+
+
+def _tak_installed_core_release():
+    """Installed takserver-core as major.minor-RELEASEn (RHEL split core), or ''.
+
+    ops #1336: on a RHEL two-server core host `rpm -q takserver` finds nothing (the single
+    package is not installed), so the version looked blank and the downgrade refusal could
+    never fire there. Read-only, no broker."""
+    try:
+        r = subprocess.run(['rpm', '-q', '--qf', '%{VERSION}-%{RELEASE}', 'takserver-core'],
+                           capture_output=True, text=True, timeout=10)
+        return (r.stdout or '').strip() if r.returncode == 0 else ''
+    except Exception:
+        return ''
+
+
+def _tak_core_db_mismatch_message(core_pkg, db_pkg):
+    """Refusal text when the takserver-core and takserver-database packages are not the same
+    release, else None (ops #1336). TAK needs both halves of a split box on one release; a
+    mixed pair installs the core, then fails on the database and leaves TAK stopped."""
+    c, d = _tak_release_key(core_pkg), _tak_release_key(db_pkg)
+    if not c or not d or c == d:
+        return None
+    return ('The takserver-core package (%s) and the takserver-database package (%s) are '
+            'different releases. A two-server update needs the core and the database package '
+            'of the SAME release. Remove the wrong file and upload the matching one, then try '
+            'again. Nothing has been changed.'
+            % (_tak_fmt_release(c), _tak_fmt_release(d)))
+
+
+def _tak_split_db_already_on_target(s1_cfg):
+    """True when Server One already runs PostgreSQL TAK_PG_MAJOR or newer (ops #1336).
+
+    A split box on 5.8 + PG18 has no database migration to run: its 5.8.x update is the
+    ordinary two-server update. False when the answer cannot be read, so an unreachable
+    Server One still goes to the migration, which refuses with a reason."""
+    try:
+        major = _tak58_s1_pg_major(s1_cfg or {})
+    except Exception:
+        return False
+    return bool(major and major >= TAK_PG_MAJOR)
 
 
 def _tak_log_if_downgrade(pkg_filename, ulog, snap_label=None):
@@ -101739,10 +101920,37 @@ def takserver_update():
     # ops #309: a box already on 5.8 + PostgreSQL 18 has no migration to run, and the gate
     # exists only to keep the PG-15 wedge away from the plain path. Take the ordinary
     # upgrade below for it.
-    _gate = _tak_target_version_gate
+    _gate_base = _tak_target_version_gate
     if _is58 and _tak_already_on_58():
         _is58 = False
-        _gate = lambda *_a: None
+        _gate_base = lambda *_a: None
+    # ops #1336: a split box whose database (Server One) is already on PostgreSQL 18 has no
+    # migration to run either. Before this, every 5.8.x update of a split box went through the
+    # migration, which stops TAK, takes no backup and never upgrades the database package.
+    if _is58 and not _tak_is_container():
+        _ts0 = _get_tak_deployment_config(settings) or {}
+        if _ts0.get('mode') == 'two_server' and _tak_split_db_already_on_target(_ts0.get('server_one') or {}):
+            _is58 = False
+            _gate_base = lambda *_a: None
+
+    # ops #1336: a container migration that stopped after the old database volume was removed is
+    # RESUMED from its saved export by this same button, whatever the version check above says
+    # (the box then reads 5.8 + PostgreSQL 18 and would otherwise take the plain upgrade, which
+    # finds "no NEW bundle" and leaves TAK on an empty database).
+    _resume58 = None
+    if _tak_is_container():
+        try:
+            _resume58 = _tak58_container_resume_find()
+        except Exception:
+            _resume58 = None
+        if _resume58:
+            _is58 = True
+
+    def _gate(*_fns):
+        """ONE gate for every branch below (ops #1336): the 5.8 gate, then the refusal of an
+        older major.minor package. The refusal used to sit on the Ubuntu .deb branches only,
+        so RHEL and container boxes accepted a 5.7 package on a 5.8 box."""
+        return _gate_base(*_fns) or _tak_cross_minor_downgrade_message(*_fns)
     if _is58 and _tak_is_container():
         # Container 5.8: PostgreSQL 18 will not start on a PG15 data directory, so the
         # existing data-preserving container upgrade cannot be used - it deliberately
@@ -101751,17 +101959,23 @@ def takserver_update():
             return jsonify({'error': 'Update already in progress'}), 409
         _zips = [f for f in os.listdir(UPLOAD_DIR)
                  if f.lower().endswith('.zip') and 'docker' in f.lower()]
-        if not _zips:
+        if not _zips and not _resume58:
             return jsonify({'error': 'Container 5.8 upgrade: upload the takserver-docker '
                                      'hardened .zip bundle.'}), 400
-        _zip = os.path.join(UPLOAD_DIR, sorted(
+        _zip = (os.path.join(UPLOAD_DIR, sorted(
             _zips, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_DIR, f)))[-1])
+            if _zips else None)
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
         threading.Thread(target=_tak_update_job('5.8 migration (container)', run_takserver_58_container_migration,
                                                 upgrade_log, upgrade_status),
                          args=(_zip,), kwargs={'log': upgrade_log, 'status': upgrade_status},
                          daemon=True).start()
+        if _resume58:
+            return jsonify({'success': True, 'migration': True, 'container': True, 'resume': True,
+                            'message': 'An earlier TAK Server 5.8 container migration stopped after '
+                                       'the old database volume was removed. Continuing from its '
+                                       'saved export — your data is not lost.'})
         return jsonify({'success': True, 'migration': True, 'container': True,
                         'message': 'TAK Server 5.8 detected on a container deployment — '
                                    'exporting the database, rebuilding on PostgreSQL %d, then '
@@ -101796,6 +102010,9 @@ def takserver_update():
                                          'takserver-core package for this host and the 5.8 '
                                          'takserver-database package for Server One. Upload '
                                          'both, then try again.'}), 400
+            _mm = _tak_core_db_mismatch_message(_core, _dbp) or _tak_cross_minor_downgrade_message(_core, _dbp)
+            if _mm:
+                return jsonify({'error': _mm}), 400
             upgrade_log.clear()
             upgrade_status.update({'running': True, 'complete': False, 'error': False})
             threading.Thread(target=_tak_update_job('5.8 migration (two-server)', run_takserver_58_two_server_migration,
@@ -101858,7 +102075,7 @@ def takserver_update():
             _db_rpm = next((f for f in _all_rpms if 'database' in f.lower()), '')
             if not _core_rpm or not _db_rpm:
                 return jsonify({'error': 'Two-server update requires both takserver-core and takserver-database .noarch.rpm packages. Upload both.'}), 400
-            _g = _gate(_core_rpm, _db_rpm)
+            _g = _gate(_core_rpm, _db_rpm) or _tak_core_db_mismatch_message(_core_rpm, _db_rpm)
             if _g:
                 return jsonify({'error': _g}), 400
             _s1 = _tak_cfg.get('server_one', {})
@@ -101900,12 +102117,9 @@ def takserver_update():
         db_pkg = next((f for f in pkg_files if 'database' in f.lower()), '')
         if not core_pkg or not db_pkg:
             return jsonify({'error': 'Two-server update requires both takserver-core and takserver-database .deb packages. Upload both.'}), 400
-        _g = _gate(core_pkg, db_pkg)
+        _g = _gate(core_pkg, db_pkg) or _tak_core_db_mismatch_message(core_pkg, db_pkg)
         if _g:
             return jsonify({'error': _g}), 400
-        _dg = _tak_cross_minor_downgrade_message(core_pkg)
-        if _dg:
-            return jsonify({'error': _dg}), 400
         s1 = tak_cfg.get('server_one', {})
         if not s1.get('host'):
             return jsonify({'error': 'Server One host not configured in deployment settings.'}), 400
@@ -101924,9 +102138,6 @@ def takserver_update():
         _g = _gate(single_pkgs[0])
         if _g:
             return jsonify({'error': _g}), 400
-        _dg = _tak_cross_minor_downgrade_message(single_pkgs[0])
-        if _dg:
-            return jsonify({'error': _dg}), 400
         upgrade_log.clear()
         upgrade_status.update({'running': True, 'complete': False, 'error': False})
         threading.Thread(target=_tak_update_job('upgrade', run_takserver_upgrade, upgrade_log, upgrade_status),
@@ -104732,6 +104943,30 @@ def run_takserver_upgrade(pkg_path):
         ulog("Error: " + str(e))
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
 
+def _tak_rpm_installed_matches(rpm_path, name='takserver'):
+    """Does `rpm -q NAME` report the version-release the rpm FILE holds? (ops #1336)
+
+    Returns (True|False|None, wanted, installed). None when either side cannot be read, so a
+    broken `rpm` never turns a good update into a failure; False only when both were read and
+    differ. This is the truth after `dnf install`: dnf exits 0 on "Nothing to do" and, on a
+    refused downgrade, the old package stays installed whatever the log says."""
+    fmt = '%{VERSION}-%{RELEASE}'
+    try:
+        w = subprocess.run(['rpm', '-qp', '--qf', fmt, rpm_path], capture_output=True,
+                           text=True, timeout=30)
+        h = subprocess.run(['rpm', '-q', '--qf', fmt, name], capture_output=True,
+                           text=True, timeout=30)
+    except Exception:
+        return None, '', ''
+    want = (w.stdout or '').strip() if w.returncode == 0 else ''
+    have = (h.stdout or '').strip() if h.returncode == 0 else ''
+    if want and have:
+        return want == have, want, have
+    if want and 'is not installed' in ((h.stdout or '') + (h.stderr or '')):
+        return False, want, ''          # rpm answered: the package is not there
+    return None, want, have
+
+
 def run_takserver_upgrade_rhel(rpm_path, external_db=None):
     """v10.0.1 — RHEL/Rocky native .rpm TAK Server upgrade via dnf. `dnf install` of the new .rpm
     upgrades in place and PRESERVES the existing cot database (TAK config guide §5.2.1 — dnf keeps
@@ -104789,13 +105024,30 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
         # deps when swapping the takserver rpm. NEVER use --allowerasing here (it would let dnf
         # erase the DB to resolve a conflict).
         ulog(""); ulog("Installing upgrade package: " + pkg_name)
-        rc(f'dnf install -y {shlex.quote(rpm_path)} --setopt=clean_requirements_on_remove=false 2>&1', "Upgrading via dnf (guide §5.2.1)...")
+        _dnf_ok = rc(f'dnf install -y {shlex.quote(rpm_path)} --setopt=clean_requirements_on_remove=false 2>&1', "Upgrading via dnf (guide §5.2.1)...")
         if not os.path.exists('/opt/tak'):
             ulog("  /opt/tak missing after dnf install — forcing reinstall...")
             rc(f'dnf reinstall -y {shlex.quote(rpm_path)} 2>&1 || dnf install -y {shlex.quote(rpm_path)} --setopt=clean_requirements_on_remove=false 2>&1')
         if not os.path.exists('/opt/tak'):
             ulog("✗ FATAL: /opt/tak not found after rpm upgrade — check `rpm -q takserver` / `dnf history`.")
             upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+        # ops #1336: /opt/tak exists on EVERY box, so it proves nothing. Ask rpm what is installed.
+        # dnf refuses some installs (an older package, a missing dependency) and the old package
+        # stays; the log used to end "TAK Server update complete" on a box that was not updated.
+        _m, _want, _have = _tak_rpm_installed_matches(rpm_path, 'takserver')
+        if _m is False or (_m is None and not _dnf_ok):
+            ulog(f"✗ The update did NOT happen. {pkg_name} should give takserver {_want or '?'}, "
+                 f"but the installed takserver is {_have or 'not reported'}"
+                 + ("" if _dnf_ok else " and dnf reported an error (see above)") + ".")
+            ulog("  TAK Server was not restarted and keeps running the version it had. Read the dnf "
+                 "lines above for the reason, fix it, and run the update again. The pre-upgrade "
+                 f"snapshot [{snap_label}] is in Snapshots & Recovery.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+        if _m is None:
+            ulog("  ⚠ Could not compare the installed version with the package (rpm query failed); "
+                 "continuing because dnf reported success.")
+        elif not _dnf_ok:
+            ulog("  dnf exit was non-zero, but rpm -q confirms the package is installed — continuing.")
 
         # SELinux: the rpm ships apply-selinux.sh — re-apply under enforcing (postinst may reset it).
         _enf = subprocess.run('getenforce 2>/dev/null', shell=True, capture_output=True, text=True).stdout.strip()
@@ -105083,31 +105335,61 @@ def _tak58_s1_preflight(s1, say):
     return True, facts
 
 
-def _tak58_s1_backup(s1, say):
+def _tak58_s1_backup(s1, say, kind='migration'):
     """pg_dump the cot database ON Server One and prove the archive is readable.
 
     Same reason as the single-server backup: `pg_dump` exiting 0 is not evidence. The
     first W3 attempt produced an archive that could not be read back, and only
     `pg_restore --list` caught it.
+
+    kind='update' (ops #1336) is the dump an ordinary two-server update takes before it
+    stops TAK or touches either package. It lands in the postgres user's own home (Debian
+    /var/lib/postgresql, RHEL /var/lib/pgsql) and only the newest three are kept.
     """
     stamp = time.strftime('%Y%m%d-%H%M%S')
-    path = '/var/lib/postgresql/tak58-pre-migration-%s.dump' % stamp
+    name = ('tak58-pre-migration-%s.dump' if kind == 'migration' else 'tak-pre-update-%s.dump') % stamp
     say('  Backing up the cot database on Server One…')
-    ok, out = _ssh_probe(s1, 'sudo -u postgres pg_dump -Fc -d cot -f %s 2>&1; echo RC=$?'
-                             % shlex.quote(path), timeout=6 * 3600)
+    ok, out = _ssh_probe(
+        s1, 'PGH=$(getent passwd postgres | cut -d: -f6); [ -n "$PGH" ] || PGH=/var/lib/postgresql; '
+            'sudo -u postgres pg_dump -Fc -d cot -f "$PGH"/%s 2>&1; echo RC=$?; echo "DUMPPATH=$PGH/%s"'
+            % (shlex.quote(name), name), timeout=6 * 3600)
     if 'RC=0' not in (out or ''):
         say('✗ Backup failed on Server One: %s' % (out or '')[:300])
         return None
+    _pm = re.search(r'DUMPPATH=(\S+)', out or '')
+    path = _pm.group(1) if _pm else '/var/lib/postgresql/' + name
     ok, out = _ssh_probe(s1, 'sudo stat -c %%s %s 2>/dev/null; sudo -u postgres pg_restore '
                              '--list %s >/dev/null 2>&1; echo LIST_RC=$?'
                              % (shlex.quote(path), shlex.quote(path)), timeout=1800)
     size = next((int(t) for t in (out or '').split() if t.isdigit()), 0)
     if 'LIST_RC=0' not in (out or '') or size <= 0:
-        say('✗ The backup on Server One is not readable (%s) — refusing to migrate without a '
+        say('✗ The backup on Server One is not readable (%s) — refusing to continue without a '
             'restorable one.' % (out or '')[:200])
         return None
     say('  ✓ Backup verified readable on Server One: %s (%s)' % (path, _cotdb_fmt_bytes(size)))
+    if kind == 'update':
+        _ssh_probe(s1, 'PGH=$(dirname %s); sudo sh -c \'ls -1t "$0"/tak-pre-update-*.dump 2>/dev/null '
+                       '| tail -n +4 | xargs -r rm -f\' "$PGH"' % shlex.quote(path), timeout=60)
     return path
+
+
+def _tak_remote_db_pkg_matches(s1_cfg, db_pkg_path):
+    """Does Server One report the takserver-database release the package file holds?
+    (True|False|None, wanted key, installed key). None when it cannot be read (ops #1336)."""
+    want = _tak_release_key(db_pkg_path)
+    if str(db_pkg_path).endswith('.rpm'):
+        cmd = "rpm -q --qf '%{VERSION}-%{RELEASE}' takserver-database 2>/dev/null"
+    else:
+        cmd = "dpkg-query -W -f='${Version}' takserver-database 2>/dev/null"
+    try:
+        ok, out = _ssh_probe(s1_cfg, cmd, timeout=30)
+    except Exception:
+        return None, want, None
+    lines = [l.strip() for l in (out or '').strip().splitlines() if l.strip()]
+    have = _tak_release_key(lines[-1]) if ok and lines else None
+    if not want or not have:
+        return None, want, have
+    return want == have, want, have
 
 
 def _tak58_s1_run_upgrade_db(s1, say, timeout=6 * 3600):
@@ -105311,8 +105593,14 @@ def run_takserver_58_two_server_migration(core_pkg_path, db_pkg_path, s1_cfg, ta
               "dpkg-query -W -f '${Version}' takserver-core 2>/dev/null")
         _iv = (subprocess.run(_q, shell=True, capture_output=True, text=True,
                               timeout=30).stdout or '').strip()
-        if not _iv.startswith('5.8'):
-            return fail(f'The core package did not install (reports {_iv or "nothing"}) — TAK '
+        # ops #1336: compare with the package's own major.minor, not a hardcoded '5.8'. A 5.9
+        # core installed fine and was then reported "did not install" with TAK left stopped.
+        _want_mm = _tak_artifact_version(core_pkg_path)
+        _have_mm = re.match(r'\s*(\d+)\.(\d+)', _iv or '')
+        _have_mm = (int(_have_mm.group(1)), int(_have_mm.group(2))) if _have_mm else None
+        if not _have_mm or (_want_mm and _have_mm != _want_mm):
+            return fail(f'The core package did not install (reports {_iv or "nothing"}, expected '
+                        f'{"%d.%d" % _want_mm if _want_mm else "the uploaded version"}) — TAK '
                         f'Server is stopped and the database has not been touched.',
                         f'Server One is untouched and your backup is at {backup}.'
                         if backup else 'Server One is untouched.')
@@ -105377,6 +105665,33 @@ def run_takserver_58_two_server_migration(core_pkg_path, db_pkg_path, s1_cfg, ta
         # TAK's CoreConfig demands verify-full. Do this BEFORE starting TAK, or TAK comes up
         # unable to reach its own database.
         _tls_ok = _tak58_s1_carry_db_tls(s1_cfg, say)
+
+        # ops #1336: pg_upgradecluster also builds the new cluster with the stock
+        # tcp_keepalives_idle=7200 (two hours). That value let the NAT on the path drop an idle
+        # link while TAK held the dead socket: the 16-hour test8 outage. The boot retrofit had
+        # already marked this box done (from the PostgreSQL 15 cluster), so it never re-ran.
+        # Converge the new cluster here, by reload, before TAK starts.
+        _ka_status, _ka_out = _split_db_keepalives_converge(s1_cfg)
+        _ka_live = re.search(r'LIVE=(\S+)', _ka_out or '')
+        if _ka_status == 'ok' and _ka_live and _ka_live.group(1) == '60':
+            say('  ✓ Database keepalives set on the new cluster (tcp_keepalives_idle=60, reported by '
+                'the running server).')
+            try:
+                _st = load_settings()
+                _st['split_db_keepalives_state'] = f'done:{SPLIT_DB_KEEPALIVE_FIX_VERSION}'
+                save_settings(_st)
+            except Exception:
+                pass
+        else:
+            say('  ⚠ Could not confirm the database keepalive setting on the new cluster '
+                f'(status {_ka_status}, running server says {(_ka_live.group(1) if _ka_live else "nothing")}). '
+                'The console will retry it by itself the next time it starts.')
+            try:   # re-arm the boot retrofit so the retry is guaranteed
+                _st = load_settings()
+                _st['split_db_keepalives_state'] = ''
+                save_settings(_st)
+            except Exception:
+                pass
 
         say('')
         say('Starting TAK Server on the migrated database…')
@@ -105464,6 +105779,18 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
         ulog(f"  Database package: {db_name}")
         ulog(f"  Server One (DB): {s1_host}")
         ulog("=" * 50)
+
+        # ops #1336: back the database up and PROVE the dump reads back BEFORE TAK is stopped or
+        # either package is touched. This update used to start with `systemctl stop takserver`;
+        # if the copy or the database install then failed, TAK stayed stopped with no dump.
+        ulog("")
+        ulog("━━━ Step 0/4: Backing up the database on Server One ━━━")
+        _backup = _tak58_s1_backup(s1_cfg, ulog, kind='update')
+        if not _backup:
+            ulog("✗ Update stopped before anything was changed: there is no verified backup of the "
+                 "database. TAK Server is still running.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
 
         heap_backup = None
         heap_file = '/etc/default/takserver'
@@ -105561,7 +105888,17 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
                 ulog("Core was upgraded but database upgrade had issues. Check Server One manually.")
                 upgrade_status.update({'running': False, 'complete': False, 'error': True})
                 return
-        ulog("✓ Database package upgraded on Server One")
+        _dm, _dw, _dh = _tak_remote_db_pkg_matches(s1_cfg, db_pkg_path)
+        if _dm is False:
+            ulog(f"✗ Server One still reports takserver-database {_tak_fmt_release(_dh)}, not "
+                 f"{_tak_fmt_release(_dw)}. The core here is already upgraded, so TAK Server is "
+                 "left STOPPED instead of starting a new core on an old database.")
+            ulog(f"  Your database backup: {_backup} on Server One. Fix Server One (see the apt lines "
+                 "above), then run the update again with the same two packages.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
+        ulog("✓ Database package upgraded on Server One"
+             + ("" if _dm else " (could not read the installed version back to confirm)"))
 
         # Re-fetch password from Server One — the DB package upgrade may have regenerated it
         fresh_pw, _pw_err = _fetch_db_password_from_server_one(s1_cfg)
@@ -105685,6 +106022,15 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
             ulog("✗ FATAL: the uploaded takserver-core .rpm is corrupted or incomplete (rpm -qp failed). Re-upload a fresh takserver-core-*.noarch.rpm.")
             upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
 
+        # ops #1336: a verified dump of the database on Server One BEFORE TAK is stopped or any
+        # package is touched (this path had none; a failed copy or install left TAK stopped).
+        ulog(""); ulog("━━━ Step 0/5: Backing up the database on Server One ━━━")
+        _backup = _tak58_s1_backup(s1_cfg, ulog, kind='update')
+        if not _backup:
+            ulog("✗ Update stopped before anything was changed: there is no verified backup of the "
+                 "database. TAK Server is still running.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+
         # Pre-upgrade snapshot — abort if it fails (protect current data), same as the single path.
         snap_label = f"pre-upgrade-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
         ulog(f"Taking pre-upgrade snapshot [{snap_label}]…")
@@ -105726,15 +106072,20 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
         ulog(""); ulog("━━━ Step 2/5: Upgrading Core (this host) ━━━")
         _core_ok = rc(f'dnf install -y {shlex.quote(core_rpm_path)} --setopt=clean_requirements_on_remove=false 2>&1',
                       "Upgrading takserver-core via dnf (guide §5.2.1)...")
-        if not _core_ok:
-            # Idempotency: dnf can exit non-zero on a re-install / scriptlet hiccup though the
-            # package installed fine (mirrors the deploy pre-stage fix). rpm -q = truth.
-            _chk = subprocess.run('rpm -q takserver-core', shell=True, capture_output=True, text=True, timeout=30, env=_broker_shim_env())
-            if _chk.returncode == 0:
-                _core_ok = True
-                ulog("takserver-core dnf exit non-zero but rpm -q confirms it is installed — continuing (idempotent).")
-        if not _core_ok:
-            ulog("✗ Core upgrade failed — check the dnf error above."); upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
+        # Idempotency: dnf can exit non-zero on a re-install / scriptlet hiccup though the
+        # package installed fine (mirrors the deploy pre-stage fix). rpm -q = truth. ops #1336:
+        # truth means the version of the package we installed, not "some takserver-core is
+        # installed" (that was true of the OLD core too, so a refused upgrade went on to the
+        # database step), and dnf exit 0 does not make a refused downgrade an upgrade.
+        _cm, _cwant, _chave = _tak_rpm_installed_matches(core_rpm_path, 'takserver-core')
+        if _cm is True and not _core_ok:
+            ulog("takserver-core dnf exit non-zero but rpm -q confirms it is installed — continuing (idempotent).")
+        if _cm is False or (_cm is None and not _core_ok):
+            ulog(f"✗ Core upgrade failed: {core_name} should give takserver-core {_cwant or '?'}, but the "
+                 f"installed core is {_chave or 'not reported'}. Check the dnf error above.")
+            ulog("  TAK Server is stopped. Server One has not been changed. Fix the cause, then run the update "
+                 f"again with the same two packages. Your database backup: {_backup} on Server One.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
         if not os.path.exists('/opt/tak'):
             ulog("✗ FATAL: /opt/tak not found after core rpm upgrade — check `rpm -q takserver-core` / `dnf history`.")
             upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
@@ -105780,6 +106131,14 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
         verify_cmd = (_PG_REMOTE_PGSVC_SH + ' '
                       'sudo -u postgres psql -lqt 2>/dev/null | grep -qw cot && systemctl is-active "$PGSVC" >/dev/null 2>&1 && echo PG_OK')
         vok, vout = _ssh_probe(s1_cfg, verify_cmd, timeout=15)
+        _dm, _dw, _dh = _tak_remote_db_pkg_matches(s1_cfg, db_rpm_path)
+        if _dm is False:
+            ulog(f"✗ Server One still reports takserver-database {_tak_fmt_release(_dh)}, not "
+                 f"{_tak_fmt_release(_dw)}. The core here is already upgraded, so TAK Server is "
+                 "left STOPPED instead of starting a new core on an old database.")
+            ulog(f"  Your database backup: {_backup} on Server One. Fix Server One (see the dnf lines "
+                 "above), then run the update again with the same two packages.")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
         if 'PG_OK' in (vout or ''):
             ulog("✓ Database package upgraded on Server One (PostgreSQL running, cot present)")
         else:

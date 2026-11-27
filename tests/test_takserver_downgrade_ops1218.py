@@ -117,7 +117,9 @@ def test_a_different_minor_is_refused_with_a_reason():
 
 def test_route_and_job_use_the_downgrade_helpers():
     route = re.search(r"^def takserver_update\(\):.*?(?=^@app\.route)", APP, re.S | re.M).group(0)
-    assert route.count('_tak_cross_minor_downgrade_message(') == 2  # single and two-server (.deb)
+    # ops #1336: ONE shared gate (`_gate`) holds the refusal; every branch calls `_gate`, so the
+    # RHEL and container branches refuse a cross-minor package too (see test_..._ops1336.py).
+    assert '_tak_cross_minor_downgrade_message(*_fns)' in route
     job = _cut('run_takserver_upgrade')
     assert job.index('_tak_log_if_downgrade(pkg_name') < job.index('_tak_upgrade_apt_install(')
     two = _cut('run_takserver_upgrade_two_server')
