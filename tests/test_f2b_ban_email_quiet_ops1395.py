@@ -386,6 +386,12 @@ def test_summary_route_is_login_protected_off_by_default_and_the_page_has_the_ch
     assert "fetch('/api/fail2ban/ban-summary'" in TEMPLATE
 
 
+def test_the_state_file_sits_in_fail2bans_own_folder_so_selinux_lets_fail2ban_write_it():
+    # Rocky/RHEL runs the ban action as fail2ban_t, which owns /var/lib/fail2ban
+    # (fail2ban_var_lib_t) but is not known to create files in /var/log/takguard (var_log_t).
+    assert "STATE_PATH = '/var/lib/fail2ban/infratak-f2b-notify-state.json'" in _script_text()
+
+
 def test_uninstall_removes_the_state_files():
-    assert "'/var/log/takguard/f2b-notify-state.json'" in APP
-    assert "'/var/log/takguard/f2b-notify-state.json.lock'" in APP
+    assert "'/var/lib/fail2ban/infratak-f2b-notify-state.json'" in APP
+    assert "'/var/lib/fail2ban/infratak-f2b-notify-state.json.lock'" in APP

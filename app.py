@@ -29159,9 +29159,9 @@ def fail2ban_uninstall_api():
             '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf',
             '/etc/systemd/system/authentik-log-forwarder.service',
             '/usr/local/sbin/infratak-f2b-notify',
-            '/var/log/takguard/f2b-notify-state.json',
-            '/var/log/takguard/f2b-notify-state.json.lock',
-            '/var/log/takguard/f2b-notify-state.json.tmp',
+            '/var/lib/fail2ban/infratak-f2b-notify-state.json',
+            '/var/lib/fail2ban/infratak-f2b-notify-state.json.lock',
+            '/var/lib/fail2ban/infratak-f2b-notify-state.json.tmp',
         ]:
             subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True)  # v10.0.5 non-root
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
@@ -124800,7 +124800,7 @@ import sys, os, re, json, smtplib, subprocess, ipaddress, pwd, time
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
 
-STATE_PATH = '/var/log/takguard/f2b-notify-state.json'
+STATE_PATH = '/var/lib/fail2ban/infratak-f2b-notify-state.json'
 F2B_LOG = '/var/log/fail2ban.log'
 PERSON_DAY_CAP = 3
 PERSON_COOLDOWN = 86400
