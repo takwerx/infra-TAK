@@ -241,7 +241,7 @@ def test_ban_action_choice():
 
 def _switch(stop_rc=0, active='active', stale=True, outdated=False, enabled='enabled',
             stop_timeout=False, ensure_raises=False, write_raises=False, start_rc=0,
-            start_raises_first=False):
+            start_raises_first=False, distro='debian'):
     """Run the shipped _startup_f2b_ufw_lock_switch against fakes. `box` is fail2ban's state:
     a stop (or a timed-out stop, which still goes on in systemd) makes it inactive, a start
     makes it active, so the test can tell whether fail2ban ends up running (ops #1342)."""
@@ -281,7 +281,7 @@ def _switch(stop_rc=0, active='active', stale=True, outdated=False, enabled='ena
         if write_raises:
             raise OSError('read-only file system')
         writes[p] = t
-    ns = {'_distro_family': lambda: 'debian', '_fw_backend': lambda: 'ufw',
+    ns = {'_distro_family': lambda: distro, '_fw_backend': lambda: 'ufw',
           'os': types.SimpleNamespace(path=types.SimpleNamespace(isdir=lambda p: True),
                                       path_basename=None),
           'subprocess': types.SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired),
@@ -389,6 +389,12 @@ def test_next_boot_waits_out_a_stop_that_is_still_running_then_starts_fail2ban_o
         assert calls.index(list(B.FLOCK_F2B_STOP_ARGV)) < calls.index(['systemctl', 'start', 'fail2ban']), kw
         assert box['active'] == 'active', kw
         assert any('may have been cut off' in m for m in logs), kw
+
+
+def test_rhel_does_nothing_even_when_fail2ban_is_stopped_ops1342():
+    # the lock switch is a ufw (Debian) step; Rocky/RHEL boxes are not touched by it
+    calls, writes, logs, box = _switch(distro='rhel', active='inactive', enabled='enabled')
+    assert calls == [] and writes == {} and box['active'] == 'inactive'
 
 
 def test_a_deactivating_fail2ban_that_is_not_enabled_is_left_alone_ops1342():
