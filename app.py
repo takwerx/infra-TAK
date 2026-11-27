@@ -125202,7 +125202,7 @@ def main():
         bans = _recent_bans(now) if (ok and due) else []
         if bans:
             if not _send(settings, recipients,
-                         f'[{server_id}] fail2ban: {len(bans)} bans in the last 24 hours',
+                         f'[{server_id}] fail2ban: {len(bans)} ban' + ('' if len(bans) == 1 else 's') + ' in the last 24 hours',
                          _summary_text(server_id, bans)):
                 _locked_state(lambda st: st.update(summary_at=0))
 

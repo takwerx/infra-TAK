@@ -25,6 +25,7 @@ the shipped app.py text, with its log files, state file and SMTP replaced.
 """
 
 import ast
+import email
 import json
 import os
 import pathlib
@@ -44,6 +45,15 @@ def _script_text():
                                              for t in n.targets):
             return ast.literal_eval(n.value)
     raise AssertionError('_F2B_NOTIFY_SCRIPT was renamed or removed')
+
+
+def _parsed(raw):
+    return email.message_from_string(raw)
+
+
+def _text(raw):
+    """The readable body of a sent message (the script sends it base64 utf-8)."""
+    return _parsed(raw).get_payload(decode=True).decode('utf-8')
 
 
 class _Mail:
@@ -160,7 +170,7 @@ def test_burst_of_50_routine_bans_sends_no_email_and_one_real_user_ban_sends_one
     box.ssh_fail('jsmith', '198.51.100.9')
     box.ban('sshd', '198.51.100.9')
     assert len(box.mail.sent) == 1
-    text = box.mail.sent[0][2]
+    text = _text(box.mail.sent[0][2])
     assert 'jsmith' in text and '198.51.100.9' in text
     assert box.mail.sent[0][1] == ['owner@example.org']
 
@@ -174,7 +184,7 @@ def test_scanners_on_tak_jails_send_nothing_but_a_device_with_a_certificate_send
     box.tak_line('203.0.113.50', 'CN=old-phone, OU=IT, O=FIRE')
     box.ban('takserver', '203.0.113.50', hint='takserver')
     assert len(box.mail.sent) == 1
-    text = box.mail.sent[0][2]
+    text = _text(box.mail.sent[0][2])
     assert 'old-phone' in text and 'real user may be locked out' in text
 
 
@@ -326,10 +336,11 @@ def test_several_recipients_all_get_the_mail(tmp_path):
 
 def test_a_certificate_name_cannot_inject_a_mail_header(tmp_path):
     box = _Box(tmp_path)
-    box.tak_line('203.0.113.50', 'CN=evil\r\nBcc: x@evil.test, O=FIRE')
+    box.tak_line('203.0.113.50', 'CN=ev"il<b>\tx\x01, O=FIRE')
     box.ban('takserver', '203.0.113.50', hint='takserver')
-    head = box.mail.sent[0][2].split('\n\n', 1)[0]
-    assert '\nBcc:' not in head and '\r' not in head
+    msg = _parsed(box.mail.sent[0][2])
+    assert msg['Subject'] == '[box1] fail2ban: a TAK device (evilbx) is blocked'
+    assert msg['Bcc'] is None and msg['Cc'] is None
 
 
 # ── the optional daily summary ──────────────────────────────────────────────────────
@@ -348,7 +359,7 @@ def test_summary_when_on_sends_one_mail_a_day_with_counts_and_top_sources(tmp_pa
     box.ban('sshd', '203.0.113.2')
     box.ban('authentik', '203.0.113.3')
     assert len(box.mail.sent) == 1, 'one summary, not one per ban'
-    assert box.mail.sent[0][2].count('Subject: [box1] fail2ban:') == 1
+    assert _parsed(box.mail.sent[0][2])['Subject'].startswith('[box1] fail2ban: 1 ban in the last 24 hours')
 
 
 def test_summary_text_has_the_count_the_jails_and_the_top_sources(tmp_path):
