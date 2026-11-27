@@ -48217,6 +48217,8 @@ def _cloudtak_newest_allowed_tag(tags, max_major=None):
         key = tuple(int(x) for x in m.groups())
         if key[0] > _cap:
             continue
+        if key > (14, 1, 1):  # ops #1410 TEST-ONLY hold: build the customer baseline on 14.1.1, never merge
+            continue
         if best is None or key > best[0]:
             best = (key, m.group(0))
     return best[1] if best else None
