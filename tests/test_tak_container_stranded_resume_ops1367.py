@@ -100,7 +100,10 @@ def _folder_intact(box):
 
 
 def _no_volume_changes(box):
-    assert not any(c.startswith('docker volume') for c in box.calls), box.calls
+    assert not any(c.startswith('docker volume') and 'inspect' not in c for c in box.calls), box.calls
+
+
+_no_volume_changes_other_than_inspect = _no_volume_changes
 
 
 # ── 1. the stranded box recovers ────────────────────────────────────────────
@@ -215,9 +218,27 @@ def test_failed_start_removes_what_it_made_and_leaves_the_folder_for_another_try
     assert st['complete'], '\n'.join(ns['upgrade_log'])
 
 
+@pytest.mark.parametrize('volume_made,why', [
+    ('2999-01-01T00:00:00Z', 'newer than the folder'),   # the 5.8 migration made the volume AFTER the folder
+    ('not a time', 'could not be read'),
+])
+def test_a_volume_that_may_be_a_new_empty_database_is_never_given_to_tak(tmp_path, volume_made, why):
+    # Box test, ops #1367: the hardened database image builds TAK's schema on its first start, so a
+    # brand-new EMPTY volume looks healthy (schema version 106) and TAK came up with no data. The
+    # only difference from the box's own volume is its age: it is older than the folder.
+    def mutate(box):
+        box.vol_created = volume_made
+    box, ns, st, log = _press(tmp_path, mutate=mutate)
+    assert st['error'] and why in log and 'EMPTY' in log
+    assert not any(c.startswith(('docker rm ', 'docker run ', 'docker create ', 'docker start '))
+                   or ' docker build ' in c for c in box.calls), box.calls
+    assert box.containers == {}
+    _folder_intact(box)
+    _no_volume_changes_other_than_inspect(box)
+
+
 @pytest.mark.parametrize('schema', [None, 0, 12])
-def test_an_empty_database_is_never_given_to_tak(tmp_path, schema):
-    # a PostgreSQL 18 cluster with no TAK schema: starting TAK would build a new EMPTY database
+def test_a_database_that_cannot_be_read_or_has_no_schema_does_not_get_tak(tmp_path, schema):
     box, ns, st, log = _press(tmp_path, schema=schema)
     assert st['error'] and 'NOT started' in log and 'EMPTY' in log
     assert not any(c.startswith('docker create ') or c.startswith('docker start ') for c in box.calls)
@@ -230,6 +251,20 @@ def test_a_slow_start_keeps_the_folder_and_says_so(tmp_path):
     box, ns, st, log = _press(tmp_path, fail=['no_messaging'])
     assert 'KEPT' in log or 'Did not see messaging' in log
     _folder_intact(box)
+
+
+@pytest.mark.parametrize('text,epoch', [
+    ('2026-11-27T16:21:09Z', 1795796469),
+    ('2026-11-27T16:21:09.123456789Z', 1795796469),
+    ('2026-11-27T18:21:09+02:00', 1795796469),
+    ('2026-11-27T11:21:09-05:00', 1795796469),
+    ('2026-11-27 16:21:09 +0000', 1795796469),
+    ('', None), (None, None), ('yesterday', None),
+])
+def test_docker_created_at_is_read_in_every_shape_docker_prints(text, epoch):
+    ns = {'re': re}
+    _load(ns, ['_tak_docker_time'])
+    assert ns['_tak_docker_time'](text) == epoch
 
 
 # ── 4. a stranded 5.7-era bundle (PostgreSQL 15, legacy layout) ─────────────

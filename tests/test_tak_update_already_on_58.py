@@ -66,6 +66,7 @@ def _env(installed, pf_facts, upload_dir, container=False, family='debian',
         '_get_tak_deployment_config': lambda s: deployment or {},
         '_get_takserver_version_info': lambda: {'version': installed},
         '_tak_58_preflight': lambda: {'ready': True, 'blockers': [], 'facts': pf_facts},
+        '_tak_db_volume_layout': lambda: None,              # ops #1367: the database volume cannot be read here
         # the worker's name says which one the button chose
         '_tak_update_job': lambda label, fn, log, status: fn.__name__,
     }
@@ -79,7 +80,7 @@ def _env(installed, pf_facts, upload_dir, container=False, family='debian',
     n['TAK_GATE_MESSAGE'] = 'gate'
     for f in ('_tak_artifact_version', '_tak_target_version_gate', '_tak_already_on_58',
               '_tak_release_key', '_tak_package_downgrade', '_tak_fmt_release',     # ops #1218
-              '_tak_cross_minor_downgrade_message', 'takserver_update'):
+              '_tak_cross_minor_downgrade_message', '_tak_container_on_58_data', 'takserver_update'):
         exec(_cut(f), n)
     return n, started
 

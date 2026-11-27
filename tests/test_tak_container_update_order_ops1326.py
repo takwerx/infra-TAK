@@ -106,6 +106,7 @@ class Box:
         self.containers = {'takserver': {'image': 'img-old-app', 'bundle': str(old_tak)},
                            'takserver-db': {'image': 'img-old-db', 'bundle': str(old_tak)}}
         self.n = 0
+        self.vol_created = '2000-01-01T00:00:00Z'     # the database volume is older than any folder made now
         self.zip_dir = tmp / 'uploads'
         self.zip_dir.mkdir()
 
@@ -171,7 +172,8 @@ class Box:
             elif sub == 'ps':
                 r.returncode = 1 if 'docker_down' in self.fail else 0
             elif sub == 'volume':
-                pass
+                if '-f' in a:                                  # `docker volume inspect -f {{.CreatedAt}}` (ops #1367)
+                    r.stdout = self.vol_created + '\n'
             elif sub == 'run' and '--entrypoint' in a:
                 if 'grep' not in ' '.join(a):
                     r.stdout = self.layout if self.layout else ''
@@ -269,7 +271,8 @@ def _ns(box):
     _load(ns, ['_pg_run', '_tak_release_key', '_tak_fmt_release', '_tak_bundle_dockerfiles',
                '_tak_is_bundle_dir', '_tak_db_volume_mount', '_tak_dockerfile_pg_major',
                '_tak_zip_bundle_info', '_tak_db_volume_layout', '_tak_volume_check',
-               '_tak_container_missing', '_tak_container_update_preflight', '_tak_pre_update_backup',
+               '_tak_container_missing', '_tak_docker_time', '_tak_volume_predates_folder',
+               '_tak_container_update_preflight', '_tak_pre_update_backup',
                '_tak_setenv_carry',
                '_tak_carry_missing', 'run_takserver_upgrade_container'])
     return ns

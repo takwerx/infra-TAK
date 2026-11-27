@@ -107149,6 +107149,39 @@ def _tak_container_missing(name):
         return None
 
 
+def _tak_docker_time(text):
+    """Seconds since the epoch for a Docker CreatedAt ('2026-11-27T16:21:09Z', or with a fraction
+    or an offset like '+02:00'), or None when it cannot be read. Pure."""
+    m = re.match(r'\s*(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:\.\d+)?\s*(Z|[+-]\d\d:?\d\d)?\s*$',
+                 text or '')
+    if not m:
+        return None
+    import calendar
+    secs = calendar.timegm(tuple(int(x) for x in m.groups()[:6]) + (0, 0, 0))
+    off = m.group(7)
+    if off and off != 'Z':
+        secs -= (-1 if off[0] == '-' else 1) * (int(off[1:3]) * 3600 + int(off[-2:]) * 60)
+    return secs
+
+
+def _tak_volume_predates_folder(folder):
+    """True when the database volume is OLDER than the bundle folder, False when it is newer, None
+    when that cannot be read (ops #1367). The failed update that made the folder only removed
+    containers, so the volume is older than the folder and still holds the box's data. The 5.8
+    migration removes the volume, unpacks the folder and then makes the volume again: there the
+    volume is NEWER, and may hold a new, empty database (the hardened database image builds TAK's
+    schema on its first start, so the schema cannot tell the two apart; box test, ops #1367)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'volume', 'inspect', '-f', '{{.CreatedAt}}',
+                                       TAK_DB_VOLUME]), capture_output=True, text=True, timeout=30)
+        made = _tak_docker_time(r.stdout) if r.returncode == 0 else None
+        if made is None:
+            return None
+        return made <= os.path.getmtime(folder)
+    except Exception:
+        return None
+
+
 def _tak_container_on_58_data():
     """True when this container box already holds TAK Server 5.8 DATA that needs no migration:
     the bundle folder /opt/tak points into is 5.8 AND the database volume holds a PostgreSQL 18
@@ -107158,7 +107191,8 @@ def _tak_container_on_58_data():
     fails the "already on 5.8" test of `_tak_already_on_58`, which asks the RUNNING database, and
     was sent to the 5.7 -> 5.8 migration, which stops with "nothing to migrate from". A volume
     that is PostgreSQL 18 has nothing to migrate whatever the containers are doing. A 5.7 box
-    (5.7 folder, PostgreSQL 15 volume), a box with no volume and an EMPTY volume all stay False."""
+    (5.7 folder, PostgreSQL 15 volume), a box with no volume and a volume with no cluster in it
+    all stay False."""
     try:
         if not _tak_is_container():
             return False
@@ -107203,9 +107237,21 @@ def _tak_container_update_preflight(zip_path, old_ctx, ulog, check_volume=True, 
             return None, ('TAK Server is not running and its folder %s is not complete (missing: %s), '
                           'so it cannot be rebuilt in place. Nothing was changed. Restore the folder '
                           'from a backup or redeploy TAK Server.' % (info['top'], ', '.join(missing)))
+        older = _tak_volume_predates_folder(old_ctx)
+        if older is not True:
+            return None, ('TAK Server is not running and this zip is the folder already in use, but the '
+                          'update could not confirm that your database is the one this folder was made '
+                          'for (%s). Starting TAK Server on a new, EMPTY database would look like lost '
+                          'data, so nothing was changed. A copy of the earlier PostgreSQL 15 database (a '
+                          'volume named %s_pre58_...) and the export under ~/tak-docker/snapshots may '
+                          'still exist. Do not delete them.'
+                          % ('the database volume is newer than the folder, which happens when the 5.8 '
+                             'migration recreated it' if older is False else
+                             'the age of the database volume could not be read', TAK_DB_VOLUME))
         info['resume'] = True
         ulog('  TAK Server has no container and this zip is the folder already in use (an earlier '
-             'update stopped half way). It will be rebuilt in place from that folder.')
+             'update stopped half way). The database volume is older than the folder, so it is the '
+             'one this box has always used. It will be rebuilt in place from that folder.')
     cur = _tak_release_key(os.path.basename(old_ctx))
     new = _tak_release_key(os.path.basename(zip_path)) or _tak_release_key(info['top'])
     if cur and new and new < cur:
@@ -107462,7 +107508,8 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True, migration=Fals
 
         # 5) Build the new-version images under TEMPORARY tags. TAK keeps running. Tags `takserver`
         #    and `takserver_db` still name the OLD images; they move only after both builds work.
-        ulog("Step 5/7: Building new TAK Server images (minutes on arm64; TAK Server keeps running)...")
+        ulog("Step 5/7: Building new TAK Server images (minutes on arm64; %s)..."
+             % ("TAK Server is already stopped" if resume else "TAK Server keeps running"))
         _app_df, _db_df = _tak_bundle_dockerfiles(new_ctx)
         if not _app_df:
             return _drop_new('No TAK Dockerfiles under %s/docker - is this an official takserver-docker zip?' % new_ctx)
@@ -107493,9 +107540,11 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True, migration=Fals
         # 6) Stop and swap. Downtime starts here.
         ulog("Step 6/7: Stopping the old containers and starting the new ones (DB volume reused)...")
         def _db_holds_tak_data():
-            """Resume only (ops #1367): before TAK starts, the database must already hold TAK's
-            schema. An EMPTY PostgreSQL 18 cluster would let TAK build a new, empty database and
-            the server would look wiped. Waits for the database to answer; False says why."""
+            """Resume only (ops #1367): before TAK starts, the database must answer and carry TAK's
+            schema. This does NOT prove the data is there: the hardened database image builds the
+            schema on its first start, so a brand-new empty volume passes (box test). It catches a
+            database that cannot be read or has no schema (a cluster in the wrong place). That the
+            volume is the box's own is checked earlier, in `_tak_volume_predates_folder`."""
             pw = _tak58_db_password()
             pgmajor = info.get('pg_major') or TAK_PG_MAJOR        # the zip's database, 15 on a 5.7 bundle
             # 5.8 schemas are numbered from V100 up; an older bundle only has to have SOME schema.
@@ -107509,10 +107558,10 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True, migration=Fals
                         break
                 time.sleep(5)
             if sv is not None and sv >= need:
-                ulog("  ✓ The database holds TAK Server's data (schema version %d)." % sv)
+                ulog("  ✓ The database answers and has TAK Server's schema (version %d)." % sv)
                 return True
-            ulog("✗ The database could not be read, or it holds no TAK Server data (schema version %s). "
-                 "TAK Server was NOT started, because it would build a new EMPTY database and look "
+            ulog("✗ The database could not be read, or it has no TAK Server schema (schema version %s). "
+                 "TAK Server was NOT started, because it would build a new, EMPTY database and look "
                  "wiped. Nothing was deleted: the database volume %s is untouched."
                  % ('unknown' if sv is None else sv, TAK_DB_VOLUME))
             return False
