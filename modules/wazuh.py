@@ -94,6 +94,9 @@ TRANSPORT_NOTE = ('Events travel on port 1514 with AES and the agent key, not TL
                   'FIPS validation of this channel has not been checked. If the server address '
                   'is on the public internet, send it over a private path (NetBird).')
 
+SCOPE_NOTE = ('The log files listed are where a TAK Server installed as a package on this server writes them. '
+              'A Docker TAK Server, or a TAK Server on a second server, keeps its logs elsewhere and is not covered yet.')
+
 _NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$')
 _DNS_RE = re.compile(
     r'^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$')

@@ -69,6 +69,7 @@ textarea.t{height:120px}
     Wazuh cannot run commands here, change this server's firewall or push settings to the agent: those are turned off and checked again at every start.
   </p>
   <p style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-bottom:6px">{{ wz_transport }}</p>
+  <p style="font-size:12px;color:var(--text-dim);line-height:1.6;margin-bottom:6px">{{ wz_scope }}</p>
   {% if wz_pin_problem %}<div class="warn-box">{{ wz_pin_problem }}</div>{% endif %}
   {{ server_form('i_') }}
   <div class="row">

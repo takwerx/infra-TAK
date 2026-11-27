@@ -133081,7 +133081,7 @@ def wazuh_page():
     return render_template('wazuh.html', settings=settings, modules=modules, wazuh=state,
                            wz_sources=wz.SOURCES, wz_family=_distro_family(), wz_pin=wz.PIN_RELEASE,
                            wz_pin_problem=wz.pin_problem(mod_registry.get_ctx()),
-                           wz_warning=wz.CARD_WARNING, wz_transport=wz.TRANSPORT_NOTE,
+                           wz_warning=wz.CARD_WARNING, wz_transport=wz.TRANSPORT_NOTE, wz_scope=wz.SCOPE_NOTE,
                            wz_default_name=wz.default_agent_name(),
                            deploying=_job.get('running', False), version=VERSION)
 

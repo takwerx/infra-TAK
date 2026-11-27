@@ -579,3 +579,8 @@ def test_the_inline_script_parses(tmp_path):
 def test_the_real_agent_log_lines_become_plain_reasons(line, words):
     """Lines copied from a real 4.14.11 agent and manager (ops #1421 box tests, Nov 27, 2026)."""
     assert words in W._why_not(line)
+
+
+def test_the_card_says_docker_and_two_server_tak_are_not_covered():
+    assert 'Docker TAK Server' in W.SCOPE_NOTE and 'not covered' in W.SCOPE_NOTE
+    assert 'wz_scope' in TEMPLATE and 'wz_scope=wz.SCOPE_NOTE' in APP
