@@ -48243,8 +48243,36 @@ EMAIL_TRANSPORT_KEYS = frozenset(['EMAIL_ENABLED', 'EMAIL_PROVIDER', 'SMTP_HOST'
                                   'SMTP_SECURE', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM'])
 
 
-def _takportal_get_existing_settings():
-    """Read current settings.json from TAK Portal container. Returns dict or {} if container missing or file invalid.
+class TakPortalSettingsUnreadable(Exception):
+    """ops #1333: TAK Portal's settings.json is there but infra-TAK could not read it, so it must
+    not build a replacement from its own seeds. The message is for the operator, in plain words."""
+
+
+_TAKPORTAL_SETTINGS_PATH = '/usr/src/app/data/settings.json'
+# docker prints one of these when the file or the container is simply not there (a fresh install).
+_TAKPORTAL_SETTINGS_ABSENT_MARKERS = ('no such file', 'could not find the file', 'no such container',
+                                      'no such object')
+# ... and one of these when Docker itself did not answer: that says nothing about the file.
+_TAKPORTAL_SETTINGS_DOCKER_DOWN_MARKERS = ('cannot connect to the docker daemon', 'permission denied',
+                                           'is the docker daemon running', 'connection refused',
+                                           'timed out', 'deadline exceeded')
+
+
+def _takportal_read_settings_state():
+    """ops #1333: read TAK Portal's settings.json and say what the read MEANT. Returns
+    (state, data, raw):
+
+      'ok'         data is the parsed dict.
+      'absent'     there is no file (or no container) to read: nothing to protect, seed it.
+      'unreadable' the file is there but empty or not a JSON object after retries. `raw` is its
+                   text, so the caller can keep a copy. A write built from our seeds would
+                   destroy it.
+      'error'      Docker did not answer (timeout, daemon down, no permission). The file may be
+                   fine; a write built from our seeds would still destroy it.
+
+    A failure that carries no sign of either (an unknown docker error) stays 'absent', exactly as
+    this read behaved before: only positive evidence blocks a write, so a fresh install is never
+    held up by an error text we did not foresee.
 
     v10.1.42: falls back to `docker cp` when `docker exec` fails. exec needs a RUNNING
     container; cp works on a created/stopped one. The deploy path seeds settings.json into a
@@ -48252,21 +48280,36 @@ def _takportal_get_existing_settings():
     the whole file from our defaults, clobbering operator values on any redeploy.
 
     v10.2.16 (GH #158): TAK Portal rewrites this file itself, in place, whenever it reloads it
-    (settings.service.js loadSettingsFromDisk), so a read can land on a half-written file. {}
-    makes the merge rebuild the file from our seeds alone, so a torn read is retried first."""
+    (settings.service.js loadSettingsFromDisk), so a read can land on a half-written file, which
+    is why a torn read is retried before it counts."""
+
+    def _parse(text):
+        try:
+            v = json.loads(text)
+        except ValueError:
+            return None
+        return v if isinstance(v, dict) else None
+
+    seen_bad = False   # a file was read, and what it held was not a JSON object
+    bad_raw = ''
+    docker_error = False
     for _attempt in range(3):
         try:
             r = subprocess.run(
-                _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', '/usr/src/app/data/settings.json']), capture_output=True, text=True, timeout=10)
+                _sudo_wrap(['docker', 'exec', _takportal_ref(), 'cat', _TAKPORTAL_SETTINGS_PATH]),
+                capture_output=True, text=True, timeout=10)
         except Exception:
+            docker_error = True
+            break
+        if r.returncode != 0:
+            # exec needs a running container: ask `docker cp` below, which does not.
             break
         body = (r.stdout or '').strip()
-        if r.returncode != 0 or not body:
-            break
-        try:
-            return json.loads(body)
-        except ValueError:
-            time.sleep(0.5)
+        parsed = _parse(body) if body else None
+        if parsed is not None:
+            return 'ok', parsed, body
+        seen_bad, bad_raw = True, (r.stdout or '')
+        time.sleep(0.5)
     # Container not running (or exec unavailable) — stream the file out as a tar on stdout.
     # `docker cp <container>:<path> -` avoids writing a temp file: under _sudo_wrap the copy
     # would land root-owned and a non-root console could not read it back.
@@ -48274,18 +48317,88 @@ def _takportal_get_existing_settings():
         import io as _io
         import tarfile as _tarfile
         cp = subprocess.run(
-            _sudo_wrap(['docker', 'cp', f'{_takportal_ref()}:/usr/src/app/data/settings.json', '-']),
+            _sudo_wrap(['docker', 'cp', f'{_takportal_ref()}:{_TAKPORTAL_SETTINGS_PATH}', '-']),
             capture_output=True, timeout=15)
+    except Exception:
+        if seen_bad:
+            return 'unreadable', {}, bad_raw
+        return 'error', {}, ''
+    try:
         if cp.returncode != 0 or not cp.stdout:
-            return {}
+            err = (cp.stderr or b'').decode('utf-8', 'replace').lower()
+            if seen_bad:
+                return 'unreadable', {}, bad_raw
+            if any(m in err for m in _TAKPORTAL_SETTINGS_ABSENT_MARKERS):
+                return 'absent', {}, ''
+            if docker_error or any(m in err for m in _TAKPORTAL_SETTINGS_DOCKER_DOWN_MARKERS):
+                return 'error', {}, ''
+            return 'absent', {}, ''
         with _tarfile.open(fileobj=_io.BytesIO(cp.stdout)) as tf:
             member = next((m for m in tf.getmembers() if m.isfile()), None)
             if member is None:
-                return {}
-            body = (tf.extractfile(member).read() or b'').decode('utf-8', 'replace').strip()
-        return json.loads(body) if body else {}
+                return 'absent', {}, ''
+            text = (tf.extractfile(member).read() or b'').decode('utf-8', 'replace')
+        parsed = _parse(text.strip()) if text.strip() else None
+        if parsed is not None:
+            return 'ok', parsed, text
+        return 'unreadable', {}, text
     except Exception:
-        return {}
+        return ('unreadable', {}, bad_raw) if seen_bad else ('error', {}, '')
+
+
+def _takportal_get_existing_settings():
+    """Read current settings.json from TAK Portal container. Returns dict, or {} when the container
+    or the file is missing or the file cannot be read. Read-only callers can use this as it is.
+    Anything that WRITES the file must ask _takportal_read_settings_state() instead: {} there
+    would make the merge rebuild the file from our seeds alone (ops #1333)."""
+    state, data, _raw = _takportal_read_settings_state()
+    return data if state == 'ok' else {}
+
+
+TAKPORTAL_UNREADABLE_KEEP = 5
+
+
+def _takportal_keep_unreadable_settings(raw):
+    """ops #1333: put a copy of a settings.json we could not parse on the host before anything can
+    replace it (TAK Portal itself rewrites a bad file from its template on boot). CONFIG_DIR/
+    takportal-settings-backups/unreadable-*.json, mode 600 (the file can hold the Authentik token).
+    Returns the path, or '' when there was nothing to keep. Never raises."""
+    try:
+        if not (raw or '').strip():
+            return ''
+        bdir = os.path.join(CONFIG_DIR, 'takportal-settings-backups')
+        os.makedirs(bdir, mode=0o700, exist_ok=True)
+        kept = sorted(f for f in os.listdir(bdir) if f.startswith('unreadable-') and f.endswith('.json'))
+        if kept:
+            with open(os.path.join(bdir, kept[-1])) as f:
+                if f.read() == raw:
+                    return os.path.join(bdir, kept[-1])
+        name = f"unreadable-{datetime.utcnow().strftime('%Y%m%dT%H%M%S%fZ')}.json"
+        fd = os.open(os.path.join(bdir, name), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            f.write(raw)
+        for old in (kept + [name])[:-TAKPORTAL_UNREADABLE_KEEP]:
+            try:
+                os.remove(os.path.join(bdir, old))
+            except OSError:
+                pass
+        return os.path.join(bdir, name)
+    except Exception:
+        return ''
+
+
+def _takportal_settings_unreadable_error(state, raw):
+    """The TakPortalSettingsUnreadable for a read that is not 'ok' or 'absent' (saves the copy)."""
+    if state == 'unreadable':
+        kept = _takportal_keep_unreadable_settings(raw)
+        return TakPortalSettingsUnreadable(
+            "TAK Portal's settings.json is there but cannot be read as JSON, so infra-TAK left it "
+            "alone and wrote nothing."
+            + (f" A copy is saved on this server at {kept}." if kept else '')
+            + " Fix the file (or put the copy back), then press Update config.")
+    return TakPortalSettingsUnreadable(
+        "infra-TAK could not read TAK Portal's settings.json (Docker did not answer), so it wrote "
+        "nothing. Try again in a minute.")
 
 
 # --- TAK Portal update channel (v10.1.55) ------------------------------------
@@ -48577,6 +48690,22 @@ def _takportal_update_git(portal_dir, plog=None):
         return out
     out['ref'] = tag
     out['to_version'] = tag.lstrip('vV')
+    # ops #1333: Update never moves TAK Portal BACKWARD. TAK Portal 2.x keeps its data in Postgres and
+    # a newer release may have changed it; older code on top of that is untested and "Portal data is
+    # not reverted". A box ahead of the tested release (an admin's not-vetted install, or a box that
+    # ran main with Beta Mode on) stays where it is until the tested release catches up. Same rule
+    # as deploy (_takportal_checkout_existing). Nothing was fetched or checked out yet.
+    if from_version and _takportal_version_tuple(from_version) > _takportal_version_tuple(tag):
+        _takportal_restore_env(portal_dir, _saved_env, plog=_log)
+        out['kept_newer'] = True
+        out['to_version'] = from_version
+        out['message'] = (f'TAK Portal {from_version} is newer than {tag.lstrip("vV")}, the newest release takwerx has tested. '
+                          f'Update does not move TAK Portal back, because it keeps its data in a database and the '
+                          f'newer release may have changed it. Nothing was changed. Update works again once '
+                          f'takwerx has tested {from_version} or a newer release.')
+        out['error'] = out['message']
+        _log(f"  {out['message']}")
+        return out
     subprocess.run(_git + ['fetch', 'origin', '--tags', '--force'],
                    capture_output=True, text=True, timeout=180)
     # A shallow clone (deploy uses --depth 1 --branch <tag>) has exactly one tag, so the
@@ -48633,16 +48762,11 @@ def _takportal_update_git(portal_dir, plog=None):
         _log(f"  {out['error']}")
         return out
     out['ok'] = True
-    # Rollback is intentional and must be SAID, not hidden: a box that lived on main with
-    # Beta Mode on and then turned it off converges DOWN to the newest release.
-    if from_version and _takportal_version_tuple(from_version) > _takportal_version_tuple(tag):
-        out['rolled_back'] = True
-        # ops #1065: after a not-vetted install this button is the way back, so say that it is one.
-        out['message'] = (f'Moving back from {from_version} to release {tag}, the version takwerx '
-                          f'tested. Portal data is not reverted.')
-    elif _picked:
-        out['message'] = (f'Installed release {tag}. takwerx has not tested it yet: if a Marketplace '
-                          f'plugin fails to install, press Update to go back to the tested version.')
+    # ops #1333: a box ahead of the target never gets here (it returned above), so there is no
+    # move-back message any more; `rolled_back` stays False in the result.
+    if _picked:
+        out['message'] = (f'Installed release {tag}. takwerx has not tested it yet. Update does not '
+                          f'move TAK Portal back: it keeps this release until takwerx has tested it.')
     elif from_version and _takportal_version_tuple(from_version) < _takportal_version_tuple(tag):
         out['message'] = f'Updated from {from_version} to GitHub Release {tag}.'
     else:
@@ -48883,7 +49007,12 @@ def _takportal_merged_settings_json(settings, adopt=()):
     v10.2.8 W12: `adopt` — keys the operator explicitly asked to move to this box's domain
     (the "Use the domain" button). Intersected with TAKPORTAL_DOMAIN_KEYS; nothing else passes it."""
     adopt = frozenset(adopt or ()) & (frozenset(TAKPORTAL_DOMAIN_KEYS) | frozenset(TAKPORTAL_AUTH_ADOPT_KEYS))
-    existing = _takportal_get_existing_settings()
+    # ops #1333: a file that is there but cannot be read is NOT an empty file. Building from our
+    # seeds alone would write over the operator's whole settings.json (and the backup helper skips
+    # an empty read, so no copy would exist). Keep a copy, write nothing, say why.
+    _state, existing, _raw = _takportal_read_settings_state()
+    if _state in ('unreadable', 'error'):
+        raise _takportal_settings_unreadable_error(_state, _raw)
     our = _takportal_build_settings_dict(settings)
     merged = dict(existing) if isinstance(existing, dict) else {}
     # v10.1.20 email ownership: when the Email Relay module IS configured, infra-TAK is
@@ -49047,7 +49176,12 @@ def _takportal_push_settings(plog=None, restart=True):
         if not _takportal_web_running():
             return False
         settings = load_settings()
-        ok, err = _takportal_write_settings_json(_takportal_merged_settings_json(settings), plog=_log)
+        try:
+            _merged = _takportal_merged_settings_json(settings)
+        except TakPortalSettingsUnreadable as e:
+            _log(f"  takportal settings push skipped: {e}")
+            return False
+        ok, err = _takportal_write_settings_json(_merged, plog=_log)
         if not ok:
             _log(f"  takportal settings push: docker cp failed: {err}")
             return False
@@ -49758,8 +49892,11 @@ def takportal_enable_auth_api():
     settings = load_settings()
     if not _takportal_auth_disabled(settings):
         return jsonify({'success': True, 'message': 'TAK Portal login is already on.'})
-    ok, err = _takportal_write_settings_json(
-        _takportal_merged_settings_json(settings, adopt=TAKPORTAL_AUTH_ADOPT_KEYS))
+    try:
+        _merged = _takportal_merged_settings_json(settings, adopt=TAKPORTAL_AUTH_ADOPT_KEYS)
+    except TakPortalSettingsUnreadable as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    ok, err = _takportal_write_settings_json(_merged)
     if not ok:
         return jsonify({'success': False, 'error': err or 'could not write TAK Portal settings'}), 500
     print("[takportal] enable-auth: PORTAL_AUTH_ENABLED turned back on (operator)", flush=True)
@@ -49792,7 +49929,11 @@ def takportal_use_domain_api():
     keys = [k for k in TAKPORTAL_DOMAIN_KEYS if k in want and k in stale]
     if not keys:
         return jsonify({'success': True, 'changed': {}, 'message': 'Nothing to change: TAK Portal already uses the domain.'})
-    ok, err = _takportal_write_settings_json(_takportal_merged_settings_json(settings, adopt=keys))
+    try:
+        _merged = _takportal_merged_settings_json(settings, adopt=keys)
+    except TakPortalSettingsUnreadable as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+    ok, err = _takportal_write_settings_json(_merged)
     if not ok:
         return jsonify({'success': False, 'error': err or 'could not write TAK Portal settings'}), 500
     print(f"[takportal] use-domain: {', '.join(keys)} moved to {settings.get('fqdn')} (operator)", flush=True)
@@ -49847,7 +49988,10 @@ def takportal_control():
     elif action == 'reconfigure':
         # Update config only: push settings into container and restart (no git pull / image build). Preserves user-configured keys (e.g. BRAND_LOGO_URL).
         settings = load_settings()
-        settings_json = _takportal_merged_settings_json(settings)
+        try:
+            settings_json = _takportal_merged_settings_json(settings)
+        except TakPortalSettingsUnreadable as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
         # v10.1.51 (W1): every step below reports what it actually did. Update Config used to
         # discard _takportal_setup_ssh()'s return value and then tell the operator
         # "(SSH configured)" regardless -- so a portal stuck on "Setup: not run yet" looked
@@ -50117,6 +50261,12 @@ def _takportal_run_update(portal_dir):
         # The git step discards local edits first, which reverts the loopback port patch. Put it
         # back so the next `compose up` (boot stagger, Guard Dog, Start) cannot publish 0.0.0.0.
         _patch_takportal_compose_ports(portal_dir)
+        if gitr.get('kept_newer'):
+            # ops #1333: not a failure and not an update. Nothing was fetched, built or restarted.
+            return {'success': True, 'unchanged': True, 'running': _takportal_web_running(),
+                    'action': 'update', 'pull': gitr['message'], 'version': gitr['from_version'],
+                    'channel': gitr['channel'], 'ref': gitr['ref'],
+                    'from_version': gitr['from_version'], 'rolled_back': False}, 200
         return {'success': False, 'error': gitr['error'],
                 'channel': gitr['channel']}, 500
     pull_msg = gitr['message']
@@ -50162,6 +50312,10 @@ def _takportal_run_update(portal_dir):
                 _takportal_setup_ssh()
             else:
                 settings_sync_error = cp_err or 'docker cp failed'
+    except TakPortalSettingsUnreadable as e:
+        # ops #1333: the file is left as it is; the page shows why nothing was synced.
+        settings_sync_error = str(e)
+        print(f'[takportal] update: {e}', flush=True)
     except Exception as e:
         settings_sync_error = str(e)[:300]
     # v10.1.60 (W4): the recreate at the end of this build takes the web container
@@ -50534,7 +50688,10 @@ def takportal_ssh_set_user():
         console_user = _pwd.getpwuid(os.getuid()).pw_name
     except Exception:
         return jsonify({'success': False, 'error': 'cannot resolve the console user'}), 500
-    existing = _takportal_get_existing_settings()
+    _state, existing, _raw = _takportal_read_settings_state()
+    if _state in ('unreadable', 'error'):
+        # ops #1333: {} here would write a settings.json holding this one key.
+        return jsonify({'success': False, 'error': str(_takportal_settings_unreadable_error(_state, _raw))}), 500
     if not isinstance(existing, dict):
         return jsonify({'success': False, 'error': 'TAK Portal settings.json not readable'}), 500
     merged = dict(existing)
@@ -50827,6 +50984,8 @@ def run_takportal_deploy():
             if not _seed_ok:
                 raise RuntimeError(_seed_err or 'docker cp failed')
             plog("  ✓ Seeded settings.json before first start (suppresses placeholder Authentik fetch)")
+        except TakPortalSettingsUnreadable as _seed_e:
+            plog(f"  ⚠ settings.json left as it is: {_seed_e}")
         except Exception as _seed_e:
             plog(f"  ⚠ Could not pre-seed settings.json: {str(_seed_e)[:80]} (first boot may log a harmless placeholder error)")
 
@@ -50883,15 +51042,21 @@ def run_takportal_deploy():
         # v10.1.42: merge, never the raw build dict — a redeploy over a surviving data volume
         # must not overwrite what the operator set in TAK Portal's own UI. portal_settings below
         # is the MERGED result, so the log lines report what the portal will actually run with.
-        settings_json = _takportal_merged_settings_json(settings)
+        # ops #1333: a settings.json that is there but unreadable is left alone, not rebuilt.
+        try:
+            settings_json = _takportal_merged_settings_json(settings)
+        except TakPortalSettingsUnreadable as _unreadable:
+            settings_json = ''
+            plog(f"  ⚠ {_unreadable}")
         try:
             portal_settings = json_mod.loads(settings_json)
         except Exception:
             portal_settings = _takportal_build_settings_dict(settings)
         ak_token = portal_settings.get('AUTHENTIK_TOKEN', '')
-        _st6_ok, _st6_err = _takportal_write_settings_json(settings_json, plog=plog)
-        if not _st6_ok:
-            plog(f"  ⚠ settings.json write failed: {_st6_err}")
+        if settings_json:
+            _st6_ok, _st6_err = _takportal_write_settings_json(settings_json, plog=plog)
+            if not _st6_ok:
+                plog(f"  ⚠ settings.json write failed: {_st6_err}")
         plog(f"  AUTHENTIK_URL (internal): {portal_settings['AUTHENTIK_URL']}")
         plog(f"  AUTHENTIK_PUBLIC_URL: {portal_settings.get('AUTHENTIK_PUBLIC_URL', '')}")
         plog(f"  TAK Server URL: {portal_settings['TAK_URL']}")
@@ -85254,7 +85419,12 @@ def _takportal_admin_guardrail(plog_fn=None):
             return {k: cur.get(k) or '' for k, req in TAKPORTAL_REQUIRED_PREFIXES.items()
                     if _takportal_with_required_prefixes(cur.get(k), req) != str(cur.get(k) or '')}
 
-        _before = _missing(_takportal_get_existing_settings())
+        _gstate, _gcur, _graw = _takportal_read_settings_state()
+        if _gstate in ('unreadable', 'error'):
+            # ops #1333: an unreadable file is not "everything missing". Keep a copy, push nothing.
+            _log(f"takportal admin guardrail skipped: {_takportal_settings_unreadable_error(_gstate, _graw)}")
+            return
+        _before = _missing(_gcur)
         if not _before:
             return  # Idempotent — no log spam on healthy boot
 
@@ -126553,7 +126723,12 @@ def _post_update_auto_deploy():
                             _auto_deploy_active['takportal'] = True
                             try:
                                 settings = load_settings()
-                                settings_json = _takportal_merged_settings_json(settings)
+                                try:
+                                    settings_json = _takportal_merged_settings_json(settings)
+                                except TakPortalSettingsUnreadable as _unreadable:
+                                    # ops #1333: leave an unreadable settings.json as it is.
+                                    print(f"Post-update: TAK Portal reconfigure skipped: {_unreadable}")
+                                    return
                                 _takportal_write_settings_json(settings_json)
                                 _takportal_setup_ssh()
                                 _ensure_infratak_network_for_authentik()
