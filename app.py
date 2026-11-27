@@ -65017,7 +65017,7 @@ def _webodm_move_to_new_images(wo_dir, compose_path, old_compose, new_compose, d
     plog((r.stdout or '')[-500:] or '(no output)')
     if r.returncode != 0:
         _drop_pending()
-        raise RuntimeError(f'docker compose pull failed: {(r.stderr or r.stdout or "")[:300]}')
+        raise RuntimeError(f'docker compose pull failed: {(r.stderr or r.stdout or "")[-300:]}')   # the end holds the error, the start holds compose warnings
     if db_upgrade:
         plog('Stopping WebODM and backing up its database…')
         try:
@@ -65037,7 +65037,7 @@ def _webodm_move_to_new_images(wo_dir, compose_path, old_compose, new_compose, d
         r = _webodm_compose(wo_dir, 'up -d', timeout=180, cfg=cfg)
         plog((r.stdout or '')[-300:] or '(no output)')
         if r.returncode != 0:
-            raise RuntimeError(f'docker compose up failed: {(r.stderr or r.stdout or "")[:300]}')
+            raise RuntimeError(f'docker compose up failed: {(r.stderr or r.stdout or "")[-300:]}')
         if db_upgrade:
             plog('Upgrading the database and starting WebODM (a few minutes)…')
             ok, why = _webodm_wait_upgraded(WEBODM_UPGRADE_WAIT_S, cfg)
