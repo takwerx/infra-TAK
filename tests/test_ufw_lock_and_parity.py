@@ -370,14 +370,31 @@ def test_next_boot_starts_an_enabled_but_stopped_fail2ban_ops1342():
     calls, writes, logs, box = _switch(active='inactive', enabled='enabled')
     assert box['active'] == 'active'
     assert writes                                       # the move still happens, then the start
-    assert any('was enabled but stopped' in m for m in logs)
+    assert any('cut off' in m and 'started' in m for m in logs)
     # the console died after the jail files were written: nothing stale, nothing outdated
     calls, writes, logs, box = _switch(active='inactive', enabled='enabled', stale=False, outdated=False)
     assert box['active'] == 'active'
-    assert any('enabled but not running' in m for m in logs)
+    assert any('enabled but not running' in m and 'cut off' in m for m in logs)
     # a failed unit (crashed at start) counts as down
     calls, writes, logs, box = _switch(active='failed', enabled='enabled', stale=False, outdated=False)
     assert box['active'] == 'active'
+
+
+def test_next_boot_waits_out_a_stop_that_is_still_running_then_starts_fail2ban_ops1342():
+    # kill -9 of the whole console (box test): the broker's stop is still unbanning, so the next
+    # console start sees `deactivating`. It waits under the same lock, then starts fail2ban.
+    for kw in ({}, {'stale': False, 'outdated': False}):
+        calls, writes, logs, box = _switch(active='deactivating', **kw)
+        assert list(B.FLOCK_F2B_STOP_ARGV) in calls, kw
+        assert calls.index(list(B.FLOCK_F2B_STOP_ARGV)) < calls.index(['systemctl', 'start', 'fail2ban']), kw
+        assert box['active'] == 'active', kw
+        assert any('cut off' in m for m in logs), kw
+
+
+def test_a_deactivating_fail2ban_that_is_not_enabled_is_left_alone_ops1342():
+    calls, writes, logs, box = _switch(active='deactivating', enabled='disabled', stale=False, outdated=False)
+    assert list(B.FLOCK_F2B_STOP_ARGV) not in calls
+    assert ['systemctl', 'start', 'fail2ban'] not in calls
 
 
 def test_next_boot_leaves_fail2ban_alone_when_it_is_running_or_not_enabled_ops1342():
