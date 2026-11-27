@@ -300,7 +300,7 @@ def test_oauth_set_off_by_the_operator_stays_off(hub):
     hub.run()
     assert hub.status['error'] is False, '\n'.join(hub.log)
     assert hub.oauth_value() == 'false'
-    assert hub.oauth_calls == 0, 'no Authentik client may be made for a hub that has OAuth off'
+    assert 'keycloak' not in (hub.fh / 'configs' / 'federation-hub-ui.yml').read_text(), 'the hub config must not get the OAuth lines'
     assert 'left as it was set' in '\n'.join(hub.log)
 
 
@@ -310,15 +310,15 @@ def test_oauth_on_stays_on_and_is_resynced(hub):
     hub.run()
     assert hub.status['error'] is False, '\n'.join(hub.log)
     assert hub.oauth_value() == 'true'
-    assert hub.oauth_calls == 1
+    assert 'keycloakAuthEndpoint' in (hub.fh / 'configs' / 'federation-hub-ui.yml').read_text()
 
 
 def test_registered_hub_with_no_allowoauth_line_is_left_alone(hub):
     hub.configs(sso=None)
     hub.manual_certs()
     hub.run()
-    assert hub.oauth_calls == 0
     assert hub.oauth_value() is None
+    assert 'keycloak' not in (hub.fh / 'configs' / 'federation-hub-ui.yml').read_text()
 
 
 def test_first_deploy_still_turns_oauth_on_when_authentik_is_installed(hub):

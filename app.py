@@ -34993,67 +34993,66 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                     if oauth_left_alone:
                         plog(f"✓ Hub sign-in with Authentik left as it was set on the hub (allowOauth: {hub_state['sso_flag'] or 'not set'}). "
                              f'Use "Enable Authentik login" to turn it on.')
+                    client_id, client_secret, _auth_url, _token_url = _ensure_authentik_fedhub_oauth_app(
+                        settings, plog=plog
+                    )
+                    fh_domain = _get_service_domain(settings, 'fedhub')
+                    fh_host = fh_domain or (remote.get('host') or '').strip() or 'localhost'
+                    redirect_uri = (
+                        f'https://{_pub_hostport(fh_host)}/api/oauth/login/redirect'
+                        if fh_domain else f'https://{fh_host}:9100/api/oauth/login/redirect'
+                    )
+                    ak_host = _get_authentik_host(settings) or f'authentik.{fqdn}'
+                    ak_public = f'https://{_pub_hostport(ak_host)}'
+                    oidc_config_url = f'{ak_public}/application/o/fedhub/.well-known/openid-configuration'
+                    auth_endpoint_url = f'{ak_public}/application/o/authorize/'
+                    token_endpoint_url = f'{ak_public}/application/o/token/'
+
+                    der_cmd = (
+                        f'sudo mkdir -p /opt/tak/certs && '
+                        f'sudo chown tak:tak /opt/tak/certs && '
+                        f'echo | openssl s_client -connect {ak_host}:{_caddy_https_port(settings)} -servername {ak_host} 2>/dev/null '
+                        f'| openssl x509 -outform DER -out /opt/tak/certs/keycloak.der 2>/dev/null && '
+                        f'chown tak:tak /opt/tak/certs/keycloak.der && '
+                        f'chmod 644 /opt/tak/certs/keycloak.der'
+                    )
+                    ok_der, _ = _module_run(cfg, der_cmd, timeout=30)
+                    if ok_der:
+                        plog(f'✓ keycloak.der generated from {ak_host}')
                     else:
-                        client_id, client_secret, _auth_url, _token_url = _ensure_authentik_fedhub_oauth_app(
-                            settings, plog=plog
-                        )
-                        fh_domain = _get_service_domain(settings, 'fedhub')
-                        fh_host = fh_domain or (remote.get('host') or '').strip() or 'localhost'
-                        redirect_uri = (
-                            f'https://{_pub_hostport(fh_host)}/api/oauth/login/redirect'
-                            if fh_domain else f'https://{fh_host}:9100/api/oauth/login/redirect'
-                        )
-                        ak_host = _get_authentik_host(settings) or f'authentik.{fqdn}'
-                        ak_public = f'https://{_pub_hostport(ak_host)}'
-                        oidc_config_url = f'{ak_public}/application/o/fedhub/.well-known/openid-configuration'
-                        auth_endpoint_url = f'{ak_public}/application/o/authorize/'
-                        token_endpoint_url = f'{ak_public}/application/o/token/'
+                        plog('⚠ keycloak.der generation failed (OAuth may fail until fixed)')
 
-                        der_cmd = (
-                            f'sudo mkdir -p /opt/tak/certs && '
-                            f'sudo chown tak:tak /opt/tak/certs && '
-                            f'echo | openssl s_client -connect {ak_host}:{_caddy_https_port(settings)} -servername {ak_host} 2>/dev/null '
-                            f'| openssl x509 -outform DER -out /opt/tak/certs/keycloak.der 2>/dev/null && '
-                            f'chown tak:tak /opt/tak/certs/keycloak.der && '
-                            f'chmod 644 /opt/tak/certs/keycloak.der'
+                    if client_id and client_secret and not oauth_left_alone:
+                        patch_cmd = (
+                            f'cd {fh_dir}/configs && '
+                            f'sudo sed -i -E "/^keycloak(Auth|Token)Endpoint[[:space:]]*:/d; /^keycloak(Access|Refresh)TokenName[[:space:]]*:/d" federation-hub-ui.yml && '
+                            f'sudo sed -i "s/^allowOauth:.*/allowOauth: true/" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakServerName:.*|keycloakServerName: {ak_public}|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakClientId:.*|keycloakClientId: {shlex.quote(client_id)}|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakSecret:.*|keycloakSecret: {shlex.quote(client_secret)}|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakRedirectUri:.*|keycloakRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakrRedirectUri:.*|keycloakrRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakClaimName:.*|keycloakClaimName: groups|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakAdminClaimValue:.*|keycloakAdminClaimValue: authentik Admins|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakDerLocation:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakTlsCertFile:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
+                            f'sudo sed -i "s|^keycloakConfigurationEndpoint:.*|keycloakConfigurationEndpoint: {oidc_config_url}|" federation-hub-ui.yml && '
+                            f'sudo sed -i -e \'$a\\\' federation-hub-ui.yml && '
+                            f'grep -q "^keycloakAuthEndpoint:" federation-hub-ui.yml || echo "keycloakAuthEndpoint: {auth_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakTokenEndpoint:" federation-hub-ui.yml || echo "keycloakTokenEndpoint: {token_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakAccessTokenName:" federation-hub-ui.yml || echo "keycloakAccessTokenName: access_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakRefreshTokenName:" federation-hub-ui.yml || echo "keycloakRefreshTokenName: refresh_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakRedirectUri:" federation-hub-ui.yml || echo "keycloakRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakrRedirectUri:" federation-hub-ui.yml || echo "keycloakrRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
+                            f'grep -q "^keycloakConfigurationEndpoint:" federation-hub-ui.yml || echo "keycloakConfigurationEndpoint: {oidc_config_url}" | sudo tee -a federation-hub-ui.yml > /dev/null'
                         )
-                        ok_der, _ = _module_run(cfg, der_cmd, timeout=30)
-                        if ok_der:
-                            plog(f'✓ keycloak.der generated from {ak_host}')
+                        ok_patch, _ = _module_run(cfg, patch_cmd, timeout=30)
+                        if ok_patch:
+                            plog('✓ federation-hub-ui.yml patched for Authentik OAuth')
+                            _module_run(cfg, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
+                            plog('✓ federation-hub restarted after OAuth patch')
                         else:
-                            plog('⚠ keycloak.der generation failed (OAuth may fail until fixed)')
-
-                        if client_id and client_secret:
-                            patch_cmd = (
-                                f'cd {fh_dir}/configs && '
-                                f'sudo sed -i -E "/^keycloak(Auth|Token)Endpoint[[:space:]]*:/d; /^keycloak(Access|Refresh)TokenName[[:space:]]*:/d" federation-hub-ui.yml && '
-                                f'sudo sed -i "s/^allowOauth:.*/allowOauth: true/" federation-hub-ui.yml && '
-                                f'sudo sed -i "s|^keycloakServerName:.*|keycloakServerName: {ak_public}|" federation-hub-ui.yml && '
-                                f'sudo sed -i "s|^keycloakClientId:.*|keycloakClientId: {shlex.quote(client_id)}|" federation-hub-ui.yml && '
-                                f'sudo sed -i "s|^keycloakSecret:.*|keycloakSecret: {shlex.quote(client_secret)}|" federation-hub-ui.yml && '
-                                f'sudo sed -i "s|^keycloakRedirectUri:.*|keycloakRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
-                                f'sudo sed -i "s|^keycloakrRedirectUri:.*|keycloakrRedirectUri: {redirect_uri}|" federation-hub-ui.yml && '
-                                f'sudo sed -i "s|^keycloakClaimName:.*|keycloakClaimName: groups|" federation-hub-ui.yml && '
-                                f'sudo sed -i "s|^keycloakAdminClaimValue:.*|keycloakAdminClaimValue: authentik Admins|" federation-hub-ui.yml && '
-                                f'sudo sed -i "s|^keycloakDerLocation:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
-                                f'sudo sed -i "s|^keycloakTlsCertFile:.*|keycloakTlsCertFile: /opt/tak/certs/keycloak.der|" federation-hub-ui.yml && '
-                                f'sudo sed -i "s|^keycloakConfigurationEndpoint:.*|keycloakConfigurationEndpoint: {oidc_config_url}|" federation-hub-ui.yml && '
-                                f'sudo sed -i -e \'$a\\\' federation-hub-ui.yml && '
-                                f'grep -q "^keycloakAuthEndpoint:" federation-hub-ui.yml || echo "keycloakAuthEndpoint: {auth_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
-                                f'grep -q "^keycloakTokenEndpoint:" federation-hub-ui.yml || echo "keycloakTokenEndpoint: {token_endpoint_url}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
-                                f'grep -q "^keycloakAccessTokenName:" federation-hub-ui.yml || echo "keycloakAccessTokenName: access_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
-                                f'grep -q "^keycloakRefreshTokenName:" federation-hub-ui.yml || echo "keycloakRefreshTokenName: refresh_token" | sudo tee -a federation-hub-ui.yml > /dev/null && '
-                                f'grep -q "^keycloakRedirectUri:" federation-hub-ui.yml || echo "keycloakRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
-                                f'grep -q "^keycloakrRedirectUri:" federation-hub-ui.yml || echo "keycloakrRedirectUri: {redirect_uri}" | sudo tee -a federation-hub-ui.yml > /dev/null && '
-                                f'grep -q "^keycloakConfigurationEndpoint:" federation-hub-ui.yml || echo "keycloakConfigurationEndpoint: {oidc_config_url}" | sudo tee -a federation-hub-ui.yml > /dev/null'
-                            )
-                            ok_patch, _ = _module_run(cfg, patch_cmd, timeout=30)
-                            if ok_patch:
-                                plog('✓ federation-hub-ui.yml patched for Authentik OAuth')
-                                _module_run(cfg, 'sudo systemctl restart federation-hub 2>&1', timeout=90)
-                                plog('✓ federation-hub restarted after OAuth patch')
-                            else:
-                                plog('⚠ Auto OAuth patch failed — use "Enable Authentik login" button')
+                            plog('⚠ Auto OAuth patch failed — use "Enable Authentik login" button')
 
                     ak_token2 = _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN') or _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
                     if ak_token2 and fqdn:
