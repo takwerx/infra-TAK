@@ -143,6 +143,9 @@ class Box:
         is_new = bundle != str(self.old_ctx / 'tak')
         if is_new and 'start_new' in self.fail and name == 'takserver-db':
             return 1
+        if not is_new and 'rollback_once' in self.fail and name == 'takserver-db':
+            self.fail.discard('rollback_once')       # the first try to put the old version back fails
+            return 1
         self.containers[name] = {'image': self.images[image], 'bundle': bundle, 'new': is_new}
         return 0
 
@@ -387,6 +390,29 @@ def test_new_tak_that_does_not_start_puts_the_old_version_back(tmp_path):
     assert box.images['takserver'] == 'img-old-app' and box.images['takserver_db'] == 'img-old-db'
     assert not any(k.startswith(('takserver:', 'takserver_db:')) for k in box.images), box.images
     assert not (box.root / 'takserver-docker-hardened-5.8-RELEASE-106').exists()
+    _old_untouched(box)
+
+
+def test_old_version_is_tried_again_when_the_first_try_to_put_it_back_fails(tmp_path):
+    box, ns, st, log = _update(tmp_path, 'takserver-docker-hardened-5.8-RELEASE-106',
+                               fail=['start_new', 'rollback_once'])
+    assert st['error'] and 'old version is running again' in log
+    assert 'once more' in log
+    assert box.containers['takserver']['bundle'] == str(box.old_ctx / 'tak')
+    _old_untouched(box)
+
+
+def test_failed_database_dump_stops_before_any_change_and_leaves_no_half_backup(tmp_path):
+    box = Box(tmp_path)
+    z = box.zip_dir / 'takserver-docker-hardened-5.8-RELEASE-106.zip'
+    _make_zip(z, 'takserver-docker-hardened-5.8-RELEASE-106', HARDENED_DB)
+    ns = _ns(box)
+    ns['_tak_db_refresh_backup'] = lambda *a, **k: ('', 'pg_dump exit 1')
+    ns['run_takserver_upgrade_container'](str(z))
+    assert ns['upgrade_status']['error']
+    assert 'backup failed' in '\n'.join(ns['upgrade_log'])
+    assert _docker_rm_calls(box) == []
+    assert not [d for d in (box.root / 'snapshots').glob('pre-update-*')], 'half-made backup folder left'
     _old_untouched(box)
 
 

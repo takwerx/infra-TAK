@@ -105024,10 +105024,10 @@ def _tak_pre_update_backup(stamp, old_tak, ulog):
         ulog('✗ The database is running but could not be backed up (password or PostgreSQL '
              'tools not found). Nothing was changed.')
         return False, dest_dir
-    ulog('  Dumping the cot database (TAK Server stays up)…')
     path, why = _tak_db_refresh_backup(pgbin, pw, ulog, stamp, prefix='pre-update')
     if not path:
         ulog('✗ The database backup failed (%s). Nothing was changed.' % why)
+        _pg_run(['rm', '-rf', dest_dir], timeout=120)     # an unfinished backup folder is not a backup
         return False, dest_dir
     try:
         kept = sorted(d for d in os.listdir(root) if _TAK_UPDATE_BACKUP_RE.match(d))
@@ -105278,7 +105278,18 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True, migration=Fals
             rc(f'ln -sfn {shlex.quote(old_tak)} /opt/tak', timeout=15)
             if had_db: dk(['docker', 'tag', db_old, TAK_DB_IMAGE])
             if had_app: dk(['docker', 'tag', app_old, TAK_CONTAINER])
-            if (had_db and had_app) and _start_stack(old_ctx, old_tak):
+            _back = False
+            for _try in (1, 2):          # a port the failed start held can need a moment to free up
+                if not (had_db and had_app):
+                    break
+                if _try == 2:
+                    ulog("  Trying the old version once more in 30 seconds...")
+                    time.sleep(30)
+                    dk(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER], 90)
+                if _start_stack(old_ctx, old_tak):
+                    _back = True
+                    break
+            if _back:
                 subprocess.run(_sudo_wrap(['rm', '-rf', new_ctx]), capture_output=True, timeout=120)
                 _drop_tags(db_new, app_new, db_old, app_old)
                 return _fail("The new version did not start, so the old version is running again. "
