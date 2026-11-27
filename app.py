@@ -16940,17 +16940,49 @@ def netbird_control_api():
         # or the briefly-shipped :latest that broke auth), so rewrite the compose to the vetted
         # pin BEFORE pull — Update always converges the box onto the tested image, never chases
         # upstream latest. (Bumping the pin in a release is what actually moves NetBird forward.)
-        _netbird_sync_compose_image_tags(nb_dir)
-        pull = _sp.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
-                       capture_output=True, text=True, cwd=nb_dir, timeout=600)
-        if pull.returncode != 0:
-            err = (pull.stderr or pull.stdout or 'docker compose pull failed').strip()[:400]
-            return jsonify({'success': False, 'error': err}), 500
+        #
+        # ops #1327: the order is (1) pull the pinned images by name, (2) back up data/, (3) only then
+        # rewrite the compose and recreate. A failed pull stops here with the compose and the
+        # running container untouched. Update no longer runs _netbird_finalize_account_store: it
+        # reset the operator's "users need approval" setting on every Update. It runs only while
+        # this install still owes it (netbird_finalize_pending, set when a deploy created the owner).
+        _s = load_settings()
+        _srv_img, _dash_img = _get_netbird_target_images(_s)
+        _compose_path = os.path.join(nb_dir, 'docker-compose.yml')
+        try:
+            with open(_compose_path) as _f:
+                _old_txt = _f.read()
+        except Exception:
+            _old_txt = _read_priv(_compose_path)
+        _backup = None
+        _same = _netbird_compose_on_target(_old_txt, _srv_img, _dash_img)
+        if not _same:
+            _ok, _backup, _msg = _netbird_prepare_image_change(nb_dir, _old_txt, _srv_img, _dash_img, lambda _m: None)
+            if not _ok:
+                return jsonify({'success': False, 'error': f'NetBird was not changed: {_msg}'[:400]}), 500
+        _wrote = _netbird_sync_compose_image_tags(nb_dir)
+        if not _same and not _wrote:
+            # the backup stopped the server; start it as it was and say so
+            _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), capture_output=True, text=True,
+                    cwd=nb_dir, timeout=180)
+            return jsonify({'success': False, 'error': 'NetBird was not changed: could not rewrite '
+                            'docker-compose.yml'}), 500
+        if _same:
+            pull = _sp.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=600)
+            if pull.returncode != 0:
+                err = (pull.stderr or pull.stdout or 'docker compose pull failed').strip()[:400]
+                return jsonify({'success': False, 'error': err}), 500
         try:
             _netbird_recreate_containers(nb_dir, lambda _m: None)
-            _netbird_finalize_account_store()
+            if _s.get('netbird_finalize_pending') and _netbird_finalize_account_store():
+                _s.pop('netbird_finalize_pending', None)
+                save_settings(_s)
         except Exception as ex:
-            return jsonify({'success': False, 'error': str(ex)[:300]}), 500
+            if not _same:
+                _netbird_revert_compose(nb_dir, _old_txt, lambda _m: None)
+            _hint = f' (data backup: {os.path.basename(_backup)})' if _backup else ''
+            return jsonify({'success': False, 'error': (str(ex)[:300] + _hint)}), 500
         time.sleep(2)
         r_status = _sp.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server']),
                              capture_output=True, text=True)
@@ -67669,21 +67701,51 @@ def _netbird_mgmt_request(path, method='GET', data=None, token=None, base='http:
     return _req.urlopen(req, timeout=timeout, context=ctx)
 
 
+def _netbird_compose_image_tags(txt):
+    """The image tags a NetBird compose names: {'server': [...], 'dashboard': [...]}. One entry per
+    `image:` line; a line with no tag gives None (Docker reads that as :latest). Parsed as whole
+    tokens, so `0.82.1` is never found inside `0.82.10` (ops #1327)."""
+    import re as _re
+    out = {'server': [], 'dashboard': []}
+    for key, name in (('server', 'netbirdio/netbird-server'), ('dashboard', 'netbirdio/dashboard')):
+        pat = _re.compile(r'^[ \t]*image:[ \t]*["\']?' + _re.escape(name)
+                          + r'(?::([^\s"\'#]+))?(?![\w./:-])', _re.M)
+        out[key] = [m.group(1) for m in pat.finditer(txt or '')]
+    return out
+
+
+def _netbird_compose_on_target(txt, srv_img, dash_img):
+    """True when EVERY netbird-server and dashboard image line in the compose names exactly the
+    tag of the target images, and each is named at least once. An exact tag compare: a text match
+    found 0.82.1 inside 0.82.10, and a tag-less line counted as the pin (ops #1327)."""
+    tags = _netbird_compose_image_tags(txt)
+    want_srv = srv_img.rsplit(':', 1)[-1]
+    want_dash = dash_img.rsplit(':', 1)[-1]
+    return (bool(tags['server']) and all(t == want_srv for t in tags['server'])
+            and bool(tags['dashboard']) and all(t == want_dash for t in tags['dashboard']))
+
+
 def _netbird_sync_compose_image_tags(nb_dir):
-    """Rewrite the NetBird compose's image: tags to the current NETBIRD_SERVER_IMAGE /
-    NETBIRD_DASHBOARD_IMAGE constants (the vetted PIN). A box may carry a different tag on disk —
-    an older pin, or the broken :latest a box was briefly moved to — so pin the compose before
-    any `docker compose pull` so it fetches exactly the vetted image. Idempotent; best-effort."""
+    """Rewrite the NetBird compose's image: tags to the current target images (the PIN for this
+    box's update channel). A box may carry a different tag on disk — an older pin, the broken
+    :latest a box was briefly moved to, a tag-less line — so pin the compose before the container
+    is recreated. Idempotent; best-effort. Callers pull the images FIRST (ops #1327): this rewrite
+    never runs ahead of a pull."""
     import re as _re
     compose = os.path.join(nb_dir, 'docker-compose.yml')
     try:
         with open(compose) as f:
             txt = f.read()
     except Exception:
-        return False
+        try:
+            txt = _read_priv(compose)
+        except Exception:
+            return False
     _srv_img, _dash_img = _get_netbird_target_images()
-    new = _re.sub(r'(image:\s*)netbirdio/netbird-server:\S+', rf'\1{_srv_img}', txt)
-    new = _re.sub(r'(image:\s*)netbirdio/dashboard:\S+', rf'\1{_dash_img}', new)
+    new = _re.sub(r'(?m)^([ \t]*image:[ \t]*["\']?)netbirdio/netbird-server(?::[^\s"\'#]+)?(?![\w./:-])',
+                  lambda m: m.group(1) + _srv_img, txt)
+    new = _re.sub(r'(?m)^([ \t]*image:[ \t]*["\']?)netbirdio/dashboard(?::[^\s"\'#]+)?(?![\w./:-])',
+                  lambda m: m.group(1) + _dash_img, new)
     if new == txt:
         return False  # already current — nothing to do
     try:
@@ -67697,6 +67759,179 @@ def _netbird_sync_compose_image_tags(nb_dir):
             return True
         except Exception:
             return False
+
+
+def _netbird_pull_images(images, plog):
+    """Pull each image BY NAME and report (ok, message). A failed pull is not fatal when the image
+    is already on this box (an offline box, a registry blip): the compose will name exactly that
+    image. A failed pull of an image that is NOT on the box stops the caller before it touches
+    the compose or the container (ops #1327: the heal used to rewrite the compose first, so a
+    failed pull left the new tag named over the old container)."""
+    for img in images:
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'pull', img]),
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode == 0:
+                continue
+            err = (r.stderr or r.stdout or 'docker pull failed').strip()[:200]
+        except Exception as e:
+            err = str(e)[:200]
+        try:
+            have = subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', img]),
+                                  capture_output=True, text=True, timeout=30)
+            on_disk = have.returncode == 0
+        except Exception:
+            on_disk = False
+        if on_disk:
+            plog(f'  ⚠ netbird: could not pull {img} ({err}); using the copy already on this box')
+            continue
+        return False, f'could not pull {img}: {err}'
+    return True, ''
+
+
+def _netbird_data_fingerprint(root):
+    """(relative path, size, mtime_ns) of every file under root — what a stopped store looks like."""
+    out = []
+    for dp, _dn, fns in os.walk(root):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            out.append((os.path.relpath(p, root), st.st_size, st.st_mtime_ns))
+    return sorted(out)
+
+
+def _netbird_backup_data(nb_dir, from_label, plog):
+    """Copy ~/netbird/data (store.db, idp.db, the rest) to ~/netbird/data.bak-<from_label> BEFORE a
+    NetBird image change (ops #1327). NetBird 0.83 migrates the store and upstream names no way
+    back, so this copy is the only way to undo it.
+
+    The server is stopped for the copy so the files are consistent (a live SQLite copy can be torn).
+    The caller recreates it right after with the new image. Returns (ok, backup_path_or_None, msg).
+    On ANY failure the server is started again and nothing has changed: no backup, no image change.
+    An identical earlier backup is reused (a heal that retries every boot adds no copies); the 5
+    newest backups are kept."""
+    import shutil as _sh
+    import sqlite3 as _sq
+    import re as _re
+    from datetime import datetime as _dt
+    data = os.path.join(nb_dir, 'data')
+    try:
+        has_data = os.path.isdir(data) and bool(os.listdir(data))
+    except OSError:
+        has_data = False
+    if not has_data:
+        return True, None, 'no NetBird data to back up'
+
+    def _start_again():
+        try:
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'start', 'netbird-server']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=120)
+        except Exception:
+            pass
+
+    label = _re.sub(r'[^0-9A-Za-z._-]', '_', (from_label or '').strip()) or 'unknown'
+    try:
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'stop', 'netbird-server']),
+                       capture_output=True, text=True, cwd=nb_dir, timeout=120)
+        st = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server']),
+                            capture_output=True, text=True, timeout=30)
+        if st.returncode == 0 and st.stdout.strip() == 'true':
+            return False, None, 'could not stop netbird-server for a consistent copy'
+    except Exception as e:
+        _start_again()
+        return False, None, f'could not stop netbird-server: {str(e)[:120]}'
+
+    dest = None
+    try:
+        fp = _netbird_data_fingerprint(data)
+        for name in sorted(os.listdir(nb_dir)):
+            old = os.path.join(nb_dir, name)
+            if name.startswith('data.bak-') and os.path.isdir(old) and _netbird_data_fingerprint(old) == fp:
+                plog(f'  ✓ netbird: data already backed up in {name}')
+                return True, old, 'already backed up'
+        need = sum(sz for _p, sz, _m in fp)
+        free = _sh.disk_usage(nb_dir).free
+        if free < int(need * 1.1) + 50 * 1024 * 1024:
+            _start_again()
+            return False, None, (f'not enough free disk for a backup of the NetBird data '
+                                 f'({need // (1024 * 1024)} MB needed, {free // (1024 * 1024)} MB free)')
+        dest = os.path.join(nb_dir, f'data.bak-{label}')
+        if os.path.exists(dest):
+            dest += '-' + _dt.utcnow().strftime('%Y%m%d-%H%M%S')
+        try:
+            _sh.copytree(data, dest, symlinks=True, copy_function=_sh.copy2)
+        except Exception:
+            # root-owned files the console cannot read: copy as root through the broker.
+            _sh.rmtree(dest, ignore_errors=True)
+            r = subprocess.run(_sudo_wrap(['cp', '-a', data, dest]),
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout or 'cp failed').strip()[:160])
+        try:
+            os.chmod(dest, 0o700)
+            os.utime(dest, None)  # copytree gave it the source folder's time; "newest" must mean newest
+        except OSError:
+            pass
+        if _netbird_data_fingerprint(dest) != fp:
+            raise RuntimeError('the copy does not match the data')
+        db = os.path.join(dest, 'store.db')
+        if os.path.isfile(db):
+            conn = _sq.connect(f'file:{db}?mode=ro&immutable=1', uri=True, timeout=5)
+            try:
+                conn.execute('SELECT count(*) FROM sqlite_master').fetchone()
+            finally:
+                conn.close()
+    except Exception as e:
+        if dest:
+            _sh.rmtree(dest, ignore_errors=True)
+        _start_again()
+        return False, None, f'backup of the NetBird data failed: {str(e)[:160]}'
+
+    try:
+        baks = sorted((os.path.join(nb_dir, n) for n in os.listdir(nb_dir) if n.startswith('data.bak-')),
+                      key=lambda p: os.path.getmtime(p), reverse=True)
+        for old in baks[5:]:
+            if old != dest:
+                _sh.rmtree(old, ignore_errors=True)
+    except OSError:
+        pass
+    plog(f'  ✓ netbird: backed up data/ to {os.path.basename(dest)} ({need // (1024 * 1024)} MB). '
+         f'To go back: stop netbird-server, copy it over data/, put the old image tags in docker-compose.yml, up -d')
+    return True, dest, 'backed up'
+
+
+def _netbird_prepare_image_change(nb_dir, compose_txt, srv_img, dash_img, plog):
+    """Everything that must succeed BEFORE the compose names a new NetBird image (ops #1327):
+    pull both images by name, then back up the data. Returns (ok, backup_path_or_None, msg). When
+    ok is False nothing has changed and netbird-server is running as before."""
+    ok, msg = _netbird_pull_images([srv_img, dash_img], plog)
+    if not ok:
+        return False, None, msg
+    cur = (_netbird_compose_image_tags(compose_txt)['server'] or [None])[0]
+    return _netbird_backup_data(nb_dir, cur or 'untagged', plog)
+
+
+def _netbird_revert_compose(nb_dir, old_txt, plog):
+    """The new image would not start: put the previous compose text back and bring the old
+    container up again, so the box keeps running (the backup is untouched either way)."""
+    compose = os.path.join(nb_dir, 'docker-compose.yml')
+    try:
+        try:
+            with open(compose, 'w') as f:
+                f.write(old_txt)
+        except Exception:
+            _write_priv(compose, old_txt)
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=180)
+        plog('  netbird: put the previous compose back' + ('' if r.returncode == 0
+             else f' — start failed: {(r.stderr or r.stdout or "").strip()[:160]}'))
+        return r.returncode == 0
+    except Exception as e:
+        plog(f'  ⚠ netbird: could not put the previous compose back: {str(e)[:120]}')
+        return False
 
 
 def _netbird_store_key_needed(server_image):
@@ -67922,8 +68157,9 @@ def _heal_netbird_pinned_image(plog=None):
     """v10.0.9: roll a NetBird box back onto the vetted pin if its compose carries a different
     image tag — e.g. the briefly-shipped :latest that jumped server 0.72.3→"24.04" / dashboard
     v2.39→v2.90 and broke auth fleet-wide (401 'token invalid'). Detects drift from the on-disk
-    compose tag, rewrites to the pin, pulls, and recreates so the box self-heals on the next
-    console boot. Idempotent: a box already on the pin is a no-op (no pull, no restart).
+    compose tag (an exact tag compare, ops #1327), pulls the pin, backs up the data, rewrites the
+    compose to the pin and recreates, so the box self-heals on the next console boot. Idempotent:
+    a box already on the pin is a no-op (no pull, no stop, no backup, no restart).
     Best-effort; never raises. (Recovery proven manually on test6/8/12 2026-07-06 — 0.72.3 starts
     clean against the newer-migrated store.db and the 401s stop.)"""
     _log = plog or (lambda m: print(m, flush=True))
@@ -67945,22 +68181,41 @@ def _heal_netbird_pinned_image(plog=None):
             except Exception:
                 return False
         _srv_img, _dash_img = _get_netbird_target_images()
-        if _srv_img in txt and _dash_img in txt:
+        if _netbird_compose_on_target(txt, _srv_img, _dash_img):
             return False  # already on this channel's target — healthy, no-op
         _pin_kind = 'dev' if _srv_img == NETBIRD_SERVER_DEV_IMAGE and NETBIRD_SERVER_DEV_IMAGE != NETBIRD_SERVER_IMAGE else 'vetted'
         _log(f"  netbird: compose off the {_pin_kind} pin — restoring {_srv_img} + recreating")
-        _netbird_sync_compose_image_tags(nb_dir)
-        subprocess.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
-                       capture_output=True, text=True, cwd=nb_dir, timeout=600)
+        # ops #1327: pull FIRST and back the data up, THEN rewrite the compose. Before, the compose
+        # was rewritten before the pull and the pull was not checked, so a failed pull left the new
+        # tag named over the old container (the next `up -d` swapped the image silently), and a
+        # move to 0.83 migrated the store with no copy of the old one.
+        _ok, _bak, _msg = _netbird_prepare_image_change(nb_dir, txt, _srv_img, _dash_img, _log)
+        if not _ok:
+            _log(f"  ⚠ netbird: image NOT changed ({_msg}); NetBird keeps running as it was. "
+                 "The next console start tries again.")
+            return False
+        _wrote = _netbird_sync_compose_image_tags(nb_dir)
+        if not _wrote:
+            _log("  ⚠ netbird: could not rewrite docker-compose.yml; starting NetBird as it was")
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']),
                            capture_output=True, text=True, cwd=nb_dir, timeout=180)
-        if r.returncode == 0:
+        if r.returncode == 0 and _wrote:
             _log(f"  ✓ netbird: restored to {_pin_kind} pin + recreated")
             return True
-        _log(f"  ⚠ netbird: pin restore recreate failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+        if r.returncode != 0:
+            _log(f"  ⚠ netbird: pin restore recreate failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+            if _wrote:
+                _netbird_revert_compose(nb_dir, txt, _log)
+            if _bak:
+                _log(f"  netbird: data backup kept in {os.path.basename(_bak)}")
         return False
     except Exception as e:
         _log(f"  netbird: pin-restore heal error (non-fatal): {e}")
+        try:  # the backup stops the server for its copy: never leave it stopped
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'start', 'netbird-server']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=120)
+        except Exception:
+            pass
         return False
 
 
@@ -68146,12 +68401,17 @@ def _netbird_complete_setup(settings, plog):
         resp = _netbird_mgmt_request('/api/setup', method='POST', data=body, timeout=30)
         result = json.loads(resp.read().decode())
         pat = result.get('personal_access_token') or ''
+        # ops #1327: THIS deploy created the account, so the onboarding / approval gates it starts
+        # with are ours to clear (once). A redeploy or Update of an existing account never sets
+        # this, so it never touches an approval setting the operator chose.
+        settings['netbird_finalize_pending'] = True
         if pat:
             settings['netbird_pat'] = pat
             settings['netbird_admin_email'] = email
             save_settings(settings)
             plog(f'  ✓ Setup complete — PAT saved (user={email})')
             return pat
+        save_settings(settings)
         plog(f'  ⚠ Setup returned 200 without PAT (keys: {list(result.keys())})')
         return None
     except urllib.error.HTTPError as e:
@@ -68555,8 +68815,28 @@ def _run_netbird_deploy(settings):
         # /api/setup then created the owner WITHOUT a PAT or an account, Authentik was never
         # registered, and the deploy still reported success. The flag only matters while
         # setup is required, and Step 5 rewrites the compose without it.
-        _nb_target_srv, _ = _get_netbird_target_images()
+        _nb_target_srv, _nb_target_dash = _get_netbird_target_images()
         nb_store_key = _ensure_netbird_store_key_setting(settings) if _netbird_store_key_needed(_nb_target_srv) else None
+        # ops #1327: a redeploy over an existing NetBird that changes the image (or finds a store
+        # with no compose) pulls the new images and backs up data/ BEFORE the compose is rewritten.
+        _old_compose = os.path.join(nb_dir, 'docker-compose.yml')
+        _old_txt = None
+        if os.path.isfile(_old_compose):
+            try:
+                with open(_old_compose) as _f:
+                    _old_txt = _f.read()
+            except Exception:
+                try:
+                    _old_txt = _read_priv(_old_compose)
+                except Exception:
+                    _old_txt = None
+        _store_exists = os.path.isfile(os.path.join(nb_dir, 'data', 'store.db'))
+        if (_old_txt is not None and not _netbird_compose_on_target(_old_txt, _nb_target_srv, _nb_target_dash)) \
+                or (_old_txt is None and _store_exists):
+            _ok, _bak, _msg = _netbird_prepare_image_change(nb_dir, _old_txt or '', _nb_target_srv,
+                                                            _nb_target_dash, plog)
+            if not _ok:
+                raise RuntimeError(f'NetBird image not changed: {_msg}. The running NetBird was left as it was.')
         _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=True, store_key=nb_store_key)
         plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{_pub_hostport(netbird_domain)}/oauth2)')
 
@@ -68564,6 +68844,8 @@ def _run_netbird_deploy(settings):
         _sp.run(_sudo_wrap(['docker', 'compose', 'pull']), capture_output=True, text=True, cwd=nb_dir)
         r = _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), capture_output=True, text=True, cwd=nb_dir)
         if r.returncode != 0:
+            if _old_txt:
+                _netbird_revert_compose(nb_dir, _old_txt, plog)
             raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
         # netbird-server reads the host CA bundle through a single-file bind mount, and
         # update-ca-certificates swaps that file, so a container started before a CA was installed
@@ -68614,7 +68896,15 @@ def _run_netbird_deploy(settings):
 
         plog('  Recreating containers to apply config...')
         _netbird_recreate_containers(nb_dir, plog)
-        _netbird_finalize_account_store(plog)
+        # ops #1327: clear the onboarding / approval gates only when this install still owes it
+        # (a deploy created the owner and the clear has not happened yet). A redeploy of a working
+        # account left "users need approval" alone.
+        if settings.get('netbird_finalize_pending'):
+            if _netbird_finalize_account_store(plog):
+                settings.pop('netbird_finalize_pending', None)
+                save_settings(settings)
+        else:
+            plog('  ✓ Account approval settings left as they are')
         plog('✓ Click Authentik on the NetBird login page to sign in')
 
         plog('')
