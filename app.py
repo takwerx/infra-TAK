@@ -128421,8 +128421,8 @@ def _startup_f2b_ufw_lock_switch():
                 started = True      # set after the call: if it raised, the finally tries again
                 how = 'restarted' if r2.returncode == 0 else f'start FAILED (rc {r2.returncode})'
                 if revive or cut_off:
-                    how = ('was stopped or still stopping from an earlier lock switch that was cut off, so '
-                           + ('started' if r2.returncode == 0 else how))
+                    how = ('was enabled but not running, or still stopping (stopped by hand, or an earlier '
+                           'lock switch may have been cut off), so ' + ('started' if r2.returncode == 0 else how))
             else:
                 how = f'not running ({act or "unknown"}), left stopped'
             if changes:
@@ -128432,7 +128432,7 @@ def _startup_f2b_ufw_lock_switch():
                 else:
                     _log(f"fail2ban: infratak-ufw action updated (IPv6 bans use ufw prepend); fail2ban {how}")
             elif stop_tried or revive:
-                _log(f"fail2ban: enabled but not running after an earlier lock switch was cut off; fail2ban {how}")
+                _log(f"fail2ban: enabled but not running at console start; fail2ban {how}")
         finally:
             if stop_tried and not started:
                 _f2b_start_if_down(_log)

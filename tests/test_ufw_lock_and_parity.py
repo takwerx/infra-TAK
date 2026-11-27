@@ -370,11 +370,11 @@ def test_next_boot_starts_an_enabled_but_stopped_fail2ban_ops1342():
     calls, writes, logs, box = _switch(active='inactive', enabled='enabled')
     assert box['active'] == 'active'
     assert writes                                       # the move still happens, then the start
-    assert any('cut off' in m and 'started' in m for m in logs)
+    assert any('may have been cut off' in m and 'started' in m for m in logs)
     # the console died after the jail files were written: nothing stale, nothing outdated
     calls, writes, logs, box = _switch(active='inactive', enabled='enabled', stale=False, outdated=False)
     assert box['active'] == 'active'
-    assert any('enabled but not running' in m and 'cut off' in m for m in logs)
+    assert any('enabled but not running at console start' in m and 'started' in m for m in logs)
     # a failed unit (crashed at start) counts as down
     calls, writes, logs, box = _switch(active='failed', enabled='enabled', stale=False, outdated=False)
     assert box['active'] == 'active'
@@ -388,7 +388,7 @@ def test_next_boot_waits_out_a_stop_that_is_still_running_then_starts_fail2ban_o
         assert list(B.FLOCK_F2B_STOP_ARGV) in calls, kw
         assert calls.index(list(B.FLOCK_F2B_STOP_ARGV)) < calls.index(['systemctl', 'start', 'fail2ban']), kw
         assert box['active'] == 'active', kw
-        assert any('cut off' in m for m in logs), kw
+        assert any('may have been cut off' in m for m in logs), kw
 
 
 def test_a_deactivating_fail2ban_that_is_not_enabled_is_left_alone_ops1342():
