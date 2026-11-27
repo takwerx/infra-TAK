@@ -29317,6 +29317,7 @@ def fail2ban_uninstall_api():
             '/etc/systemd/system/infratak-f2b-watch.timer',
             '/etc/systemd/system/infratak-f2b-watch.service',
             '/usr/local/sbin/infratak-f2b-notify',
+            '/usr/local/sbin/infratak-f2b-watch',   # ops #1406
             '/var/lib/fail2ban/infratak-f2b-notify-state.json',
             '/var/lib/fail2ban/infratak-f2b-notify-state.json.lock',
             '/var/lib/fail2ban/infratak-f2b-notify-state.json.tmp',
@@ -124965,7 +124966,10 @@ PERSON_COOLDOWN = 86400
 SUMMARY_EVERY = 86400
 
 # ops #1406: `infratak-f2b-notify --watch` runs from a timer every 5 minutes.
-WATCH_FAIL_MIN = 3          # failed guesses from one address before a good login needs a person
+# The timer runs its own copy of this file (infratak-f2b-watch), never the notify hook: an OLDER
+# notifier (a box rolled back to 10.4.10 or earlier) takes "--watch" for a banned address and
+# mails "Banned --watch" at every run (found on a real Rocky 9 box).
+WATCH_FAIL_MIN = 3         # failed guesses from one address before a good login needs a person
 WATCH_WINDOW = 1800         # ...when they came within 30 minutes before it
 WATCH_RECENT = 1800         # a good login older than this is not news
 HEALTH_RUNS = 2             # runs in a row that must see fail2ban failing before anyone is mailed
@@ -125803,7 +125807,7 @@ _F2B_WATCH_SERVICE = (
     "Description=infra-TAK fail2ban and login watch (mails only when a person is needed)\n\n"
     "[Service]\n"
     "Type=oneshot\n"
-    "ExecStart=/usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify --watch\n"
+    "ExecStart=/usr/local/sbin/infratak-f2b-watch --watch\n"
 )
 _F2B_WATCH_TIMER = (
     "[Unit]\n"
@@ -125816,6 +125820,7 @@ _F2B_WATCH_TIMER = (
     "[Install]\n"
     "WantedBy=timers.target\n"
 )
+_F2B_WATCH_SCRIPT_PATH = '/usr/local/sbin/infratak-f2b-watch'
 _F2B_WATCH_UNITS = ('/etc/systemd/system/infratak-f2b-watch.service',
                     '/etc/systemd/system/infratak-f2b-watch.timer')
 
@@ -125828,6 +125833,12 @@ def _f2b_watch_ensure():
     if not os.path.exists('/usr/local/sbin/infratak-f2b-notify'):
         return False
     changed = False
+    # The timer runs its own copy of the script, written first so the timer never starts
+    # without it. A box rolled back to an older release keeps this copy and the older
+    # notify hook never sees "--watch" (it would take it for a banned address).
+    if _f2b_read_text(_F2B_WATCH_SCRIPT_PATH) != _F2B_NOTIFY_SCRIPT:
+        _write_priv(_F2B_WATCH_SCRIPT_PATH, _F2B_NOTIFY_SCRIPT, perm=0o755)
+        changed = True
     for path, text in zip(_F2B_WATCH_UNITS, (_F2B_WATCH_SERVICE, _F2B_WATCH_TIMER)):
         if _f2b_read_text(path) != text:
             _write_priv(path, text)

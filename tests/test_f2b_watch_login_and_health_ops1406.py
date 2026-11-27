@@ -490,11 +490,47 @@ def test_ban_mode_is_unchanged_a_ban_for_a_bot_still_sends_nothing(tmp_path):
 
 def test_timer_units_run_the_script_every_5_minutes_after_10_minutes_of_uptime():
     svc, tmr = _const('_F2B_WATCH_SERVICE'), _const('_F2B_WATCH_TIMER')
-    assert 'ExecStart=/usr/bin/env python3 /usr/local/sbin/infratak-f2b-notify --watch' in svc
+    assert 'ExecStart=/usr/local/sbin/infratak-f2b-watch --watch' in svc
     assert 'Type=oneshot' in svc
     assert 'OnBootSec=10min' in tmr and 'OnUnitActiveSec=5min' in tmr
     assert 'WantedBy=timers.target' in tmr and 'Unit=infratak-f2b-watch.service' in tmr
     assert ' ;' not in svc and ' #' not in svc
+
+
+def test_rolled_back_box_is_safe_the_timer_never_runs_the_notify_hook_with_watch():
+    """Found on a real Rocky 9 box: the 10.4.10-and-older notifier takes `--watch` for a banned
+    address and mails `Banned --watch` every 5 minutes. So the timer runs its own copy of the
+    script (infratak-f2b-watch), which an older release never rewrites or removes."""
+    svc = _const('_F2B_WATCH_SERVICE')
+    assert 'ExecStart=/usr/local/sbin/infratak-f2b-watch --watch' in svc
+    assert 'infratak-f2b-notify' not in svc
+    assert _const('_F2B_WATCH_SCRIPT_PATH') == '/usr/local/sbin/infratak-f2b-watch'
+    ens = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == '_f2b_watch_ensure')
+    src = ast.get_source_segment(APP, ens)
+    assert src.index('_F2B_WATCH_SCRIPT_PATH') < src.index('zip(_F2B_WATCH_UNITS')   # script first, then units
+    assert '/usr/local/sbin/infratak-f2b-watch' in APP[APP.index('def fail2ban_uninstall_api'):]
+
+
+def test_the_non_root_broker_accepts_the_timer_units_and_the_watch_script():
+    """Found by reading the broker: it lets root run only infra-TAK's own scripts. The first
+    version used /usr/bin/env python3 and would have been refused on every non-root box."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('takwerx_broker_t1406', REPO / 'broker' / 'takwerx_broker.py')
+    B = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(B)
+    B._check_unit_write('/etc/systemd/system/infratak-f2b-watch.service',
+                        _const('_F2B_WATCH_SERVICE').encode(), 'w')
+    B._check_unit_write('/etc/systemd/system/infratak-f2b-watch.timer',
+                        _const('_F2B_WATCH_TIMER').encode(), 'w')
+    assert B.PATH_CLASS.get('/usr/local/sbin/infratak-f2b-watch') == B.DEST_ASSET
+    bad = _const('_F2B_WATCH_SERVICE').replace('/usr/local/sbin/infratak-f2b-watch --watch',
+                                               '/usr/bin/env python3 /usr/local/sbin/infratak-f2b-watch --watch')
+    try:
+        B._check_unit_write('/etc/systemd/system/infratak-f2b-watch.service', bad.encode(), 'w')
+    except B.Denied:
+        pass
+    else:
+        raise AssertionError('the broker should refuse /usr/bin/env in a root unit')
 
 
 def test_the_timer_is_made_on_install_on_every_start_and_removed_on_uninstall():

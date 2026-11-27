@@ -556,6 +556,7 @@ PATH_ALLOW_EXACT = (
     # /usr/local/sbin prefix (which stays denied as a root-PATH escalation surface).
     '/usr/local/sbin/tak-console-restart.sh',   # daily console-restart timer
     '/usr/local/sbin/infratak-f2b-notify',       # fail2ban off-box notify hook
+    '/usr/local/sbin/infratak-f2b-watch',        # ops #1406: the same script, run by the watch timer
     '/usr/local/sbin/takserver-renew-letsencrypt.sh',  # ops #633: daily LE renewal
                                                  # (takserver-cert-renewal.service); moved
                                                  # here from /opt/tak
@@ -778,6 +779,7 @@ PATH_CLASS = {
     '/usr/local/bin/mediamtx': DEST_ASSET,
     '/usr/local/sbin/tak-console-restart.sh': DEST_ASSET,
     '/usr/local/sbin/infratak-f2b-notify': DEST_ASSET,
+    '/usr/local/sbin/infratak-f2b-watch': DEST_ASSET,
     '/usr/local/sbin/takserver-renew-letsencrypt.sh': DEST_ASSET,
     '/var/lib/infratak-kernel-patch.sh': DEST_ASSET,
     '/var/lib/infratak-os-upgrade.sh': DEST_ASSET,
@@ -804,6 +806,7 @@ PATH_CLASS_PENDING = {
     '/usr/bin/caddy': 'W2 part 2', '/usr/local/bin/mediamtx': 'W2 part 2',
     '/usr/local/sbin/tak-console-restart.sh': 'W2 part 2',
     '/usr/local/sbin/infratak-f2b-notify': 'W2 part 2',
+    '/usr/local/sbin/infratak-f2b-watch': 'W2 part 2',
     '/usr/local/sbin/takserver-renew-letsencrypt.sh': 'W2 part 2',
     '/var/lib/infratak-kernel-patch.sh': 'W2 part 2',
     '/var/lib/infratak-os-upgrade.sh': 'W2 part 2',
