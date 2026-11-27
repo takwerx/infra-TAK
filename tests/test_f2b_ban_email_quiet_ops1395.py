@@ -64,6 +64,7 @@ class _Box:
         self.f2b_log = tmp_path / 'fail2ban.log'
         self.tak_log = tmp_path / 'takserver-messaging.log'
         self.ssh_log = ''
+        self.smtp_down = False
         self.f2b_log.write_text('')
         self.tak_log.write_text('')
         self.settings_path = tmp_path / 'settings.json'
@@ -89,6 +90,7 @@ class _Box:
         mod = types.ModuleType('infratak_f2b_notify')
         exec(compile(_script_text(), 'infratak-f2b-notify', 'exec'), mod.__dict__)
         mail = self.mail
+        box = self
 
         class SMTP:
             def __init__(self, *a, **k):
@@ -101,6 +103,8 @@ class _Box:
                 return False
 
             def sendmail(self, frm, to, text):
+                if box.smtp_down:
+                    raise OSError('connection refused')
                 mail.sent.append((frm, to, text))
 
         mod.smtplib = types.SimpleNamespace(SMTP=SMTP)
@@ -290,6 +294,27 @@ def test_no_alert_address_sends_nothing_and_exits_clean(tmp_path):
     box.ssh_fail('jsmith', '203.0.113.1')
     box.ban('sshd', '203.0.113.1')
     assert box.mail.sent == []
+
+
+def test_a_box_with_no_mail_relay_exits_clean_and_the_next_ban_can_still_mail(tmp_path):
+    box = _Box(tmp_path)
+    box.smtp_down = True
+    box.ssh_fail('jsmith', '203.0.113.1')
+    box.ban('sshd', '203.0.113.1')                      # SMTP refused: no crash, nothing sent
+    assert box.mail.sent == []
+    box.smtp_down = False
+    box.ban('sshd', '203.0.113.1')                      # the slot was given back, so this mails
+    assert len(box.mail.sent) == 1
+
+
+def test_a_failed_summary_mail_is_tried_again_at_the_next_ban(tmp_path):
+    box = _Box(tmp_path, {'f2b_daily_summary': True})
+    box.smtp_down = True
+    box.ban('sshd', '203.0.113.1')
+    assert box.mail.sent == []
+    box.smtp_down = False
+    box.ban('sshd', '203.0.113.2')
+    assert len(box.mail.sent) == 1
 
 
 def test_several_recipients_all_get_the_mail(tmp_path):
