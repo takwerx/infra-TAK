@@ -2328,7 +2328,7 @@ threading.Thread(target=_warm_update_cache_bg, daemon=True).start()
 
 _json_file_cache = {}  # path -> ((mtime_ns, size), text); invalidated on any file change
 
-def _load_json_cached(p):
+def _load_json_cached_with_text(p):
     """Read+parse a small JSON config with an mtime/size cache: one stat() per call, a
     real disk read only when the file actually changes. Returns a FRESH dict each call
     (json.loads) so callers can safely read-modify-write. {} on missing/unreadable.
@@ -2342,7 +2342,7 @@ def _load_json_cached(p):
     try:
         st = os.stat(p)
     except OSError:
-        return {}
+        return {}, ''
     key = (st.st_mtime_ns, st.st_size)
     cached = _json_file_cache.get(p)
     if not cached or cached[0] != key:
@@ -2350,15 +2350,48 @@ def _load_json_cached(p):
             with open(p) as f:
                 cached = (key, f.read())
         except OSError:
-            return {}
+            return {}, ''
         _json_file_cache[p] = cached
     try:
-        return json.loads(cached[1])
+        return json.loads(cached[1]), cached[1]
+    except Exception:
+        return {}, cached[1]
+
+
+def _load_json_cached(p):
+    """The parsed dict only (see _load_json_cached_with_text)."""
+    return _load_json_cached_with_text(p)[0]
+
+class _LoadedSettings(dict):
+    """The dict load_settings() returns. It remembers the file text it was read from, so
+    save_settings() can tell which keys THIS caller changed and write only those on top of
+    the file as it is now (ops #1378). Without it every save wrote the caller's whole dict:
+    a deploy thread that loaded settings, ran for minutes and saved at the end put back the
+    old value of every key another thread wrote in between. The post-update stamp
+    (last_console_version) was lost that way on a fresh install, 21 minutes after it was
+    saved. A plain dict (a copy, a dict built by hand) has no baseline and is saved whole,
+    as before."""
+    _base_text = None
+
+
+def _settings_baseline(s):
+    """The key/value pairs `s` held when it was read (or last saved), or None for a dict
+    that did not come from load_settings(). An unparseable baseline is {}: every key of the
+    caller then counts as changed, which is what a whole-file save did before."""
+    text = getattr(s, '_base_text', None)
+    if text is None:
+        return None
+    try:
+        base = json.loads(text) if text else {}
     except Exception:
         return {}
+    return base if isinstance(base, dict) else {}
+
 
 def load_settings():
-    s = _load_json_cached(os.path.join(CONFIG_DIR, 'settings.json'))
+    s, _text = _load_json_cached_with_text(os.path.join(CONFIG_DIR, 'settings.json'))
+    s = _LoadedSettings(s)
+    s._base_text = _text
     # Type guard: a core identity key persisted with a non-scalar type (e.g. server_ip
     # written as [null, null] from an unpacked (ip, source) tuple) crashes every
     # `(settings.get(...) or '').strip()` — including at module import, so the console
@@ -2384,10 +2417,48 @@ CORE_SETTINGS_KEYS = ('ssl_mode', 'fqdn', 'server_ip', 'os_type', 'os_name',
                       'pkg_mgr', 'arch', 'console_port', 'install_dir')
 _settings_write_lock = threading.Lock()
 
+_MISSING = object()
+
+def _merge_settings_with_disk(s, base, disk):
+    """`disk` (the file now) with only the changes `s` made since it was read as `base`:
+    keys added or changed in `s` are set, keys removed from `s` are removed, every other key
+    stays as the file has it. Returns the merged dict and the sorted names of keys that
+    another writer changed (or removed) since `base` and that this merge therefore kept (names only,
+    never values: settings hold passwords)."""
+    merged = dict(disk)
+    kept = []
+    for k in set(s) | set(base):
+        if k in s:
+            if k in base and s[k] == base[k]:
+                if disk.get(k, _MISSING) != base[k]:
+                    kept.append(k)
+                continue
+            merged[k] = s[k]
+        elif k in base:
+            merged.pop(k, None)
+    return merged, sorted(kept)
+
 def save_settings(s):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     p = os.path.join(CONFIG_DIR, 'settings.json')
     with _settings_write_lock:
+        # (0) Keep other writers' keys (ops #1378). A dict from load_settings() carries the
+        # text it was read from; write only what this caller changed on top of the file as
+        # it is now. Any failure here falls back to the old whole-dict save below.
+        _caller_view = s
+        _base = _settings_baseline(s)
+        if _base is not None:
+            try:
+                with open(p) as _f:
+                    _disk = json.loads(_f.read())
+                if isinstance(_disk, dict):
+                    _merged, _kept = _merge_settings_with_disk(s, _base, _disk)
+                    if _kept:
+                        print(f"[save_settings] kept keys another writer changed since this "
+                              f"caller read the file: {_kept}", flush=True)
+                    s = _merged
+            except Exception:
+                pass
         # (3) Never-drop guard. Fast path: when the caller carries every core key (the
         # overwhelming common case — callers do load→modify→save) we skip the disk read
         # entirely. A core key is only ever MISSING from the incoming dict on the
@@ -2439,6 +2510,13 @@ def save_settings(s):
                 except Exception:
                     pass
             raise
+        # The caller may keep using its dict and save it again: what it holds now is the
+        # new baseline, so a later removal of a key it added here still removes it.
+        if isinstance(_caller_view, _LoadedSettings):
+            try:
+                _caller_view._base_text = json.dumps(_caller_view)
+            except Exception:
+                _caller_view._base_text = None
 
 def _read_os_release():
     """(os_type, os_name) from /etc/os-release, mapped exactly as start.sh detect_os()
