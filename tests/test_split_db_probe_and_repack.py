@@ -87,6 +87,9 @@ def watch(tmp_path):
     _stub(stubs / 'pg_isready', PG_ISREADY_STUB % {'dir': tmp_path})
     _stub(stubs / 'sudo', SUDO_STUB % {'dir': tmp_path})
     _stub(stubs / 'psql', '#!/bin/sh\nexit 0\n')
+    # ops #1338: the restart asks pg_lsclusters which cluster serves the port. A one-cluster
+    # Debian Server One, so the restart still goes through `pg_ctlcluster` (recorded above).
+    _stub(stubs / 'pg_lsclusters', '#!/bin/sh\necho "15 main 5432 online postgres /var/lib/postgresql/15/main /x"\n')
     _stub(stubs / 'timeout', '#!/bin/sh\n[ "$(cat %s/tcp)" = up ]\n' % tmp_path)
     _stub(stubs / 'sleep', '#!/bin/sh\nexit 0\n')
     _stub(gd / 'send-alert-email.sh', '#!/bin/sh\necho "$1" >> %s/alerts\n' % tmp_path)

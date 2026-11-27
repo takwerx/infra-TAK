@@ -109,6 +109,8 @@ def _control(sandbox, action='start', port=5432, database=True):
           'jsonify': lambda d, *a: d,
           'load_settings': lambda: {},
           '_get_tak_deployment_config': lambda s: cfg,
+          # the start/stop/restart command is not what this test is about (ops #1338 tests it)
+          '_pg_ctl_cmd': lambda action, db_port=5432: 'true',
           '_ssh_probe': probe}
     try:
         ns['_pg_isready_cmd'] = _helper()

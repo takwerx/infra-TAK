@@ -43,7 +43,8 @@ _FUNCS = {
     '_cloudtak_store_endpoint', '_cloudtak_compose_is_garage', '_cloudtak_env_read',
     '_cloudtak_env_set', '_cloudtak_migrate_minio_to_garage', '_cloudtak_garage_converge',
     '_cloudtak_garage_rollback', '_cloudtak_web_dir', '_cloudtak_plugins_dir',
-    '_cloudtak_remote_garage_sh',
+    '_cloudtak_remote_garage_sh', '_cloudtak_compose_at', '_cloudtak_env_parse_text',
+    '_cloudtak_rclone_bytes', '_cloudtak_migrate_space_short', '_cloudtak_load_legacy_image',
     '_open_secret_w',   # ops #632: .env writes go through it
 }
 
@@ -105,6 +106,8 @@ class Compose:
             return 1, 'boom: ' + self.fail_on
         if 'copy' in args:
             return 0, '2026/10/07 INFO  : a.png: Copied (new)\n2026/10/07 INFO  : b.kml: Copied (new)\n'
+        if 'size' in args:
+            return 0, '{"count":2,"bytes":2048,"sizeless":0}\n'
         return 0, ''
 
 
@@ -119,6 +122,8 @@ def _ns(compose, legacy='quay.io/minio/minio:RELEASE.2024-08-17T01-24-54Z'):
     ns = _load()
     ns['_cloudtak_compose_run'] = compose
     ns['_cloudtak_legacy_minio_image'] = lambda d: legacy
+    ns['_cloudtak_keep_legacy_image'] = lambda *a, **k: True        # ops #1334: tested in its own file
+    ns['_cloudtak_fs_free_local'] = lambda p: (1, 500 * 1024 ** 3)
     ns['_cloudtak_revert_checkout'] = lambda *a, **k: True
     return ns
 
@@ -165,6 +170,8 @@ def test_migration_runs_upstreams_steps_in_order_then_archives(ct):
             '--profile migrate up -d --pull missing store minio-legacy',
             '--profile migrate run --rm --quiet-pull migrate lsd garage:',
             '--profile migrate run --rm --quiet-pull migrate lsd minio:',
+            '--profile migrate run --rm --quiet-pull migrate size --json minio:cloudtak',
+            '--profile migrate run --rm --quiet-pull migrate size --json garage:cloudtak',
             '--profile migrate run --rm --quiet-pull migrate copy --update -v minio:cloudtak garage:cloudtak',
             '--profile migrate run --rm --quiet-pull migrate check --one-way --size-only minio:cloudtak garage:cloudtak',
             '--profile migrate rm -sf minio-legacy']
@@ -222,12 +229,12 @@ def test_web_dir_follows_the_tree(tmp_path):
     assert ns['_cloudtak_plugins_dir'](str(tmp_path)) == str(tmp_path / 'app' / 'plugins')
 
 
-def test_remote_script_quotes_a_valid_image_and_drops_an_invalid_one():
-    ns = _load()
-    sh = ns['_cloudtak_remote_garage_sh']('quay.io/minio/minio:RELEASE.2024-08-17T01-24-54Z')
-    assert "MINIO_LEGACY_IMAGE=quay.io/minio/minio:RELEASE.2024-08-17T01-24-54Z ./cloudtak.sh migrate-store" in sh
-    bad = ns['_cloudtak_remote_garage_sh']('x; rm -rf /')
-    assert 'rm -rf' not in bad and 'MINIO_LEGACY_IMAGE' not in bad and './cloudtak.sh migrate-store' in bad
+def test_remote_script_writes_secret_and_endpoint_but_no_longer_runs_upstreams_migrate_store():
+    # ops #1334: upstream's cloudtak.sh migrate-store copies with `rclone sync` (line 485 of
+    # 13.127.0) and leaves the services stopped on a failure. The move is our own function now.
+    sh = _load()['_cloudtak_remote_garage_sh']()
+    assert 'GARAGE_RPC_SECRET' in sh and 'AWS_S3_Endpoint=http://store:3900' in sh
+    assert 'migrate-store' not in sh and 'sync' not in sh
 
 
 def _body(name):
@@ -248,7 +255,7 @@ def test_update_builds_first_then_moves_the_store_then_starts():
     assert i_capture < i_checkout < i_build < i_store < i_up
     assert "build --no-cache && {dcc} up -d" not in body          # never chained again
     r_build = body.index('f"cd ~/CloudTAK && {dcc} build --no-cache"')
-    r_store = body.index('_cloudtak_remote_garage_sh(legacy_minio_img)')
+    r_store = body.index('_cloudtak_remote_garage_converge(remote_cfg, plog, legacy_image=legacy_minio_img)')
     r_up = body.index('f"cd ~/CloudTAK && {dcc} up -d"')
     assert r_build < r_store < r_up
     assert '_cloudtak_garage_rollback(cloudtak_dir, prev_sha, plog)' in body
@@ -258,13 +265,13 @@ def test_update_builds_first_then_moves_the_store_then_starts():
 
 def test_deploy_moves_the_store_only_after_images_built():
     body = re.sub(r'#.*', '', _body('run_cloudtak_deploy'))
-    assert body.index('plog("✓ Images built")') < body.index('_cloudtak_garage_converge(cloudtak_dir, plog, start=False)')
+    assert body.index('plog("✓ Images built")') < body.index('_cloudtak_garage_converge(cloudtak_dir, plog, start=False, restart_on_fail=True)')
 
 def test_every_env_writer_runs_the_store_step():
     for fn in ('run_cloudtak_deploy', 'run_cloudtak_redeploy'):
         body = re.sub(r'#.*', '', _body(fn))
-        assert '_cloudtak_garage_converge(cloudtak_dir, plog, start=False)' in body, fn
-        assert '_cloudtak_remote_garage_sh(' in body, fn
+        assert '_cloudtak_garage_converge(cloudtak_dir, plog, start=False, restart_on_fail=True)' in body, fn
+        assert '_cloudtak_remote_garage_converge(' in body, fn
 
 
 def test_no_plugin_path_is_hardcoded_to_api_web_any_more():

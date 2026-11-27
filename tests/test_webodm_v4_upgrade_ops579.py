@@ -56,20 +56,27 @@ WANT = {'_IMAGE_EXACT_TAG_RE', '_image_ref_parts', '_image_exact_version', '_ima
         '_webodm_strip_olefile', 'WEBODM_DB_VOLUME', 'WEBODM_DB_DUMP_PREFIX', 'WEBODM_UPGRADE_WAIT_S', 'WEBODM_PULL_TIMEOUT_S',
         '_webodm_db_sh', '_webodm_db_needs_upgrade', '_webodm_answers', '_webodm_db_room_check', '_webodm_backup_db_95',
         '_webodm_wait_upgraded', '_webodm_restore_95', '_run_webodm_update',
-        '_FREE_SPACE_BACKUPS_HINT'}
+        '_FREE_SPACE_BACKUPS_HINT',
+        # ops #1328: the shared routine and the host adapters it runs through
+        '_WebodmResult', '_webodm_remote', '_webodm_run', '_webodm_put_file', '_webodm_db_data_probe',
+        '_webodm_move_to_new_images', 'WEBODM_PENDING_COMPOSE', '_webodm_prepare_db_upgrade'}
 
 
 class Box:
     """A fake WebODM box: the compose file, the db volume state and every command run."""
 
     def __init__(self, pg='9.5', used_kb=40_000, free_kb=10_000_000, dump_ok=True,
-                 upgrade_fails=False, pull_ok=True, times_out=()):
+                 upgrade_fails=False, pull_ok=True, times_out=(), exec_fails=False):
         self.compose = OLD
+        self.exec_fails = exec_fails   # wo_db is not running: `docker exec` into it fails
+        self.compose_at_pull = None
         self.pg, self.used_kb, self.free_kb = pg, used_kb, free_kb
         self.dump_ok, self.upgrade_fails, self.pull_ok = dump_ok, upgrade_fails, pull_ok
         # steps that hit the console's time limit once ('pull', 'up -d', 'docker stop')
         self.times_out = set(times_out)
         self.calls, self.writes, self.running_images, self.timeouts = [], [], None, {}
+        self.pending, self.pending_writes, self.pull_files = None, [], []
+        self.events = []   # ordered: pull, dump, write-compose, up
 
     def _r(self, rc=0, out='', err=''):
         return types.SimpleNamespace(returncode=rc, stdout=out, stderr=err)
@@ -85,12 +92,15 @@ class Box:
             self._maybe_time_out('docker stop', argv, kw.get('timeout'))
         if argv[:5] == ['docker', 'exec', '-u', 'postgres', 'wo_db']:
             cmd = argv[-1]
+            if self.exec_fails:
+                return self._r(rc=1, err='Error response from daemon: container wo_db is not running')
             if 'PG_VERSION' in cmd:
                 return self._r(out=self.pg + '\n')
             if cmd.startswith('du -sk'):
                 return self._r(out=f'{self.used_kb}\t/var/lib/postgresql/data\nFilesystem 1024-blocks Used '
                                    f'Available Capacity Mounted\n/dev/root 100 50 {self.free_kb} 50% /\n')
             if 'pg_dumpall' in cmd:
+                self.events.append('dump')
                 return self._r(out='1\n') if self.dump_ok else self._r(rc=1, err='pg_dumpall: boom')
         if argv[:3] == ['docker', 'logs', 'wo_db']:
             return self._r(out='UPGRADE FAILED. ...' if self.upgrade_fails else 'Upgrade complete.')
@@ -102,28 +112,49 @@ class Box:
             return self._r(out='200' if 'webodm_webapp:3.3.1' in self.running_images else '403')
         return self._r()
 
-    def compose_cmd(self, d, action, timeout=300):
+    def compose_cmd(self, d, action, timeout=300, cfg=None):
+        # the new images are pulled from the side file; its name must be the one the routine wrote
+        m = re.match(r"-f '?([^' ]+)'? pull$", action)
+        if m:
+            self.pull_files.append(m.group(1))
+            action = 'pull'
+            # what the pull reads is the NEW set, not what is on disk
+            self.pull_reads = self.pending
         self.calls.append(('compose', action))
         self.timeouts[action] = timeout
+        if action == 'pull':
+            self.compose_at_pull = self.compose   # what a console killed right now would leave on disk
+        if action.startswith('run --rm --no-deps -T --entrypoint sh wo_db'):
+            return self._r(out=self.pg + '\n')   # the one-off read of the db volume (no database start)
         self._maybe_time_out(action, ['docker', 'compose', action], timeout)
         if action == 'pull':
+            self.events.append('pull')
             return self._r(0 if self.pull_ok else 1, err='' if self.pull_ok else 'pull access denied')
+        if action == 'up -d wo_db':
+            self.exec_fails = False   # the 9.5 database is up again
+            return self._r()
         if action == 'up -d':
+            self.events.append('up')
             self.running_images = self.compose
         return self._r()
 
     def write(self, path, content, **kw):
+        if path.endswith('docker-compose.pending.yml'):
+            self.pending = content
+            self.pending_writes.append(content)
+            return
         self.writes.append(content)
         self.compose = content
+        self.events.append('write')
 
 
 def _run(box):
-    ns = {'re': re, 'os': __import__('os'),
+    ns = {'re': re, 'os': __import__('os'), 'shlex': __import__('shlex'),
           'time': types.SimpleNamespace(time=lambda: 0, sleep=lambda s: None,
                                         strftime=lambda f: '20261109-060000')}
     for node in TREE.body:
         names = ({t.id for t in node.targets if isinstance(t, ast.Name)} if isinstance(node, ast.Assign)
-                 else {node.name} if isinstance(node, ast.FunctionDef) else set())
+                 else {node.name} if isinstance(node, (ast.FunctionDef, ast.ClassDef)) else set())
         if names & WANT:
             exec(compile(ast.Module([node], []), 'app.py', 'exec'), ns)
     # _webodm_wait_upgraded's clock: let each wait loop run a few rounds, then time out
@@ -168,6 +199,9 @@ def test_update_from_3x_checks_room_dumps_then_starts_4x():
     assert stop < dump
     assert _images(box.running_images) == ns['WEBODM_IMAGES']
     assert any('backup-infratak-20261109-060000-pg95.sql.gz' in m for m in status['log'])
+    # ops #1328: the compose on disk changes LAST, after the pull and the dump
+    assert box.events == ['pull', 'dump', 'write', 'up'], box.events
+    assert box.pull_files == ['/home/takwerx/webodm/docker-compose.pending.yml']
 
 
 def test_update_already_on_18_makes_no_backup_and_no_stop():
