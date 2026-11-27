@@ -1196,6 +1196,11 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
         'agency_name': inst.get('agency_name') or '',
         # Certificate renewal (W458), on unless the operator turned it off.
         'renewal_enabled': atlas_renewal.enabled(inst),
+        # ops #1416: "Authentik administrators are also ATLAS administrators".
+        # On unless the operator turned it off; the problem line is read from
+        # the stored guard answer, never probed (like the admin group's).
+        'authentik_admins_on': atlas_access.global_admins_wanted(inst),
+        'authentik_admins_problem': authentik_admins_problem(settings, inst),
         'version': _installed_version(ctx, inst),
         'running_version': (_running_version(ctx, inst)
                             if running and probe_version else None),
@@ -1222,7 +1227,8 @@ def instance_status(ctx, inst, projects=None, probe_version=False,
 #: rely on; `test_atlas_route_contract.py` holds both halves to it.
 INSTANCE_FIELDS = ('slug', 'name', 'mode', 'size_gb', 'port', 'built',
                    'running', 'stranded', 'version', 'running_version',
-                   'agency_name', 'renewal_enabled', 'admin_group_problem',
+                   'agency_name', 'renewal_enabled', 'authentik_admins_on',
+                   'authentik_admins_problem', 'admin_group_problem',
                    'admin_signin_problem', 'latest',
                    'update_available', 'paths')
 
@@ -1825,8 +1831,14 @@ def _seed_relay_choice(ctx, plog, inst=None):
              'InfraTAK\'s email configuration" in Admin → Email')
 
 
-def admin_groups_for(inst=None, global_group=None):
+def admin_groups_for(inst=None, global_group=None, include_global=True):
     """The groups that may administer one deployment, most specific first.
+
+    ⚠️ **`include_global=False` (ops #1416) leaves the global group out.** The
+    operator switched "Authentik administrators are also ATLAS administrators"
+    off and the lockout guard passed, so only the agency's own group (none, for
+    the plain deployment) is managed. The groups the operator added stay on the
+    line through `merged_admin_groups`.
 
     ⚠️ **Both, and in that order.** The agency's own administrators and the
     global administrators are alternatives — never the same person — so
@@ -1842,7 +1854,8 @@ def admin_groups_for(inst=None, global_group=None):
     slug = atlas_instances.derive(inst)['slug']
     if slug:
         names.append(atlas_instances.derive(inst)['admin_group'])
-    names.append(global_group or ADMIN_GROUP)
+    if include_global:
+        names.append(global_group or ADMIN_GROUP)
     return names
 
 
@@ -2087,10 +2100,19 @@ def agency_admin_group_outcome(ctx, inst, ak_url, ak_headers, plog=None):
             return failed('Could not create the agency admin group', exc)
 
     # --- and its way in ----------------------------------------------------- #
+    # ⚠️ Only what is in force (ops #1416): this rewrites the same policy the
+    # switch edits, and must not put back a group the operator took out.
+    in_force = True
+    if ctx:
+        try:
+            in_force = atlas_access.global_admins_in_force(ctx['load_settings'](), inst)
+        except Exception:
+            in_force = True
     result = atlas_access.ensure(atlas_access.Api(ak_url, ak_headers),
                                  names['authentik_slug'], add=[group_name],
                                  plog=log,
-                                 admin_group=global_admin_group(ak_url, ak_headers))
+                                 admin_group=global_admin_group(ak_url, ak_headers),
+                                 include_global=in_force)
     if result['status'] == 'failed':
         return outcome('failed', 'Could not admit the agency admin group: %s'
                        % result['detail'])
@@ -2124,6 +2146,22 @@ def _record_agency_group_state(ctx, inst, outcome, plog=None):
         if plog:
             plog('  ⚠ Could not record the admin-group state: %s' % str(exc)[:80])
     return outcome
+
+
+def authentik_admins_problem(settings, inst):
+    """What the row should say when the switch is off but not in force, or None.
+
+    ⚠️ **Off that did not take is a problem to show** (ops #1416). The operator
+    asked for the Authentik administrators to be out; the guard found their own
+    group empty or missing, so they are still in. Silence would read as done.
+    """
+    if settings is None or atlas_access.global_admins_wanted(inst):
+        return None
+    state = settings.get(atlas_access.state_key(atlas_instances.derive(inst)['settings_prefix']))
+    if isinstance(state, dict) and state.get('global_in') is True:
+        return ('Authentik administrators are switched off for ATLAS, but they are '
+                'still in for now: %s.' % (state.get('detail') or 'not checked'))
+    return None
 
 
 def agency_group_problem(settings, inst):
@@ -2220,6 +2258,209 @@ def _never_admin_groups(body, inst):
     return names
 
 
+def _global_in_force(ctx, inst):
+    """Whether the global administrators are in the gates now (ops #1416).
+
+    True whenever it cannot be told: a missing answer must never read as "taken
+    out", because taking a group out is the direction that can lock people out.
+    """
+    if ctx is None:
+        return True
+    try:
+        return atlas_access.global_admins_in_force(ctx['load_settings'](), inst)
+    except Exception:
+        return True
+
+
+def _read_admin_line(dirpath):
+    """The names on the deployment's `TAKMDM_ADMIN_GROUP` line, or None if unreadable."""
+    try:
+        with open(os.path.join(dirpath, '.env'), 'r', encoding='utf-8') as fh:
+            return _admin_group_names(_last_env_value(fh.read(), 'TAKMDM_ADMIN_GROUP'))
+    except OSError:
+        return None
+
+
+def _record_global_admins_state(ctx, inst, global_in, detail):
+    """Remember what the guard found, for the next writer and for the row."""
+    try:
+        s = ctx['load_settings']()
+        s[atlas_access.state_key(atlas_instances.derive(inst)['settings_prefix'])] = {
+            'global_in': bool(global_in), 'detail': detail,
+            'checked_at': int(time.time())}
+        ctx['save_settings'](s)
+    except Exception:
+        pass
+
+
+def _clear_global_admins_state(ctx, inst):
+    try:
+        s = ctx['load_settings']()
+        s.pop(atlas_access.state_key(atlas_instances.derive(inst)['settings_prefix']), None)
+        ctx['save_settings'](s)
+    except Exception:
+        pass
+
+
+def _guard_inputs(ctx, inst, dirpath, settings):
+    """``(api, policy_groups, env_groups, global_group)``, or None when it cannot be asked."""
+    token = _authentik_token(ctx, settings)
+    if not token:
+        return None
+    ak_url = ctx['_get_authentik_api_url'](settings)
+    headers = {'Authorization': 'Bearer %s' % token,
+               'Content-Type': 'application/json'}
+    env_groups = _read_admin_line(dirpath)
+    if env_groups is None:
+        return None
+    api = atlas_access.Api(ak_url, headers)
+    pol = atlas_access._find(
+        api, 'policies/expression/', 'name',
+        atlas_access.policy_name(atlas_instances.derive(inst)['authentik_slug']))
+    policy_groups = atlas_access.parse_groups(pol.get('expression')) if pol else []
+    return api, policy_groups, env_groups, global_admin_group(ak_url, headers)
+
+
+def refresh_global_admins(ctx, inst, plog, dirpath=None):
+    """Run the lockout guard for a deployment whose switch is off. True = global admins stay in.
+
+    ⚠️ **Re-asked on every update (ops #1416), not only when the switch is
+    pressed.** The operator's group can lose its last member, or be deleted,
+    long after the switch was turned off. An update that kept the global
+    administrators out then would leave ATLAS with nobody who can administer
+    it, and the console is not the thing to find that out with. So the guard
+    runs again, and when it fails the global administrators come back for this
+    update, with a line that says why. The switch itself stays off.
+
+    ⚠️ A question that cannot be asked (no token, Authentik down, `.env` not
+    readable) keeps the last answer instead of flipping a gate on a guess.
+    Nothing is asked, and nothing is recorded, while the switch is on.
+    """
+    if ctx is None or atlas_access.global_admins_wanted(inst):
+        return True
+    stored = _global_in_force(ctx, inst)
+    try:
+        settings = ctx['load_settings']()
+        dirpath = dirpath or instance_paths(ctx, inst)['dir']
+        inputs = _guard_inputs(ctx, inst, dirpath, settings)
+        if inputs is None:
+            plog('  ⚠ Could not check your ATLAS admin group; leaving the Authentik '
+                 'administrators setting as it was')
+            return stored
+        api, policy_groups, env_groups, global_group = inputs
+        ok, why = atlas_access.guard(api, policy_groups, env_groups,
+                                     admin_group=global_group)
+    except Exception as exc:
+        plog('  ⚠ Could not check your ATLAS admin group (%s); leaving the Authentik '
+             'administrators setting as it was' % str(exc)[:80])
+        return stored
+    _record_global_admins_state(ctx, inst, not ok, why)
+    if ok:
+        plog('  ✓ Authentik administrators are not ATLAS administrators here (%s)' % why)
+    else:
+        plog('  ⚠ The Authentik administrators stay ATLAS administrators for now: %s. '
+             'The setting is still off and applies again once your own group is '
+             'in place.' % why)
+    return not ok
+
+
+def set_authentik_admins(ctx, inst, enabled):
+    """Turn "Authentik administrators are also ATLAS administrators" on or off. `(steps, error)`.
+
+    ⚠️ **ops #1416 (TAK-MDM issue 14).** Off removes Authentik's superuser group
+    from both gates: the access policy in Authentik and `TAKMDM_ADMIN_GROUP` in
+    the deployment's `.env`. On puts it back. Per deployment, recorded in its
+    record (`atlas_access.OFF_KEY`), so every later deploy and update keeps it.
+
+    ⚠️ **Off is refused unless somebody else can still get in** (`atlas_access.guard`):
+    one group in both gates that exists and holds an enabled user. Nothing is
+    changed on a refusal.
+
+    ⚠️ **Order.** The Authentik policy first, the `.env` after: a half-done change
+    then turns superusers away at the proxy, never the operator's group. If the
+    policy cannot be written, the record is put back and `.env` is not touched.
+    """
+    paths = instance_paths(ctx, inst)
+    dirpath = paths['dir']
+    if not os.path.exists(os.path.join(dirpath, '.env')):
+        return [], 'That deployment has no configuration on disk yet.'
+    steps = []
+    settings = ctx['load_settings']()
+    token = _authentik_token(ctx, settings)
+    if not token:
+        return steps, 'Authentik is not available, so the ATLAS access cannot be changed.'
+    names = atlas_instances.derive(inst)
+    ak_url = ctx['_get_authentik_api_url'](settings)
+    headers = {'Authorization': 'Bearer %s' % token, 'Content-Type': 'application/json'}
+    api = atlas_access.Api(ak_url, headers)
+    try:
+        global_group = global_admin_group(ak_url, headers)
+        if not enabled:
+            inputs = _guard_inputs(ctx, inst, dirpath, settings)
+            if inputs is None:
+                return steps, ('Could not read ATLAS\'s admin line or ask Authentik, '
+                               'so nothing was changed.')
+            _api, policy_groups, env_groups, _gg = inputs
+            ok, why = atlas_access.guard(api, policy_groups, env_groups,
+                                         admin_group=global_group)
+            if not ok:
+                return steps, ('Not turned off, so nobody is locked out: %s. Put your '
+                               'own ATLAS admin group (with at least one member) on '
+                               'both ATLAS\'s admin line and Authentik\'s access policy '
+                               'for ATLAS first.' % why)
+            steps.append('Checked: ' + why)
+    except Exception as exc:
+        return steps, 'Could not check the access: %s' % str(exc)[:100]
+
+    # Record first, so every writer below reads the new answer; put back on failure.
+    before = [dict(i) for i in load_instances(ctx)]
+    now = []
+    for other in before:
+        if (other.get('slug') or None) == (inst or {}).get('slug'):
+            other = dict(other)
+            if enabled:
+                other.pop(atlas_access.OFF_KEY, None)
+            else:
+                other[atlas_access.OFF_KEY] = True
+            inst = other
+        now.append(other)
+    save_instances(ctx, now)
+    if enabled:
+        _clear_global_admins_state(ctx, inst)
+    else:
+        _record_global_admins_state(ctx, inst, False, steps[-1] if steps else '')
+
+    def undo():
+        save_instances(ctx, before)
+        if enabled:
+            _record_global_admins_state(ctx, inst, False, 'put back after a failure')
+        else:
+            _clear_global_admins_state(ctx, inst)
+
+    add = [names['admin_group']] if names['slug'] else []
+    result = atlas_access.ensure(api, names['authentik_slug'], add=add,
+                                 plog=steps.append, admin_group=global_group,
+                                 include_global=enabled)
+    if result['status'] == 'failed':
+        undo()
+        return steps, 'Authentik\'s access policy was not changed: %s' % result['detail']
+    steps.append('Authentik access policy: Authentik administrators '
+                 + ('in' if enabled else 'out'))
+    try:
+        changed = _arm_admin_gates(ctx, dirpath, steps.append, inst=inst,
+                                   global_group=global_group)
+    except Exception as exc:
+        undo()
+        # Put the policy back as it was, so the two gates agree.
+        atlas_access.ensure(api, names['authentik_slug'], add=add, plog=steps.append,
+                            admin_group=global_group, include_global=not enabled)
+        return steps, 'Could not change ATLAS\'s admin line: %s' % str(exc)[:100]
+    if changed:
+        _compose(ctx, 'up -d api', timeout=300, inst=inst)
+        steps.append('ATLAS restarted with the new admin line')
+    return steps, None
+
+
 def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
     """Turn on ATLAS's own two admin checks, once it is safe to.
 
@@ -2258,12 +2499,29 @@ def _arm_admin_gates(ctx, dirpath, plog, inst=None, global_group=None):
     # was dropped on every update — while `atlas_access` kept that group in
     # the Authentik policy. Authentik let those administrators in and ATLAS
     # refused them: the same lockout as above, made by an update.
-    managed = admin_groups_for(inst, global_group)
+    # ⚠️ **Whether the global administrators are managed at all (ops #1416).**
+    # Off, and the guard passing, leaves `authentik Admins` out: the operator
+    # asked for ATLAS administrators to be a list they own. The guard runs on
+    # every update, so a group that lost its members brings them back.
+    include_global = refresh_global_admins(ctx, inst, plog, dirpath)
+    managed = admin_groups_for(inst, global_group, include_global=include_global)
     current = _admin_group_names(_last_env_value(body, 'TAKMDM_ADMIN_GROUP'))
     wanted_names = merged_admin_groups(
         current, managed,
         previously_managed=_previously_managed_admin_groups(body, inst),
         never=_never_admin_groups(body, inst))
+    if not wanted_names:
+        # ⚠️ **Never a blank admin line.** ATLAS treats an empty
+        # `TAKMDM_ADMIN_GROUP` as "not armed" (fail-open to whoever Authentik
+        # lets in), and a line with nobody on it is the lockout. Reached only
+        # when every name on the line was one that may never be an admin group.
+        plog('  ⚠ No ATLAS admin group would be left; keeping the Authentik '
+             'administrators on the admin line')
+        managed = admin_groups_for(inst, global_group)
+        wanted_names = merged_admin_groups(
+            current, managed,
+            previously_managed=_previously_managed_admin_groups(body, inst),
+            never=_never_admin_groups(body, inst))
     wanted = ','.join(wanted_names)
     lines_now = [l for l in body.splitlines() if l.startswith('TAKMDM_ADMIN_GROUP=')]
     if current != wanted_names or len(lines_now) != 1:
@@ -5508,6 +5766,9 @@ def _reconcile_access(ctx, inst, plog):
     on the newest release returned at "nothing to do" and checked nothing —
     the one press an operator makes to repair a missing group did nothing.
     """
+    # ⚠️ First (ops #1416): every writer below reads the answer it records, so
+    # they all agree on whether the global administrators are in.
+    refresh_global_admins(ctx, inst, plog)
     # ⚠️ Re-asked on every update, because the binding can disappear long
     # after the deploy that made it — an Authentik restore, or somebody
     # unbinding the policy. A check that only runs at install answers a
@@ -6373,8 +6634,13 @@ def converge_access(ctx, ak_url, ak_headers, log):
             add = [names['admin_group']] if names['slug'] else []
             if admin_group is None:
                 admin_group = global_admin_group(ak_url, ak_headers)
-            out[name] = atlas_access.ensure(api, app_slug, add=add, plog=say,
-                                            admin_group=admin_group)['status']
+            # ⚠️ What is in force (ops #1416), read from the stored answer and
+            # never re-asked at boot: Authentik may still be starting, and a
+            # boot must not flip a gate on a guess.
+            out[name] = atlas_access.ensure(
+                api, app_slug, add=add, plog=say, admin_group=admin_group,
+                include_global=atlas_access.global_admins_in_force(
+                    ctx['load_settings'](), inst))['status']
         except Exception as exc:
             say('⚠ access policy not checked: %s' % str(exc)[:80])
             out[name] = 'failed'
@@ -7596,6 +7862,23 @@ def register(ctx):
             return jsonify({'success': False, 'error': err, 'steps': steps}), 400
         return jsonify({'success': True, 'steps': steps})
 
+    def instance_authentik_admins_view(slug):
+        """Turn "Authentik administrators are also ATLAS administrators" on or off."""
+        from flask import request as _rq
+
+        inst = _addressed(slug)
+        if inst is None:
+            return jsonify({'success': False,
+                            'error': 'no deployment with that slug'}), 404
+        data = _rq.get_json(silent=True) or {}
+        if not isinstance(data.get('enabled'), bool):
+            return jsonify({'success': False,
+                            'error': 'enabled must be true or false'}), 400
+        steps, err = set_authentik_admins(ctx, inst, data['enabled'])
+        if err:
+            return jsonify({'success': False, 'error': err, 'steps': steps}), 400
+        return jsonify({'success': True, 'steps': steps})
+
     def instance_control_view(slug):
         """Start, stop or restart one deployment.
 
@@ -7762,6 +8045,9 @@ def register(ctx):
              'endpoint': f'{KEY}_instance_name', 'view': instance_name_view},
             {'url': f'/api/{KEY}/instances/<slug>/renewal', 'methods': ['POST'],
              'endpoint': f'{KEY}_instance_renewal', 'view': instance_renewal_view},
+            {'url': f'/api/{KEY}/instances/<slug>/authentik-admins', 'methods': ['POST'],
+             'endpoint': f'{KEY}_instance_authentik_admins',
+             'view': instance_authentik_admins_view},
             {'url': f'/api/{KEY}/instances/<slug>/remove', 'methods': ['POST'],
              'endpoint': f'{KEY}_instance_remove', 'view': instance_remove_view},
             {'url': f'/api/{KEY}/instances/<slug>/remove-status', 'methods': ['GET'],
