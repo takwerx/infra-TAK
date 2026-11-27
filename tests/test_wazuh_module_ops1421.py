@@ -492,6 +492,19 @@ def test_app_wires_the_module_in_every_place_a_module_needs():
     assert "mod_registry.wazuh.reassert(mod_registry.get_ctx())" in APP
 
 
+def test_the_start_up_lock_down_check_runs_after_the_registry_is_loaded_and_not_in_the_migrations():
+    """The first box test showed the check never ran: _startup_migrations reaches it before
+    mod_registry.load_all() has run, so the module was not there yet."""
+    init = APP.index("mod_registry.init_registry(app, _MODULE_CTX, login_required)")
+    hook = APP.index("threading.Thread(target=_wazuh_reassert_on_start, daemon=True, name='wazuh-reassert').start()")
+    assert hook > init
+    mig = _fn_source('_startup_migrations')
+    assert 'wazuh' not in mig.lower()
+    body = _fn_source('_wazuh_reassert_on_start')
+    assert 'time.sleep(' in body and 'mod_registry.wazuh.reassert(mod_registry.get_ctx())' in body
+    assert 'except Exception' in body
+
+
 def test_the_page_route_needs_a_login():
     i = APP.index("@app.route('/wazuh')")
     assert APP[i:i + 80].split('\n')[1] == '@login_required'

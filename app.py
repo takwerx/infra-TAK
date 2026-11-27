@@ -129347,15 +129347,6 @@ def _startup_migrations():
         except Exception as _cs_err:
             print(f"Startup migration: caddy self-heal error (non-fatal): {_cs_err}", flush=True)
 
-        # ops #1421 (Security #1422 C6): the Wazuh agent's lock-down is checked on every console
-        # start and so after every Update Now (which restarts the console). Writes nothing
-        # when it is intact, so the agent is never restarted for nothing.
-        try:
-            if mod_registry.MODULES.get('wazuh'):
-                mod_registry.wazuh.reassert(mod_registry.get_ctx())
-        except Exception as _wz_err:
-            print(f"Startup migration: Wazuh lock-down check error (non-fatal): {_wz_err}", flush=True)
-
         # ops #633: move the renewal script from /opt/tak to LE_RENEW_SCRIPT first,
         # so the heal below patches the copy that will actually run.
         try:
@@ -132779,6 +132770,22 @@ _MODULE_CTX = {
 # silently drop its routes.
 _registry_loaded = mod_registry.load_all(_MODULE_CTX)
 mod_registry.init_registry(app, _MODULE_CTX, login_required)
+
+
+def _wazuh_reassert_on_start():
+    """ops #1421 (Security #1422 C6): the Wazuh agent's lock-down is checked on every console
+    start, and so after every Update Now (which restarts the console). It starts here, after the
+    module registry is loaded: _startup_migrations runs earlier and finds no module (first box
+    test, Nov 27: the check never ran). Writes nothing when the lock-down is intact."""
+    time.sleep(20)           # let the broker and the console settle
+    try:
+        if mod_registry.MODULES.get('wazuh'):
+            mod_registry.wazuh.reassert(mod_registry.get_ctx())
+    except Exception as _wz_err:
+        print(f"Wazuh lock-down check error (non-fatal): {_wz_err}", flush=True)
+
+
+threading.Thread(target=_wazuh_reassert_on_start, daemon=True, name='wazuh-reassert').start()
 print(f"[startup] module registry loaded: {_registry_loaded}", flush=True)
 _caddy_registry_loaded()
 
