@@ -105,6 +105,7 @@ def _merge(existing):
     ns = _load(['_takportal_settings_value_is_blank', '_takportal_template_placeholder_keys',
                 '_takportal_with_required_prefixes', '_takportal_merged_settings_json'],
                {'_takportal_get_existing_settings': lambda: dict(existing),
+                '_takportal_read_settings_state': lambda: ('ok', dict(existing), ''),
                 '_takportal_build_settings_dict': lambda s: dict(BUILT)})
     return json.loads(ns['_takportal_merged_settings_json']({}))
 

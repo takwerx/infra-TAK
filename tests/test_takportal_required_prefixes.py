@@ -111,6 +111,7 @@ def test_required_set_is_our_accounts_and_groups():
 
 def _merge(existing):
     ns = _ns({'_takportal_get_existing_settings': lambda: dict(existing),
+              '_takportal_read_settings_state': lambda: ('ok', dict(existing), ''),
               '_takportal_build_settings_dict': lambda s: {
                   'USERS_HIDDEN_PREFIXES': 'akadmin,webadmin,ak-,adm_,nodered-,ma-',
                   'GROUPS_HIDDEN_PREFIXES': 'authentik, MA -, vid_, tak_ROLE_',
@@ -152,6 +153,7 @@ def _guardrail(states, push_ok=True):
     logs, pushes = [], []
     ns = _ns({'_takportal_web_running': lambda: True,
               '_takportal_get_existing_settings': lambda: next(reads),
+              '_takportal_read_settings_state': lambda: ('ok', next(reads), ''),
               '_takportal_push_settings': lambda plog=None: pushes.append(1) or push_ok},
              funcs=('_takportal_with_required_prefixes', '_takportal_admin_guardrail'))
     ns['os'] = types.SimpleNamespace(path=types.SimpleNamespace(expanduser=lambda p: p, isdir=lambda p: True))

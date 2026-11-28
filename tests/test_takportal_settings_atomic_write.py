@@ -145,10 +145,14 @@ def test_a_torn_read_is_retried_instead_of_returning_empty():
     def run(argv, **kw):
         calls.append(argv)
         return types.SimpleNamespace(returncode=0, stdout=next(reads), stderr='')
-    read = _load('_takportal_get_existing_settings', {
+    # ops #1333: the retry now lives in the state reader (the dict reader wraps it).
+    state_read = _load('_takportal_read_settings_state', {
         'subprocess': types.SimpleNamespace(run=run), '_sudo_wrap': lambda a: a,
-        '_takportal_ref': lambda: 'c0ffee', 'time': types.SimpleNamespace(sleep=lambda s: None)})
-    assert read() == {'TAK_URL': 'https://tak.example.com:8443/Marti'}
+        '_takportal_ref': lambda: 'c0ffee', 'time': types.SimpleNamespace(sleep=lambda s: None),
+        '_TAKPORTAL_SETTINGS_PATH': SETTINGS, '_TAKPORTAL_SETTINGS_ABSENT_MARKERS': (),
+        '_TAKPORTAL_SETTINGS_DOCKER_DOWN_MARKERS': ()})
+    state, data, _raw = state_read()
+    assert state == 'ok' and data == {'TAK_URL': 'https://tak.example.com:8443/Marti'}
     assert len(calls) == 2
 
 

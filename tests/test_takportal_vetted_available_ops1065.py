@@ -13,7 +13,7 @@ Pins, each red on dev before this change and green with it:
   * the not-vetted install refuses a non-tag ref, a stale or different tag, a release that is not newer
     than Vetted, Beta Mode, a wrong password, and runs only the release GitHub calls the newest;
   * it is audited (who, from, to, "NOT VETTED");
-  * Update then goes back to Vetted, and says it is a move back;
+  * (ops #1333: Update no longer goes back to Vetted; it keeps a newer box and says so);
   * the badge, deploy and Guard Dog's "Update pending" stay silent for an Available-only release;
   * nothing but the display function asks GitHub for the newest release.
 """
@@ -396,20 +396,21 @@ def test_the_route_is_login_required_and_password_gated_before_anything_else():
 
 # ------------------------------------------- the git step: install Available, Update goes back
 
-def test_a_named_release_installs_then_update_goes_back_to_vetted_and_says_so(portal):
+def test_a_named_release_installs_then_update_keeps_it_and_says_so(portal):
     """The box test in miniature, with real git: vetted 2.0.14, GitHub 2.0.15. Install 2.0.15 by hand,
-    then the normal Update returns to 2.0.14 and says it is a move back."""
+    then the normal Update does NOT move back to 2.0.14 (ops #1333; ops #1065 used to). It stops, changes
+    nothing and says why."""
     n = _git_ns(tag='2.0.14')                                   # Update's answer: the vetted release
     n['_takportal_update_ctx'].target_tag = '2.0.15'
     r = n['_takportal_update_git'](str(portal), plog=lambda m: None)
     assert r['ok'] is True and r['to_version'] == '2.0.15' and r['rolled_back'] is False, r
-    assert 'has not tested it' in r['message'] and 'press Update' in r['message']
+    assert 'has not tested it' in r['message'] and 'does not move TAK Portal back' in r['message']
     assert _git(portal, 'rev-parse', 'HEAD') == _git(portal, 'rev-parse', '2.0.15^{commit}')
     n['_takportal_update_ctx'].target_tag = ''                  # the next job, a plain Update
     r = n['_takportal_update_git'](str(portal), plog=lambda m: None)
-    assert r['ok'] is True and r['rolled_back'] is True and r['to_version'] == '2.0.14', r
-    assert 'Moving back from 2.0.15 to release 2.0.14' in r['message'] and 'takwerx' in r['message']
-    assert _git(portal, 'rev-parse', 'HEAD') == _git(portal, 'rev-parse', '2.0.14^{commit}')
+    assert r['ok'] is False and r['kept_newer'] is True and r['rolled_back'] is False, r
+    assert r['to_version'] == '2.0.15' and 'newer than 2.0.14' in r['message'] and 'Nothing was changed' in r['message']
+    assert _git(portal, 'rev-parse', 'HEAD') == _git(portal, 'rev-parse', '2.0.15^{commit}')   # still on 2.0.15
 
 
 @pytest.mark.parametrize('ref', ['main', 'origin/main', 'HEAD', 'a' * 40, '2.0.15; id', '--upload-pack=x'])
@@ -475,7 +476,7 @@ def test_page_shows_both_versions_and_the_not_vetted_button():
     assert 'id="portal-unvetted-modal"' in html and 'id="portal-unvetted-password"' in html
     assert 'takwerx has not tested or security-reviewed TAK Portal 2.0.40. It runs with access to this server.' in html
     assert 'may fail to install' not in html
-    assert 'go back to 2.0.39' in html
+    assert 'Update does not move TAK Portal back' in html and 'go back to 2.0.39' not in html
     assert 'Update installs the TAK Portal release takwerx tested' in html
 
 
@@ -505,20 +506,21 @@ def test_on_beta_mode_the_page_still_shows_available_but_offers_no_install():
     assert 'id="unvetted-btn"' not in html and 'id="portal-unvetted-modal"' not in html
 
 
-def test_page_on_an_unvetted_release_says_the_update_button_moves_back():
+def test_page_on_an_unvetted_release_says_the_update_button_keeps_it():
     html = _render(channel_info=_info(on_unvetted=True, installed='2.0.40'), portal_version='2.0.40',
                    portal_update_available=False)
-    assert '⬇ Back to 2.0.39' in html and 'moves it back to 2.0.39' in html
+    assert 'Back to' not in html and 'moves it back' not in html
+    assert 'Update keeps it as it is and does not move it back' in html
     assert 'var PORTAL_ON_UNVETTED=true' in html
     html = _render(channel_info=_info())
     assert '⬆ Update' in html and 'Back to' not in html
     assert 'var PORTAL_ON_UNVETTED=false' in html
 
 
-def test_the_update_button_asks_before_moving_back_and_the_install_asks_for_the_password():
+def test_the_update_button_never_offers_a_move_back_and_the_install_asks_for_the_password():
     assert TPL.count('onclick="portalUpdateClick()"') == 2
     fn = TPL[TPL.index('function portalUpdateClick()'):TPL.index('function portalUnvettedOpen()')]
-    assert 'PORTAL_ON_UNVETTED' in fn and 'confirm(' in fn and 'portalUpdate();' in fn
+    assert 'confirm(' not in fn and 'BACK' not in fn and 'portalUpdate();' in fn
     inst = TPL[TPL.index('async function portalUnvettedInstall()'):TPL.index('async function portalUpdate(){')]
     assert 'portal-unvetted-password' in inst and "'/api/takportal/install-unvetted'" in inst
     assert 'password:pw' in inst and 'tag:PORTAL_AVAILABLE_TAG' in inst
