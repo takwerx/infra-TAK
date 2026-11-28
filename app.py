@@ -75303,6 +75303,8 @@ def authentik_reputation_config_api():
         policy = next((p for p in resp.get('results', [])
                        if p.get('name') == 'infratak-brute-force'), None)
         if not enabled:
+            # The stage binding comes off before the policy it asks.
+            _ak_ldap_gate_remove(url, headers, lambda m: None)
             if policy:
                 del_req = _req.Request(
                     f'{url}/api/v3/policies/reputation/{policy["pk"]}/',
@@ -89349,19 +89351,266 @@ def _authentik_fix_ldap_flow_recursion(plog):
     return True
 
 
+# The per-username limit on the LDAP sign-in flow (TAK Server 8446/8089 passwords and
+# every other LDAP client).
+#
+# Read from Authentik's own source (2026.8.6, authentik-server-1 on a dev box, 2026-11-24):
+#   - authentik/policies/reputation/models.py: ReputationPolicy.passes() scores
+#     `request.user.username` and returns True when the score is AT or BELOW the threshold.
+#   - authentik/flows/markers.py: ReevaluateMarker evaluates a stage binding's policies
+#     with PLAN_CONTEXT_PENDING_USER, the name the identification stage just accepted. A
+#     binding that does not pass REMOVES its stage from the plan.
+#   - authentik/stages/deny/stage.py: a deny stage ends the flow with access denied.
+#   - authentik/lib/expression/evaluator.py: ak_call_policy(name) runs a policy by name
+#     with the current request and raises ValueError when no policy has that name.
+# Docs: https://docs.goauthentik.io/add-secure-apps/flows-stages/stages/deny/
+#       https://docs.goauthentik.io/customize/policies/types/reputation/
+#       https://docs.goauthentik.io/add-secure-apps/flows-stages/flow/#stage-bindings
+#
+# So the limit is a deny stage between the identification stage and the password stage,
+# and one expression policy on that stage binding decides whether the deny stage runs:
+#   - the name has too many failed sign-ins (`infratak-brute-force` says so) -> deny;
+#   - the LDAP service account is never denied: TAK Server binds as it for every lookup,
+#     so a stranger who guesses its password wrong must not be able to stop every sign-in.
+# A policy on the password stage's own binding is NOT an option: not passing would drop
+# the password stage and sign the name in with no password check.
+#
+# A stage binding with no policy bound passes for everyone, which for a deny stage means
+# every sign-in is refused. So the binding is built on a scratch flow, gets its policy
+# there, and only then moves to the LDAP flow in one request. Every failure on the way
+# leaves the LDAP flow as it was.
+_AK_LDAP_FLOW_SLUG = 'ldap-authentication-flow'
+_AK_LDAP_REPUTATION_POLICY = 'infratak-brute-force'
+_AK_LDAP_GATE_STAGE = 'infratak-ldap-sign-in-limit'
+_AK_LDAP_GATE_POLICY = 'infratak-ldap-sign-in-limit'
+_AK_LDAP_GATE_STAGING_FLOW = 'infratak-ldap-sign-in-limit-staging'
+_AK_LDAP_GATE_ORDER = 12            # the blueprint has identification 10, password 15
+_AK_LDAP_GATE_DENY_MESSAGE = 'Too many failed sign-in attempts. Try again later.'
+_AK_LDAP_GATE_EXPRESSION = (
+    "# Managed by infra-TAK: the console rewrites this text.\n"
+    "# True = this LDAP sign-in stops at the deny stage.\n"
+    "if request.user.username == \"adm_ldapservice\":\n"
+    "    return False\n"
+    "try:\n"
+    "    return ak_call_policy(\"infratak-brute-force\").passing\n"
+    "except ValueError:\n"
+    "    return False\n"
+)
+
+
+def _ak_ldap_gate_call(url, headers, method, path, body=None, timeout=10):
+    """One Authentik API call for the LDAP sign-in limit. Returns the parsed JSON ({} when
+    the answer has no body, as a DELETE does)."""
+    import urllib.request as _req
+    data = json.dumps(body).encode() if body is not None else None
+    req = _req.Request(f'{url}/api/v3/{path}', data=data, headers=headers, method=method)
+    raw = _req.urlopen(req, timeout=timeout).read()
+    return json.loads(raw.decode()) if raw else {}
+
+
+def _ak_ldap_gate_binding_ok(bindings, gate_policy_pk):
+    """True when a stage binding carries exactly our one policy the way the limit needs it.
+    Anything else (no policy, a negated one, a second one) can refuse every sign-in."""
+    if len(bindings) != 1:
+        return False
+    b = bindings[0]
+    return (b.get('policy') == gate_policy_pk and b.get('enabled') is True
+            and b.get('negate') is False and b.get('failure_result') is False)
+
+
+def _ak_ldap_gate_clear_name(url, headers, username):
+    """Forget the failed sign-ins counted against one username (what Clear scores on the
+    Authentik page does for every name). Returns how many below-zero scores were removed."""
+    import urllib.parse as _up
+    rows = _ak_ldap_gate_call(
+        url, headers, 'GET',
+        f'policies/reputation/scores/?identifier={_up.quote(username)}&page_size=100').get('results', [])
+    cleared = 0
+    for row in rows:
+        if row.get('identifier') == username and (row.get('score') or 0) < 0:
+            _ak_ldap_gate_call(url, headers, 'DELETE', f"policies/reputation/scores/{row['pk']}/")
+            cleared += 1
+    return cleared
+
+
+def _ak_ldap_gate_remove(url, headers, plog):
+    """Take the limit off the LDAP flow. The stage binding goes first, so sign-ins are
+    never left with a deny stage that has no policy. Returns True if anything was removed."""
+    def call(method, path, body=None):
+        return _ak_ldap_gate_call(url, headers, method, path, body)
+
+    removed = False
+    stages = [s for s in call('GET', f'stages/deny/?search={_AK_LDAP_GATE_STAGE}').get('results', [])
+              if s.get('name') == _AK_LDAP_GATE_STAGE]
+    for stage in stages:
+        for fsb in call('GET', f"flows/bindings/?stage={stage['pk']}").get('results', []):
+            call('DELETE', f"flows/bindings/{fsb['pk']}/")
+            removed = True
+        call('DELETE', f"stages/deny/{stage['pk']}/")
+        removed = True
+    for pol in call('GET', f'policies/expression/?search={_AK_LDAP_GATE_POLICY}').get('results', []):
+        if pol.get('name') == _AK_LDAP_GATE_POLICY:
+            call('DELETE', f"policies/expression/{pol['pk']}/")
+            removed = True
+    for flow in call('GET', f'flows/instances/?slug={_AK_LDAP_GATE_STAGING_FLOW}').get('results', []):
+        if flow.get('slug') == _AK_LDAP_GATE_STAGING_FLOW:
+            call('DELETE', f"flows/instances/{_AK_LDAP_GATE_STAGING_FLOW}/")
+            removed = True
+    if removed:
+        plog("  reputation policy: LDAP sign-in limit removed")
+    return removed
+
+
+def _ak_ldap_gate_ensure(url, headers, plog, reputation_policy_pk=None):
+    """Put the per-username limit on the LDAP sign-in flow, or repair it.
+
+    Returns (changed, repaired). `repaired` is True only when the flow was in a state that
+    refused sign-ins for names that had done nothing wrong, so the caller knows LDAP
+    clients may have been failing until now.
+    """
+    def call(method, path, body=None):
+        return _ak_ldap_gate_call(url, headers, method, path, body)
+
+    changed = repaired = False
+    flows = call('GET', f'flows/instances/?slug={_AK_LDAP_FLOW_SLUG}').get('results', [])
+    flow = next((f for f in flows if f.get('slug') == _AK_LDAP_FLOW_SLUG), None)
+    if not flow:
+        plog(f"  reputation policy: {_AK_LDAP_FLOW_SLUG} not found — skipping the sign-in limit")
+        return False, False
+    flow_pk = flow['pk']
+    # A PolicyBinding's target is the flow's policybindingmodel_ptr_id, not the flow's pk.
+    flow_target_pk = flow.get('policybindingmodel_ptr_id') or flow_pk
+
+    # 1. The policy that decides (find, create, or put our text back).
+    pols = call('GET', f'policies/expression/?search={_AK_LDAP_GATE_POLICY}').get('results', [])
+    gate_pol = next((p for p in pols if p.get('name') == _AK_LDAP_GATE_POLICY), None)
+    if not gate_pol:
+        gate_pol = call('POST', 'policies/expression/',
+                        {'name': _AK_LDAP_GATE_POLICY, 'expression': _AK_LDAP_GATE_EXPRESSION})
+        changed = True
+    elif gate_pol.get('expression') != _AK_LDAP_GATE_EXPRESSION:
+        call('PATCH', f"policies/expression/{gate_pol['pk']}/", {'expression': _AK_LDAP_GATE_EXPRESSION})
+        changed = True
+    gate_pol_pk = gate_pol['pk']
+
+    # 2. The deny stage.
+    stages = call('GET', f'stages/deny/?search={_AK_LDAP_GATE_STAGE}').get('results', [])
+    stage = next((s for s in stages if s.get('name') == _AK_LDAP_GATE_STAGE), None)
+    if not stage:
+        stage = call('POST', 'stages/deny/',
+                     {'name': _AK_LDAP_GATE_STAGE, 'deny_message': _AK_LDAP_GATE_DENY_MESSAGE})
+        changed = True
+    stage_pk = stage['pk']
+
+    # 3. Where it goes: after the name is known, before the password is checked.
+    ident_order = pw_order = None
+    for fsb in call('GET', f'flows/bindings/?target={flow_pk}&ordering=order').get('results', []):
+        model = (fsb.get('stage_obj') or {}).get('meta_model_name') or ''
+        if model == 'authentik_stages_identification.identificationstage' and ident_order is None:
+            ident_order = fsb.get('order')
+        elif model == 'authentik_stages_password.passwordstage' and pw_order is None:
+            pw_order = fsb.get('order')
+    if ident_order is None or pw_order is None or pw_order - ident_order < 2:
+        plog(f"  reputation policy: {_AK_LDAP_FLOW_SLUG} has no room between its identification "
+             f"stage ({ident_order}) and its password stage ({pw_order}) — sign-in limit NOT installed")
+        order = None
+    else:
+        order = _AK_LDAP_GATE_ORDER if ident_order < _AK_LDAP_GATE_ORDER < pw_order else pw_order - 1
+
+    # 4. What is there now. Keep one good binding; anything else comes off first.
+    have_good = False
+    for fsb in call('GET', f'flows/bindings/?stage={stage_pk}').get('results', []):
+        on_flow = fsb.get('target') == flow_pk
+        fsb_target = fsb.get('policybindingmodel_ptr_id') or fsb['pk']
+        bindings = call('GET', f'policies/bindings/?target={fsb_target}').get('results', [])
+        policy_ok = _ak_ldap_gate_binding_ok(bindings, gate_pol_pk)
+        placed_ok = (order is not None and ident_order < (fsb.get('order') or 0) < pw_order
+                     and fsb.get('evaluate_on_plan') is False and fsb.get('re_evaluate_policies') is True)
+        if on_flow and policy_ok and placed_ok and not have_good:
+            have_good = True
+            continue
+        call('DELETE', f"flows/bindings/{fsb['pk']}/")
+        changed = True
+        if on_flow and not policy_ok:
+            repaired = True
+            plog("  reputation policy: the sign-in limit's stage binding had the wrong policies "
+                 f"({len(bindings)}) — removed it so LDAP sign-ins work, building it again")
+
+    # 5. Build it away from the LDAP flow, then move it there complete.
+    if have_good:
+        # A scratch flow left behind by a run that was cut off.
+        try:
+            for _left in call('GET', f'flows/instances/?slug={_AK_LDAP_GATE_STAGING_FLOW}').get('results', []):
+                if _left.get('slug') == _AK_LDAP_GATE_STAGING_FLOW:
+                    call('DELETE', f'flows/instances/{_AK_LDAP_GATE_STAGING_FLOW}/')
+                    changed = True
+        except Exception:
+            pass
+    if not have_good and order is not None:
+        new_fsb = None
+        try:
+            staging = [f for f in call('GET', f'flows/instances/?slug={_AK_LDAP_GATE_STAGING_FLOW}').get('results', [])
+                       if f.get('slug') == _AK_LDAP_GATE_STAGING_FLOW]
+            staging_flow = staging[0] if staging else call('POST', 'flows/instances/', {
+                'name': _AK_LDAP_GATE_STAGING_FLOW, 'slug': _AK_LDAP_GATE_STAGING_FLOW,
+                'title': _AK_LDAP_GATE_STAGING_FLOW, 'designation': 'stage_configuration'})
+            new_fsb = call('POST', 'flows/bindings/', {
+                'target': staging_flow['pk'], 'stage': stage_pk, 'order': order,
+                'evaluate_on_plan': False, 're_evaluate_policies': True,
+                'policy_engine_mode': 'any', 'invalid_response_action': 'retry'})
+            new_target = new_fsb.get('policybindingmodel_ptr_id') or new_fsb['pk']
+            call('POST', 'policies/bindings/', {
+                'policy': gate_pol_pk, 'target': new_target, 'order': 0, 'enabled': True,
+                'negate': False, 'timeout': 30, 'failure_result': False})
+            made = call('GET', f'policies/bindings/?target={new_target}').get('results', [])
+            if not _ak_ldap_gate_binding_ok(made, gate_pol_pk):
+                raise RuntimeError('the new stage binding does not carry the sign-in limit policy')
+            call('PATCH', f"flows/bindings/{new_fsb['pk']}/", {'target': flow_pk})
+            changed = True
+            plog(f"  reputation policy: sign-in limit bound to {_AK_LDAP_FLOW_SLUG} "
+                 f"(deny stage at order {order}, checked per username)")
+        except Exception:
+            if new_fsb:
+                try:
+                    call('DELETE', f"flows/bindings/{new_fsb['pk']}/")
+                except Exception:
+                    pass
+            raise
+        finally:
+            try:
+                call('DELETE', f'flows/instances/{_AK_LDAP_GATE_STAGING_FLOW}/')
+            except Exception:
+                pass
+
+    # 6. A binding on the flow itself is evaluated when the flow is planned, before the
+    #    identification stage. The stage binding above replaces it.
+    if reputation_policy_pk:
+        old = call('GET', f'policies/bindings/?policy={reputation_policy_pk}&target={flow_target_pk}').get('results', [])
+        for b in old:
+            call('DELETE', f"policies/bindings/{b['pk']}/")
+            changed = True
+            if b.get('negate') is not True and b.get('enabled') is not False:
+                # Not negated, this binding refused every LDAP sign-in (v0.9.2 to v0.9.12-rc).
+                repaired = True
+            plog(f"  reputation policy: removed the flow-level binding {b.get('pk')}")
+    return changed, repaired
+
+
 def _authentik_setup_reputation_policy(plog):
-    """v0.9.2: Create and bind an Authentik ReputationPolicy on the ldap-authentication-flow.
+    """Create the Authentik ReputationPolicy and put it on the ldap-authentication-flow.
 
-    This adds a flow-level brute-force check that runs *inside* Authentik before
-    the password stage. Every failed login decrements the source-IP score by 1.
-    When the score drops below the threshold the policy denies the flow immediately.
-    Scores recover over time. This is complementary to Fail2ban (which blocks at
-    the host firewall level) — reputation policy trips first (faster, lower threshold).
+    The check runs inside Authentik after the identification stage and before the
+    password stage (see _ak_ldap_gate_ensure). Every failed sign-in lowers the score of
+    that username by 1, every good one raises it by 1. At the threshold the flow stops
+    at a deny stage until the score recovers (Authentik drops a score 24 hours after its
+    last change) or the operator clears the scores on the Authentik page. The LDAP
+    service account is never stopped. Fail2ban works on source addresses at the host
+    firewall; an LDAP bind has no client address to give it, so this is the per-name limit.
 
-    Idempotency key: settings.authentik_reputation_policy.last_outcome in
-    {applied, idempotent-noop}.
+    The operator's Disable on the Authentik page holds:
+    settings.authentik_reputation_policy.last_outcome == 'disabled' keeps it off.
 
-    Returns True if applied (first run), False if no-op or skipped.
+    Returns True if applied, False if skipped or turned off.
     """
     import urllib.request as _req
     import urllib.error
@@ -89395,6 +89644,15 @@ def _authentik_setup_reputation_policy(plog):
     # create; PATCH only on drift), so re-running is cheap and safe.
     rep_cfg = settings.get('authentik_reputation_policy') or {}
     threshold = rep_cfg.get('threshold', -5)
+    if rep_cfg.get('last_outcome') == 'disabled':
+        # Turned off on the Authentik page. Leave it off, and make sure no part of the
+        # limit is left on the flow.
+        try:
+            _ak_ldap_gate_remove(url, headers, plog)
+        except Exception as _rm_e:
+            plog(f"  reputation policy: could not remove the sign-in limit ({str(_rm_e)[:120]})")
+        plog("  reputation policy: turned off on the Authentik page — skipping")
+        return False
     _first_run = rep_cfg.get('last_outcome') not in ('applied', 'idempotent-noop')
 
     if _first_run:
@@ -89450,139 +89708,11 @@ def _authentik_setup_reputation_policy(plog):
 
         policy_pk = policy_obj['pk']
 
-        # 2. Find the ldap-authentication-flow pk
-        req = _req.Request(
-            f'{url}/api/v3/flows/instances/?slug=ldap-authentication-flow',
-            headers=headers
-        )
-        flows = json.loads(_req.urlopen(req, timeout=10).read().decode())['results']
-        ldap_flow = next((f for f in flows if f.get('slug') == 'ldap-authentication-flow'), None)
-        if not ldap_flow:
-            plog("  reputation policy: ldap-authentication-flow not found — skipping bind")
-        else:
-            flow_pk = ldap_flow['pk']
-            # Authentik stores PolicyBinding.target using the flow's policybindingmodel_ptr_id,
-            # not the flow's own pk.  Using the flow pk in both the duplicate-check query and
-            # the POST body causes the query to miss an existing binding (different UUID stored
-            # in the DB) and then the POST to fail with "Select a valid choice" 400.
-            flow_target_pk = ldap_flow.get('policybindingmodel_ptr_id') or flow_pk
-            # 3. Check if binding already exists
-            req = _req.Request(
-                f'{url}/api/v3/policies/bindings/?policy={policy_pk}&target={flow_target_pk}',
-                headers=headers
-            )
-            bindings = json.loads(_req.urlopen(req, timeout=10).read().decode())['results']
-            if not bindings:
-                plog("  reputation policy: binding policy to ldap-authentication-flow…")
-                # v0.9.12-late-cycle fix: negate=True is REQUIRED for ReputationPolicy.
-                #
-                # Upstream Authentik 2026.2.2 source — verified via
-                #   docker exec authentik-server-1 ak shell -c \
-                #     "import inspect; from authentik.policies.reputation.models import ReputationPolicy; \
-                #      print(inspect.getsource(ReputationPolicy.passes))"
-                # on tak-10 (2026-05-11):
-                #
-                #     def passes(self, request: PolicyRequest) -> PolicyResult:
-                #         ...
-                #         score = Reputation.objects.filter(query).aggregate(
-                #             total_score=Sum("score"))["total_score"] or 0
-                #         passing = score <= self.threshold
-                #         return PolicyResult(bool(passing))
-                #
-                # ReputationPolicy.passes() returns True ONLY when the user is bad
-                # enough to act on (score <= threshold). A "good" user with score=0
-                # or positive returns False. With negate=False on the binding, the
-                # binding result for a normal user is False → policy_engine_mode='any'
-                # with this as the only binding → flow non-applicable → every LDAP
-                # bind returns 49 even when the password is correct. We shipped
-                # negate=False v0.9.2 → v0.9.12-rc; this masked behind the LDAP
-                # outpost bind cache until v0.9.12 force-recreates wiped it.
-                #
-                # negate=True inverts the boolean: normal users pass, brute-forcers
-                # (score <= -5) are blocked. This is exactly the Authentik-documented
-                # usage of ReputationPolicy as a brute-force gate.
-                #
-                # failure_result=True (fail-open) is kept as defence-in-depth for any
-                # future policy-evaluation exception.
-                bind_data = {
-                    'policy':          policy_pk,
-                    'target':          flow_target_pk,
-                    'order':           0,
-                    'enabled':         True,
-                    'negate':          True,
-                    'timeout':         30,
-                    'failure_result':  True,
-                }
-                req = _req.Request(
-                    f'{url}/api/v3/policies/bindings/',
-                    data=json.dumps(bind_data).encode(),
-                    headers=headers, method='POST'
-                )
-                try:
-                    _req.urlopen(req, timeout=10)
-                    plog("  reputation policy: bound to ldap-authentication-flow")
-                except urllib.error.HTTPError as _bind_err:
-                    _body = _bind_err.read().decode('utf-8', errors='replace')[:500]
-                    plog(f"  reputation policy: binding POST returned {_bind_err.code} — {_body}")
-                    # Re-query: binding may already exist (race condition / prior partial run)
-                    _recheck = _req.Request(
-                        f'{url}/api/v3/policies/bindings/?policy={policy_pk}&target={flow_target_pk}',
-                        headers=headers
-                    )
-                    try:
-                        _existing = json.loads(_req.urlopen(_recheck, timeout=10).read().decode())['results']
-                    except Exception:
-                        _existing = []
-                    if _existing:
-                        plog("  reputation policy: binding confirmed via re-check — treating as bound")
-                    else:
-                        raise RuntimeError(
-                            f"HTTP {_bind_err.code} creating policy binding: {_body}"
-                        ) from _bind_err
-            else:
-                plog("  reputation policy: binding already exists")
-                # v0.9.12 retro-fix on the BINDING (not the policy):
-                #   failure_result MUST be True (fail-open on policy exception)
-                #   negate          MUST be True (see upstream-source comment above)
-                # Either field drifted means the v0.9.12 binding contract isn't met.
-                #
-                # Implementation: PATCH /api/v3/policies/bindings/{pk}/ returns HTTP 405
-                # Method Not Allowed on Authentik 2026.x — observed empirically on tak-10
-                # (May 2026). PUT may or may not work; DELETE + POST always works and is
-                # idempotent at the API layer. Use that.
-                for _b in bindings:
-                    _drift_fail = _b.get('failure_result') is not True
-                    _drift_neg  = _b.get('negate')         is not True
-                    if _drift_fail or _drift_neg:
-                        plog(f"  reputation policy: binding {_b.get('pk')} drift — failure_result={_b.get('failure_result')} negate={_b.get('negate')} → DELETE+POST recreate (PATCH returns 405 on Authentik 2026.x)")
-                        try:
-                            # Capture full record so the recreate preserves all fields.
-                            _orig = dict(_b)
-                            _del_req = _req.Request(
-                                f"{url}/api/v3/policies/bindings/{_b['pk']}/",
-                                headers=headers, method='DELETE'
-                            )
-                            _req.urlopen(_del_req, timeout=10)
-                            _new = {
-                                'policy':          _orig.get('policy') or policy_pk,
-                                'target':          _orig.get('target') or flow_target_pk,
-                                'order':           _orig.get('order', 0),
-                                'enabled':         _orig.get('enabled', True),
-                                'negate':          True,
-                                'timeout':         _orig.get('timeout', 30),
-                                'failure_result':  True,
-                            }
-                            _post_req = _req.Request(
-                                f'{url}/api/v3/policies/bindings/',
-                                data=json.dumps(_new).encode(),
-                                headers=headers, method='POST'
-                            )
-                            _new_resp = json.loads(_req.urlopen(_post_req, timeout=10).read().decode())
-                            plog(f"  reputation policy: binding recreated as {_new_resp.get('pk')} (negate=True, failure_result=True)")
-                        except Exception as _pe:
-                            plog(f"  reputation policy: binding recreate error (non-fatal): {_pe}")
+        # 2. Put the limit on the LDAP flow where the username is known (and take the
+        #    old flow-level binding off).
+        _ak_ldap_gate_ensure(url, headers, plog, policy_pk)
 
-        # 4. Persist outcome
+        # 3. Persist outcome
         try:
             s = load_settings()
             rc = s.get('authentik_reputation_policy') or {}
@@ -94676,6 +94806,21 @@ def _ensure_authentik_webadmin(skip_bind_verify=False, reset_password=True):
             except Exception:
                 pass
             return True, None
+        if verdict == 'fail':
+            # The password was set a moment ago, so a refused bind can also be the sign-in
+            # limit holding the name (failed sign-ins counted against "webadmin"). That count
+            # is kept by name: deleting and recreating the user would not lift it. The
+            # operator asked for a working webadmin, so forget the count and probe again.
+            try:
+                if _ak_ldap_gate_clear_name(url, headers, 'webadmin'):
+                    print("Sync webadmin: webadmin was held by the sign-in limit — "
+                          "cleared its failed sign-ins, probing again", flush=True)
+                    time.sleep(3)
+                    verdict = _test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', webadmin_pass)
+            except Exception as _lim_e:
+                print(f"Sync webadmin: sign-in limit check error (non-fatal): {str(_lim_e)[:120]}", flush=True)
+            if verdict == 'inconclusive':
+                return True, None
         if verdict == 'fail':
             try:
                 req_del = _req.Request(f'{url}/api/v3/core/users/{webadmin_pk}/', headers=headers, method='DELETE')
@@ -124736,59 +124881,23 @@ def _startup_fix_reputation_policy_drift():
             except Exception as _pe:
                 print(f"Startup migration: reputation policy PATCH error (non-fatal): {_pe}")
 
-        # 2. Bindings: enforce failure_result=True (fail-open) AND negate=True.
-        #    Authentik 2026.x ReputationPolicy.passes() returns True ONLY when
-        #    score <= threshold (i.e. user is BAD enough to act on). We use it
-        #    as a brute-force gate, so the binding must invert that with
-        #    negate=True — otherwise every normal-reputation user gets denied
-        #    and the flow becomes non-applicable (the v0.9.2 → v0.9.12-rc bug).
-        #    Source: inspect.getsource(ReputationPolicy.passes) on the deployed
-        #    authentik-server-1 container; verified on tak-10 2026-05-11.
-        #    See docs/RELEASE-v0.9.12-alpha.md § B7 and docs/HANDOFF-LDAP-AUTHENTIK.md.
-        #
-        #    Authentik 2026.x returns HTTP 405 Method Not Allowed for PATCH on
-        #    /api/v3/policies/bindings/{pk}/ (observed empirically on tak-10 May
-        #    2026). DELETE + POST always works. Idempotent at the API layer.
-        try:
-            req = _req2.Request(
-                f'{url}/api/v3/policies/bindings/?policy={policy_pk}',
-                headers=headers)
-            br = json.loads(_req2.urlopen(req, timeout=8).read().decode())
-        except Exception:
+        # 2. The limit on the LDAP flow: a deny stage whose binding carries exactly one
+        #    policy (see _ak_ldap_gate_ensure). A deny-stage binding with no policy, or
+        #    the old flow-level binding without negate, refuses every LDAP sign-in (the
+        #    v0.9.2 → v0.9.12-rc bug). Repair either one; report it only when sign-ins
+        #    were really being refused, because the caller then also restarts TAK Server.
+        if (settings.get('authentik_reputation_policy') or {}).get('last_outcome') == 'disabled':
+            try:
+                _ak_ldap_gate_remove(url, headers, lambda m: print(f"Startup migration:{m}", flush=True))
+            except Exception as _pe:
+                print(f"Startup migration: sign-in limit removal error (non-fatal): {_pe}")
             return any_patched
-        for binding in br.get('results', []):
-            _drift_fail = binding.get('failure_result') is not True
-            _drift_neg  = binding.get('negate')         is not True
-            if _drift_fail or _drift_neg:
-                bpk = binding.get('pk')
-                print(f"Startup migration: reputation binding {bpk} drift — "
-                      f"failure_result={binding.get('failure_result')} negate={binding.get('negate')} → "
-                      f"DELETE+POST recreate (PATCH 405 on Authentik 2026.x)")
-                try:
-                    _orig = dict(binding)
-                    req = _req2.Request(
-                        f'{url}/api/v3/policies/bindings/{bpk}/',
-                        headers=headers, method='DELETE')
-                    _req2.urlopen(req, timeout=10)
-                    new_data = {
-                        'policy':          _orig.get('policy') or policy_pk,
-                        'target':          _orig.get('target'),
-                        'order':           _orig.get('order', 0),
-                        'enabled':         _orig.get('enabled', True),
-                        'negate':          True,
-                        'timeout':         _orig.get('timeout', 30),
-                        'failure_result':  True,
-                    }
-                    req = _req2.Request(
-                        f'{url}/api/v3/policies/bindings/',
-                        data=json.dumps(new_data).encode(),
-                        headers=headers, method='POST')
-                    new_resp = json.loads(_req2.urlopen(req, timeout=10).read().decode())
-                    print(f"Startup migration: reputation binding recreated as "
-                          f"{new_resp.get('pk')} (negate=True, failure_result=True)")
-                    any_patched = True
-                except Exception as _pe:
-                    print(f"Startup migration: reputation binding recreate error (non-fatal): {_pe}")
+        try:
+            _changed, _repaired = _ak_ldap_gate_ensure(
+                url, headers, lambda m: print(f"Startup migration:{m}", flush=True), policy_pk)
+            any_patched = any_patched or _repaired
+        except Exception as _pe:
+            print(f"Startup migration: sign-in limit error (non-fatal): {_pe}")
 
         if not any_patched:
             # Quiet idempotent path — no log line on every reboot.
