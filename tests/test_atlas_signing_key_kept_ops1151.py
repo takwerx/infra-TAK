@@ -537,11 +537,13 @@ def test_a_loop_of_the_module_checks_the_key():
         'time.sleep(SIGNING_KEY_CHECK_INTERVAL_S)')
 
 
-def test_rollback_asks_atlas_before_the_checkout():
+def test_rollback_asks_atlas_right_after_the_checkout():
+    # ops #1330: the route checks out first, so a checkout that fails leaves ATLAS alone. The
+    # release's contents are read from git (`target`), not from the checkout.
     route = _app_func('console_rollback_api')
     assert "get('before_console_rollback')" in route
     assert "'modules/atlas_signed_identity.py'" in route
-    assert route.index("get('before_console_rollback')") < route.index("'checkout', '--force'")
+    assert route.index("'checkout', '--force'") < route.index("get('before_console_rollback')")
 
 
 def test_every_console_step_that_saves_the_providers_asks_for_the_key_check():

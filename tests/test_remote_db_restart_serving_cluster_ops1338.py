@@ -397,6 +397,10 @@ def _control(sandbox, action, lsclusters=MIGRATED_BOTH_DOWN, port=5432):
           '_ssh_probe': probe}
     if helper:
         ns['_pg_ctl_cmd'] = helper
+    # ops #1382: the button's readiness check is now the _pg_isready_cmd helper (absent on older code)
+    ready = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_pg_isready_cmd'), None)
+    if ready:
+        exec(compile(ast.Module(body=[ready], type_ignores=[]), 'app.py:_pg_isready_cmd', 'exec'), ns)
     exec(compile(ast.Module(body=[node], type_ignores=[]), 'app.py:takserver_control', 'exec'), ns)
     out = ns['takserver_control']()
     return out, sent

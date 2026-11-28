@@ -71,6 +71,15 @@ Each entry says where the fact comes from. `✅ verified <date> on <box>` means 
 - ✅ verified 2026-11-27 on the same box: `docker inspect takserver` answers for the IMAGE of that name when no container exists, so a "no container" test uses `docker container inspect`.
 - Not verified on a box: the 5.7 layout (`<volume>/15/data`): no 5.7 Docker bundle is in our files folder. It is read from the Dockerfile only.
 
+## CloudTAK: a video link on a CoT is pulled by CloudTAK's media server, by the name in the link (ops #1424)
+
+**Source (official):** CloudTAK `api/stateless/routes/video-lease.ts` (`GET /api/video/active`: a link whose host differs from CloudTAK's own media host answers `leasable: true`, "CloudTAK has a media server provisioned and can attempt to serve the stream") and `app/src/components/util/VideoPlayer.vue` (`requestUrlStream` turns a raw `url` into an ephemeral proxy lease). The media server then pulls that RTSP address itself, from inside its Docker network.
+
+- ✅ verified 2026-11-27 on fresh-install ubuntu-22.04 (fi-20261127-212026, MediaMTX on the box, CloudTAK local, real wildcard names): the same test stream played through CloudTAK (video wall and marker lease, decoded frames) with the link `rtsp://stream.<fqdn>:8554/<path>` and failed with `Stream cannot play: source of path '<uuid>' has timed out` (HTTP 500 on the playlist) with the link `rtsp://<fqdn>:8554/<path>`. Only the host name in the link differed.
+- Why: infra-TAK pins `stream.<fqdn>` to the box in the media container (`_cloudtak_stream_host_pin`, ops #560) and the standalone MediaMTX lets only the CloudTAK Docker network read without a password. The bare `<fqdn>` leaves the box and comes back from another address (401) or not at all.
+- Rule for our code: any video link infra-TAK writes for CloudTAK or ATAK uses the media server's name from `_get_service_domain(settings, 'mediamtx')` (or `tak_video_restreamer`), never `settings['fqdn']`. The TAK Simulator wrote the bare name until ops #1424.
+- Not verified: a link that uses the box's IP address instead of a name (no-domain boxes), pulled by CloudTAK. The exact reason the bare name fails (401 or no return) was not separated; the symptom and the cure were.
+
 ## CloudTAK: documentation site
 
 **Source (official):** https://docs.cloudtak.io/ ("Get started with CloudTAK | CloudTAK Documentation"). The same site holds the integrations (ETL) pages at https://docs.cloudtak.io/integrations/, which the CloudTAK page already links.
