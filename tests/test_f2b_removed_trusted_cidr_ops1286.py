@@ -81,6 +81,9 @@ class Box:
                 exec(_func(f), ns)
         ns.setdefault('_f2b_retired_cidrs', lambda: [])
         ns.setdefault('_f2b_unretire', lambda text: None)
+        # "Never ban Starlink" (#736) is off and never downloaded on this box: no ranges.
+        ns.setdefault('_f2b_starlink_known', lambda: set())
+        ns.setdefault('_f2b_starlink_cidrs', lambda: [])
         self.ns = ns
 
     def post_trusted(self, cidrs):

@@ -120,6 +120,31 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 </div>
 </div>
 
+<!-- Never ban Starlink (infra-TAK #736) -->
+<div class="card" id="f2b-starlink-card" style="margin-bottom:8px">
+<div class="card-title" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:0">
+<div style="display:flex;align-items:center;gap:10px">
+<span>🛰 Never ban Starlink addresses</span>
+<span class="badge badge-red" id="f2b-starlink-badge" style="font-size:10px;padding:2px 8px"><span class="dot"></span>Off</span>
+</div>
+<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:0">
+<span style="font-size:12px;color:var(--text-dim);font-family:'JetBrains Mono',monospace">Enable</span>
+<div class="toggle-wrap" style="position:relative;width:40px;height:22px">
+<input type="checkbox" id="f2b-starlink-toggle" onchange="toggleStarlink()" style="opacity:0;width:0;height:0;position:absolute">
+<span id="f2b-starlink-track" style="position:absolute;inset:0;border-radius:11px;background:var(--border);cursor:pointer;transition:background .2s"></span>
+<span id="f2b-starlink-thumb" style="position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform .2s;pointer-events:none"></span>
+</div>
+</label>
+</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px;line-height:1.6">
+Starlink puts many users behind one shared address. One ban on that address cuts off <strong>every</strong> drone, laptop and phone behind it, for up to 7 days if a repeat-offender ban follows. Turn this on if your teams use Starlink: the address ranges Starlink publishes are added to the never-ban list of every jail and updated every day.
+</div>
+<div style="margin-top:10px;padding:10px 12px;background:rgba(234,179,8,0.08);border:1px solid rgba(234,179,8,0.35);border-radius:8px;font-size:12px;color:var(--text-secondary);line-height:1.5">
+⚠ While this is on, nobody on Starlink can be banned on this box, an attacker on Starlink included. Your logins and certificates still protect it.
+</div>
+<div id="f2b-starlink-info" style="font-size:11px;color:var(--text-dim);margin-top:10px"></div>
+</div>
+
 <!-- Ban emails (ops #1395) -->
 <div class="card" id="f2b-mail-card" style="margin-bottom:8px">
 <div class="card-title">✉️ Ban emails</div>
@@ -963,6 +988,71 @@ function saveTrustedCidrs() {
     }).catch(()=>{ if (msg) { msg.style.color = 'var(--red)'; msg.textContent = 'Network error'; } showToast('Network error', 'error'); });
 }
 
+function _starlinkWhen(ts) {
+  if (!ts) return 'never';
+  try { return new Date(ts * 1000).toLocaleString(); } catch (e) { return ''; }
+}
+
+function renderStarlink(d) {
+  var on = !!d.enabled;
+  var badge = document.getElementById('f2b-starlink-badge');
+  var toggle = document.getElementById('f2b-starlink-toggle');
+  var track = document.getElementById('f2b-starlink-track');
+  var thumb = document.getElementById('f2b-starlink-thumb');
+  var info = document.getElementById('f2b-starlink-info');
+  if (badge) {
+    badge.className = on ? 'badge badge-green' : 'badge badge-red';
+    badge.innerHTML = on ? '<span class="dot dot-pulse"></span>On' : '<span class="dot"></span>Off';
+  }
+  if (toggle) toggle.checked = on;
+  if (track) track.style.background = on ? 'var(--green)' : 'var(--border)';
+  if (thumb) thumb.style.transform = on ? 'translateX(18px)' : '';
+  if (!info) return;
+  info.textContent = '';
+  if (on || d.ranges) {
+    var line = document.createElement('div');
+    line.textContent = (on ? 'Never banned: ' : 'Last list: ') + (d.ranges || 0) + ' Starlink ranges (' +
+      (d.v4 || 0) + ' IPv4, ' + (d.v6 || 0) + ' IPv6), updated ' + _starlinkWhen(d.fetched_at) + '.';
+    info.appendChild(line);
+  }
+  // While off nothing is downloaded, so an old failure would sit there for ever: show it only while on.
+  if (on && d.last_error) {
+    var err = document.createElement('div');
+    err.style.color = 'var(--red)';
+    err.textContent = 'Last download failed (' + _starlinkWhen(d.last_attempt) + '): ' + d.last_error +
+      (d.ranges ? ' The last good list stays in use.' : '');
+    info.appendChild(err);
+  }
+}
+
+function loadStarlink() {
+  fetch('/api/fail2ban/starlink').then(r=>r.json()).then(d=>{ if (d.ok) renderStarlink(d); }).catch(()=>{});
+}
+
+function toggleStarlink() {
+  var toggle = document.getElementById('f2b-starlink-toggle');
+  var want = !!(toggle && toggle.checked);
+  if (want && !confirm('Never ban Starlink addresses?\n\nNobody on Starlink can then be banned on this box, an attacker on Starlink included.')) {
+    toggle.checked = false;
+    return;
+  }
+  if (toggle) toggle.disabled = true;
+  var info = document.getElementById('f2b-starlink-info');
+  if (info) info.textContent = want ? 'Downloading the Starlink address list…' : 'Removing the Starlink ranges…';
+  fetch('/api/fail2ban/starlink', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled: want})})
+    .then(r=>r.json()).then(d=>{
+      if (toggle) toggle.disabled = false;
+      if (d.ok) {
+        showToast(want ? 'Starlink addresses will not be banned.' : 'Starlink addresses can be banned again.', 'success');
+        if (d.warning) showToast(d.warning, 'error');
+      } else {
+        showToast(d.error || 'Could not change the setting', 'error');
+      }
+      renderStarlink(d);
+      loadStatus();
+    }).catch(()=>{ if (toggle) toggle.disabled = false; showToast('Network error', 'error'); loadStarlink(); });
+}
+
 function loadBanSummary() {
   fetch('/api/fail2ban/ban-summary').then(r=>r.json()).then(d=>{
     var cb = document.getElementById('f2b-daily-summary');
@@ -984,6 +1074,7 @@ function saveBanSummary(on) {
 }
 
 loadTrustedCidrs();
+loadStarlink();
 loadBanSummary();
 loadStatus();
 loadLog();
@@ -1283,7 +1374,8 @@ setInterval(function(){ loadStatus(); loadLog(); }, 30000);
     var esc = function(s){ return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];}); };
     var html = '';
     info.groups.forEach(function(g){
-      var chips = g.cidrs.map(function(c){
+      // A group with a summary (Starlink: ~400 ranges) shows the count, not every range.
+      var chips = (g.summary ? [g.summary] : g.cidrs).map(function(c){
         return '<code style="background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:4px;padding:1px 6px;margin-right:6px;font-size:11px">' + esc(c) + '</code>';
       }).join('');
       html += '<div style="margin-bottom:10px">'
