@@ -85,25 +85,67 @@ SHARE_LINKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sha
 SHARE_LINKS_CAP_MARKER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'share_links_capped.json')
 
 
+def _cap_log(text):
+    """One line to the editor's log (the journal). A log line must never stop the cap or the editor."""
+    try:
+        print(text, flush=True)
+    except Exception:
+        pass
+
+
+def _cap_read_links():
+    """Read the links file for the cap. Returns (links, problem, empty).
+    problem is None when the file is fine or missing, else a short plain reason (links is {} then).
+    empty is True when the file holds nothing at all: no old link can be in it. Writes nothing."""
+    try:
+        with open(SHARE_LINKS_FILE, 'rb') as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return {}, None, False
+    except (IOError, OSError) as e:
+        return {}, 'cannot be read (%s)' % (e.strerror or e), False
+    if not raw.strip():
+        return {}, 'is empty', True
+    try:
+        links = json.loads(raw.decode('utf-8'))
+    except ValueError:
+        return {}, 'is cut off or not valid JSON', False
+    if not isinstance(links, dict):
+        return {}, 'is not a list of links (the top level is not an object)', False
+    return links, None, False
+
+
+def _is_share_link(info):
+    """A real link has a text `stream`. Other entries (a number, an object with no stream, data a
+    newer version keeps in this file) are not ours to change. Same test as the editor's."""
+    return isinstance(info, dict) and isinstance(info.get('stream'), str) and bool(info['stream'])
+
+
 def cap_never_ending_share_links(now=None):
     """Once per box: give every share link that never ends an end time 24 hours from now.
+    Same rules as the editor's own copy (mediamtx-installer PR 84, ops #1323; this copy ops #1363):
+    - a link with `limits_version` (stamped by an editor that has the viewer limits) is never
+      touched, so a link made on purpose stays, whatever happened to the marker file;
+    - only real links are touched (see _is_share_link);
+    - an empty file holds no old link, so the marker is made and a link made later is kept
+      (editor v2.1.17, the pin in infra-TAK 10.4.9, does not stamp, so the marker is what protects it);
+    - a cut-off or unreadable file is never written over: one log line says why, nothing is
+      changed and the cap tries again at the next start.
     A link an admin makes later that never ends is kept, because the marker says this ran.
-    Returns how many were capped, or None when it could not run (nothing is changed)."""
+    Returns how many were capped, or None when it could not run."""
     if os.path.exists(SHARE_LINKS_CAP_MARKER_FILE):
         return 0
     now = time.time() if now is None else now
-    links = {}
-    if os.path.exists(SHARE_LINKS_FILE):
-        try:
-            with open(SHARE_LINKS_FILE, 'r') as f:
-                links = json.load(f)
-        except (ValueError, IOError):
-            return None  # unreadable: never write over it, try again at the next start
-        if not isinstance(links, dict):
-            return None
+    links, problem, empty = _cap_read_links()
+    if problem and not empty:
+        _cap_log("Warning: old share links not capped: %s %s. The cap tries again at the next start."
+                 % (os.path.basename(SHARE_LINKS_FILE), problem))
+        return None
+    if empty:
+        _cap_log("%s is empty: no old share links to cap." % os.path.basename(SHARE_LINKS_FILE))
     capped = 0
     for info in links.values():
-        if isinstance(info, dict) and not info.get('expires'):
+        if _is_share_link(info) and not info.get('expires') and 'limits_version' not in info:
             info['expires'] = now + SHARE_LINK_LEGACY_CAP_SECONDS
             info['ttl_label'] = '24 hours (set by the update)'
             capped += 1
@@ -113,7 +155,9 @@ def cap_never_ending_share_links(now=None):
                 json.dump(links, f, indent=2)
         with open(SHARE_LINKS_CAP_MARKER_FILE, 'w') as f:
             json.dump({'capped': capped, 'at': int(now)}, f)
-    except (IOError, OSError):
+    except (IOError, OSError) as e:
+        _cap_log("Warning: old share links not capped: could not write (%s). The cap tries again at the next start."
+                 % (e.strerror or e))
         return None
     return capped
 
