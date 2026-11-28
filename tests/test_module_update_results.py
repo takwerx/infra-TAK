@@ -291,6 +291,18 @@ def test_takserver_update_factory_records_every_variant():
     assert "_mod_result_start('takserver'" in body and "_tracked_finish('takserver'" in body
 
 
+def test_takserver_update_records_the_installed_version_and_drops_the_old_card():
+    # The failure card showed "? → 5.8 migration" because "from" was empty. It also stayed red
+    # above a new update that was running. A page reload removed it, but the page did not.
+    body = APP[APP.index('def _tak_update_job('):APP.index('plugin_install_log = []')]
+    assert "_mod_result_start('takserver', 'update', _frm, kind)" in body
+    assert "_get_takserver_version_info().get('version')" in body
+    js = (REPO / 'static' / 'takserver.js').read_text(encoding='utf-8')
+    start = js[js.index('async function startTakUpdate('):js.index('function pollUpgradeLog(')]
+    drop = start.index('.module-last-result[data-module="takserver"]')
+    assert start.index('if(d.error)') < drop < start.index('pollUpgradeLog()')
+
+
 def test_registry_modules_get_the_seams_and_use_them():
     ctx = APP[APP.index('_MODULE_CTX = {'):APP.index('_MODULE_CTX = {') + 600]
     assert "'mod_result_start': _mod_result_start" in ctx and "'tracked_finish': _tracked_finish" in ctx
