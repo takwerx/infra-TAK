@@ -101,8 +101,9 @@ class FakeDocker:
             if m and m.group(1) in self.files:
                 # the broker on a non-root console (nuc, ops #1335) gives an EMPTY stdout for
                 # `docker cp C:PATH -`; a copy to a host folder works, so that is what the guard asks for
-                assert argv[3] != '-' and argv[3].endswith('/'), argv
-                with open(os.path.join(argv[3], 'PG_VERSION'), 'w') as fh:
+                # and a folder target is not enough: the broker then names the file `f`, not PG_VERSION
+                assert argv[3] != '-' and argv[3].endswith('/PG_VERSION'), argv
+                with open(argv[3], 'w') as fh:
                     fh.write(self.files[m.group(1)] + '\n')
                 return types.SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
             return types.SimpleNamespace(returncode=1, stdout=b'',

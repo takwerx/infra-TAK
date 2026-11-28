@@ -57669,7 +57669,8 @@ def _cloudtak_postgis_state(remote_cfg=None):
                     os.remove(dest)
                 except OSError:
                     pass
-                cp = subprocess.run(_sudo_wrap(['docker', 'cp', f'{cid}:/var/lib/postgresql/{d}/PG_VERSION', tmp + '/']),
+                # a named file, not a folder: through the broker a folder target gets a file called `f`
+                cp = subprocess.run(_sudo_wrap(['docker', 'cp', f'{cid}:/var/lib/postgresql/{d}/PG_VERSION', dest]),
                                     capture_output=True, timeout=30)
                 if cp.returncode != 0 or not os.path.isfile(dest):
                     continue
