@@ -57674,8 +57674,13 @@ def _cloudtak_postgis_state(remote_cfg=None):
                                     capture_output=True, timeout=30)
                 if cp.returncode != 0 or not os.path.isfile(dest):
                     continue
-                with open(dest, 'r', encoding='utf-8', errors='replace') as fh:
-                    text = fh.read(64)
+                try:
+                    with open(dest, 'r', encoding='utf-8', errors='replace') as fh:
+                        text = fh.read(64)
+                except PermissionError:
+                    # a root docker made the copy (0600, root): read it the way docker was run
+                    cat = subprocess.run(_sudo_wrap(['cat', dest]), capture_output=True, text=True, timeout=20)
+                    text = (cat.stdout or '')[:64] if cat.returncode == 0 else ''
                 vm = re.match(r'\s*(\d+)', text)
                 if vm:
                     out['data_major'] = int(vm.group(1))

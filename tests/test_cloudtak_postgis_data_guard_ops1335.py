@@ -226,6 +226,27 @@ def test_a_guard_error_keeps_the_pin():
     assert 'skipped' in logs[0]
 
 
+def test_a_copy_made_by_root_that_the_console_cannot_open_is_read_with_cat():
+    # aws-arm, `sudo -n docker cp`: the copy is root:root 0600, so open() says PermissionError
+    d = FakeDocker(files={'18/docker': '18'}, image='postgres:18-alpine', image_major='18')
+    real_run = d.run
+
+    def run(argv, **kw):
+        if argv[:1] == ['cat']:
+            return _R(0, '18\n')
+        r = real_run(argv, **kw)
+        if argv[:2] == ['docker', 'cp'] and os.path.exists(argv[3]):
+            os.chmod(argv[3], 0)
+        return r
+    if os.geteuid() == 0:
+        return          # root can open a mode 0 file: nothing to prove
+    ns = _ns(d)
+    ns['subprocess'] = types.SimpleNamespace(run=run, PIPE=_real_subprocess.PIPE, STDOUT=_real_subprocess.STDOUT)
+    ns['_sudo_wrap'] = lambda argv: list(argv)
+    logs = []
+    assert ns['_cloudtak_postgis_guard'](PIN, {}, False, log=logs.append) == 'postgres:18-alpine'
+
+
 def test_the_local_read_copies_to_a_folder_and_leaves_none_behind(tmp_path, monkeypatch):
     # `docker cp C:PATH -` answers with nothing through the broker on a non-root console (nuc), so the
     # guard must copy to a folder; the folder is private to this read and is removed afterwards
