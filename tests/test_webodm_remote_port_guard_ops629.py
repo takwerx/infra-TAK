@@ -71,8 +71,9 @@ def test_remote_deploy_locks_the_port_before_the_containers_start():
     src = _func_src('_run_webodm_deploy_remote')
     assert '"0.0.0.0:{wo_port}:8000"' in src  # still published for Caddy, so the guard is required
     guard = src.index("_remote_docker_port_guard(deploy_cfg, settings, 'webodm', [wo_port]")
-    assert guard < src.index('docker compose -f {compose_path_remote} pull') < src.index('docker compose -f {compose_path_remote} up -d')
-    after = src[guard:src.index('docker compose -f {compose_path_remote} pull')]
+    # ops #1328: pull and `up -d` both run inside _webodm_move_to_new_images, after the lock
+    assert guard < src.index('_webodm_move_to_new_images(')
+    after = src[guard:src.index('_webodm_move_to_new_images(')]
     assert 'if not _wo_guard_ok' in after and 'return' in after, 'no lock must mean no start'
 
 

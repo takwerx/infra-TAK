@@ -282,8 +282,38 @@ else
   else
     echo $((_daily + 1)) > "$DB_RESTART_COUNT_FILE"
     echo 0 > "$FAIL_COUNT_FILE"   # the next attempt needs 3 fresh consecutive failures
+    # ops #1338: restart the cluster that SERVES $DB_PORT (pg_lsclusters), never a hardcoded
+    # 15: after the 5.8 split migration the old PostgreSQL 15 sits stopped next to 18, and
+    # `pg_ctlcluster 15 main restart` succeeded on THAT while 18 stayed down. The text between
+    # the markers is the same as _PG_CTL_SH in app.py (a test keeps them identical).
+    read -r -d '' PGCTL_SH <<'PGCTL_EOF' || true
+# pgctl-begin
+pgctl() {
+A="$1"; P="${2:-5432}"; S=""
+if command -v pg_lsclusters >/dev/null 2>&1; then
+  L=$(pg_lsclusters -h 2>/dev/null)
+  S=$(printf '%s\n' "$L" | awk -v p="$P" '$3==p {print $1" "$2}' | sort -n | tail -1)
+  [ -n "$S" ] || S=$(printf '%s\n' "$L" | awk 'NF {print $1" "$2}' | sort -n | tail -1)
+fi
+if [ -n "$S" ]; then
+  set -- $S
+  sudo -n pg_ctlcluster "$1" "$2" "$A" 2>&1 || sudo -n systemctl "$A" "postgresql@$1-$2" 2>&1
+  return $?
+fi
+U=""
+for u in $(systemctl list-units --all --type=service --no-legend 'postgresql-*.service' 2>/dev/null | awk '{print $1}' | sed 's/\.service$//' | sort -V -r); do
+  systemctl is-active --quiet "$u" 2>/dev/null && { U="$u"; break; }
+done
+[ -n "$U" ] || U=$(systemctl list-unit-files --no-legend 'postgresql-*.service' 2>/dev/null | awk '{print $1}' | sed 's/\.service$//' | sort -V | tail -1)
+[ -n "$U" ] || U=postgresql
+sudo -n systemctl "$A" "$U" 2>&1
+}
+# pgctl-end
+PGCTL_EOF
+    PGCTL_PORT=$(printf '%d' "$DB_PORT" 2>/dev/null) || PGCTL_PORT=5432
     RESTART_OUT=$(ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "${SSH_USER}@${DB_HOST}" \
-      'sudo -n pg_ctlcluster 15 main restart 2>&1 || sudo -n systemctl restart postgresql 2>&1' 2>&1 \
+      "$PGCTL_SH
+pgctl restart $PGCTL_PORT" 2>&1 \
       | tr '\n' ' ' | cut -c1-200)
     sleep 5
     if timeout 6 bash -c "</dev/tcp/$DB_HOST/$DB_PORT" >/dev/null 2>&1; then
@@ -347,7 +377,7 @@ Check from this server:
 
 Check on Server One ($DB_HOST):
   pg_isready -h $DB_HOST -p $DB_PORT
-  sudo pg_ctlcluster 15 main status
+  sudo pg_lsclusters   (the cluster on port $DB_PORT is the one TAK Server uses)
   sudo -u postgres psql -lqt
 
 (This alert backs off to daily after 24h of the same state.)
