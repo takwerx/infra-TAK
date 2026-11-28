@@ -53131,7 +53131,9 @@ def mediamtx_recovery(_try_guarded=False):
         if not (deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip()):
             try:
                 _ut = _read_priv(_tp_unit) or ''
-                _ut_new = _mediamtx_editor_unit_with_prestart(_ut)
+                # ops #1400: the dash on ExecStartPre and the trusted-proxies line are set here, in
+                # Python, not by `sed -i` (which logged two SELinux denials per Patch on Rocky).
+                _ut_new = _mediamtx_editor_unit_for_patch(_mediamtx_editor_unit_with_prestart(_ut), _tp_line)
                 if _ut_new != _ut:
                     _write_priv(_tp_unit, _ut_new)
             except Exception:
@@ -53151,13 +53153,15 @@ def mediamtx_recovery(_try_guarded=False):
             for _svc in _restart_after:
                 if _svc != 'mediamtx-webeditor':
                     subprocess.run(_sudo_wrap(['systemctl', 'start', _svc]), capture_output=True, timeout=60)
+        # A remote host's unit is edited over SSH with sed (it has no console domain to deny it);
+        # a local one was edited in Python above (ops #1400).
         cmd = (
-            ('mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
+            (('mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
+              "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
+              f"if grep -q '^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=' {_tp_unit} 2>/dev/null; then "
+              f"sed -i 's|^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=.*|{_tp_line}|' {_tp_unit}; "
+              f"else sed -i '/^\\[Service\\]/a {_tp_line}' {_tp_unit} 2>/dev/null; fi; ")
              if _is_remote else '') +
-            "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
-            f"if grep -q '^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=' {_tp_unit} 2>/dev/null; then "
-            f"sed -i 's|^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=.*|{_tp_line}|' {_tp_unit}; "
-            f"else sed -i '/^\\[Service\\]/a {_tp_line}' {_tp_unit} 2>/dev/null; fi; "
             'systemctl daemon-reload 2>/dev/null; systemctl restart mediamtx-webeditor 2>/dev/null; true'
         )
         ok_run, out = _module_run_root(deploy_cfg, cmd, timeout=25)   # ops #890: mv/sed/systemctl need root
@@ -127756,12 +127760,37 @@ def _mediamtx_editor_reclaim(plog=None):
     return stopped
 
 
+def _mediamtx_editor_relabel_pylib():
+    """ops #1400: give the editor's package folder the SELinux label the policy says it
+    has. `pip --target` builds each wheel in /tmp and moves it, so the compiled files
+    (markupsafe's `_speedups*.so`) keep the `tmp_t` label; the console's check then
+    `execute`s them as `tmp_t` and the kernel logs a denial on every run (a refusal once the
+    console's domain enforces). `restorecon` sets the policy default (`usr_t`). RHEL with
+    SELinux on only; best effort, never raises. True when restorecon ran clean."""
+    if _distro_family() != 'rhel' or not os.path.isdir(_MEDIAMTX_EDITOR_PYLIB):
+        return False
+    try:
+        if (subprocess.run(['getenforce'], capture_output=True, text=True,
+                           timeout=10).stdout or '').strip() in ('', 'Disabled'):
+            return False
+        r = subprocess.run(_sudo_wrap(['restorecon', '-R', _MEDIAMTX_EDITOR_PYLIB]),
+                           capture_output=True, timeout=120)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _mediamtx_editor_pylib_ok():
     """True when the editor's packages import from _MEDIAMTX_EDITOR_PYLIB with nothing else:
     no user site, no HOME, the console's own environment left out. The dir is the console's
-    and world-readable, so the console's answer is the editor's answer."""
+    and world-readable, so the console's answer is the editor's answer.
+
+    ops #1400: the files get their policy label first (see _mediamtx_editor_relabel_pylib), so
+    the check never loads a `tmp_t` file, on a fresh install or on a box that kept the label
+    from an older install."""
     if not os.path.isdir(_MEDIAMTX_EDITOR_PYLIB):
         return False
+    _mediamtx_editor_relabel_pylib()
     try:
         r = subprocess.run(['/usr/bin/python3', '-s', '-c', _MEDIAMTX_EDITOR_PY_IMPORTS],
                            capture_output=True, text=True, timeout=30,
@@ -128021,6 +128050,31 @@ def _mediamtx_editor_unit_with_prestart(txt):
             done = True
         out.append(ln)
     return '\n'.join(out) if done else txt
+
+
+def _mediamtx_editor_unit_for_patch(txt, tp_line):
+    """The editor unit text after the two edits "Patch web editor" makes, done in Python
+    (ops #1400). They were `sed -i` calls: `sed -i` writes a temp file and asks SELinux for a
+    file-create label (`setfscreate`), which the console's domain does not hold, so every Patch
+    on Rocky logged two denials. Same result as the sed lines, line for line:
+      - `ExecStartPre=/usr/bin/python3 ...` becomes `ExecStartPre=-/usr/bin/python3 ...`
+        (a failing pre-step must not stop the editor);
+      - every `Environment=INFRATAK_TRUSTED_PROXIES=...` line becomes `tp_line`; with none, one
+        is added after the `[Service]` line (nothing is added when there is no such line).
+    Idempotent: a unit that is already right comes back unchanged."""
+    key = f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
+    out, seen = [], False
+    for ln in (txt or '').split('\n'):
+        if ln.startswith('ExecStartPre=/usr/bin/python3'):
+            ln = 'ExecStartPre=-' + ln[len('ExecStartPre='):]
+        if ln.startswith(key):
+            ln, seen = tp_line, True
+        out.append(ln)
+    if not seen:
+        i = next((n for n, ln in enumerate(out) if ln.startswith('[Service]')), None)
+        if i is not None:
+            out.insert(i + 1, tp_line)
+    return '\n'.join(out)
 
 
 def _startup_heal_mediamtx_editor_prestart():
