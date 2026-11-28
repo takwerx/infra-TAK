@@ -53,7 +53,7 @@ HOST_FUNCS = VERSION_FUNCS + ('_postgres_host_security_items', '_postgres_securi
                               '_is_major_jump')
 CONVERGE_FUNCS = VERSION_FUNCS + ('_pg_run', '_pg_stack_container', '_pg_container_version',
                                   '_pg_container_image_state', '_pg_image_version', '_pg_wait_healthy',
-                                  '_postgres_compose_converge')
+                                  '_pg_compose_service_image', '_postgres_compose_converge')
 
 OS_INSTALL_HOW = 'Console page → "Operating system updates available" → Install updates.'
 
@@ -233,6 +233,7 @@ class FakeDocker:
         self.pull_brings = pull_brings
         self.up_rc, self.ready = up_rc, ready
         self.cid = 'cid1' if running_container else ''
+        self.config_rc, self.config_out = 1, ''
         self.calls, self.pulls = [], []
         self.recycle_requests = []    # GH #549: TAK LDAP heal requests made
 
@@ -258,6 +259,10 @@ class FakeDocker:
             return out(0, '%s postgres:16-alpine\n' % self.img)
         if argv[:3] == ['docker', 'image', 'inspect']:
             return out(0, self.tag_img + '\n')
+        if argv[:3] == ['docker', 'compose', 'config']:
+            # ops #1331: the compose file names the image; the older tests leave it unreadable, so
+            # the converge falls back to the running container's own image (the pre-#1331 behaviour).
+            return out(self.config_rc, self.config_out, '' if self.config_rc == 0 else 'no')
         if argv[:2] == ['docker', 'run']:
             # the throwaway read of the pulled image: never mounts or starts the data volume
             assert '--rm' in argv and '-v' not in argv and '--volume' not in argv
