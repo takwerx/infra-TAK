@@ -53,11 +53,13 @@ def _segment(name, required):
     return None
 
 
-def _boot(config_dir):
+def _boot(config_dir, printed=None):
     ns = {'os': os, 'json': json, 'tempfile': tempfile, 'threading': threading,
           'CONFIG_DIR': str(config_dir), 'CORE_SETTINGS_KEYS': CORE,
           '_json_file_cache': {}, '_settings_write_lock': threading.Lock(),
-          '_MISSING': object(), 'print': lambda *a, **k: None}
+          '_MISSING': object(),
+          'print': (lambda *a, **k: printed.append(' '.join(str(x) for x in a))) if printed is not None
+          else (lambda *a, **k: None)}
     for name in OPTIONAL + REQUIRED:
         src = _segment(name, name in REQUIRED)
         if src:
@@ -206,3 +208,45 @@ def test_file_stays_mode_600(tmp_path):
     s['k'] = 1
     ns['save_settings'](s)
     assert (pathlib.Path(tmp_path) / 'settings.json').stat().st_mode & 0o777 == 0o600
+
+
+def test_journal_names_the_keys_it_kept_and_never_a_value(tmp_path):
+    """The proof on a box: the journal says which keys the merge kept, so a lost stamp is visible."""
+    printed = []
+    ns = _boot(tmp_path, printed)
+    _write(tmp_path, _base_settings())
+    deploy = ns['load_settings']()
+    other = ns['load_settings']()
+    other['last_console_version'] = '10.4.9-alpha'
+    other['webadmin_password'] = 'hunter2-secret'
+    ns['save_settings'](other)
+    deploy['authentik'] = {'deployed': True}
+    printed.clear()
+    ns['save_settings'](deploy)
+    line = ' '.join(printed)
+    assert 'last_console_version' in line and 'webadmin_password' in line
+    assert 'hunter2-secret' not in line and '10.4.9-alpha' not in line
+    assert 'authentik' not in line          # the caller's own key is not "kept"
+
+
+def test_nothing_to_report_when_no_other_writer(tmp_path):
+    printed = []
+    ns = _boot(tmp_path, printed)
+    _write(tmp_path, _base_settings())
+    s = ns['load_settings']()
+    s['k'] = 1
+    ns['save_settings'](s)
+    assert printed == []
+
+
+def test_key_removed_by_another_writer_stays_removed(tmp_path):
+    ns = _boot(tmp_path)
+    _write(tmp_path, _base_settings(email_relay={'a': 1}))
+    slow = ns['load_settings']()
+    fast = ns['load_settings']()
+    fast.pop('email_relay')
+    ns['save_settings'](fast)
+    slow['other'] = 1
+    ns['save_settings'](slow)
+    final = _disk(tmp_path)
+    assert 'email_relay' not in final and final['other'] == 1

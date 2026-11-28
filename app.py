@@ -2423,19 +2423,19 @@ def _merge_settings_with_disk(s, base, disk):
     """`disk` (the file now) with only the changes `s` made since it was read as `base`:
     keys added or changed in `s` are set, keys removed from `s` are removed, every other key
     stays as the file has it. Returns the merged dict and the sorted names of keys that
-    another writer changed (or removed) since `base` and that this merge therefore kept (names only,
-    never values: settings hold passwords)."""
+    another writer added, changed or removed since `base` and that this merge therefore
+    kept (names only, never values: settings hold passwords)."""
     merged = dict(disk)
     kept = []
-    for k in set(s) | set(base):
-        if k in s:
-            if k in base and s[k] == base[k]:
-                if disk.get(k, _MISSING) != base[k]:
-                    kept.append(k)
-                continue
-            merged[k] = s[k]
-        elif k in base:
-            merged.pop(k, None)
+    for k in set(s) | set(base) | set(disk):
+        in_s, in_b = k in s, k in base
+        if (in_s != in_b) or (in_s and s[k] != base[k]):
+            if in_s:
+                merged[k] = s[k]
+            else:
+                merged.pop(k, None)
+        elif disk.get(k, _MISSING) != base.get(k, _MISSING):
+            kept.append(k)
     return merged, sorted(kept)
 
 def save_settings(s):
