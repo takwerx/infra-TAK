@@ -178,7 +178,7 @@ def test_only_matching_names_are_deleted(ak, tmp_path):
         assert (ak / k).exists(), k
     assert (ak / '.env.bak.autotune.7000').is_symlink() and outside.exists()
     assert (ak / '.env.bak.autotune.7001').is_dir()
-    assert len(_left(ak, '.env.bak.autotune.1*')) == 20
+    assert len(_left(ak, '.env.bak.autotune.10*')) == 20
 
 
 def test_tag_with_dots_and_dashes_is_one_tag(ak):

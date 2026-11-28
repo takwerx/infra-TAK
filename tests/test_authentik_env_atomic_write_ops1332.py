@@ -340,7 +340,8 @@ def test_tunings_restore_a_damaged_env_from_the_newest_good_backup(tmp_path, mon
 
 def _guard_ns(volume, calls=None):
     ns = _load('_open_secret_w', '_authentik_env_sane', '_authentik_env_newest_good_backup',
-               '_authentik_env_restore_from_backup', '_authentik_env_guard_before_mint')
+               '_authentik_env_restore_from_backup', '_authentik_env_guard_before_mint',
+               '_authentik_prune_env_backups', '_authentik_prune_env_backups_quiet')   # ops #1379
 
     def vol():
         if calls is not None:

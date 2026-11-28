@@ -271,6 +271,7 @@ def test_gunicorn_timeout_puts_the_env_back_when_the_lock_is_busy(tmp_path, monk
     busy = subprocess.CompletedProcess([], 75, stdout='not run: busy', stderr='not run: busy')
     ns = {'os': os, 'subprocess': subprocess, '_sudo_wrap': list, '_AK_COMPOSE_LOCK_BUSY_RC': 75,
           '_open_secret_w': _OPEN_SECRET_W['_open_secret_w'],
+          '_authentik_prune_env_backups_quiet': lambda *a, **k: 0,   # ops #1379
           '_ak_compose_subprocess': lambda *a, **k: busy}
     exec(compile(ast.get_source_segment(APP, FUNCS['_ensure_authentik_gunicorn_timeout']), 'app.py', 'exec'), ns)
     ns['_ensure_authentik_gunicorn_timeout'](logged.append)
