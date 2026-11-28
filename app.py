@@ -84936,16 +84936,28 @@ def _tak_uaf_ldap_conflicts():
 def _tak_remove_flatfile_user(name):
     """ops #1426: remove ONE user from TAK Server's flat file so the RUNNING TAK Server stops
     using it (no restart). Returns (ok, how). TAK Server keeps the file in memory, so the file
-    is not edited by hand: TAK's own user-management call changes both."""
-    api = 'https://127.0.0.1:8443/user-management/api/delete-user/' + urllib.parse.quote(name, safe='')
-    res, err = _tak_admin_marti_req(api, timeout=30, method='DELETE')
+    is not edited by hand: `UserManager.jar usermod -D` is TAK's own tool (it works as the console
+    user, without write access to the tak-owned file; verified on a non-root install). TAK's REST
+    call for it (/user-management/api/delete-user) answers 404 when TAK's auth is LDAP. A Docker
+    TAK has java and the jar only inside its container, so the call goes through `docker exec`,
+    as for the certificate groups (create-client-cert). An argv list, never a shell string."""
+    argv = ['java', '-jar', '/opt/tak/utils/UserManager.jar', 'usermod', '-D', name]
+    full = (['docker', 'exec', TAK_CONTAINER, 'bash', '-c', shlex.join(argv)]
+            if _tak_is_container() else argv)
+    err = ''
     try:
-        left = _tak_uaf_file_users(_read_priv('/opt/tak/UserAuthenticationFile.xml') or '') or {}
+        r = subprocess.run(full, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
+        if r.returncode != 0:
+            err = f'exit {r.returncode}: {(r.stdout or "").strip()[-100:]}'
+    except Exception as e:
+        err = str(e)[:100]
+    try:
+        left = _tak_uaf_file_users(_read_priv('/opt/tak/UserAuthenticationFile.xml') or '')
     except Exception:
         left = None
-    if res is not None and left is not None and name.lower() not in left:
-        return True, 'removed through TAK Server'
-    return False, f'TAK Server did not remove it ({str(err or "user is still in the file")[:120]})'
+    if left is not None and name.lower() not in left:
+        return True, 'removed with UserManager.jar (TAK Server was not restarted)'
+    return False, f'UserManager.jar did not remove it ({err or "the user is still in the file"})'
 
 
 def _tak_uaf_conflict_alert(plog, conflicts, removed):

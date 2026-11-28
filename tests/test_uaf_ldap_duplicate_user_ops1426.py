@@ -23,14 +23,15 @@ time, and CloudTAK answers each one with a groups call (a new login). The CloudT
 places, or the user in one place only: 0 lines a second (fresh install, Ubuntu 22.04).
 
 The console checks every 5 minutes. A flat-file `webadmin` whose LDAP twin is ROLE_ADMIN is removed
-through TAK's own user-management call (no restart); any other name is only reported (it is the
+with TAK's own UserManager.jar (no restart); any other name is only reported (it is the
 operator's); nothing is removed when LDAP lacks the user or when LDAP's `webadmin` is not ROLE_ADMIN.
 Same fake box idea as test_groupless_client_ops1039: the file, LDAP, the Marti API and the mail are stubs.
 """
 
 import os
 import re
-import urllib.parse
+import shlex
+import types
 
 import pytest
 
@@ -67,7 +68,9 @@ class Box:
     """One TAK box: the flat file, what LDAP holds, the TAK delete call and the mail."""
 
     def __init__(self, file_users, ldap, delete_works=True, ldap_up=True, split=False, update_running=False,
-                 mail_to='ops@example.org'):
+                 mail_to='ops@example.org', container=False):
+        self.container = container
+        self.calls = []
         self.file = list(file_users)
         self.ldap = ldap                  # {cn: [groups]}
         self.delete_works = delete_works
@@ -86,15 +89,25 @@ class Box:
     def ns(self):
         box = self
 
-        def _tak_admin_marti_req(url, timeout=12, method='GET', json_body=None):
-            m = re.match(r'https://127\.0\.0\.1:8443/user-management/api/delete-user/(.+)$', url)
-            assert method == 'DELETE' and m, (method, url)
-            if not box.delete_works:
-                return None, 'HTTP 404'
-            name = urllib.parse.unquote(m.group(1))
-            box.deleted.append(name)
-            box.file = [u for u in box.file if u[0] != name]
-            return True, None
+        class _Run:
+            """subprocess.run for the one call the check makes: UserManager.jar usermod -D NAME
+            (directly, or through docker exec on a Docker TAK)."""
+            PIPE, STDOUT = -1, -2
+
+            @staticmethod
+            def run(argv, **kw):
+                box.calls.append(list(argv))
+                inner = argv
+                if argv[:2] == ['docker', 'exec']:
+                    assert argv[2] == 'takserver' and argv[3:5] == ['bash', '-c'], argv
+                    inner = shlex.split(argv[5])
+                assert inner[:3] == ['java', '-jar', '/opt/tak/utils/UserManager.jar'], argv
+                assert inner[3:5] == ['usermod', '-D'] and len(inner) == 6, argv
+                if not box.delete_works:
+                    return types.SimpleNamespace(returncode=1, stdout='Exception: cannot reach TAK Server')
+                box.deleted.append(inner[5])
+                box.file = [u for u in box.file if u[0] != inner[5]]
+                return types.SimpleNamespace(returncode=0, stdout="Removed user 'webadmin' from group '")
 
         def _ldap_users_tak_groups(ldap_pass, cns=None):
             if not box.ldap_up:
@@ -107,7 +120,7 @@ class Box:
             box.settings.update(s)
 
         ns = {
-            'os': os, 'time': type('T', (), {'time': staticmethod(lambda: box.now)}), 'urllib': urllib,
+            'time': type('T', (), {'time': staticmethod(lambda: box.now)}),
             'load_settings': lambda: dict(box.settings),
             'save_settings': _save,
             '_get_tak_deployment_config': lambda s: {'mode': 'two_server' if box.split else 'single'},
@@ -116,7 +129,8 @@ class Box:
             '_get_authentik_env_value': lambda s, k: 'ldap-pass',
             '_ensure_ldapsearch': lambda: True,
             '_ldap_users_tak_groups': _ldap_users_tak_groups,
-            '_tak_admin_marti_req': _tak_admin_marti_req,
+            'subprocess': _Run, 'shlex': shlex, 'TAK_CONTAINER': 'takserver',
+            '_tak_is_container': lambda: box.container,
             '_console_update_in_progress': lambda: box.update_running,
             '_guarddog_server_identifier': lambda s: 'box-1',
             '_guarddog_send_alert_email_via_relay': lambda to, subj, body, force=False: box.mails.append((to, subj, body)) or True,
@@ -148,6 +162,15 @@ def test_webadmin_with_other_groups_is_removed_without_a_restart():
     assert box.deleted == ['webadmin']
     assert [u[0] for u in box.file] == ['admin']              # the admin cert user stays
     assert out['removed'] == ['webadmin']
+
+
+def test_the_removal_runs_usermanager_as_one_argv_and_on_docker_through_docker_exec():
+    box = storm_box()
+    box.check(box.ns())
+    assert box.calls == [['java', '-jar', '/opt/tak/utils/UserManager.jar', 'usermod', '-D', 'webadmin']]
+    dbox = storm_box(container=True)
+    dbox.check(dbox.ns())
+    assert dbox.deleted == ['webadmin'] and dbox.calls[0][:5] == ['docker', 'exec', 'takserver', 'bash', '-c']
 
 
 def test_removal_is_reported_in_plain_words_once():
