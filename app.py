@@ -67336,6 +67336,19 @@ def webodm_ready():
     return jsonify({'ready': False, 'status': status_msg, 'url': wo_url})
 
 
+def _webodm_db_clear_sh(db_dir):
+    """Shell text that removes the WebODM Postgres data folder as root on a remote host (ops #1445).
+    The folder (`<webodm dir>/db`) belongs to the database container's user (uid 999, mode 700), so a
+    non-root SSH user cannot delete it: the old `rm -rf ... 2>/dev/null; true` printed nothing, exited 0
+    and left the old data (and its admin login) for the next Deploy. Runs no sudo when the folder is not
+    there. Refuses any path that is not an absolute `.../db`, because this runs `rm -rf` as root."""
+    d = (db_dir or '').strip()
+    if not d.startswith('/') or d.rstrip('/').rsplit('/', 1)[-1] != 'db' or d.rstrip('/') == '/db':
+        raise ValueError(f'refusing to remove {d!r}: not an absolute WebODM db folder')
+    q = shlex.quote(d.rstrip('/'))
+    return f'[ ! -e {q} ] || ' + _as_root_sh(f'rm -rf {q}')
+
+
 @app.route('/api/webodm/uninstall', methods=['POST'])
 @login_required
 def webodm_uninstall():
@@ -67353,7 +67366,26 @@ def webodm_uninstall():
         _module_run(deploy_cfg,
             f'docker compose -f {compose_path_remote} down --volumes 2>/dev/null; true',
             timeout=90)
-        _module_run(deploy_cfg, f'rm -rf {wo_dir_remote}/db 2>/dev/null; true', timeout=15)
+        # ops #1445: the db folder is owned by the container's database user, so remove it as root and
+        # report a failure. Under sudo a bare `~` is root's home, so resolve it to the SSH user's home first.
+        if wo_dir_remote == '~' or wo_dir_remote.startswith('~/'):
+            _ok_home, _home = _module_run(deploy_cfg, 'echo $HOME', timeout=10)
+            _home = (_home or '').strip()
+            if not _ok_home or not _home.startswith('/'):
+                return jsonify({'error': 'Could not read the home folder on the remote host, so the WebODM '
+                                         'database was not removed. WebODM is still marked as installed: '
+                                         'check the SSH connection and press Uninstall again.'}), 500
+            wo_dir_remote = _home + wo_dir_remote[1:]
+        try:
+            _clear_cmd = _webodm_db_clear_sh(f'{wo_dir_remote}/db')
+        except ValueError as _e:
+            return jsonify({'error': str(_e)}), 500
+        _ok_clear, _out_clear = _module_run(deploy_cfg, _clear_cmd, timeout=60)
+        if not _ok_clear:
+            return jsonify({'error': f'Could not remove the WebODM database folder {wo_dir_remote}/db on the '
+                                     f'remote host: {(_out_clear or "").strip()[-300:]}. WebODM is still marked as '
+                                     'installed. The SSH user needs passwordless sudo (or be root); fix that '
+                                     'and press Uninstall again.'}), 500
     else:
         import shutil as _sh
         wo_dir = _webodm_dir()   # ~/webodm OR (flipped box) /root/webodm
