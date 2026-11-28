@@ -65547,7 +65547,31 @@ def _cloudtak_update_space_problem(cloudtak_dir, remote_cfg=None):
     return None
 
 
-def _cloudtak_update_space_lines(problem, minio_store=False):
+def _cloudtak_prune_build_cache(plog, remote_cfg=None):
+    """Delete the unused Docker build cache. Returns the 'Total' size line Docker printed ('' if
+    none), or None when the prune could not run. Never raises, never blocks an Update.
+
+    ops #1452: every CloudTAK build is `--no-cache`, so nothing ever reads the cache an Update
+    leaves (about 10 GB each). Guard Dog only caps it at 20 GB and prunes more at 70% / 80% disk,
+    so after two Updates ~19 GB sat there and the third Update was refused for lack of space.
+    `builder prune` only removes build cache: never images (the MinIO image of ops #1334 stays),
+    containers or volumes, and BuildKit keeps cache a running build holds."""
+    try:
+        rc, out, err = _cloudtak_docker(['docker', 'builder', 'prune', '-af'],
+                                        remote_cfg=remote_cfg, timeout=900)
+    except Exception as e:
+        plog(f"  ⚠ Could not clear the old Docker build cache ({str(e)[:100]}). Going on without it.")
+        return None
+    if rc != 0:
+        plog(f"  ⚠ Could not clear the old Docker build cache ({(err or out or '').strip()[:140]}). Going on without it.")
+        return None
+    for ln in reversed((out or '').splitlines()):
+        if ln.strip().lower().startswith('total'):
+            return ln.split(':', 1)[-1].strip()
+    return ''
+
+
+def _cloudtak_update_space_lines(problem, minio_store=False, cache_pruned=False):
     """The log lines for a refused Update: what is short, that nothing changed, what to do.
 
     ops #1334: `minio_store=True` (the box still has ~/CloudTAK/.docker-store) leaves out
@@ -65560,8 +65584,10 @@ def _cloudtak_update_space_lines(problem, minio_store=False):
             f"✗ Not enough free disk space to update CloudTAK: {problem['free'] / gb:.1f} GB free for "
             f"{problem['what']} ({problem['where']}); the update needs about {problem['need'] / gb:.0f} GB.",
             "  Nothing was changed. CloudTAK is still running as before.",
-            "  Free some space, then press Update again. A safe way: run `docker builder prune -af` on this",
-            "  server (unused build cache), and delete old logs or backups.",
+            "  Free some space, then press Update again. " + (
+                "The old build cache was already cleared; delete old logs or backups." if cache_pruned else
+                "A safe way: run `docker builder prune -af` on this"),
+            *([] if cache_pruned else ["  server (unused build cache), and delete old logs or backups."]),
             "  Do NOT run `docker image prune -a` or `docker system prune -a` yet: this server still has your",
             "  files in the old MinIO folder (~/CloudTAK/.docker-store), and the MinIO program that reads",
             "  them is a Docker image that cannot be downloaded again. Those commands would delete it.",
@@ -65572,9 +65598,12 @@ def _cloudtak_update_space_lines(problem, minio_store=False):
         f"✗ Not enough free disk space to update CloudTAK: {problem['free'] / gb:.1f} GB free for "
         f"{problem['what']} ({problem['where']}); the update needs about {problem['need'] / gb:.0f} GB.",
         "  Nothing was changed. CloudTAK is still running as before.",
-        "  Free some space, then press Update again. Safe ways: run `docker builder prune -af` and",
-        "  `docker image prune -af` on this server (all unused build cache and unused images; the",
-        "  -a is needed, without it Docker removes only a small part), and",
+        *(["  Free some space, then press Update again. The old build cache was already cleared. A safe way:",
+           "  run `docker image prune -af` on this server (all unused images; the",
+           "  -a is needed, without it Docker removes only a small part), and"] if cache_pruned else
+          ["  Free some space, then press Update again. Safe ways: run `docker builder prune -af` and",
+           "  `docker image prune -af` on this server (all unused build cache and unused images; the",
+           "  -a is needed, without it Docker removes only a small part), and"]),
         "  delete old logs or backups. Do not delete Docker volumes: they hold your data.",
         "  " + _FREE_SPACE_BACKUPS_HINT,
     ]
@@ -65671,8 +65700,19 @@ def run_cloudtak_update():
         # rebuild. A full disk used to fail the build after minutes and leave the checkout unwritable.
         _space = _cloudtak_update_space_problem(None if is_remote else os.path.expanduser('~/CloudTAK'),
                                                 remote_cfg=(remote_cfg if is_remote else None))
+        _cache_pruned = False
+        if _space and _space['what'].startswith('the CloudTAK images'):
+            # ops #1452: old build cache from earlier Updates is what usually holds the space, and
+            # no CloudTAK build reads it (all are --no-cache). Clear it, then measure again.
+            plog("  Disk is short for the update. Clearing the old Docker build cache first (nothing reads it)…")
+            _freed = _cloudtak_prune_build_cache(plog, remote_cfg=(remote_cfg if is_remote else None))
+            if _freed is not None:
+                _cache_pruned = True
+                plog(f"  Old build cache cleared{(': ' + _freed) if _freed else ''}.")
+                _space = _cloudtak_update_space_problem(None if is_remote else os.path.expanduser('~/CloudTAK'),
+                                                        remote_cfg=(remote_cfg if is_remote else None))
         if _space:
-            for _l in _cloudtak_update_space_lines(_space, minio_store=bool(_store_now)):
+            for _l in _cloudtak_update_space_lines(_space, minio_store=bool(_store_now), cache_pruned=_cache_pruned):
                 plog(_l)
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
@@ -66176,6 +66216,11 @@ def run_cloudtak_update():
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
         _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=(remote_cfg if is_remote else None))
+        # ops #1452: the build cache this Update just wrote (about 10 GB) is never read again:
+        # every CloudTAK build is --no-cache. Give the disk back now, not at the next Update.
+        _freed_after = _cloudtak_prune_build_cache(plog, remote_cfg=(remote_cfg if is_remote else None))
+        if _freed_after is not None:
+            plog(f"  Cleared the build cache this update left{(': ' + _freed_after) if _freed_after else ''}.")
         plog("")
         plog(f"✓ CloudTAK updated to {release_tag}")
         plog("Update finished — CloudTAK is running.")

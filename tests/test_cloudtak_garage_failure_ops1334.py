@@ -202,7 +202,7 @@ def test_2_space_message_drops_the_image_prune_while_minio_data_exists():
 
 def test_2_update_passes_whether_the_minio_folder_is_there():
     update = re.sub(r'#.*', '', _body('run_cloudtak_update'))
-    assert '_cloudtak_update_space_lines(_space, minio_store=bool(_store_now))' in update
+    assert '_cloudtak_update_space_lines(_space, minio_store=bool(_store_now), cache_pruned=_cache_pruned)' in update
 
 
 def test_2_the_minio_image_is_saved_before_the_first_service_is_stopped(ct):
