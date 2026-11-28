@@ -303,7 +303,9 @@ def test_the_console_has_the_banner_and_the_restart_button():
 
 def test_tak_server_image_builds_pull_a_fresh_base():
     # deploy and update both build the takserver image; a cached old Temurin must not survive
-    assert APP.count('docker build --pull -t {TAK_CONTAINER}') == 2
+    # (ops #1326: the update builds under a temporary tag, {app_new}, and moves the tag after both builds work)
+    assert APP.count('docker build --pull -t {TAK_CONTAINER}') == 1
+    assert APP.count('docker build --pull -t {app_new}') == 1
     assert 'docker build -t {TAK_CONTAINER}' not in APP
 
 

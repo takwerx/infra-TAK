@@ -106,7 +106,9 @@ def test_network_error_is_retried_but_other_errors_are_not():
 
 def test_update_now_uses_the_retry_for_every_fetch():
     body = _block("@app.route('/api/update/apply'", '# Issue #113: the daily restart')
-    assert body.count('_git_fetch_retry(_git,') == 3
+    # dev branch, release tag. (ops #1329: the third, `+main:refs/remotes/origin/main`, is gone: Update
+    # Now no longer installs the tip of main when the release lookup fails.)
+    assert body.count('_git_fetch_retry(_git,') == 2
     assert "timeout=60, isolated_fetch=True" not in body
 
 

@@ -383,7 +383,7 @@ def get_version_info(ctx):
     has not been rebuilt since gets the update too (security_update). publish_login_new
     tells the page the update will start asking publishers for a login."""
     info = {'version': '', 'update_available': False, 'latest': TVR_SHA[:7],
-            'security_update': False, 'publish_login_new': False}
+            'security_update': False, 'publish_login_new': False, 'unfinished_update': False}
     dirpath = tvr_dir(ctx)
     local_full = ''
     try:
@@ -398,7 +398,16 @@ def get_version_info(ctx):
     info['security_update'] = (info['publish_login_new'] or
                                s.get('tak_video_restreamer_mediamtx_version') != TVR_MEDIAMTX_VERSION or
                                s.get('tak_video_restreamer_py_pins') != TVR_PY_PINS_REV)
-    info['update_available'] = info['security_update'] or bool(local_full and local_full != TVR_SHA)
+    # ops #1341: the checkout moves first and proves nothing. _run_update checks out TVR_SHA in
+    # Step 1 and rebuilds the image in Step 3, so an update whose build failed (or was killed)
+    # left HEAD == TVR_SHA over an image still built from older source, and this card said
+    # "up to date". The commit the image was last BUILT from is recorded in settings only after
+    # a build that worked (deploy Step 6, update Step 4): a recorded commit that is not the pin
+    # is an update that did not finish. A box that never recorded one says nothing (unchanged).
+    built = (s.get('tak_video_restreamer_commit_sha') or '').strip()
+    info['unfinished_update'] = bool(built and not TVR_SHA.startswith(built))
+    info['update_available'] = (info['security_update'] or info['unfinished_update']
+                                or bool(local_full and local_full != TVR_SHA))
     return info
 
 
