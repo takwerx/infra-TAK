@@ -271,6 +271,7 @@ def _rhel_run(installed_after, dnf_rc=0, package='5.7-RELEASE43'):
             'subprocess': types.SimpleNamespace(run=_Run(handler)),
             'upgrade_log': log, 'upgrade_status': status,
             '_tak_snapshot': lambda label, ulog: (True, {'db_dump': True}),
+            '_tak_downgrade_needs_dump': lambda name, snap: '',   # ops #1337 gate, not under test here
             'load_settings': lambda: {}, 'save_settings': lambda s: None,
             '_sanitize_coreconfig_name_entries': lambda: (False, ''),
             '_resync_ldap_credential_to_coreconfig': lambda: (False, ''),
@@ -352,6 +353,7 @@ def _split_run(fn, backup_ok=True, db_installed='5.8-RELEASE105', tak_cfg=None):
             '_tak_upgrade_apt_install': lambda *a, **k: 0,
             '_tak_systemctl': lambda a: 'systemctl %s takserver' % a,
             '_tak_snapshot': lambda label, ulog: (True, {'db_dump': True}),
+            '_tak_downgrade_needs_dump': lambda name, snap: '',   # ops #1337 gate, not under test here
             'load_settings': lambda: {}, 'save_settings': lambda s: None,
             '_read_priv': lambda p: '', '_read_coreconfig': lambda: '', '_write_priv': lambda *a, **k: None,
             '_coreconfig_db_tls_converge': lambda cc, *a: cc,
