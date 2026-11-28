@@ -22,6 +22,10 @@ speculative fix.
   changes through the `ufw`/`firewalld` shim. "Works on my Ubuntu box" is not done.
 - **No hardcoded secrets, and no new unauthenticated surface.** Every new route
   carries `@login_required`. Every newly opened port is justified and firewalled.
+  A PR check (`secret-scan`) fails any commit that adds a key, token or password,
+  even one you delete in a later commit, because this repo's history is public.
+  If it flags a made-up value in a test, add `gitleaks:allow` in a comment on that
+  line. Never allow a real credential: rotate it.
 - **Fleet-uniform config.** A config value is either a constant every box
   converges to, or is computed from observable signals on that box. Never
   preserve a number someone typed during an incident.

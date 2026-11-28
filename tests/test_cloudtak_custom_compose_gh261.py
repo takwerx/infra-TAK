@@ -325,7 +325,8 @@ def _reclone(home, tag, fail=False):
 
 def _helpers_reclone():
     ns = {'shlex': shlex}
-    src = '\n\n'.join([_assign('CLOUDTAK_CUSTOM_COMPOSE'), _fn('_cloudtak_remote_reclone_sh')])
+    src = '\n\n'.join([_assign('CLOUDTAK_CUSTOM_COMPOSE'), _assign('_CT_REMOTE_HAS_DATA_SH'),
+                       _fn('_cloudtak_remote_reclone_sh')])
     exec(compile(src, 'app.py', 'exec'), ns)
     return ns
 

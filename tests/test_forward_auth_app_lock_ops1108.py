@@ -200,20 +200,22 @@ def test_a_name_that_is_not_a_slug_writes_no_compare():
 
 def test_generate_caddyfile_gives_every_site_its_own_application():
     src = _func_src('generate_caddyfile')
-    for host in ('infratak_host', 'nodered_host', 'portal_host', 'mtx_host', 'wo_host', 'at_host'):
+    for host in ('infratak_host', 'nodered_host', 'portal_host', 'mtx_host', 'wo_host', 'mr_host',
+                 'at_host'):
         assert src.count(f'app=_fa_app({host})') == 1, host
-    # four direct calls of the writer, and each gives an application. Federation Hub has its
+    # five direct calls of the writer (console, Node-RED, WebODM, MeshRelay, ATLAS, ops #973),
+    # and each gives an application. Federation Hub has its
     # own helper (ops #1204) and gives none: its check sits in a `handle`, where Caddy sorts
     # the directives, so the compare would run before the check and refuse every request.
     calls = re.findall(r'_caddy_forward_auth_lines\((.*?)\)\)\n', src, re.S)
-    assert len(calls) == 4, calls
+    assert len(calls) == 5, calls
     assert all('app=_fa_app(' in c for c in calls), calls
     assert 'app=_fa_app(fh_host)' not in src
     assert src.count("_fedhub_forward_auth_lines(ak_up, '            ')") == 1
     assert 'return _caddy_forward_auth_lines(ak_up, indent)\n' in _func_src('_fedhub_forward_auth_lines') + '\n'
     # every check that gets an application is a direct line of the site's `route` block
     # (8 spaces)
-    assert [c.split(',')[1].strip() for c in calls] == ['"        "'] * 4
+    assert [c.split(',')[1].strip() for c in calls] == ['"        "'] * 5
     # a failed lookup never stops the Caddyfile build
     look = src[src.index('_fa_apps = _caddy_app_lock_apps()') - 40:src.index('def _fa_app(host):')]
     assert 'try:' in look and 'except Exception:' in look

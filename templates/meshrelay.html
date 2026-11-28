@@ -1,0 +1,121 @@
+{% extends 'base.html' %}
+{% block title %}MeshRelay — infra-TAK{% endblock %}
+{% block page_css %}<style>
+*{box-sizing:border-box;margin:0;padding:0}
+.main{flex:1;padding:32px;overflow-y:auto;min-height:100vh}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px 24px;margin-bottom:20px}
+.card-title{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin-bottom:16px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s;text-transform:none;letter-spacing:normal}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}.btn-primary:hover{opacity:.9}.btn-primary:disabled{opacity:.4;cursor:not-allowed}
+.btn-danger{background:rgba(239,68,68,.1);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.2)}
+.btn-secondary{background:var(--border);color:var(--text-secondary);border:1px solid var(--border)}.btn-secondary:hover{background:#253040}
+.mono{font-family:'JetBrains Mono',monospace}
+.log-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:14px;height:300px;overflow-y:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.6;color:#94a3b8;white-space:pre-wrap}
+.url-box{background:#050810;border:1px solid var(--border);border-radius:8px;padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--cyan);word-break:break-all;line-height:1.6}
+.warn-box{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:8px;padding:12px 14px;font-size:12px;color:#f59e0b;line-height:1.6;margin-bottom:16px}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+</style>{% endblock %}
+{% block content %}<div class="main">
+
+<div style="display:flex;align-items:center;gap:16px;margin-bottom:28px;padding-bottom:20px;border-bottom:1px solid var(--border)">
+  <span style="font-size:34px">&#128251;</span>
+  <div>
+    <div class="mono" style="font-size:20px;font-weight:700;color:var(--text-primary);letter-spacing:.04em">MESHRELAY</div>
+    <div style="font-size:12px;color:var(--text-dim);margin-top:4px">Push-to-talk relay for the MeshRelay phone app</div>
+  </div>
+</div>
+
+{% if not meshrelay.get('installed') %}
+<div class="card">
+  <div class="card-title">Install</div>
+  <p style="font-size:13px;color:var(--text-secondary);line-height:1.7;margin-bottom:16px">
+    Installs the MeshRelay server from one checked release. Phones connect on UDP {{ mr_ptt_port }}.
+    The dashboard is served on its own name behind Authentik. Every phone needs an account.
+  </p>
+  {% if mr_pin_problem %}
+  <div class="warn-box">{{ mr_pin_problem }}</div>
+  {% endif %}
+  <button class="btn btn-primary" id="deployBtn" onclick="startDeploy()" {% if mr_pin_problem or deploying %}disabled{% endif %}>Install MeshRelay</button>
+</div>
+<div class="card" id="logCard" style="{% if not deploying %}display:none{% endif %}">
+  <div class="card-title">Log</div>
+  <div class="log-box" id="logBox"></div>
+</div>
+{% else %}
+<div class="card">
+  <div class="card-title">Service</div>
+  <p style="font-size:13px;color:var(--text-secondary)">
+    Status: <b>{{ 'running' if meshrelay.get('running') else 'stopped' }}</b>
+    &middot; Version: <span class="mono">{{ mr_version or 'unknown' }}</span>
+    {% if mr_pinned and mr_pinned != mr_version %}&middot; Update available: <span class="mono">{{ mr_pinned }}</span>{% endif %}
+  </p>
+  {% if mr_url %}<div class="url-box" style="margin-top:14px">{{ mr_url }}/</div>{% endif %}
+  <p style="font-size:12px;color:var(--text-dim);margin-top:10px">Phones connect to this server's address on UDP {{ mr_ptt_port }}.</p>
+  <div class="row">
+    <button class="btn btn-secondary" onclick="ctl('start')">Start</button>
+    <button class="btn btn-secondary" onclick="ctl('restart')">Restart</button>
+    <button class="btn btn-secondary" onclick="ctl('stop')">Stop</button>
+    <button class="btn btn-primary" onclick="act('update')" {% if not mr_pinned or mr_pinned == mr_version %}disabled{% endif %}>Update</button>
+    <button class="btn btn-secondary" onclick="act('rollback')">Roll back</button>
+  </div>
+</div>
+
+{% if mr_first_password %}
+<div class="card">
+  <div class="card-title">First admin password</div>
+  <div class="warn-box">Shown here for 24 hours after the install, or until you hide it. Then the console forgets it. Sign in to the dashboard as <b>admin</b>. MeshRelay makes you change it at first login.</div>
+  <div class="url-box">{{ mr_first_password }}</div>
+  <div class="row"><button class="btn btn-secondary" onclick="forgetPw()">Hide it</button></div>
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="card-title">Remove</div>
+  <p style="font-size:13px;color:var(--text-secondary);line-height:1.7;margin-bottom:14px">
+    Removes the server, its users, recordings and TAK connection keys. This cannot be undone.
+  </p>
+  <button class="btn btn-danger" onclick="doUninstall()">Uninstall MeshRelay</button>
+</div>
+{% endif %}
+
+<p id="meshrelayNotice" style="font-size:11px;color:var(--text-dim);line-height:1.6;margin-top:8px">{{ mr_notice }}<a href="https://{{ mr_source }}" rel="noopener" target="_blank" style="color:var(--text-dim);text-decoration:underline">{{ mr_source }}</a></p>
+
+<script>
+const J = {'Content-Type':'application/json'};
+async function startDeploy(){
+  const btn = document.getElementById('deployBtn');
+  btn.disabled = true; btn.textContent = 'Installing…';
+  document.getElementById('logCard').style.display = 'block';
+  await fetch('/api/meshrelay/deploy', {method:'POST', headers:J, body:'{}'});
+  const box = document.getElementById('logBox');
+  const t = setInterval(async () => {
+    const d = await (await fetch('/api/meshrelay/log')).json();
+    box.textContent = (d.entries||[]).join('\n');
+    box.scrollTop = box.scrollHeight;
+    if(d.complete || d.error){ clearInterval(t); if(d.complete) setTimeout(()=>location.reload(), 1200); else btn.textContent = 'Install failed — see log'; }
+  }, 1000);
+}
+async function ctl(a){
+  const d = await (await fetch('/api/meshrelay/control', {method:'POST', headers:J, body:JSON.stringify({action:a})})).json();
+  if(!d.success) alert(d.output || d.error || 'failed');
+  setTimeout(()=>location.reload(), 800);
+}
+async function act(a){
+  const d = await (await fetch('/api/meshrelay/'+a, {method:'POST', headers:J, body:'{}'})).json().catch(()=>({}));
+  if(d && d.error) alert(d.error);
+  setTimeout(()=>location.reload(), 800);
+}
+async function forgetPw(){
+  await fetch('/api/meshrelay/forget-password', {method:'POST', headers:J, body:'{}'});
+  location.reload();
+}
+async function doUninstall(){
+  if(!confirm('Uninstall MeshRelay?\n\nUsers, recordings and TAK connection keys are deleted.')) return;
+  const pw = prompt('Confirm with your infra-TAK admin password:');
+  if(!pw) return;
+  const d = await (await fetch('/api/meshrelay/uninstall', {method:'POST', headers:J, body:JSON.stringify({password: pw})})).json().catch(()=>({}));
+  if(d && d.error){ alert(d.error); return; }
+  setTimeout(()=>location.reload(), 1500);
+}
+</script>
+</div>{% endblock %}

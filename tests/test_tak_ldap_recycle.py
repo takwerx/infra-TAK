@@ -1095,6 +1095,87 @@ def test_gh549_healthy_boot_is_checked_once_per_tak_start_and_quietly():
         assert box.user_api == [] and 'boot_checked_tak_start' not in box.settings.get('tak_ldap_recycle', {})
 
 
+# ── ops #1428: the end of an update looks once at TAK's HTTPS side ──────────────────────
+
+def _stuck_after_a_rollback(**kw):
+    """Run fi-20261127-190409: a console rolled back to 10.3.12 recreated the LDAP outpost under a
+    running TAK, left its API without groups on purpose (clients connected), and marked that outpost
+    start as handled. Update Now then sees no new outpost start and no pending request."""
+    kw.setdefault('tak_start', T0 - 3 * 24 * HOUR)
+    kw.setdefault('ldap_start', T0 - HOUR)
+    kw.setdefault('settings', {'tak_ldap_recycle': {'healed_ldap_start': kw['ldap_start']}})
+    kw.setdefault('https', 'no_groups')
+    kw.setdefault('outpost', 'others')
+    kw.setdefault('api_restart', 'fixes')
+    return healthy_box(**kw)
+
+
+def test_ops1428_end_of_update_finds_a_stuck_https_side_that_an_old_console_marked_handled():
+    box = _stuck_after_a_rollback()
+    assert box.recycle(trigger='end of console update', final=True) is False
+    assert box.api_restarts() == [['systemctl', 'restart', 'takserver-api']]    # only TAK's API process
+    assert box.restarts() == [] and box.drops() == []                           # TAK not restarted, nobody dropped
+    assert any('gave users no groups at the end of the console update' in l for l in box.log)
+    st = box.settings['tak_ldap_recycle']
+    assert st['last_outcome'] == 'HTTPS healed by an API-only restart'
+    assert 'pending' not in st and 'https_broken_since' not in st
+    n = len(box.api_restarts())
+    box.t += 600
+    assert box.recycle(trigger='end of console update', final=True) is False    # healed: the next update checks, touches nothing
+    assert len(box.api_restarts()) == n and box.restarts() == []
+
+
+def test_ops1428_a_healthy_https_side_costs_one_quiet_check_at_the_end_of_an_update():
+    box = _stuck_after_a_rollback(https='ok')
+    assert box.recycle(trigger='end of console update', final=True) is False
+    assert box.restarts() == [] and box.api_restarts() == [] and box.drops() == [] and box.reauths() == []
+    assert [m for _, m, _ in box.user_api][:1] == ['GET']                        # one login, as the boot check does
+    assert not any('Clients that connected during it' in l for l in box.log)    # no outage story for a healthy box
+
+
+def test_ops1428_only_the_end_of_an_update_makes_the_extra_check_not_the_10_minute_ticks():
+    box = _stuck_after_a_rollback()
+    assert box.recycle(trigger='periodic LDAP outage check', final=False) is False
+    assert box.user_api == [] and box.api_restarts() == [] and box.restarts() == []
+    box = _stuck_after_a_rollback()
+    assert box.recycle(trigger='console start', check_outpost=False, final=True) is False
+    assert box.user_api == [] and box.api_restarts() == []
+
+
+def test_ops1428_a_tak_that_just_started_is_not_checked_while_its_api_warms_up():
+    box = _stuck_after_a_rollback(tak_start=T0 - 5 * 60)
+    box.recycle(trigger='end of console update', final=True)
+    assert box.user_api == [] and box.api_restarts() == [] and box.restarts() == []
+
+
+def test_ops1428_no_local_outpost_means_no_extra_check():
+    box = _stuck_after_a_rollback(ldap_start=None, settings={})
+    box.recycle(trigger='end of console update', final=True)
+    assert box.user_api == [] and box.api_restarts() == [] and box.restarts() == []
+
+
+def test_ops1428_an_api_that_does_not_answer_is_not_a_reason_to_restart_anything():
+    box = _stuck_after_a_rollback(https='down')
+    assert box.recycle(trigger='end of console update', final=True) is False
+    assert box.api_restarts() == [] and box.restarts() == [] and box.drops() == []
+
+
+def test_ops1428_the_boot_check_and_the_update_check_do_not_both_log_in_in_one_call():
+    # TAK and the outpost started together 20 min ago: the boot check looks (once); the update check must not repeat it
+    box = healthy_box(tak_start=T0 - 20 * 60, ldap_start=T0 - 20 * 60 + 30, https='ok')
+    box.recycle(trigger='end of console update', final=True)
+    logins = [u for _, m, u in box.user_api if m == 'GET' and u.endswith('/groups/all')]
+    assert len(logins) == 1, box.user_api      # one login = groups/all, missions, create, delete
+
+
+def test_ops1428_an_idle_box_with_a_stuck_https_side_is_restarted_as_the_outage_path_does_today():
+    # Nobody is connected, so the existing path restarts TAK itself; this change adds the look, not a new restart rule
+    box = idle_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups', outpost='others',
+                   settings={'tak_ldap_recycle': {'healed_ldap_start': T0 - HOUR}})
+    assert box.recycle(trigger='end of console update', final=True) is True
+    assert box.restarts() == [['systemctl', 'restart', 'takserver']]
+
+
 def test_ops316_https_broken_after_an_8089_heal_never_restarts_tak():
     # The 8089 heal gave the empty client its groups back: it counts as a client to keep.
     box = outage_box(tak_start=T0 - 3 * 24 * HOUR, ldap_start=T0 - HOUR, https='no_groups')
@@ -1711,8 +1792,9 @@ def test_two_callers_heal_once():
     box.request('PgBouncer image swap')
     assert box.recycle() is False
     n = len(box.api)
-    assert box.recycle(trigger='boot LDAP service-account heal') is False
-    assert box.recycle(trigger='Resync LDAP to TAK Server') is False
+    # the other callers are never the end of a console update (ops #1428: only that one looks at HTTPS again)
+    assert box.recycle(trigger='boot LDAP service-account heal', final=False) is False
+    assert box.recycle(trigger='Resync LDAP to TAK Server', final=False) is False
     assert len(box.api) == n and box.drops() == ['tls:16']
 
 
@@ -1765,7 +1847,9 @@ def test_outpost_recreated_under_a_running_tak_heals_its_clients_on_update():
     box.t += 7 * 24 * HOUR
     n = len(box.api)
     assert box.recycle() is False
-    assert len(box.api) == n
+    # ops #1428: the end of an update now also looks once at TAK's HTTPS side, read-only (it reads the client
+    # list to pick a user); nothing is healed again, dropped or restarted
+    assert all(m == 'GET' for m, _, _ in box.api[n:]) and box.drops() == ['tls:16'] and box.restarts() == []
     # ...but a NEW outpost restart under TAK is checked again
     box.ldap_start = box.t - HOUR
     box.recycle()
