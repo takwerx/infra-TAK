@@ -32,10 +32,13 @@ def _const(name):
 
 def _pin_function():
     """`_webodm_pin_images` and WEBODM_IMAGES, taken out of app.py (importing app.py starts a server)."""
-    src = ast.get_source_segment(APP, next(
-        n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == '_webodm_pin_images'))
     ns = {'re': re, 'WEBODM_IMAGES': _const('WEBODM_IMAGES')}
-    exec(src, ns)
+    # the direction check it calls (ops #1307) is cut out with it
+    for n in TREE.body:
+        if (isinstance(n, ast.FunctionDef) and n.name in ('_webodm_pin_images', '_image_ref_parts',
+                                                          '_image_exact_version', '_image_ahead_of_pin')) or (
+                isinstance(n, ast.Assign) and any(getattr(t, 'id', None) == '_IMAGE_EXACT_TAG_RE' for t in n.targets)):
+            exec(compile(ast.Module([n], []), 'app.py', 'exec'), ns)
     return ns['_webodm_pin_images']
 
 
