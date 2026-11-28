@@ -5,7 +5,6 @@
 test_atlas_roster.py 1
 test_console_watchdogs_honour_authentik_update.py 1
 test_ldap_fqdn_move_backoff_ops128.py 1
-test_ldap_outpost_token_missing_provider_ops663.py 1   # fixed by ops #1444 (PR 808): drop this line when that merges
 test_os_upgrade_histories_ops285.py 2
 test_postgres_followups_ops755.py 1
 test_postgres_security_ops754.py 1
