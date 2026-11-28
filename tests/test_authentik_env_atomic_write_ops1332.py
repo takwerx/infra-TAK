@@ -55,6 +55,10 @@ def _fn(name):
 
 def _load(*names, **extra):
     ns = {'os': os, 'subprocess': subprocess, 'time': time, 're': re}
+    for node in TREE.body:      # ops #1379: module-level constants the prune helper reads
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], 'id', '') in ('AUTHENTIK_ENV_BACKUPS_KEEP', '_AK_ENV_BACKUP_RE')):
+            exec(compile(ast.get_source_segment(APP, node), 'app.py:const', 'exec'), ns)
     ns.update(extra)
     for n in names:
         exec(compile(_fn(n), f'app.py:{n}', 'exec'), ns)
@@ -336,7 +340,8 @@ def test_tunings_restore_a_damaged_env_from_the_newest_good_backup(tmp_path, mon
 
 def _guard_ns(volume, calls=None):
     ns = _load('_open_secret_w', '_authentik_env_sane', '_authentik_env_newest_good_backup',
-               '_authentik_env_restore_from_backup', '_authentik_env_guard_before_mint')
+               '_authentik_env_restore_from_backup', '_authentik_env_guard_before_mint',
+               '_authentik_prune_env_backups', '_authentik_prune_env_backups_quiet')   # ops #1379
 
     def vol():
         if calls is not None:
@@ -417,6 +422,7 @@ def test_volume_probe_reads_docker_volume_ls():
 def _tunings_ns(log, open_secret_w):
     ns = _load('_authentik_env_sane', '_authentik_env_newest_good_backup',
                '_authentik_env_restore_from_backup', '_authentik_tighten_env_backups',
+               '_authentik_prune_env_backups', '_authentik_prune_env_backups_quiet',   # ops #1379
                '_authentik_apply_official_tunings', '_authentik_fix_trusted_proxy_cidrs')
     from datetime import datetime
     ns.update({
