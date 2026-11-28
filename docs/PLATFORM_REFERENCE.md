@@ -87,6 +87,19 @@ Each entry says where the fact comes from. `✅ verified <date> on <box>` means 
 - infra-TAK links the docs home page from the header of the CloudTAK page (`templates/cloudtak.html`, `id="ct-docs-link"`), opening in a new tab.
 - ✅ verified 2026-11-20 from the Studio: both URLs return HTTP 200 with the titles above. Not checked: whether every page of the site stays at the same path in later CloudTAK releases.
 
+## CloudTAK database (PostGIS image): never start an older PostgreSQL on newer data
+
+**Source (official):** https://github.com/docker-library/postgres (PostgreSQL 18 images moved the data directory to `/var/lib/postgresql/18/docker` and the image volume to `/var/lib/postgresql`; 17 and older use `/var/lib/postgresql/data`; the image sets `PG_MAJOR` in its environment). https://www.postgresql.org/docs/current/app-pg-upgrade.html (a server cannot start on a data directory from a newer major).
+
+- CloudTAK's own compose pins `postgis/postgis:17-3.4-alpine` with no named volume (an anonymous volume). ✅ verified 2026-11-27 for CloudTAK v14.4.0 (GitHub contents API).
+- `docker cp CONTAINER:/var/lib/postgresql/data/PG_VERSION -` (or `.../18/docker/PG_VERSION`) reads the data's major from a running, stopped or restarting container; it needs no running server. ✅ verified 2026-11-27 on a Studio colima VM with real `postgres:17-alpine` and `postgres:18-alpine` containers, including a `postgres:17-alpine` container restarting on PostgreSQL 18 data.
+- So infra-TAK's postgis pin (`POSTGIS_IMAGE`) is forced only when the data is on the pin's major or older, or cannot be read; newer data keeps the image the container already runs, else no image line (ops #1335).
+
+## ETL shim state file (`/data/stacks.json`)
+
+- Our own file, not an outside contract. It holds `"__format": 1` (a key no CloudFormation stack name can have; `CreateStack` names start with a letter). The shim refuses to serve on a higher or unreadable format, keeps entries it cannot run instead of dropping them, and copies the file aside (`.bak-pre-format`, `.bak-<time>` at most 5, `.corrupt-<time>`). Shims before this change drop an entry they cannot run and rewrite the file without it (ops #1335).
+- ✅ verified 2026-11-27: the previous shim code loads a file that holds `__format` and drops only that key, keeping every layer.
+
 ## Customer states: what Update does to a box that is not "the last release, built by us"
 
 Written for the stack audit (ops #1311, after the 10.4.8 redis crash loop, infra-TAK #759). The rule (maintainer rule, Thu Nov 26, 2026): before a change ships, list the customer states it can meet and prove each on a box that really has that state, with data written by the NEWEST upstream version. This table is the list. The T&E and the update-path matrix (ops #1309, ops #1308) copy rows from it.

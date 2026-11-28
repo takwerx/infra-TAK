@@ -14,12 +14,13 @@ import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
 import fs from 'node:fs';
+import path from 'node:path';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import {
     compile, normalizeFn, ValidationError, rateMs, parseCron, cronMatch, wantsWarm, warmBudgetMb, planEviction,
     parseLogLines, parseSubnet, inSubnet, KEEPWARM_MS, MAX_CONCURRENT, REPO, hookRoute, HOOK_MAX_BODY, HOOK_SECRET_RE,
     sqsReplay, sqsSnapshot, sqsBytes, SQS_MAX_PER_LAYER, SQS_MAX_DEAD, SQS_MAX_BYTES,
-    hookResponse, hookEventHeaders, hookCookie, HOOK_FIXED_HEADERS, sigv4Verify,
+    hookResponse, hookEventHeaders, hookCookie, HOOK_FIXED_HEADERS, sigv4Verify, parseState, serializeState, STATE_FORMAT,
 } from './lib.mjs';
 
 const PORT = 4000;                                            // AWS API — internal only, never published
@@ -49,18 +50,60 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---- state ----
 // Every name-keyed map has no prototype: a name like "constructor" is only ever a key.
 let stacks = Object.create(null);   // StackName -> { id, status, created, desc, fn }
-try { stacks = Object.assign(Object.create(null), JSON.parse(fs.readFileSync(STATE, 'utf8'))); } catch { /* fresh */ }
-for (const [name, s] of Object.entries(stacks)) {
-    const fn = normalizeFn(s?.fn);
-    if (fn && fn.FunctionName === name) s.fn = fn; else { log(`state: dropping stack ${name} (not a runnable ETL function)`); delete stacks[name]; }
+// Entries of stacks.json this shim cannot run. They are never dropped: they stay in the file, so
+// a layer an older or newer shim wrote is not lost by a start-up check (ops #1335).
+let held = Object.create(null);
+const stamp = () => new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+/, '');
+function keepCopy(suffix) {
+    // a copy of the file as it is now, beside it (never over an existing copy); at most 5 of the
+    // time-stamped `.bak-<time>` ones are kept. Returns the path, or null when none was made.
+    const to = `${STATE}.${suffix}`;
+    try { fs.copyFileSync(STATE, to, fs.constants.COPYFILE_EXCL); } catch (e) {
+        if (e.code !== 'EEXIST') log(`state: could not keep ${to}: ${e.message}`);
+        return null;
+    }
+    log(`state: kept a copy of ${STATE} as ${to}`);
+    try {
+        const dir = path.dirname(STATE), base = path.basename(STATE);
+        const mine = fs.readdirSync(dir).filter((f) => f.startsWith(`${base}.bak-2`)).sort();
+        for (const f of mine.slice(0, Math.max(0, mine.length - 5))) fs.rmSync(path.join(dir, f), { force: true });
+    } catch { /* pruning is best-effort */ }
+    return to;
+}
+function loadState() {
+    let text;
+    try { text = fs.readFileSync(STATE, 'utf8'); } catch (e) {
+        if (e.code === 'ENOENT') return;   // fresh
+        log(`state: cannot read ${STATE} (${e.code || e.message}) — refusing to serve, the file is untouched`); process.exit(1);
+    }
+    if (!text.trim()) return;
+    const r = parseState(text);
+    if (r.status === 'newer') {
+        log(`state: ${STATE} is format ${JSON.stringify(r.format)}, newer than this shim reads (${STATE_FORMAT}) — refusing to serve, the file is untouched. Update the console (Update Now) to run the newer shim.`);
+        process.exit(1);
+    }
+    if (r.status === 'corrupt') {
+        keepCopy(`corrupt-${stamp()}`);
+        log(`state: ${STATE} is not readable (${r.error}) — starting with no layers; the old file was kept beside it`);
+        return;
+    }
+    stacks = r.stacks; held = r.held;
+    for (const name of Object.keys(held)) log(`state: keeping ${name} (not a layer this shim can run); it stays in the file`);
+    // Copies first, then the first write: the copy is the file exactly as it was found.
+    if (Object.keys(held).length) keepCopy(`bak-${stamp()}`);
+    if (r.format === 0 && Object.keys(stacks).length + Object.keys(held).length) {
+        keepCopy('bak-pre-format');   // the file as an older shim wrote it, before the format key goes in
+        save();
+    }
 }
 function save() {
     try {
         const tmp = `${STATE}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify(stacks, null, 1), { mode: 0o600 });
+        fs.writeFileSync(tmp, serializeState(stacks, held), { mode: 0o600 });
         fs.renameSync(tmp, STATE);
     } catch (e) { log('save fail', e.message); }
 }
+loadState();
 const runs = Object.create(null);     // FunctionName -> [{ stream, ts, lines }]
 const status = Object.create(null);   // FunctionName -> { runs, errors, skipped, last: {...} }
 const timers = Object.create(null);
@@ -422,7 +465,7 @@ async function query(form, res) {          // CloudFormation + STS (both AWS que
         let desc = ''; try { desc = JSON.parse(body).Description || ''; } catch { /* compile already parsed it */ }
         stacks[name] = { id: prev?.id || `arn:aws:cloudformation:local:000000000000:stack/${name}/${randomUUID()}`,
             status: action === 'CreateStack' ? 'CREATE_COMPLETE' : 'UPDATE_COMPLETE', created: prev?.created || new Date().toISOString(), desc, fn };
-        save(); arm(name);
+        delete held[name]; save(); arm(name);
         // a changed image/env must not be served by an old warm container
         dropWarm(fn.FunctionName);
         log(`  -> fn=${fn.FunctionName} image=${fn.Image} schedule=${JSON.stringify(fn.Schedule)} outgoing=${fn.Outgoing} webhook=${fn.Webhook} unsupported=${fn.Unsupported.join(',') || 'none'}`);
@@ -432,7 +475,7 @@ async function query(form, res) {          // CloudFormation + STS (both AWS que
         disarm(name);
         const fnName = stacks[name]?.fn.FunctionName;
         if (fnName) { dropWarm(fnName); sqsPurge(fnName); delete runs[fnName]; delete status[fnName]; }
-        delete stacks[name]; save(); return cfnOk(res, action, '');
+        delete stacks[name]; delete held[name]; save(); return cfnOk(res, action, '');
     }
     if (action === 'CancelUpdateStack') return cfnOk(res, action, '');
     return cfnErr(res, 'InvalidAction', `shim: unsupported ${action}`);
