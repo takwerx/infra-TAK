@@ -556,6 +556,7 @@ PATH_ALLOW_EXACT = (
     # /usr/local/sbin prefix (which stays denied as a root-PATH escalation surface).
     '/usr/local/sbin/tak-console-restart.sh',   # daily console-restart timer
     '/usr/local/sbin/infratak-f2b-notify',       # fail2ban off-box notify hook
+    '/usr/local/sbin/infratak-f2b-watch',        # ops #1406: the same script, run by the watch timer
     '/usr/local/sbin/takserver-renew-letsencrypt.sh',  # ops #633: daily LE renewal
                                                  # (takserver-cert-renewal.service); moved
                                                  # here from /opt/tak
@@ -778,6 +779,7 @@ PATH_CLASS = {
     '/usr/local/bin/mediamtx': DEST_ASSET,
     '/usr/local/sbin/tak-console-restart.sh': DEST_ASSET,
     '/usr/local/sbin/infratak-f2b-notify': DEST_ASSET,
+    '/usr/local/sbin/infratak-f2b-watch': DEST_ASSET,
     '/usr/local/sbin/takserver-renew-letsencrypt.sh': DEST_ASSET,
     '/var/lib/infratak-kernel-patch.sh': DEST_ASSET,
     '/var/lib/infratak-os-upgrade.sh': DEST_ASSET,
@@ -804,6 +806,7 @@ PATH_CLASS_PENDING = {
     '/usr/bin/caddy': 'W2 part 2', '/usr/local/bin/mediamtx': 'W2 part 2',
     '/usr/local/sbin/tak-console-restart.sh': 'W2 part 2',
     '/usr/local/sbin/infratak-f2b-notify': 'W2 part 2',
+    '/usr/local/sbin/infratak-f2b-watch': 'W2 part 2',
     '/usr/local/sbin/takserver-renew-letsencrypt.sh': 'W2 part 2',
     '/var/lib/infratak-kernel-patch.sh': 'W2 part 2',
     '/var/lib/infratak-os-upgrade.sh': 'W2 part 2',
@@ -864,6 +867,7 @@ UNIT_FILES = frozenset({
     'mediamtx-webeditor.service.d/10-infratak-journal.conf',
     'mediamtx-webeditor.service.d/20-infratak-home.conf',
     'ptt-server.service',       # ops #973: MeshRelay PTT server, runs as its own `ptt` account
+    'infratak-f2b-watch.service', 'infratak-f2b-watch.timer',   # ops #1406: Guard Dog login/fail2ban watch
 })
 _UNIT_FILE_RE = re.compile(r'^tak[a-z0-9]+guard\.(service|timer)$')   # Guard Dog watchers
 # Users a non-root unit may run as, and the groups it may add. A unit running as
@@ -2824,6 +2828,11 @@ _PKGMGR_FLAGS = frozenset({
     '--assumeno', '--assume-no', '-C', '--cacheonly', '-v', '--verbose',
     '-s', '--simulate', '--dry-run', '--just-print', '--refresh',
     '--allow-downgrades', '--reinstall', '--purge', '--auto-remove', '--autoremove',
+    # GH #761: run_takserver_58_migration always sends this on Ubuntu (the OS patch job
+    # holds takserver, #117). Left off this list, the broker refused every 5.8 update
+    # from a non-root console after TAK Server was already stopped. It only lets apt
+    # change a held package its own plan needs; it names no file, URL, config or hook.
+    '--allow-change-held-packages',
     '--no-install-recommends', '--no-install-suggests', '-f', '--fix-broken',
     '-m', '--fix-missing', '--only-upgrade', '--no-remove', '--with-new-pkgs',
     '--upgradable', '--installed', '--all', '--available', '--enabled', '--disabled',

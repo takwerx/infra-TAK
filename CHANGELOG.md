@@ -4,6 +4,34 @@ All notable changes to infra-TAK, newest first. Each entry opens with a plain-la
 
 Back to the [README](README.md).
 
+## v10.4.10-alpha — 2026-11-27 — MeshRelay push-to-talk module, safer updates and rollbacks, quiet fail2ban emails
+
+**Headline: Adds MeshRelay, a push-to-talk voice server, as a new module. Updates and rollbacks no longer put an older version over newer data. fail2ban no longer emails you for every bot it bans. Update from the Console page, Update Now.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.10-alpha))
+
+**New: MeshRelay.**
+- Install the MeshRelay push-to-talk relay server (by R3 Systems, AGPL-3.0) from the console, on Ubuntu, Rocky and ARM64. Its dashboard is behind Caddy and Authentik sign-in, and Guard Dog watches it. infra-TAK installs v4.9.1 and checks every downloaded file.
+
+**Updates and rollbacks keep your data.**
+- NetBird repair, WebODM Update and Node-RED no longer replace a newer image with an older one.
+- Update Now installs new console libraries and checks them. Console Rollback puts the older code back first and warns before it would set a newer Authentik Redis to an older one.
+- Authentik's secrets file is written in one safe step. Authentik Update on a remote host no longer goes back to an older version.
+- TAK Server rollback keeps certificates; Docker TAK Server Update keeps the old containers until the new build works; the TAK Server 5.8 update no longer stops on a held Java 17; Guard Dog restarts the right remote PostgreSQL version.
+- Federation Hub, WebODM, ATLAS, CloudTAK and NetBird take a backup or keep their data before risky update steps. The MediaMTX Patch editor is never moved to an older version.
+- Your Caddyfile, Email Relay and Node-RED edits survive an update.
+
+**fail2ban.**
+- Bans from bots send no email. You get an email only for a TAK Server device with a client certificate or a real user account. Optional daily summary, off by default.
+- fail2ban always starts again after the firewall lock switch.
+
+**Security.**
+- New public security practices paper for agencies.
+
+**Known issues.**
+- The first Update Now from 10.4.9 runs the 10.4.9 update code, by design.
+- After a rollback to 10.4.9, the MeshRelay page is gone until you update again. Voice keeps working.
+- A rollback to a release older than 10.4.4 can hide new missions and data feeds from users in groups, until the next release.
+- Do not roll back to 10.4.8: the Authentik restart loop comes back.
+
 ## v10.4.9-alpha — 2026-11-27 — Authentik Redis restart-loop fix, Guard Dog update emails that try again, ATLAS admin fixes, Federation group names
 
 **Headline: Fixes the Authentik Redis restart loop that 10.4.8 caused on some servers. A server already in the loop repairs itself when it updates. Guard Dog update emails now arrive even when GitHub or the mail relay fails for a moment. Fixes for ATLAS admins, fail2ban, Federation and Rocky. Update from the Console page, Update Now.** ([Release notes](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.9-alpha))
