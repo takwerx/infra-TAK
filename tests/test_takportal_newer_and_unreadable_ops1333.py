@@ -40,6 +40,7 @@ import sys
 import tarfile
 import threading
 import types
+from urllib.parse import urlparse
 
 import pytest
 
@@ -204,7 +205,7 @@ GOOD = json.dumps({'TAK_URL': 'https://tak.example.com:8443/Marti', 'BETA_MODE':
 def test_a_readable_file_is_ok():
     n = _reader(Docker(exec_out=GOOD))
     state, data, raw = n['_takportal_read_settings_state']()
-    assert state == 'ok' and data['TAK_URL'].startswith('https://tak.example.com')
+    assert state == 'ok' and urlparse(data['TAK_URL']).hostname == 'tak.example.com'
     assert n['_takportal_get_existing_settings']() == data
 
 
@@ -263,8 +264,8 @@ def test_docker_not_answering_is_an_error_not_an_empty_file(kw):
 
 MERGE_FUNCS = ['_takportal_template_placeholder_keys', '_takportal_with_required_prefixes',
                '_takportal_merged_settings_json', '_takportal_settings_unreadable_error',
-               '_takportal_keep_unreadable_settings']
-MERGE_CONSTS = ('TakPortalSettingsUnreadable', 'TAKPORTAL_DOMAIN_KEYS', 'TAKPORTAL_AUTH_ADOPT_KEYS',
+               '_takportal_keep_unreadable_settings', '_takportal_unreadable_text']
+MERGE_CONSTS = ('TakPortalSettingsUnreadable', '_TAKPORTAL_UNREADABLE_PAGE_TEXT', '_TAKPORTAL_UNREADABLE_DOCKER_TEXT', 'TAKPORTAL_DOMAIN_KEYS', 'TAKPORTAL_AUTH_ADOPT_KEYS',
                 'TAKPORTAL_AUTHORITATIVE_KEYS', 'EMAIL_TRANSPORT_KEYS', 'TAKPORTAL_TEMPLATE_PLACEHOLDERS',
                 'TAKPORTAL_TEMPLATE_TAK_CONNECTION', 'TAKPORTAL_REQUIRED_PREFIXES', 'TAKPORTAL_UNREADABLE_KEEP')
 
@@ -384,3 +385,31 @@ def test_only_the_reader_and_the_merge_read_the_state_for_a_write():
     file from `_takportal_get_existing_settings()` alone, which cannot tell absent from unreadable."""
     for name in ('_takportal_merged_settings_json', '_takportal_admin_guardrail', 'takportal_ssh_set_user'):
         assert '_takportal_read_settings_state()' in _src(name), name
+
+
+# ---- what a page shows is fixed text, never the exception's own text (CodeQL: stack trace exposure) -------
+
+@pytest.mark.parametrize('state', ['unreadable', 'error'])
+def test_a_page_shows_fixed_text_not_the_exception_text(tmp_path, state):
+    """The exception text carries the saved copy's path (log only). The page and the API answer get a fixed
+    sentence, picked by `kind`. Red on dev: no helper, the handlers returned str(e)."""
+    n = _merge_ns(tmp_path, state, raw='{"TAK_URL": "https://tak.exa')
+    with pytest.raises(n['TakPortalSettingsUnreadable']) as e:
+        n['_takportal_merged_settings_json']({})
+    shown = n['_takportal_unreadable_text'](e.value)
+    assert 'wrote nothing' in shown and str(tmp_path) not in shown
+    assert shown == (n['_TAKPORTAL_UNREADABLE_PAGE_TEXT'] if state == 'unreadable'
+                     else n['_TAKPORTAL_UNREADABLE_DOCKER_TEXT'])
+    assert str(tmp_path) in str(e.value) or state == 'error'          # the log line keeps the exact path
+
+
+def test_no_handler_returns_the_unreadable_exception_text():
+    """A handler that answers with str(e) of TakPortalSettingsUnreadable would put an exception's text in a
+    response (CodeQL py/stack-trace-exposure). Every handler goes through the fixed-text helper."""
+    for name in ('takportal_enable_auth_api', 'takportal_use_domain_api', 'takportal_control', '_takportal_run_update'):
+        f = _FUNCS[name]
+        for h in [x for x in ast.walk(f) if isinstance(x, ast.ExceptHandler)
+                  and 'TakPortalSettingsUnreadable' in ast.get_source_segment(APP, x.type)]:
+            body = '\n'.join(ast.get_source_segment(APP, st) for st in h.body)
+            assert "str(e)" not in body.replace("{e}", ""), (name, body)
+            assert '_takportal_unreadable_text(e)' in body or name == '_takportal_push_settings', (name, body)

@@ -49892,7 +49892,27 @@ EMAIL_TRANSPORT_KEYS = frozenset(['EMAIL_ENABLED', 'EMAIL_PROVIDER', 'SMTP_HOST'
 
 class TakPortalSettingsUnreadable(Exception):
     """ops #1333: TAK Portal's settings.json is there but infra-TAK could not read it, so it must
-    not build a replacement from its own seeds. The message is for the operator, in plain words."""
+    not build a replacement from its own seeds. The message is for the operator, in plain words
+    and goes to the log; `kind` ('unreadable' or 'error') picks the fixed text a page shows."""
+    kind = 'error'
+
+
+# What a page or an API answer shows (fixed text: the message with the saved copy's path stays in the log).
+_TAKPORTAL_UNREADABLE_PAGE_TEXT = (
+    "TAK Portal's settings.json is there but cannot be read as JSON, so infra-TAK left it alone and "
+    "wrote nothing. A copy is saved in the takportal-settings-backups folder of the console user's "
+    ".config folder (the console log has the exact path). Fix the file (or put the copy back), then "
+    "press Update config.")
+_TAKPORTAL_UNREADABLE_DOCKER_TEXT = (
+    "infra-TAK could not read TAK Portal's settings.json (Docker did not answer), so it wrote "
+    "nothing. Try again in a minute.")
+
+
+def _takportal_unreadable_text(exc):
+    """Fixed, operator-facing text for a TakPortalSettingsUnreadable (never the exception's own text)."""
+    if getattr(exc, 'kind', 'error') == 'unreadable':
+        return _TAKPORTAL_UNREADABLE_PAGE_TEXT
+    return _TAKPORTAL_UNREADABLE_DOCKER_TEXT
 
 
 _TAKPORTAL_SETTINGS_PATH = '/usr/src/app/data/settings.json'
@@ -50038,11 +50058,13 @@ def _takportal_settings_unreadable_error(state, raw):
     """The TakPortalSettingsUnreadable for a read that is not 'ok' or 'absent' (saves the copy)."""
     if state == 'unreadable':
         kept = _takportal_keep_unreadable_settings(raw)
-        return TakPortalSettingsUnreadable(
+        err = TakPortalSettingsUnreadable(
             "TAK Portal's settings.json is there but cannot be read as JSON, so infra-TAK left it "
             "alone and wrote nothing."
             + (f" A copy is saved on this server at {kept}." if kept else '')
             + " Fix the file (or put the copy back), then press Update config.")
+        err.kind = 'unreadable'
+        return err
     return TakPortalSettingsUnreadable(
         "infra-TAK could not read TAK Portal's settings.json (Docker did not answer), so it wrote "
         "nothing. Try again in a minute.")
@@ -51542,7 +51564,8 @@ def takportal_enable_auth_api():
     try:
         _merged = _takportal_merged_settings_json(settings, adopt=TAKPORTAL_AUTH_ADOPT_KEYS)
     except TakPortalSettingsUnreadable as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        print(f'[takportal] settings write skipped: {e}', flush=True)
+        return jsonify({'success': False, 'error': _takportal_unreadable_text(e)}), 500
     ok, err = _takportal_write_settings_json(_merged)
     if not ok:
         return jsonify({'success': False, 'error': err or 'could not write TAK Portal settings'}), 500
@@ -51579,7 +51602,8 @@ def takportal_use_domain_api():
     try:
         _merged = _takportal_merged_settings_json(settings, adopt=keys)
     except TakPortalSettingsUnreadable as e:
-        return jsonify({'success': False, 'error': str(e)}), 500
+        print(f'[takportal] settings write skipped: {e}', flush=True)
+        return jsonify({'success': False, 'error': _takportal_unreadable_text(e)}), 500
     ok, err = _takportal_write_settings_json(_merged)
     if not ok:
         return jsonify({'success': False, 'error': err or 'could not write TAK Portal settings'}), 500
@@ -51638,7 +51662,8 @@ def takportal_control():
         try:
             settings_json = _takportal_merged_settings_json(settings)
         except TakPortalSettingsUnreadable as e:
-            return jsonify({'success': False, 'error': str(e)}), 500
+            print(f'[takportal] settings write skipped: {e}', flush=True)
+            return jsonify({'success': False, 'error': _takportal_unreadable_text(e)}), 500
         # v10.1.51 (W1): every step below reports what it actually did. Update Config used to
         # discard _takportal_setup_ssh()'s return value and then tell the operator
         # "(SSH configured)" regardless -- so a portal stuck on "Setup: not run yet" looked
@@ -51961,7 +51986,7 @@ def _takportal_run_update(portal_dir):
                 settings_sync_error = cp_err or 'docker cp failed'
     except TakPortalSettingsUnreadable as e:
         # ops #1333: the file is left as it is; the page shows why nothing was synced.
-        settings_sync_error = str(e)
+        settings_sync_error = _takportal_unreadable_text(e)
         print(f'[takportal] update: {e}', flush=True)
     except Exception as e:
         settings_sync_error = str(e)[:300]
