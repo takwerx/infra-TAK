@@ -124,7 +124,7 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 <div class="card" id="f2b-mail-card" style="margin-bottom:8px">
 <div class="card-title">✉️ Ban emails</div>
 <div style="font-size:12px;color:var(--text-dim);margin-top:6px;line-height:1.6">
-Bots bump into a public server all day, so routine bans are <strong>not emailed</strong>. They stay on this page and in the Guard Dog log. You get an email only when a person needs to look: a TAK device with a certificate is blocked, or someone failed SSH passwords for a real account. At most 3 such emails a day.
+Bots bump into a public server all day, so routine bans are <strong>not emailed</strong>. They stay on this page and in the Guard Dog log. You get an email only when a person needs to look: a TAK device with a certificate is blocked, or someone failed SSH passwords for a real account, or a login to SSH, this console or Authentik worked right after 3 or more failed guesses from the same address, or fail2ban itself stopped working (service down, a jail not running, a ban that failed). Each cause is mailed once a day, and at most 3 such emails a day. Addresses on your trusted list are never mailed about.
 </div>
 <label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;cursor:pointer">
 <input type="checkbox" id="f2b-daily-summary" onchange="saveBanSummary(this.checked)">
