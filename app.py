@@ -35935,12 +35935,25 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             _ok_lock, out_lock = _module_run(cfg, lock_diag_cmd, timeout=20)
             if out_lock:
                 plog(('APT lock status:\n' + out_lock.strip())[:1200])
+        # ops #1438: the package's preinst runs `systemctl stop federation-hub` under `set -e`. On a hub
+        # installed by hand, systemd may not have reloaded since the init scripts appeared, so the unit
+        # is "not loaded", that stop answers exit 5, dpkg refuses the package and every Update ends the
+        # same way. A reload first makes systemd read the unit. Best effort: if it fails, say so and
+        # let apt run as it did before (the install step then names its own error).
+        ok_rl, out_rl = _module_run(cfg, 'sudo systemctl daemon-reload', timeout=90)
+        if ok_rl:
+            plog('✓ systemd reloaded on the hub host (so the package can stop the hub)')
+        else:
+            plog(f'⚠ systemctl daemon-reload failed before the package install: {(out_rl or "")[-200:].strip()}')
         plog('Running apt-get now...')
         ok_inst, out_inst = _module_run(cfg, install_cmd, timeout=600)
         if out_inst:
             tail = out_inst[-4500:] if len(out_inst) > 4500 else out_inst
             plog(tail)
         if not ok_inst:
+            if 'not loaded' in (out_inst or '') or 'exit status 5' in (out_inst or ''):
+                plog('✗ The package could not stop the hub (systemd reports the Federation Hub unit as not loaded). '
+                     'On the hub host run: sudo systemctl daemon-reload, then press Update again.')
             plog('✗ apt-get install failed — fix errors on target, then redeploy or update')
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
