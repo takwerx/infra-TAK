@@ -13,6 +13,7 @@ import io
 import json
 import pathlib
 import re
+import threading
 import time as _real_time
 import types
 import urllib.error
@@ -87,16 +88,20 @@ class FakeAuthentik:
 
 @pytest.fixture
 def ak(monkeypatch):
+    # ops #1444: never patch time.sleep on the shared time module. The patch is process-wide, so a
+    # thread left over from an earlier test (pytest -n keeps them) wrote its own sleep(1.0) into
+    # `sleeps` and test_provider_step_does_not_retry_a_real_4xx failed once on dev. The code under
+    # test gets its own `time` stand-in (f.clock) that only it can reach.
     sleeps = []
-    monkeypatch.setattr(_real_time, 'sleep', lambda n: sleeps.append(n))
     f = FakeAuthentik()
     monkeypatch.setattr(urllib.request, 'urlopen', f.urlopen)
     f.sleeps = sleeps
+    f.clock = types.SimpleNamespace(sleep=lambda n: sleeps.append(n))
     return f
 
 
-def _ensure_ns():
-    ns = {'json': json, 'time': _real_time}
+def _ensure_ns(clock):
+    ns = {'json': json, 'time': clock}
     exec(_fn('_ak_ldap_provider_ensure'), ns)
     return ns
 
@@ -104,12 +109,12 @@ def _ensure_ns():
 def test_provider_step_retries_a_500_then_succeeds(ak):
     ak.provider_posts = [500, 502, 'prov-1']
     log = []
-    pk = _ensure_ns()['_ak_ldap_provider_ensure']('http://ak', {}, 'bind', 'inv', plog=log.append, delay=1)
+    pk = _ensure_ns(ak.clock)['_ak_ldap_provider_ensure']('http://ak', {}, 'bind', 'inv', plog=log.append, delay=1)
     assert pk == 'prov-1'
     assert len(ak.sleeps) == 2
 
 
-def test_provider_step_uses_the_provider_a_500_created_anyway(ak):
+def test_provider_step_uses_the_provider_a_500_created_anyway(ak, monkeypatch):
     # The API answered 500 but had created the provider: the next look finds it, no second POST.
     ak.provider_posts = [500]
     posts = []
@@ -120,21 +125,33 @@ def test_provider_step_uses_the_provider_a_500_created_anyway(ak):
             ak.providers = [{'pk': 'prov-9', 'name': 'LDAP'}]
             posts.append(1)
         return real(req, timeout)
-    urllib.request.urlopen = urlopen
-    pk = _ensure_ns()['_ak_ldap_provider_ensure']('http://ak', {}, 'bind', 'inv', delay=1)
+    monkeypatch.setattr(urllib.request, 'urlopen', urlopen)
+    pk = _ensure_ns(ak.clock)['_ak_ldap_provider_ensure']('http://ak', {}, 'bind', 'inv', delay=1)
     assert pk == 'prov-9' and len(posts) == 1
+
+
+def test_a_sleep_in_another_thread_is_not_counted_as_a_retry(ak):
+    # Proof for ops #1444: with the old fixture (time.sleep patched on the shared module) this
+    # recorded 0.01 and the 403 test above failed at random. Now only the code under test counts.
+    t = threading.Thread(target=lambda: _real_time.sleep(0.01))
+    t.start()
+    t.join()
+    assert ak.sleeps == []
+    ak.provider_posts = [403]
+    assert _ensure_ns(ak.clock)['_ak_ldap_provider_ensure']('http://ak', {}, 'bind', 'inv', delay=1) is None
+    assert ak.sleeps == []
 
 
 def test_provider_step_gives_up_after_the_tries_and_does_not_loop_forever(ak):
     ak.provider_posts = [500]
-    pk = _ensure_ns()['_ak_ldap_provider_ensure']('http://ak', {}, 'bind', 'inv', attempts=3, delay=1)
+    pk = _ensure_ns(ak.clock)['_ak_ldap_provider_ensure']('http://ak', {}, 'bind', 'inv', attempts=3, delay=1)
     assert pk is None
     assert len(ak.sleeps) == 2
 
 
 def test_provider_step_does_not_retry_a_real_4xx(ak):
     ak.provider_posts = [403]
-    pk = _ensure_ns()['_ak_ldap_provider_ensure']('http://ak', {}, 'bind', 'inv', delay=1)
+    pk = _ensure_ns(ak.clock)['_ak_ldap_provider_ensure']('http://ak', {}, 'bind', 'inv', delay=1)
     assert pk is None and ak.sleeps == []
 
 
@@ -152,7 +169,7 @@ def _repair_ns(tmp_path, monkeypatch, fake):
                        "      AUTHENTIK_TOKEN: placeholder\n  server:\n    image: y\n")
     monkeypatch.setenv('HOME', str(home))
     import os
-    ns = {'json': json, 'os': os, 're': re, 'time': _real_time,
+    ns = {'json': json, 'os': os, 're': re, 'time': fake.clock,
           'load_settings': lambda: {},
           '_get_module_deployment_config': lambda s, k: {},
           '_get_authentik_env_value': lambda s, k: 'bootstrap',
