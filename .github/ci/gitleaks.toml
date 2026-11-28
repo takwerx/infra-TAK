@@ -1,0 +1,31 @@
+# gitleaks settings for .github/ci/secret_scan.sh (ops #1433).
+# Start from gitleaks' own rules (AWS, GitHub, Slack, private keys, generic API keys, ...).
+# Add nothing here to make a real secret pass: rotate it. An allow-list entry is only for a
+# value that is made up on purpose. Prefer `gitleaks:allow` in a comment on that line.
+title = "infra-TAK"
+
+[extend]
+useDefault = true
+
+# Made-up values that tests write on purpose. Each is matched exactly: a new test fixture that looks
+# like a real secret still fails the check, so say "gitleaks:allow" on that line or pick a clearly
+# fake value.
+[[allowlists]]
+description = "fake AUTHENTIK_SECRET_KEY in tests/test_authentik_env_atomic_write_ops1332.py"
+regexTarget = "secret"
+regexes = ['''^origSecretKey456$''']
+
+[[allowlists]]
+description = "fake password used by two login tests (wrong-guess-123)"
+regexTarget = "secret"
+regexes = ['''^wrong-guess-123$''']
+
+[[allowlists]]
+description = "public GPG fingerprint of the TAK package signing key, pinned in broker/takwerx_broker.py (a fingerprint is public by design)"
+regexTarget = "secret"
+regexes = ['''^71C03345F393DBD0E03AEB2BF06237936851F5B5$''']
+
+[[allowlists]]
+description = "a CA key FILE NAME (int-ca-01.key, INT-CA-02.p12, ...), not the key: letters, digits and dashes, then a key-file ending"
+regexTarget = "secret"
+regexes = ['''(?i)^[a-z0-9-]+(\.[a-z0-9-]+)*\.(key|pem|p12|jks|keystore|plain|bak|crt|csr)(\.[a-z0-9]+)?$''']
