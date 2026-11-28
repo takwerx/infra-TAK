@@ -102094,7 +102094,11 @@ def _tak_update_job(kind, target, log, status):
         # run distinct; entries already on disk keep their old ids and are left alone.
         run_id = '%s@%.3f#%s' % (kind, started, secrets.token_hex(4))
         pkg = a[0] if a and isinstance(a[0], str) else ''
-        _mod_result_start('takserver', 'update', '', kind)     # v10.2.8 W10 — the card + Diagnostics
+        try:    # Record the installed version. Then a failure card shows "5.7-RELEASE43 → …", not "? → …".
+            _frm = _get_takserver_version_info().get('version') or ''
+        except Exception:
+            _frm = ''
+        _mod_result_start('takserver', 'update', _frm, kind)   # v10.2.8 W10 — the card + Diagnostics
         # v10.2.11 (ops #9): the record used to be written only when the worker ENDED, so a
         # run cut off by a console restart, a reboot or an OOM kill left no log anywhere —
         # the one run that changed the box was the one Diagnostics could not show (lutak2.net:
