@@ -74823,7 +74823,7 @@ def authentik_control():
         # but the button is always live — and now that the .env pin actually converges, a
         # downgrade would TAKE where before .env silently absorbed it.
         if _inst and _cur['tuple'] > (_ak_ver_tuple(latest) + (0, 0, 0))[:3]:
-            return jsonify({'error': f'Refusing to downgrade Authentik: v{_inst} is running '
+            return jsonify({'error': f'Refusing to downgrade Authentik: v{_inst} '
                                      f'({_cur["what"]}), this channel targets v{latest}. Promote the vetted '
                                      f'release instead of downgrading a live IdP. Nothing was changed.'}), 409
         # ops #1331: a move to a new release FAMILY runs database migrations the old image cannot

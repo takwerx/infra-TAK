@@ -290,6 +290,7 @@ def test_stopped_stack_with_a_newer_env_pin_is_refused(home, monkeypatch):
     body, status, _ = run_update(box, monkeypatch, home)
     assert status == 409, body
     assert box.mutations() == [] and box.env_text() == env_before
+    assert 'is running' not in body['error'] and 'the tag docker compose would start' in body['error']
 
 
 def test_stopped_stack_with_an_older_env_pin_still_updates(home, monkeypatch):
