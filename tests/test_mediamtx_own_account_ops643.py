@@ -359,10 +359,14 @@ def test_deploy_and_patch_take_the_dir_back_before_writing():
     dep = _fn_full('run_mediamtx_deploy')
     assert dep.index('_mediamtx_editor_reclaim(plog=plog)') < dep.index("_shutil.copy2(webeditor_src")
     rec = _fn_full('mediamtx_recovery')
-    assert rec.index('_mediamtx_editor_reclaim()') < rec.index('_write_priv(editor_path, content)')
+    # ops #1341: the editor file itself is now written by _mediamtx_editor_refresh (called from the patch)
+    assert rec.index('_mediamtx_editor_reclaim()') < rec.index('_mediamtx_editor_refresh(')
+    assert '_write_priv(editor_path, content)' in _fn_full('_mediamtx_editor_refresh')
     assert '_mediamtx_hand_over_files(_mediamtx_owner())' in rec
     # no more takwerx copy into the editor's dir, and no fixed /tmp hop on the local box
-    assert "_write_priv('/opt/mediamtx-webeditor/ensure_overlay.py', MEDIAMTX_ENSURE_OVERLAY_SCRIPT" in rec
+    # (ops #1387: written through the route's _put, which is _write_priv on the full path)
+    assert "_put('/opt/mediamtx-webeditor/ensure_overlay.py', MEDIAMTX_ENSURE_OVERLAY_SCRIPT" in rec
+    assert '_write_priv(path, content, perm=perm)' in rec
 
 
 def test_reclaim_drops_links_and_special_files(tmp_path):
@@ -380,6 +384,7 @@ def test_reclaim_drops_links_and_special_files(tmp_path):
              _mediamtx_account_ready=lambda: True)
     import stat as _stat
     ns.update(_stat=_stat, _MEDIAMTX_EDITOR_DIR=str(ed), _MEDIAMTX_CONF_DIR=str(tmp_path / 'etc'))
+    exec(_fn('_mediamtx_editor_reclaim_applies'), ns)   # ops #1387: the reclaim's own guard
     exec(_fn('_mediamtx_editor_reclaim'), ns)
     stopped = ns['_mediamtx_editor_reclaim']()
     assert stopped == ['mediamtx-webeditor', 'mediamtx']

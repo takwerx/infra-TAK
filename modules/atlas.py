@@ -4116,6 +4116,19 @@ def deploy(ctx, job, params):
                 'channel back to the one this deployment came from, then press '
                 'Update.')
 
+        # ⚠️ **A dump before the checkout moves, as Update takes one (ops #1340).** Deploy on a
+        # built deployment checks out the release and rebuilds `api`, which migrates the database
+        # forward, and until now it took no dump: the one button that rebuilds on top of data had
+        # no way back. Only for a deployment that finished a deploy before (its commit is
+        # recorded after the containers are up) and whose containers exist: a first deploy that
+        # failed halfway holds no data worth keeping, and refusing its repair would trap it.
+        if (_built and settings.get(f'{_prefix}commit_sha') and
+                os.path.isdir(os.path.join(dirpath, '.git')) and
+                instance_is_built(ctx, _inst)):
+            plog('')
+            plog('━━━ Backing up the database first ━━━')
+            backup_database(ctx, _inst, _dump_version(ctx, _inst, _built, plog), plog)
+
         if os.path.isdir(os.path.join(dirpath, '.git')):
             plog(f'  Already cloned at {dirpath} — fetching {tag}')
             ctx['_module_git'](dirpath, 'checkout', '--', '.', timeout=60)
@@ -5851,7 +5864,8 @@ def _run_update(ctx, inst=None):
         slot['log'] = list(log)
         print('[' + _me['name'] + '] update: ' + msg, flush=True)
 
-    slot.update({'running': True, 'complete': False, 'error': False, 'log': []})
+    slot.update({'running': True, 'complete': False, 'error': False, 'log': [],
+                 'refused': False})
     try:
         dirpath = _me['dir']
         if not os.path.isdir(os.path.join(dirpath, '.git')):
@@ -5880,7 +5894,8 @@ def _run_update(ctx, inst=None):
             for line in refusal:
                 plog(line)
             _reconcile_access(ctx, inst, plog)
-            slot.update({'running': False, 'complete': True, 'error': False})
+            # ops #1340: complete, but NOT updated. Update All reads this flag.
+            slot.update({'running': False, 'complete': True, 'error': False, 'refused': True})
             return
         if here and there and there == here:
             unfinished = _unfinished_update(ctx, inst, dirpath, _prefix, target)
@@ -5939,7 +5954,7 @@ def _run_update(ctx, inst=None):
         # ops #864: a database backup BEFORE anything changes. ATLAS 2.x migrates forward only, so
         # without a dump an update that goes wrong has no way back. No backup, no update.
         plog('━━━ Backing up the database first ━━━')
-        backup_database(ctx, inst, current, plog)
+        backup_database(ctx, inst, _dump_version(ctx, inst, current, plog), plog)
 
         tag = 'v' + target
         plog('━━━ Step 1/3: Fetching ' + tag + ' ━━━')
@@ -6099,6 +6114,28 @@ def _run_pg_dump(cid):
     return p.returncode, p.stdout or b'', (p.stderr or b'').decode('utf-8', 'replace')
 
 
+def _dump_version(ctx, inst, installed, plog=None):
+    """The release the database was last written by, for naming a dump (ops #1340).
+
+    ⚠️ **The checkout moves first and proves nothing about the data.** After an update died
+    mid-rebuild the VERSION file already reads the NEW release, so a retry named its dump (and
+    its "go back to" commands) for the new release while the data was still the old one's.
+    The running container is the witness: ATLAS migrates its database when the new api starts,
+    so a container still answering with an OLDER release has not migrated anything. Anything
+    else (no answer, or the same release) keeps the on-disk version: restoring a dump onto the
+    newer release is the safe direction, onto an older one it is not.
+    """
+    here = _parse_version(installed)
+    running = _running_version(ctx, inst)
+    there = _parse_version(running)
+    if here and there and there < here:
+        if plog:
+            plog('  The running container is still on v%s (the source on disk is v%s), so this '
+                 'backup is named for v%s.' % (running, installed, running))
+        return running
+    return installed
+
+
 def backup_paths(ctx, inst):
     """(folder holding this deployment's dumps, compose `-p` flag or '')."""
     paths = instance_paths(ctx, inst)
@@ -6143,6 +6180,12 @@ def backup_database(ctx, inst, version, plog):
             'to 1.x without a backup.' % exc)
     size = os.path.getsize(path)
     plog('✓ Database backed up (%.1f MB) before the update' % (size / 1048576.0))
+    # ops #1340: on a retry, say the dump from before the interrupted attempt is still there.
+    _mine = atlas_backup._clean_version(version or 'unknown')
+    _earlier = [b for b in atlas_backup.list_backups(folder) if b['version'] != _mine]
+    if _earlier:
+        plog('  The backup from the earlier release v%s is kept too: %s'
+             % (_earlier[0]['version'], _earlier[0]['path']))
     for line in atlas_backup.describe(paths['dir'], flag, path, version or ''):
         plog(line)
     return path
@@ -6434,6 +6477,7 @@ def _run_update_all(ctx):
     _update_all_status.update({'running': True, 'complete': False,
                                'error': False, 'log': [], 'results': []})
     results = []
+    refused = []
     try:
         found = load_instances(ctx)
         projects = compose_projects_present(ctx)
@@ -6453,6 +6497,16 @@ def _run_update_all(ctx):
                 log.append('    ' + line)
             _update_all_status['log'] = list(log)
             ok = bool(slot['complete']) and not slot['error']
+            if ok and slot.get('refused'):
+                # ops #1340: a refused downgrade is not an update. It was reported "updated
+                # to <the newer version it already had>", which read as a success.
+                refused.append(name)
+                results.append({
+                    'name': name, 'slug': inst.get('slug'), 'ok': None,
+                    'detail': 'not updated: it is newer than the channel offers (see the log above)',
+                })
+                _update_all_status['results'] = list(results)
+                continue
             results.append({
                 'name': name, 'slug': inst.get('slug'), 'ok': ok,
                 'detail': ('updated to ' + (_installed_version(ctx, inst) or '?')
@@ -6464,6 +6518,9 @@ def _run_update_all(ctx):
             plog('✗ %d of %d deployment(s) failed: %s'
                  % (len(failed), len(results),
                     ', '.join(r['name'] for r in failed)))
+        elif refused:
+            plog('— %d deployment(s) not updated, newer than the channel offers: %s'
+                 % (len(refused), ', '.join(refused)))
         else:
             plog('✓ Every finished deployment is on the newest release')
         # ⚠️ `complete` is true either way: the run finished. `error` says

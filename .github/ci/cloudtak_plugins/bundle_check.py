@@ -16,6 +16,10 @@ of CloudTAK:
                       then run infra-TAK's own pre-build shield from app.py on the tree
   install-dispatcher  run the Dispatcher repo's own install.sh --no-build (standalone users)
   verify              open the built web app and look for each plugin's menu entry
+  verify-routes       check every CloudTAK API call the plugin's browser code makes still has a
+                      route in this CloudTAK (ops #1414: the menu can load while the action is dead)
+  routes-local        the same check for plugin checkouts you hold (the two private plugins, run on
+                      the Studio: a GitHub-hosted run cannot read them)
 
 Both install steps write expect.json, built from the plugin's OWN source (the key / label /
 tooltip / description strings in its `menu.add({...})` call), so a plugin that renames its menu
@@ -182,6 +186,9 @@ def verify_bundle(expect, dist):
     lines, problems = [], 0
     for p in expect['plugins']:
         label = f"{p['name']} ({p['key']})"
+        if p.get('skipped'):
+            lines.append(f"skip  {label}: {p['skipped']}")
+            continue
         if p.get('error'):
             lines.append(f"FAIL  {label}: {p['error']}")
             problems += 1
@@ -195,6 +202,277 @@ def verify_bundle(expect, dist):
                 lines.append(f"FAIL  {label}: menu entry '{e['label']}' (key {e['key']}) is NOT in the built app "
                              f"({len(chunks)} JS files searched). The plugin was installed but did not make it into the build.")
                 problems += 1
+    return lines, problems
+
+
+# ── the CloudTAK routes each plugin calls (ops #1414) ────────────────────────────
+#
+# Why this exists: a menu entry in the bundle proves the plugin loaded, not that its main action
+# works. CloudTAK 14.0.0 removed routes, changed chat and location, and a plugin that calls a route
+# that is gone shows its menu and then fails when the user clicks. So: for every plugin, read every
+# CloudTAK API call its browser code makes (std('/api/...', {method})), and check that CloudTAK's own
+# source (plus the routes the plugin ships in server/) still defines that route with that method.
+# It needs no TAK Server and no login, so it runs in the nightly with the rest.
+
+HTTP_VERBS = ('get', 'post', 'put', 'patch', 'delete')
+# A call to CloudTAK's own fetch helper. `std` is what plugins use (plain fetch gives 401 No Auth Present).
+CALL_RE = re.compile(r'(?<![\w.$])(?:std|stdurl|server\s*\.\s*(?:GET|POST|PUT|PATCH|DELETE))\s*\(\s*(?=[`\'"A-Za-z_])')
+ROUTE_RE = re.compile(r'\bschema\s*\.\s*(' + '|'.join(HTTP_VERBS) + r')\s*\(\s*(?:\'([^\'\n]+)\'|"([^"\n]+)"|`([^`\n]+)`)')
+ROUTE_DIR_RE = re.compile(r'^(?:api|tasks)(?:/[^/]+)*/routes$')
+
+
+def _read_arg(text, i):
+    """(kind, value, end) for the first argument of a call that starts at text[i].
+    kind 'str' = a string or template literal with `${...}` parts left in; 'other' = anything else."""
+    q = text[i]
+    if q not in '\'"`':
+        return 'other', '', i
+    j, out = i + 1, []
+    while j < len(text):
+        c = text[j]
+        if c == '\\' and j + 1 < len(text):
+            out.append(text[j:j + 2])
+            j += 2
+            continue
+        if q == '`' and c == '$' and text[j + 1:j + 2] == '{':
+            depth, k, inq = 1, j + 2, None
+            while k < len(text) and depth:
+                d = text[k]
+                if inq:
+                    if d == '\\':
+                        k += 1
+                    elif d == inq:
+                        inq = None
+                elif d in '\'"`':
+                    inq = d
+                elif d == '{':
+                    depth += 1
+                elif d == '}':
+                    depth -= 1
+                k += 1
+            out.append(text[j:k])
+            j = k
+            continue
+        if c == q:
+            return 'str', ''.join(out), j + 1
+        if c == '\n' and q != '`':
+            break
+        out.append(c)
+        j += 1
+    return 'other', '', j
+
+
+def _call_end(text, i):
+    """Index of the ')' that closes the call whose '(' was just before text[i] (string-aware)."""
+    depth, quote, j = 1, None, i
+    while j < len(text):
+        c = text[j]
+        if quote:
+            if c == '\\':
+                j += 1
+            elif c == quote:
+                quote = None
+        elif c in '\'"`':
+            quote = c
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return len(text)
+
+
+def _fill(template, consts):
+    """(path, open_tail) for a call path with every ${...} resolved: a known string constant becomes
+    its text, a value in a path position becomes ':p'. A '?query' built on the fly is dropped. A value
+    glued onto the end of a path (`${BASE}${path}`) cannot be read: open_tail is then True and the
+    caller only checks that CloudTAK has routes under that prefix."""
+    out, i, open_tail = '', 0, False
+    while i < len(template):
+        if template.startswith('${', i):
+            depth, k = 1, i + 2
+            while k < len(template) and depth:
+                depth += (template[k] == '{') - (template[k] == '}')
+                k += 1
+            expr = template[i + 2:k - 1].strip()
+            if expr in consts:
+                out += consts[expr]
+            elif out == '' or out.endswith('/'):
+                out += ':p'
+            elif '?' not in out and not re.search(r'[\'"`]\?', expr):
+                open_tail = True
+            i = k
+        else:
+            out += template[i]
+            i += 1
+    return out, open_tail
+
+
+def _literals(text):
+    """(start, end, value) of every string and template literal outside comments."""
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '/' and text.startswith('//', i):
+            j = text.find('\n', i)
+            i = n if j < 0 else j
+        elif c == '/' and text.startswith('/*', i):
+            j = text.find('*/', i + 2)
+            i = n if j < 0 else j + 2
+        elif c in '\'"`':
+            kind, value, end = _read_arg(text, i)
+            if kind == 'str':
+                yield i, end, value
+                i = end
+            else:
+                i += 1
+        else:
+            i += 1
+
+
+_STD_CTX = re.compile(r'(?<![\w.$])std\s*\(\s*$')      # stdurl() only builds an address: the method is chosen later
+_SERVER_CTX = re.compile(r'\bserver\s*\.\s*(GET|POST|PUT|PATCH|DELETE)\s*\(\s*$')
+_CONST_CTX = re.compile(r'\bconst\s+(\w+)\s*(?::\s*string\s*)?=\s*$')
+
+
+def derive_calls(plugin_dir):
+    """([{method, path, prefix, file, line}], [{file, line}]) from the plugin's browser code.
+
+    Three kinds of call are read: std('/api/...', {method}) (CloudTAK's fetch helper), the typed
+    client server.GET('/api/...') and any other string that holds an /api/ path (a plain fetch built
+    on serverUrl). std() and the typed client know their method; every other string (stdurl() builds an address that a later fetch or sendBeacon uses) matches any method. `path` has no query
+    and ':p' where the plugin puts a value. prefix=True: only the start of the path can be read (a
+    constant such as BASE, a path that ends in '/', or a tail added at run time), so the check is
+    that CloudTAK has routes under it. The second list is calls to std()/server.* whose first
+    argument is not a literal: they are reported, never silently skipped."""
+    calls, unread = [], []
+    for root, dirs, files in os.walk(plugin_dir):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
+        for n in sorted(files):
+            if not n.endswith(SRC_SUFFIXES) or n.endswith('.d.ts'):
+                continue
+            rel = os.path.relpath(Path(root, n), plugin_dir).replace(os.sep, '/')
+            try:
+                text = Path(root, n).read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                continue
+            consts = _consts(text)
+            for m in CALL_RE.finditer(text):
+                if _read_arg(text, m.end())[0] != 'str':
+                    unread.append({'file': rel, 'line': text.count('\n', 0, m.start()) + 1})
+            for start, end, value in _literals(text):
+                path, open_tail = _fill(value, consts)
+                k = path.find('/api/')
+                # Nothing, or a value (the server address), before /api/. A fixed host name is another site.
+                if k < 0 or path[:k] not in ('', ':p'):
+                    continue
+                path = re.sub(r'\{[^}]*\}', ':p', path[k:]).split('?')[0]
+                before = text[max(0, start - 80):start]
+                sm = _SERVER_CTX.search(before)
+                method = '*'
+                if sm:
+                    method = sm.group(1).lower()
+                elif _STD_CTX.search(before):
+                    mm = re.search(r'\bmethod\s*:\s*[\'"`]([A-Za-z]+)[\'"`]', text[end:_call_end(text, end)])
+                    method = (mm.group(1) if mm else 'get').lower()
+                cm = _CONST_CTX.search(before) if '${' not in value else None
+                if cm and re.search(r'\$\{\s*' + re.escape(cm.group(1)) + r'\b', text):
+                    continue            # a constant the calls below use as ${NAME}: they are checked, not the constant
+                prefix = open_tail or path.endswith('/') or bool(cm)
+                call = {'method': method, 'path': path.rstrip('/') or '/', 'prefix': prefix,
+                        'file': rel, 'line': text.count('\n', 0, start) + 1}
+                if not any(c['method'] == call['method'] and c['path'] == call['path'] and c['prefix'] == call['prefix']
+                           for c in calls):
+                    calls.append(call)
+    return calls, unread
+
+
+def cloudtak_routes(ct):
+    """{(method, '/api/...')} that this CloudTAK checkout defines. Routes are `schema.get('/x', ...)`
+    in api/*/routes/*.ts (and tasks/*/routes) and are mounted under /api."""
+    ct, routes = Path(ct), set()
+    for root, _dirs, files in os.walk(ct):
+        rel = os.path.relpath(root, ct).replace(os.sep, '/')
+        if 'node_modules' in rel.split('/') or not ROUTE_DIR_RE.match(rel):
+            continue
+        for n in sorted(files):
+            if not n.endswith('.ts'):
+                continue
+            text = Path(root, n).read_text(encoding='utf-8', errors='replace')
+            for m in ROUTE_RE.finditer(text):
+                path = m.group(2) or m.group(3) or m.group(4)
+                if path.startswith('/'):
+                    routes.add((m.group(1), ('/api' + path).rstrip('/') or '/api'))
+    return routes
+
+
+def _seg_match(call_seg, route_seg):
+    return call_seg == route_seg or route_seg.startswith(':') or call_seg == ':p'
+
+
+def route_exists(routes, method, path, prefix=False):
+    """Is there a route for this call? method '*' = any method. prefix = only the start of the
+    path is known, so any route under it counts."""
+    segs = path.strip('/').split('/')
+    for m, r in routes:
+        rs = r.strip('/').split('/')
+        if method != '*' and m != method:
+            continue
+        if (len(rs) >= len(segs) if prefix else len(rs) == len(segs)) \
+                and all(_seg_match(a, b) for a, b in zip(segs, rs)):
+            return True
+    return False
+
+
+def other_method(routes, method, path):
+    """The methods CloudTAK does have for this path, when `method` is not one of them."""
+    return sorted({m.upper() for m in HTTP_VERBS if m != method and route_exists(routes, m, path)})
+
+
+def _says(c):
+    return f"{c['method'].upper() if c['method'] != '*' else 'any method'} {c['path']}{'/...' if c.get('prefix') else ''}"
+
+
+def verify_routes(expect, routes):
+    """(report lines, number of problems). One line per plugin, then one per call that has no route.
+    A plugin may list `allow_missing` calls it copes with (each needs a `why`): they are shown as
+    `known`, not counted, so a NEW missing route is still red."""
+    lines, problems = [], 0
+    if not routes:
+        return ['FAIL  no routes found in this CloudTAK checkout: the route scan cannot read it'], 1
+    for p in expect['plugins']:
+        label = f"{p['name']} ({p['key']})"
+        if p.get('skipped'):
+            lines.append(f"skip  {label}: {p['skipped']}")
+            continue
+        calls = p.get('calls', [])
+        if not calls:
+            if p.get('unread'):
+                lines.append(f"note  {label}: no CloudTAK API call with a literal path ({len(p['unread'])} call(s) pass a variable); nothing this check can compare")
+            else:
+                lines.append(f"ok    {label}: the plugin makes no CloudTAK API call of its own, nothing to compare")
+            continue
+        allowed = {(a['method'].lower(), a['path']): a['why'] for a in p.get('allow_missing', [])}
+        missing, known = [], []
+        for c in calls:
+            if route_exists(routes, c['method'], c['path'], c.get('prefix', False)):
+                continue
+            (known if (c['method'], c['path']) in allowed else missing).append(c)
+        for c in missing:
+            alt = other_method(routes, c['method'], c['path']) if c['method'] != '*' and not c.get('prefix') else []
+            why = (f"CloudTAK has {', '.join(alt)} for this path but not {c['method'].upper()}" if alt
+                   else 'CloudTAK has no route for this')
+            lines.append(f"FAIL  {label}: {_says(c)} ({c['file']}:{c['line']}): {why}")
+            problems += 1
+        for c in known:
+            lines.append(f"known {label}: {_says(c)} ({c['file']}:{c['line']}) is not in this CloudTAK; tolerated: {allowed[(c['method'], c['path'])]}")
+        if not missing:
+            lines.append(f"ok    {label}: all {len(calls) - len(known)} CloudTAK API calls have a route")
+        if p.get('unread'):
+            lines.append(f"note  {label}: {len(p['unread'])} call(s) pass a variable, not a literal, so they were not checked "
+                         f"({', '.join(sorted({u['file'] for u in p['unread']}))})")
     return lines, problems
 
 
@@ -230,11 +508,24 @@ def copy_dir(src, dest):
 
 def plugin_expectation(p, web_src, sha=None):
     entries = derive_menu(web_src)
-    out = {'key': p['key'], 'name': p['name'], 'install_dir': p['install_dir'], 'source': sha or 'local', 'menu': entries}
+    calls, unread = derive_calls(web_src)
+    out = {'key': p['key'], 'name': p['name'], 'install_dir': p['install_dir'], 'source': sha or 'local',
+           'menu': entries, 'calls': calls, 'unread': unread}
+    if p.get('allow_missing'):
+        out['allow_missing'] = p['allow_missing']
     if not entries:
         out['error'] = (f'could not read a menu.add({{key, label}}) call in the plugin source ({web_src.name}/); '
                         'either the plugin no longer registers a menu entry or it does it in a way this check cannot read')
     return out
+
+
+PRIVATE_NOTE = ('private repo: a GitHub-hosted run cannot read it, so it is not built or checked here. '
+                'Run `bundle_check.py routes-local` on the Studio against the local checkout (see README)')
+
+
+def private_expectation(p):
+    return {'key': p['key'], 'name': p['name'], 'install_dir': p['install_dir'], 'source': 'private',
+            'menu': [], 'calls': [], 'unread': [], 'skipped': PRIVATE_NOTE}
 
 
 def cmd_install_catalog(a):
@@ -246,6 +537,10 @@ def cmd_install_catalog(a):
         raise SystemExit('ERROR: this CloudTAK has no app/src: the check only covers CloudTAK 13.102.0 and newer')
     expect = []
     for p in plugins:
+        if p.get('private'):
+            print(f"SKIPPED {p['name']} ({p['key']}): {PRIVATE_NOTE}")
+            expect.append(private_expectation(p))
+            continue
         if p.get('local_path'):
             src, sha = REPO_ROOT / p['local_path'], None
             server = REPO_ROOT / p['server_path'] if p.get('server_path') else None
@@ -376,8 +671,40 @@ def cmd_verify(a):
     expect = json.loads(Path(a.expect).read_text(encoding='utf-8'))
     lines, problems = verify_bundle(expect, a.dist)
     print('\n'.join(lines))
-    total = sum(1 for ln in lines if not ln.startswith(' '))
-    print(f"\n{total - problems} of {total} checks passed" if lines else 'nothing to check')
+    skipped = sum(1 for ln in lines if ln.startswith('skip'))
+    total = sum(1 for ln in lines if not ln.startswith((' ', 'skip')))
+    print(f"\n{total - problems} of {total} checks passed" + (f" ({skipped} skipped: private)" if skipped else '')
+          if lines else 'nothing to check')
+    return 1 if problems else 0
+
+
+def cmd_verify_routes(a):
+    expect = json.loads(Path(a.expect).read_text(encoding='utf-8'))
+    lines, problems = verify_routes(expect, cloudtak_routes(a.ct))
+    print('\n'.join(lines))
+    checked = sum(1 for ln in lines if ln.startswith(('ok', 'FAIL')))
+    print(f"\n{checked - problems} of {checked} plugins' API calls match a CloudTAK route" if checked else 'nothing to check')
+    return 1 if problems else 0
+
+
+def cmd_routes_local(a):
+    """Route check for plugin checkouts on this machine. Each --plugin is a repo folder with plugin/
+    (browser code) and server/ (its own routes, optional)."""
+    routes = cloudtak_routes(a.ct)
+    plugins = []
+    for repo in a.plugin:
+        repo = Path(repo)
+        web = repo / 'plugin' if (repo / 'plugin').is_dir() else repo
+        calls, unread = derive_calls(web)
+        server = repo / 'server'
+        for f in sorted(server.glob('*.ts')) if server.is_dir() else []:
+            for m in ROUTE_RE.finditer(f.read_text(encoding='utf-8', errors='replace')):
+                path = m.group(2) or m.group(3) or m.group(4)
+                if path.startswith('/'):
+                    routes.add((m.group(1), ('/api' + path).rstrip('/') or '/api'))
+        plugins.append({'name': repo.name, 'key': repo.name, 'calls': calls, 'unread': unread})
+    lines, problems = verify_routes({'plugins': plugins}, routes)
+    print('\n'.join(lines))
     return 1 if problems else 0
 
 
@@ -401,6 +728,14 @@ def main(argv=None):
     s.add_argument('--expect', required=True)
     s.add_argument('--dist', required=True, help="the built web app (CloudTAK's app/dist)")
     s.set_defaults(fn=cmd_verify)
+    s = sub.add_parser('verify-routes')
+    s.add_argument('--expect', required=True)
+    s.add_argument('--ct', required=True, help='CloudTAK checkout the plugins were installed into')
+    s.set_defaults(fn=cmd_verify_routes)
+    s = sub.add_parser('routes-local')
+    s.add_argument('--ct', required=True, help='CloudTAK checkout (any tag or main)')
+    s.add_argument('--plugin', action='append', required=True, help='plugin repo folder (repeat for more)')
+    s.set_defaults(fn=cmd_routes_local)
     a = ap.parse_args(argv)
     return a.fn(a) or 0
 

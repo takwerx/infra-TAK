@@ -71,6 +71,72 @@ def render_main_cf_block(relay_host, relay_port, smtp_auth=True, tls='may'):
     return '\n'.join(lines) + '\n'
 
 
+MAIN_CF_MARKER = '# TAKWERX Email Relay'
+# Every key render_main_cf_block() writes, plus a few an older block carried. Only these
+# lines directly under our marker are ours; whatever follows them belongs to the operator.
+_BLOCK_KEYS = frozenset((
+    'inet_interfaces', 'mynetworks', 'mydestination', 'relayhost', 'smtp_sasl_auth_enable',
+    'smtp_sasl_password_maps', 'smtp_sasl_security_options', 'smtp_tls_security_level',
+    'smtp_use_tls', 'header_size_limit', 'smtp_generic_maps', 'smtp_sasl_mechanism_filter',
+    'smtp_tls_note_starttls_offer'))
+_BLOCK_COMMENT_PREFIXES = ('# Send-only smarthost', '# (default mydestination', '# recipient table')
+
+
+def _is_block_line(line):
+    t = line.strip()
+    if t.startswith(_BLOCK_COMMENT_PREFIXES):
+        return True
+    # The line sync_root_alias() adds after our block, when it is exactly ours. One that also
+    # names an operator's map is not ours alone and stays.
+    if re.fullmatch(r'virtual_alias_maps\s*=\s*hash:' + re.escape(ROOT_ALIAS_MAP), t):
+        return True
+    m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*=', t)
+    return bool(m) and m.group(1) in _BLOCK_KEYS
+
+
+def strip_main_cf_block(text):
+    """main.cf without our block. Only the marker and the lines render_main_cf_block()
+    writes under it are removed; operator lines that follow them stay. It used to delete
+    everything after the marker, so a line an operator added below our block was lost on
+    every deploy (ops #1343)."""
+    out, lines, i = [], (text or '').split('\n'), 0
+    while i < len(lines):
+        if lines[i].startswith(MAIN_CF_MARKER):
+            i += 1
+            while i < len(lines) and _is_block_line(lines[i]):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return '\n'.join(out)
+
+
+def merge_generic_map(existing, ours):
+    """New body for /etc/postfix/generic: our `root@<name>` lines, then every other line
+    the file already holds. A line of ours is replaced; nothing else is dropped. The file
+    used to be rewritten whole on every deploy and every Update, so an entry an operator
+    added was lost (ops #1343). With nothing else in the file the result is exactly `ours`."""
+    mine = {ln.split()[0].lower() for ln in (ours or '').splitlines() if ln.split()}
+    keep = []
+    for ln in (existing or '').splitlines():
+        if not ln.strip():
+            continue
+        if not ln.lstrip().startswith('#') and ln.split()[0].lower() in mine:
+            continue
+        keep.append(ln.rstrip())
+    return (ours or '') + ('\n'.join(keep) + '\n' if keep else '')
+
+
+def write_generic_map(ctx, text, plog=None):
+    """Write /etc/postfix/generic keeping lines that are not ours, then build the map."""
+    try:
+        existing = ctx['_read_priv']('/etc/postfix/generic')
+    except Exception:
+        existing = ''
+    ctx['_write_priv']('/etc/postfix/generic', merge_generic_map(existing, text))
+    return _postmap(ctx, '/etc/postfix/generic', plog or (lambda m: None))
+
+
 def accepted_message(settings, to_addr):
     """What a successful test send actually proves, in words (v10.2.8 W6, GH #87).
 
@@ -206,8 +272,7 @@ def sync_root_alias(ctx, settings, plog=None, from_addr='', reload=True, names=N
         # Sender rewrite for every host name (a box deployed before GH #667 only had one).
         sender = (from_addr or ((settings or {}).get('email_relay') or {}).get('from_addr') or '').strip()
         if sender and ctx['_safe_alert_emails'](sender):
-            ctx['_write_priv']('/etc/postfix/generic', _generic_map_text(sender, *names)[0])
-            _postmap(ctx, '/etc/postfix/generic', plog)
+            write_generic_map(ctx, _generic_map_text(sender, *names)[0], plog)
         # Map first, then main.cf: main.cf must never name a table that does not exist.
         ctx['_write_priv'](ROOT_ALIAS_MAP, render_root_alias_map(names, dests))
         if not _postmap(ctx, ROOT_ALIAS_MAP, plog):
@@ -436,8 +501,9 @@ def deploy(ctx, job, params):
         except Exception:
             existing = ''
         if existing:
-            # Remove previous TAKWERX block if present
-            existing = re.sub(r'\n# TAKWERX Email Relay.*', '', existing, flags=re.DOTALL)
+            # Remove previous TAKWERX block if present. Only the lines we wrote: whatever an
+            # operator added below it stays (ops #1343).
+            existing = strip_main_cf_block(existing)
             # Remove any existing relayhost line (Ubuntu default has a blank one)
             existing = re.sub(r'^\s*relayhost\s*=.*$', '', existing, flags=re.MULTILINE)
             # Remove any existing mynetworks (we set it in our block for Docker relay)
@@ -481,8 +547,7 @@ def deploy(ctx, job, params):
         if len(generic_names) > 1:
             plog(f"⚠ Host names disagree ({', '.join(generic_names)}); "
                  "sender rewrite covers each of them")
-        ctx['_write_priv']('/etc/postfix/generic', generic_text)
-        _postmap(ctx, '/etc/postfix/generic', plog)
+        write_generic_map(ctx, generic_text, plog)
         plog("✓ Credentials written and hashed" if smtp_auth else "✓ Sender map written (no SMTP login)")
         # GH #667: mail the host sends to root reaches a person. Postfix restarts in
         # Step 4, so no reload here.
