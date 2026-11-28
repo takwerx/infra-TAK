@@ -1,5 +1,5 @@
 {
-  "_comment": "Every CloudTAK plugin takwerx ships. Read by bundle_check.py and the nightly (ops #301). tests/test_cloudtak_plugin_nightly_ops301.py keeps it in step with CLOUDTAK_PLUGINS in app.py. in_catalog=false: not in infra-TAK's own catalog (TAK Portal installs it), so infra-TAK's build shield treats it as a foreign plugin.",
+  "_comment": "Every CloudTAK plugin takwerx ships. Read by bundle_check.py and the nightly (ops #301). tests/test_cloudtak_plugin_nightly_ops301.py keeps it in step with CLOUDTAK_PLUGINS in app.py. in_catalog=false: not in infra-TAK's own catalog (TAK Portal installs it), so infra-TAK's build shield treats it as a foreign plugin. private=true: the repo cannot be read from a GitHub-hosted run, so the nightly lists it as skipped (never silently); the route check for it runs on the Studio (README).",
   "plugins": [
     {
       "key": "tak-dispatcher",
@@ -22,7 +22,14 @@
       "name": "Search Containment",
       "repo": "https://github.com/clptak/cloudtak-plugin-search-containment",
       "install_dir": "search-containment",
-      "in_catalog": false
+      "in_catalog": false,
+      "allow_missing": [
+        {
+          "method": "get",
+          "path": "/api/basemap/:p/tiles",
+          "why": "CloudTAK 14.0.0 removed it; trails.ts catches the failure and uses the basemap's own zoom levels (ops #1074)"
+        }
+      ]
     },
     {
       "key": "taksim",
@@ -39,6 +46,35 @@
       "plugin_subpath": "plugin",
       "install_dir": "print",
       "in_catalog": false
+    },
+    {
+      "key": "crosstak",
+      "name": "CrossTAK",
+      "repo": "https://github.com/takwerx/cloudtak-crosstak-plugin",
+      "plugin_subpath": "plugin",
+      "server_subpath": "server",
+      "install_dir": "crosstak",
+      "in_catalog": false
+    },
+    {
+      "key": "hazcmdr",
+      "name": "HazCmdr",
+      "repo": "https://github.com/takwerx/cloudtak-hazcmdr-plugin",
+      "plugin_subpath": "plugin",
+      "server_subpath": "server",
+      "install_dir": "hazcmdr",
+      "in_catalog": false,
+      "private": true
+    },
+    {
+      "key": "rapidsos",
+      "name": "RapidSOS",
+      "repo": "https://github.com/takwerx/cloudtak-rapidsos-plugin",
+      "plugin_subpath": "plugin",
+      "server_subpath": "server",
+      "install_dir": "rapidsos",
+      "in_catalog": false,
+      "private": true
     }
   ]
 }

@@ -9,7 +9,8 @@ What this does, and no more:
 
 * `take` writes one plain-SQL dump of the deployment's database to a folder
   next to (not inside) the deployment, mode 0600, keeps the newest `KEEP` per
-  deployment, and checks the file is a complete dump before it says it worked.
+  deployment (plus the newest dump of an earlier release, ops #1340), and
+  checks the file is a complete dump before it says it worked.
 * `restore_steps` writes the exact commands that put a dump back and return the
   deployment to the release it was on, for the page and the update log.
 
@@ -72,7 +73,7 @@ def backup_name(version, now=None):
     """`takmdm-v<installed version>-<UTC date>-<UTC time>.sql`. The version in
     the name is the release the dump was taken FROM, so it is also the one to go
     back to."""
-    ver = _VER_RE.sub('', str(version or 'unknown'))[:40] or 'unknown'
+    ver = _clean_version(version)
     stamp = time.strftime('%Y%m%d-%H%M%S', time.gmtime(now))
     return 'takmdm-v%s-%s.sql' % (ver, stamp)
 
@@ -98,10 +99,37 @@ def list_backups(directory):
     return out
 
 
-def prune(directory, keep=KEEP):
-    """Delete all but the newest `keep` dumps. Returns the names deleted."""
+def _clean_version(version):
+    """The version as it appears in a file name."""
+    return _VER_RE.sub('', str(version or 'unknown'))[:40] or 'unknown'
+
+
+def prune(directory, keep=KEEP, version=None):
+    """Delete all but the newest `keep` dumps. Returns the names deleted.
+
+    ⚠️ **The newest dump from a different release is never deleted (ops #1340).**
+    An update that is interrupted after its checkout moved is retried, and every
+    retry takes a dump named for the release now on disk. Three retries pushed
+    the dump taken BEFORE the migration out of the newest three, so the one copy
+    that could put the old release back was deleted by the very retries meant to
+    finish the update. `version` is the release the dump just taken is named for;
+    the newest dump of any other release stays, on top of the newest `keep`. It
+    ages out when a dump for a newer release becomes the newest different one
+    (the next real update), so at most one extra file is ever held.
+    """
+    listed = list_backups(directory)
+    kept = listed[:max(keep, 1)]
+    if version is not None:
+        mine = _clean_version(version)
+        for b in listed:
+            if b['version'] != mine:
+                if b not in kept:
+                    kept.append(b)
+                break
     gone = []
-    for b in list_backups(directory)[max(keep, 1):]:
+    for b in listed:
+        if b in kept:
+            continue
         try:
             os.unlink(b['path'])
             gone.append(b['name'])
@@ -155,7 +183,7 @@ def take(directory, version, dump, plog, now=None):
         except OSError:
             pass
         raise BackupError('cannot write the backup file: %s' % exc)
-    removed = prune(directory)
+    removed = prune(directory, version=version)
     if removed:
         plog('  removed older backups (keeping the newest %d): %s' % (KEEP, ', '.join(removed)))
     return final

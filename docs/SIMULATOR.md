@@ -85,10 +85,13 @@ and message rate. The engine log is the container's log.
 | `load-test` | N units (50–2000, a run parameter) on random walks with short stale | T&E, Guard Dog CoT-database validation |
 | `sensor-showcase` | a sweeping radar at the center, three ADS-B-shaped aircraft, two AIS-shaped vessels, a helicopter hold, a UAS with sensor and video, four ground units on a patrol route, 20-minute loop at 2× | the sensor picture: radar cone, air, sea |
 
-Video links point at the box's MediaMTX or TAK Video Restreamer (`rtsp://<host>:8554/<stream>`)
-when one is installed; publish a stream under the name the entity uses (`uas1` in the showcase and
-drone presets) and the video button in ATAK/CloudTAK opens it. Without a media server the link is
-simply omitted.
+Video links point at the box's MediaMTX or TAK Video Restreamer, by the same name the MediaMTX
+editor hands out (`rtsp://stream.<your domain>:8554/<stream>`, or the name you chose on the Domains
+card; a box with no domain uses its address) when one is installed. The Simulator does not make
+the picture: publish a stream under the name the entity uses (`uas1` in the showcase and drone
+presets) and the video button in ATAK/CloudTAK opens it. Without a media server the link is
+simply omitted. The link is written when the Simulator is deployed or rebuilt, so after a console
+update press Rebuild Now on the Simulator page to pick up a changed name.
 
 ## Writing a scenario
 

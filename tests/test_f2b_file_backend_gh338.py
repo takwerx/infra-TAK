@@ -198,6 +198,7 @@ def test_sshd_falling_back_to_the_journal_names_one_backend(tmp_path):
         '[sshd]\nenabled  = true\nfilter   = sshd\nlogpath  = /nonexistent/auth.log\n'
         'backend  = auto\nmaxretry = 5\n')
     ns = {'re': re, 'os': os, 'subprocess': types.SimpleNamespace(run=_Run())}
+    exec(_func('_f2b_sshd_section_logpath_to_journal'), ns)      # ops #1342: the section-scoped rewrite
     exec(_func('_f2b_selfheal_sshd_backend').replace("'/etc/fail2ban/jail.d'", repr(str(jaild))), ns)
     ns.update(_f2b_is_available=lambda: True, _sudo_wrap=lambda c: c,
               _write_priv=lambda p, c, **k: pathlib.Path(p).write_text(c))

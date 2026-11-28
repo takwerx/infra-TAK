@@ -545,7 +545,7 @@ load();
   </div></div>
   <div class="modal-overlay" id="gd-rollback-modal"><div class="modal" style="background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:400px;max-width:90vw">
     <h3 style="font-size:16px;margin-bottom:8px;color:var(--yellow)">↩ Roll Back Console?</h3>
-    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">This will revert the console to <strong>{{ settings.get('console_rollback', {}).get('tag', 'previous version') }}</strong>. The console will restart briefly. This cannot be undone.</p>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:20px">This will revert the console to <strong>{{ settings.get('console_rollback', {}).get('label') or settings.get('console_rollback', {}).get('tag') or 'previous version' }}</strong>. The console will restart briefly. This cannot be undone.</p>
     <div style="margin-bottom:16px"><label class="form-label">Admin password</label><input class="form-input" type="password" id="gd-rollback-password" placeholder="Confirm password" onkeydown="if(event.key==='Enter')doConsoleRollbackSubmit()"></div>
     <div style="display:flex;gap:10px;justify-content:flex-end"><button class="btn btn-ghost" onclick="document.getElementById('gd-rollback-modal').classList.remove('open');document.getElementById('gd-rollback-password').value=''">Cancel</button><button class="btn" style="background:rgba(234,179,8,0.15);color:var(--yellow);border:1px solid rgba(234,179,8,0.4)" onclick="doConsoleRollbackSubmit()">↩ Roll Back</button></div>
     <div id="gd-rollback-msg" style="margin-top:10px;font-size:12px;color:var(--red)"></div>
@@ -556,7 +556,7 @@ load();
     <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">A snapshot was taken before the last update. You can roll back the console to the previous version if the update caused issues.</p>
     <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:12px">
       <div>
-        <div style="font-size:13px;font-weight:600;color:var(--yellow)">↩ {{ settings.get('console_rollback', {}).get('tag', '') }}</div>
+        <div style="font-size:13px;font-weight:600;color:var(--yellow)">↩ {{ settings.get('console_rollback', {}).get('label') or settings.get('console_rollback', {}).get('tag') or '' }}</div>
         <div style="font-size:11px;color:var(--text-dim);margin-top:2px">Snapshot taken {{ settings.get('console_rollback', {}).get('snapshot_at', '') }} before last update</div>
       </div>
       <button onclick="doConsoleRollback()" style="padding:7px 16px;background:rgba(234,179,8,0.1);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);border-radius:6px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">↩ Roll Back to {{ settings.get('console_rollback', {}).get('tag', '') }}</button>
