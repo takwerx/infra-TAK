@@ -4,7 +4,7 @@ Team Awareness Kit Infrastructure Management Platform.
 
 One clone. One password. One URL. Manage everything from your browser.
 
-**Current release: [v10.4.9-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.9-alpha)**
+**Current release: [v10.4.10-alpha](https://github.com/takwerx/infra-TAK/releases/tag/v10.4.10-alpha)**
 
 Older releases on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases) — each tag carries its full release notes.
 
@@ -105,6 +105,8 @@ The full codebase map is in **[ARCHITECTURE.md](ARCHITECTURE.md)**. To build a M
 - Session-based authentication
 - All config files are 600 permissions
 - Authentik bootstrap credentials auto-generated per deployment
+
+For security officers and IT reviewers: **[How we keep infra-TAK secure](docs/SECURITY-PRACTICES.md)** ([PDF](docs/infra-TAK-security-practices.pdf)) says what we do to find and fix problems, how fast we patch, what is still open, and how to report a problem or suggest something we should test.
 
 ## Design notes
 

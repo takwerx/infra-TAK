@@ -739,9 +739,10 @@ def test_remote_deploy_writes_the_bind_it_closed_and_looks_again_at_the_end():
     assert caddy < port, 'the port is looked at only after Caddy runs the new site'
 
 
-def test_console_rollback_opens_the_port_before_the_checkout():
+def test_console_rollback_opens_the_port_after_the_checkout():
+    # ops #1330: the checkout comes first, so a checkout that fails leaves the port as it was.
     rb = _fn('console_rollback_api')
-    assert rb.index('_mediamtx_remote_hls_port_before_rollback(') < rb.index("['checkout', '--force', prev_tag]")
+    assert rb.index("['checkout', '--force', target]") < rb.index('_mediamtx_remote_hls_port_before_rollback(')
 
 
 def test_a_direct_road_to_a_closed_port_opens_it_again():

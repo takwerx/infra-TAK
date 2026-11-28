@@ -239,38 +239,73 @@ def test_ban_action_choice():
 
 # ── the move ────────────────────────────────────────────────────────────────
 
-def _switch(stop_rc=0, active='active', stale=True, outdated=False):
+def _switch(stop_rc=0, active='active', stale=True, outdated=False, enabled='enabled',
+            stop_timeout=False, ensure_raises=False, write_raises=False, start_rc=0,
+            start_raises_first=False, distro='debian'):
+    """Run the shipped _startup_f2b_ufw_lock_switch against fakes. `box` is fail2ban's state:
+    a stop (or a timed-out stop, which still goes on in systemd) makes it inactive, a start
+    makes it active, so the test can tell whether fail2ban ends up running (ops #1342)."""
     calls, writes, logs = [], {}, []
+    box = {'active': active, 'start_raised': False}
 
     def run(argv, **kw):
         calls.append(list(argv))
         if argv[:3] == ['systemctl', 'is-active', 'fail2ban']:
-            return subprocess.CompletedProcess(argv, 0, active + '\n', '')
+            return subprocess.CompletedProcess(argv, 0 if box['active'] == 'active' else 3,
+                                               box['active'] + '\n', '')
+        if argv[:3] == ['systemctl', 'is-enabled', 'fail2ban']:
+            return subprocess.CompletedProcess(argv, 0, enabled + '\n', '')
         if argv[0] == 'flock':
+            if stop_timeout:
+                box['active'] = 'inactive'          # the stop goes on in systemd after the client dies
+                raise subprocess.TimeoutExpired(argv, kw.get('timeout'))
+            if stop_rc == 0:
+                box['active'] = 'inactive'
             return subprocess.CompletedProcess(argv, stop_rc, '', 'denied' if stop_rc else '')
+        if argv[:3] == ['systemctl', 'start', 'fail2ban']:
+            if start_raises_first and not box['start_raised']:
+                box['start_raised'] = True
+                raise subprocess.TimeoutExpired(argv, kw.get('timeout'))
+            if start_rc == 0:
+                box['active'] = 'active'
+            return subprocess.CompletedProcess(argv, start_rc, '', '')
         return subprocess.CompletedProcess(argv, 0, '', '')
-    ns = {'_distro_family': lambda: 'debian', '_fw_backend': lambda: 'ufw',
+
+    def ensure():
+        calls.append(['ENSURE'])
+        if ensure_raises:
+            raise RuntimeError('disk full')
+        return True
+
+    def write(p, t):
+        if write_raises:
+            raise OSError('read-only file system')
+        writes[p] = t
+    ns = {'_distro_family': lambda: distro, '_fw_backend': lambda: 'ufw',
           'os': types.SimpleNamespace(path=types.SimpleNamespace(isdir=lambda p: True),
                                       path_basename=None),
-          'subprocess': types.SimpleNamespace(run=run), '_sudo_wrap': lambda c: list(c),
+          'subprocess': types.SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired),
+          '_sudo_wrap': lambda c: list(c),
           '_UFW_LOCK_PATH': B.UFW_LOCK_PATH,
           '_f2b_stale_ufw_jails': lambda: [('/etc/fail2ban/jail.d/infratak-sshd.conf',
                                             'action   = ufw\n         infratak-guarddog\n')] if stale else [],
           '_f2b_ufw_action_outdated': lambda: outdated,
-          '_f2b_ensure_ufw_action': lambda: calls.append(['ENSURE']) or True,
+          '_f2b_ensure_ufw_action': ensure,
           '_F2B_STALE_UFW_RE': _stale_re(),
-          '_write_priv': lambda p, t: writes.__setitem__(p, t),
+          '_write_priv': write,
           '_ufw_ipv4_parity_heal': lambda log: calls.append(['PARITY']),
           'threading': types.SimpleNamespace(Thread=lambda **kw: types.SimpleNamespace(start=lambda: None)),
           'time': None, 'print': lambda *a, **k: logs.append(a[0])}
     ns['os'].path.basename = os.path.basename
+    exec(_func('_f2b_start_if_down'), ns)
+    exec(_func('_f2b_enabled_but_down'), ns)
     exec(_func('_startup_f2b_ufw_lock_switch'), ns)
     ns['_startup_f2b_ufw_lock_switch']()
-    return calls, writes, logs
+    return calls, writes, logs, box
 
 
 def test_move_stops_fail2ban_under_the_lock_before_anything_changes():
-    calls, writes, logs = _switch()
+    calls, writes, logs, box = _switch()
     i_stop = calls.index(list(B.FLOCK_F2B_STOP_ARGV))
     i_ensure = calls.index(['ENSURE'])
     i_start = calls.index(['systemctl', 'start', 'fail2ban'])
@@ -283,23 +318,103 @@ def test_move_stops_fail2ban_under_the_lock_before_anything_changes():
 
 
 def test_move_changes_nothing_when_the_locked_stop_is_refused():
-    calls, writes, logs = _switch(stop_rc=1)
+    calls, writes, logs, box = _switch(stop_rc=1)
     assert writes == {} and ['ENSURE'] not in calls
     assert ['systemctl', 'start', 'fail2ban'] not in calls
     assert any('next console start tries again' in m for m in logs)
 
 
-def test_move_on_a_stopped_fail2ban_rewrites_without_starting_it():
-    calls, writes, logs = _switch(active='inactive')
+def test_move_on_a_disabled_stopped_fail2ban_rewrites_without_starting_it():
+    # a fail2ban that is stopped AND not enabled at boot (uninstalled, or the operator's choice)
+    # is not ours to start
+    calls, writes, logs, box = _switch(active='inactive', enabled='disabled')
     assert list(B.FLOCK_F2B_STOP_ARGV) not in calls
     assert ['systemctl', 'start', 'fail2ban'] not in calls
     assert writes
+    assert box['active'] == 'inactive'
+
+
+def test_a_stop_that_times_out_still_puts_fail2ban_back_ops1342():
+    # The stop under the lock waits up to 300 s (200+ unbans). On a timeout the old code jumped to
+    # the outer except and never started fail2ban; on Debian nothing else does.
+    calls, writes, logs, box = _switch(stop_timeout=True)
+    assert list(B.FLOCK_F2B_STOP_ARGV) in calls
+    assert ['systemctl', 'start', 'fail2ban'] in calls
+    assert box['active'] == 'active'
+    assert writes == {}                                 # the jails were not changed
+    assert any('took over 300 s' in m for m in logs)
+
+
+def test_an_error_after_the_stop_still_puts_fail2ban_back_ops1342():
+    for kw in ({'ensure_raises': True}, {'write_raises': True}):
+        calls, writes, logs, box = _switch(**kw)
+        assert list(B.FLOCK_F2B_STOP_ARGV) in calls
+        assert box['active'] == 'active', kw            # stopped, then the step raised: started anyway
+        assert any('error (non-fatal)' in m for m in logs)
+
+
+def test_the_normal_move_starts_fail2ban_once_ops1342():
+    calls, writes, logs, box = _switch()
+    assert calls.count(['systemctl', 'start', 'fail2ban']) == 1
+    assert box['active'] == 'active'
+
+
+def test_a_start_that_times_out_is_tried_again_by_the_finally_ops1342():
+    calls, writes, logs, box = _switch(start_raises_first=True)
+    assert calls.count(['systemctl', 'start', 'fail2ban']) == 2
+    assert box['active'] == 'active'
+
+
+def test_next_boot_starts_an_enabled_but_stopped_fail2ban_ops1342():
+    # the console died between the stop and the start: jails not yet moved
+    calls, writes, logs, box = _switch(active='inactive', enabled='enabled')
+    assert box['active'] == 'active'
+    assert writes                                       # the move still happens, then the start
+    assert any('may have been cut off' in m and 'started' in m for m in logs)
+    # the console died after the jail files were written: nothing stale, nothing outdated
+    calls, writes, logs, box = _switch(active='inactive', enabled='enabled', stale=False, outdated=False)
+    assert box['active'] == 'active'
+    assert any('enabled but not running at console start' in m and 'started' in m for m in logs)
+    # a failed unit (crashed at start) counts as down
+    calls, writes, logs, box = _switch(active='failed', enabled='enabled', stale=False, outdated=False)
+    assert box['active'] == 'active'
+
+
+def test_next_boot_waits_out_a_stop_that_is_still_running_then_starts_fail2ban_ops1342():
+    # kill -9 of the whole console (box test): the broker's stop is still unbanning, so the next
+    # console start sees `deactivating`. It waits under the same lock, then starts fail2ban.
+    for kw in ({}, {'stale': False, 'outdated': False}):
+        calls, writes, logs, box = _switch(active='deactivating', **kw)
+        assert list(B.FLOCK_F2B_STOP_ARGV) in calls, kw
+        assert calls.index(list(B.FLOCK_F2B_STOP_ARGV)) < calls.index(['systemctl', 'start', 'fail2ban']), kw
+        assert box['active'] == 'active', kw
+        assert any('may have been cut off' in m for m in logs), kw
+
+
+def test_rhel_does_nothing_even_when_fail2ban_is_stopped_ops1342():
+    # the lock switch is a ufw (Debian) step; Rocky/RHEL boxes are not touched by it
+    calls, writes, logs, box = _switch(distro='rhel', active='inactive', enabled='enabled')
+    assert calls == [] and writes == {} and box['active'] == 'inactive'
+
+
+def test_a_deactivating_fail2ban_that_is_not_enabled_is_left_alone_ops1342():
+    calls, writes, logs, box = _switch(active='deactivating', enabled='disabled', stale=False, outdated=False)
+    assert list(B.FLOCK_F2B_STOP_ARGV) not in calls
+    assert ['systemctl', 'start', 'fail2ban'] not in calls
+
+
+def test_next_boot_leaves_fail2ban_alone_when_it_is_running_or_not_enabled_ops1342():
+    for kw in ({'active': 'active', 'stale': False, 'outdated': False},
+               {'active': 'inactive', 'enabled': 'disabled', 'stale': False, 'outdated': False},
+               {'active': 'inactive', 'enabled': 'not-found', 'stale': False, 'outdated': False}):
+        calls, writes, logs, box = _switch(**kw)
+        assert ['systemctl', 'start', 'fail2ban'] not in calls, kw
 
 
 def test_old_action_file_on_a_box_already_moved_is_loaded_by_a_locked_restart():
     # ops #1275: boxes on the 10.4.6+ action (ufw insert 1) get the prepend action; a reload
     # would leave current bans on the old action, so fail2ban stops under the lock and starts
-    calls, writes, logs = _switch(stale=False, outdated=True)
+    calls, writes, logs, box = _switch(stale=False, outdated=True)
     i_stop = calls.index(list(B.FLOCK_F2B_STOP_ARGV))
     i_ensure = calls.index(['ENSURE'])
     i_start = calls.index(['systemctl', 'start', 'fail2ban'])
@@ -309,7 +424,7 @@ def test_old_action_file_on_a_box_already_moved_is_loaded_by_a_locked_restart():
 
 
 def test_current_action_file_and_moved_jails_do_not_restart_fail2ban():
-    calls, writes, logs = _switch(stale=False, outdated=False)
+    calls, writes, logs, box = _switch(stale=False, outdated=False)
     assert list(B.FLOCK_F2B_STOP_ARGV) not in calls
     assert ['systemctl', 'start', 'fail2ban'] not in calls
     assert ['ENSURE'] in calls                          # the file is still kept current

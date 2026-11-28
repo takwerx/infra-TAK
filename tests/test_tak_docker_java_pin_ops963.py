@@ -202,7 +202,7 @@ def test_missing_or_unreadable_dockerfile_builds_as_shipped(tmp_path):
 
 def test_both_docker_build_paths_run_the_patch_before_the_app_image_build():
     calls = [m.start() for m in re.finditer(r'_patch_tak_hardened_java_pin\((new_ctx|build_ctx), _app_df, (ulog|log_step)\)', APP)]
-    builds = [m.start() for m in re.finditer(r"docker build --pull -t \{TAK_CONTAINER\} -f \{shlex\.quote\(_app_df\)\}", APP)]
+    builds = [m.start() for m in re.finditer(r"docker build --pull -t \{(?:TAK_CONTAINER|app_new)\} -f \{shlex\.quote\(_app_df\)\}", APP)]
     assert len(calls) == 2 and len(builds) == 2
     for c, b in zip(sorted(calls), sorted(builds)):
         assert c < b < c + 2500, 'the pin is patched just before the takserver image is built'
