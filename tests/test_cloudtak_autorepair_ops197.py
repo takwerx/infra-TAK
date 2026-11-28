@@ -230,7 +230,8 @@ class Box:
                 '_CLOUDTAK_RECREATE_PENDING', 'CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR',
                 'CLOUDTAK_AUTOREPAIR_SETTLE_S', 'CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S',
                 'CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S', '_CLOUDTAK_COMPOSE_UP_RE',   # ops #889
-                'CLOUDTAK_JOBEND_POLL_S', *_present('CLOUDTAK_AUTOREPAIR_PASSES', 'CLOUDTAK_AUTOREPAIR_RECHECK_S'),   # ops #1018
+                'CLOUDTAK_JOBEND_POLL_S', *_present('CLOUDTAK_AUTOREPAIR_PASSES', 'CLOUDTAK_AUTOREPAIR_RECHECK_S',
+                                                    'CLOUDTAK_AUTOREPAIR_JOB_MAX_PER_HOUR'),   # ops #1358   # ops #1018
                 '_CLOUDTAK_AUTOREPAIR_RECORD', '_CLOUDTAK_COMPOSE_BUSY_RE',
                 '_CLOUDTAK_PORTAL_JOB_RE',   # ops #850: TAK Portal's helper counts as a stack change
                 'cloudtak_autorepair_status', '_cloudtak_autorepair_lock')]
@@ -245,7 +246,7 @@ class Box:
                 '_cloudtak_autorepair_wait_reason',
                 '_cloudtak_autorepair_record', '_cloudtak_autorepair_record_save',
                 '_cloudtak_autorepair_request', *_present('_cloudtak_autorepair_await_quiet'), '_cloudtak_autorepair_run',
-                '_cloudtak_autorepair_notify')])
+                '_cloudtak_autorepair_notify', *_present('_cloudtak_autorepair_limit_note'))])   # ops #1358
         exec(compile(src, 'app.py', 'exec'), ns)
         ns['CLOUDTAK_AUTOREPAIR_RECHECK_S'] = 0     # ops #1018: no real waiting in a test (ignored on a commit without it)
         ns['CLOUDTAK_JOBEND_POLL_S'] = 0

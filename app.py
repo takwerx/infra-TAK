@@ -124023,6 +124023,10 @@ _startup_heal_cloudtak_etl_layer()
 # 'failed' / 'rate_limited' and Guard Dog sends today's "action needed" email. A repair that
 # works is logged on the Guard Dog page's Activity log, not emailed (ops #230).
 CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR = 3
+# ops #1358: a repair that follows a real TAK Portal Marketplace job (its helper was seen running) has its own
+# budget. Each job recreates CloudTAK again, so three jobs in an hour are three real repairs, not a loop. Repairs
+# with no job behind them keep the limit above.
+CLOUDTAK_AUTOREPAIR_JOB_MAX_PER_HOUR = 10
 CLOUDTAK_AUTOREPAIR_SETTLE_S = 90       # api up this long: TAK Portal waits for it, then prunes
 CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S = 900   # a failed repair is reported, not retried straight away
 CLOUDTAK_AUTOREPAIR_COMPOSE_WAIT_S = 900  # ops #889: the recreate outlasted the console's 240 s: wait for it this long
@@ -124190,7 +124194,7 @@ def _cloudtak_autorepair_record_save(d):
         print(f"[cloudtak-autorepair] record write failed (non-fatal): {e}", flush=True)
 
 
-def _cloudtak_autorepair_request(settle_s=None):
+def _cloudtak_autorepair_request(settle_s=None, job=False):
     """Guard Dog saw CloudTAK drift twice in a row, or (ops #850) a TAK Portal Marketplace job just
     ended (settle_s then replaces the long api settle wait). Answer {'state', 'detail'}:
       ok           — no drift from here (it cleared, or was never ours to fix)
@@ -124198,7 +124202,11 @@ def _cloudtak_autorepair_request(settle_s=None):
       waiting      — not settled yet; ask again next check ('busy': someone is still working
                      on the stack, so Guard Dog does not count this wait — ops #230)
       rate_limited — CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR used up: send the alarm
-      failed       — the last repair failed, or cannot run here: send the alarm"""
+      failed       — the last repair failed, or cannot run here: send the alarm
+    job (ops #1358): a TAK Portal Marketplace job just ended. Its repairs are counted apart
+    (record key job_attempts, CLOUDTAK_AUTOREPAIR_JOB_MAX_PER_HOUR) so a few jobs in an hour do not
+    use up the budget that stops a repair loop. A rate_limited answer for a job carries retry_at,
+    the time the hour window frees."""
     ct_dir = os.path.expanduser('~/CloudTAK')
     with _cloudtak_autorepair_lock:
         if cloudtak_autorepair_status.get('running'):
@@ -124225,14 +124233,20 @@ def _cloudtak_autorepair_request(settle_s=None):
         last = rec.get('last') or {}
         if last.get('result') == 'failed' and now - float(last.get('at') or 0) < CLOUDTAK_AUTOREPAIR_FAIL_HOLD_S:
             return {'state': 'failed', 'detail': f"automatic repair failed: {last.get('detail') or 'unknown'}"}
-        tries = [t for t in (rec.get('attempts') or []) if isinstance(t, (int, float)) and now - t < 3600]
-        if len(tries) >= CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR:
+        _key, _max = ('job_attempts', CLOUDTAK_AUTOREPAIR_JOB_MAX_PER_HOUR) if job else ('attempts', CLOUDTAK_AUTOREPAIR_MAX_PER_HOUR)
+        tries = [t for t in (rec.get(_key) or []) if isinstance(t, (int, float)) and now - t < 3600]
+        if len(tries) >= _max:
+            if job:
+                _free = min(tries) + 3600
+                return {'state': 'rate_limited', 'retry_at': _free,
+                        'detail': f'{len(tries)} automatic repairs in the last hour after TAK Portal jobs, so the console '
+                                  f"paused repairs; it tries again by itself at {time.strftime('%H:%M', time.gmtime(_free))} UTC"}
             return {'state': 'rate_limited',
                     'detail': f'{len(tries)} automatic repairs in the last hour, so Guard Dog stopped trying'}
         wait, busy = _cloudtak_autorepair_wait_reason(ct_dir, settle_s)
         if wait:
             return {'state': 'waiting', 'detail': wait, 'busy': busy}
-        rec['attempts'] = tries + [now]
+        rec[_key] = tries + [now]
         _cloudtak_autorepair_record_save(rec)
         detail = _cloudtak_drift_summary(drift)
         cloudtak_autorepair_status.update({'running': True, 'kind': drift['kind'], 'detail': detail, 'started': now})
@@ -124414,6 +124428,19 @@ def _cloudtak_jobend_step(st, busy, now):
     return False
 
 
+def _cloudtak_autorepair_limit_note(r):
+    """ops #1358: say in plain words, on the Guard Dog page's Activity log, that repairs after TAK Portal
+    jobs are paused and when they resume. Until now the only trace was a journal line."""
+    try:
+        line = (f"{datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')} | cloudtak-watch | CloudTAK repair paused: "
+                f"{r.get('detail') or ''}. Until then CloudTAK runs on TAK Portal's compose file (stock media and "
+                f"postgis images). To fix it sooner, restart the infra-TAK console.")
+        line = ' '.join(line.split())
+        _write_priv('/var/log/takguard/restarts.log', line + '\n', mode='a')
+    except Exception as e:
+        print(f"[cloudtak-autorepair] pause note not logged: {e}", flush=True)
+
+
 def _cloudtak_jobend_tick(st, now=None):
     """Look once. When a TAK Portal Marketplace job has just ended, ask for the same repair that
     Guard Dog's cloudtak-autorepair asks for (_cloudtak_autorepair_request: no drift means 'ok' and
@@ -124424,11 +124451,21 @@ def _cloudtak_jobend_tick(st, now=None):
         return None
     now = time.time() if now is None else now
     busy = _cloudtak_stack_busy_procs()
-    if not _cloudtak_jobend_step(st, None if busy is None else bool(busy), now):
+    # ops #1358: was TAK Portal's own helper part of this busy spell? Then it was a Marketplace job.
+    if busy and any(_CLOUDTAK_PORTAL_JOB_RE.search(l) for l in busy):
+        st['portal_job'] = True
+    ask = _cloudtak_jobend_step(st, None if busy is None else bool(busy), now)
+    if not ask and busy is not None and not busy and st.get('retry_at') and now >= st['retry_at']:
+        # the job budget was used up earlier; its hour window has freed, so repair without waiting for a new job
+        st['retry_at'], st['portal_job'], ask = None, True, True
+    if not ask:
         return None
-    r = _cloudtak_autorepair_request(settle_s=CLOUDTAK_JOBEND_QUIET_S)
+    r = _cloudtak_autorepair_request(settle_s=CLOUDTAK_JOBEND_QUIET_S, job=bool(st.get('portal_job')))
     if r.get('state') != 'waiting':
-        st['pending_since'] = None
+        st['pending_since'], st['portal_job'] = None, False
+    if r.get('state') == 'rate_limited' and r.get('retry_at'):
+        st['retry_at'] = float(r['retry_at']) + 5
+        _cloudtak_autorepair_limit_note(r)
     if r.get('state') != 'ok':
         print(f"[cloudtak-autorepair] TAK Portal job ended: {r.get('state')} — {r.get('detail') or ''}", flush=True)
     return r
