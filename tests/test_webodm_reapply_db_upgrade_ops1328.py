@@ -52,6 +52,7 @@ PENDING = f'{HOME}/webodm/docker-compose.pending.yml'
 DEPLOY_WANT = wo579.WANT | {
     '_run_webodm_deploy', '_run_webodm_deploy_remote', 'WEBODM_DOCKER_COMPOSE', 'WEBODM_LOCAL_SETTINGS_STUB',
     'WEBODM_OVERLAY_REPO', 'WEBODM_OVERLAY_REF', 'WEBODM_OVERLAY_SHA', '_webodm_deploy_log', 'ODM_MAX_CORES',
+    '_webodm_plugin_clear_sh', '_as_root_sh',  # ops #1381: the remote deploy clears the plugin folder as root
 }
 
 

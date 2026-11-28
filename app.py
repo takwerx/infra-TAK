@@ -66451,6 +66451,14 @@ def _startup_webodm_local_admin():
         print(f"Startup migration: WebODM admin check error (non-fatal): {_e}")
 
 
+def _webodm_plugin_clear_sh(plugin_dir):
+    """Shell text that removes the old WebODM overlay plugin folder as root (ops #1381). The folder
+    holds root-owned __pycache__ files the WebODM container wrote, so the SSH user cannot delete it.
+    Does nothing, and runs no sudo, when the folder is not there (first deploy)."""
+    q = shlex.quote(plugin_dir)
+    return f'[ ! -e {q} ] || ' + _as_root_sh(f'rm -rf {q}')
+
+
 def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     """Deploy WebODM on a remote host via SSH (mirrors Node-RED remote pattern)."""
     import secrets as _sec
@@ -66526,8 +66534,16 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     if not ok:
         _webodm_deploy_status.update({'running': False, 'error': True})
         return
+    # ops #1381: the running WebODM container (root) writes __pycache__/*.pyc into this bind-mounted
+    # folder, so a non-root SSH user cannot delete it ("Permission denied" on the second Reapply).
+    # Remove the old folder as root (ops #890 wrapper); a first deploy has no folder and needs no sudo.
+    ok, out = _module_run(deploy_cfg, _webodm_plugin_clear_sh(f'{wo_dir_remote}/plugins/webodm-tak-overlay'),
+                          timeout=60, log_fn=plog)
+    if not ok:
+        plog(f'✗ Plugin clone failed: could not remove the old plugin folder: {(out or "")[-300:]}')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
     ok, out = _module_run(deploy_cfg,
-        f'rm -rf {wo_dir_remote}/plugins/webodm-tak-overlay && '
         f'git clone --depth=1 --branch {WEBODM_OVERLAY_REF} {WEBODM_OVERLAY_REPO} '
         f'{wo_dir_remote}/plugins/webodm-tak-overlay 2>&1 && '
         f'[ "$(git -C {wo_dir_remote}/plugins/webodm-tak-overlay rev-parse HEAD)" = {WEBODM_OVERLAY_SHA} ] && '
