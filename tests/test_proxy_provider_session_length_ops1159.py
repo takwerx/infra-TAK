@@ -154,9 +154,9 @@ def test_providers_that_are_not_ours_are_left_alone(monkeypatch):
 def test_every_provider_name_infratak_creates_is_covered(monkeypatch):
     ns, calls = _load(monkeypatch, [_prov(i, n, 'hours=1') for i, n in enumerate(
         ['infra-TAK', 'TAK Portal Proxy', 'Node-RED Proxy', 'MediaMTX', 'Federation Hub Proxy',
-         'WebODM Proxy', 'TAK Video Restreamer Proxy', 'ATLAS MDM Proxy',
+         'WebODM Proxy', 'TAK Video Restreamer Proxy', 'ATLAS MDM Proxy', 'MeshRelay Proxy',
          'ATLAS MDM Proxy (agency-a)'], start=10)])
-    assert ns['_run']() == 9
+    assert ns['_run']() == 10
 
 
 def test_a_second_run_finds_nothing_to_do(monkeypatch):

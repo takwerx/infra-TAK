@@ -43,9 +43,15 @@ APP = (REPO / 'app.py').read_text(encoding='utf-8')
 _FUNCS = {'verify_password', 'hash_password', '_hash_method_error', 'stored_hash_unusable',
           '_require_admin_password', 'console_rollback_api',
           # ops #917: the route now looks at the release's web editor pin before the checkout
-          '_mediamtx_editor_ref_lacks_hashing', '_console_release_editor_ref'}
+          '_mediamtx_editor_ref_lacks_hashing', '_console_release_editor_ref',
+          # ops #1330: the route makes sure the release is on the box, and checks out first
+          '_rollback_git', '_rollback_resolve_target', '_rollback_current_ref',
+          '_console_release_const', '_rollback_pin_short', '_rollback_pin_changes',
+          '_rollback_pin_message', '_rollback_redis_hazard', '_rollback_redis_hazard_here',
+          '_console_release_app_has'}
 _ASSIGNS = {'PASSWORD_HASH_METHOD', '_HASH_METHOD_ERRORS', 'check_password_hash',
-            'generate_password_hash', '_MEDIAMTX_EDITOR_HASHING_SINCE'}
+            'generate_password_hash', '_MEDIAMTX_EDITOR_HASHING_SINCE',
+            '_ROLLBACK_REPO_URL', '_ROLLBACK_REF_RE', '_ROLLBACK_SHA_RE', '_ROLLBACK_PIN_WATCH'}
 
 
 def _load():
@@ -88,7 +94,16 @@ def box():
 
     def _run(argv, **kw):
         state['runs'].append(argv)
-        return _R(0)
+        r = _R(0)
+        if 'rev-parse' in argv and '--verify' in argv:
+            r.stdout = 'a' * 40          # the release's commit, as git answers for a tag that is here
+        elif 'rev-parse' in argv:
+            r.stdout = 'b' * 40
+        elif 'symbolic-ref' in argv:
+            r.stdout = 'dev'
+        elif 'grep' in argv:
+            r.returncode = 1             # no pinned constants to compare
+        return r
 
     def _save(s):
         state['settings'] = s
@@ -128,7 +143,8 @@ def test_right_password_is_accepted_and_rolls_back(box):
     assert r.status_code == 200, r.get_json()
     d = r.get_json()
     assert d['ok'] is True and d['tag'] == 'v10.2.30'
-    assert any(a[-2:] == ['checkout', 'v10.2.30'] or 'v10.2.30' in a for a in box['runs'])
+    # ops #1330: it checks out the commit it resolved the tag to
+    assert any('checkout' in a and ('a' * 40) in a for a in box['runs'])
     assert box['restarts'] == [1]
     assert box['settings']['console_rollback'] == {'available': False}
 

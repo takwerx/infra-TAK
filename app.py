@@ -769,19 +769,41 @@ def _priv_pipe(argv, filter_argv, timeout=60, **kw):
                           capture_output=True, text=True, timeout=timeout)
 
 
-def _detached_console_restart(delay=2):
+def _detached_console_restart(delay=2, result=None):
     """Restart the console itself after a short delay, detached, so the current
     HTTP response returns before the worker is bounced. Replaces the shell
     `Popen('sleep 2 && systemctl restart takwerx-console')` (sleep isn't broker-
     allowed). systemd owns the restart, so it completes even though this thread is
-    killed mid-restart."""
+    killed mid-restart.
+
+    ops #1329: a failed restart used to vanish (`except: pass`, output to /dev/null): the page
+    said "restarting", nothing restarted, and the Update Now lock blocked retries for 20
+    minutes. Pass `result` (a dict holding an `event`, a threading.Event) to learn the outcome: a
+    restart that works kills this process before it reports, so only a FAILURE ever sets the
+    event, with `ok` False and `error` holding the reason. A failure is also written to the
+    journal."""
     def _go():
         time.sleep(delay)
         try:
-            subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-console']),
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
+            r = subprocess.run(_sudo_wrap(['systemctl', 'restart', 'takwerx-console']),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            rc, err = r.returncode, (r.stderr or '').strip()
+        except Exception as e:
+            rc, err = 1, str(e)
+        # Only a command that ran, ended with a positive exit code AND said why is a failed restart
+        # (a masked unit, an unreachable broker). A restart that WORKS stops this very process: the
+        # command is killed by the stop (negative code, -15 on the first box test, Nov 27) or ends
+        # with no message. That is a restart under way, never an error to show the customer.
+        if rc > 0 and err:
+            err = err.splitlines()[-1][:200]
+            print(f"Console restart FAILED (rc={rc}): {err}", flush=True)
+            if result is not None:
+                result.update({'ok': False, 'error': err})
+                ev = result.get('event')
+                if ev is not None:
+                    ev.set()
+        elif rc != 0:
+            print(f"Console restart command ended rc={rc} with no message: restart under way", flush=True)
     threading.Thread(target=_go, daemon=True).start()
 
 
@@ -1146,18 +1168,251 @@ def _read_priv(path):
 
 
 def _open_secret_w(path):
-    """open(path, 'w') for a file that holds secrets (module .env files).
+    """Write a file that holds secrets (module .env files): atomic, 0600, all or nothing.
 
     ops #632: a plain open() creates the file at the umask default (0644), and the
     startup converge only tightened it to 600 at the NEXT console start — until then
     every local user (tak, postgres) could read the Authentik/CloudTAK passwords.
-    Create it 0600, and tighten an existing one BEFORE the new content goes in."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+
+    ops #1332: the old body opened with O_TRUNC, so a full disk or a dead process
+    mid-write left ~/authentik/.env empty or cut short. That file holds PG_PASS and
+    AUTHENTIK_SECRET_KEY, and a Deploy over the old database volume then minted new
+    ones. Now `with _open_secret_w(p) as f: f.write(...)` collects the text in memory;
+    only a clean exit from the `with` writes it, to a 0600 temp file in the SAME folder
+    that is fsynced and renamed over the old one. An error inside the `with`, a full
+    disk, or a crash leaves the old file exactly as it was. A full disk raises an
+    OSError with a plain message (errno ENOSPC), never a half-written file.
+    Fallback: if the folder will not let us make or rename a file (a read-only folder,
+    a root-owned folder, an SELinux rename denial), the text is written over the file
+    in place (no O_TRUNC; truncate to length only after the write succeeded)."""
+    import contextlib, errno, io
+
+    @contextlib.contextmanager
+    def _writer():
+        buf = io.StringIO()
+        yield buf                       # an exception in the with-body skips everything below
+        data = buf.getvalue().encode('utf-8')
+        real = os.path.realpath(path)
+        folder = os.path.dirname(real) or '.'
+        try:
+            st = os.stat(real)
+        except OSError:
+            st = None
+
+        def _full(exc):
+            return OSError(errno.ENOSPC, f'Disk is full: could not save {real}. '
+                                         f'The old file was left unchanged. Free some disk space and retry.')
+
+        def _in_place():
+            print(f"secret write: could not rename a new file over {real} (folder or SELinux refused); "
+                  f"writing it in place instead", flush=True)
+            fd = os.open(real, os.O_WRONLY | os.O_CREAT, 0o600)    # no O_TRUNC
+            try:
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    pass
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.ftruncate(fd, len(data))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+        tmp = None
+        try:
+            try:
+                fd, tmp = _tempfile_mkstemp(folder, real)
+            except (PermissionError, FileNotFoundError):
+                _in_place()
+                return
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+                try:
+                    os.fchmod(fd, 0o600)
+                except OSError:
+                    pass
+                if st is not None and os.getuid() == 0:
+                    try:
+                        os.fchown(fd, st.st_uid, st.st_gid)     # keep the owner a root console found
+                    except OSError:
+                        pass
+            finally:
+                os.close(fd)
+            try:
+                os.replace(tmp, real)
+            except PermissionError:
+                os.unlink(tmp)
+                tmp = None
+                _in_place()
+                return
+            tmp = None
+            try:
+                dfd = os.open(folder, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
+        except OSError as e:
+            if e.errno in (errno.ENOSPC, errno.EDQUOT):
+                raise _full(e) from e
+            raise
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def _tempfile_mkstemp(folder, real):
+        import tempfile
+        return tempfile.mkstemp(prefix='.' + os.path.basename(real) + '.', suffix='.tmp', dir=folder)
+
+    return _writer()
+
+
+def _authentik_env_sane(text):
+    """ops #1332: does this .env text still hold the two secrets Authentik cannot lose?
+
+    PG_PASS (the database password; Postgres keeps the old one inside its volume) and
+    AUTHENTIK_SECRET_KEY (signs sessions and encrypts stored secrets). An empty or cut-short
+    file has neither. Both must have a value."""
+    seen = {}
+    for ln in (text or '').splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith('#') or '=' not in ln:
+            continue
+        k, v = ln.split('=', 1)
+        seen[k.strip()] = v.strip().strip('"').strip("'")
+    has_pass = bool(seen.get('PG_PASS') or seen.get('AUTHENTIK_POSTGRESQL__PASSWORD'))
+    return has_pass and bool(seen.get('AUTHENTIK_SECRET_KEY'))
+
+
+def _authentik_tighten_env_backups(folder):
+    """ops #1332: make every old `.env.bak*` / `.env.damaged*` copy private (0600). Returns how many it changed.
+
+    Six writers made these with a plain open() (0644) while they hold PG_PASS and
+    AUTHENTIK_SECRET_KEY, so every local user could read them, and a long-running box carries
+    hundreds (autotune writes one per change). Idempotent; a file we do not own is skipped."""
+    changed = 0
     try:
-        os.fchmod(fd, 0o600)
+        names = os.listdir(folder)
     except OSError:
-        pass                    # not ours (pre-flip root-owned) — the converge heals it
-    return os.fdopen(fd, 'w')
+        return 0
+    for name in names:
+        if not (name.startswith('.env.bak') or name.startswith('.env.damaged')):
+            continue
+        fp = os.path.join(folder, name)
+        try:
+            if os.path.islink(fp) or not os.path.isfile(fp):
+                continue
+            if os.stat(fp).st_mode & 0o077:
+                os.chmod(fp, 0o600)
+                changed += 1
+        except OSError:
+            continue
+    return changed
+
+
+def _authentik_env_newest_good_backup(env_path):
+    """Newest `<env>.bak*` next to env_path that is still sane, as (path, text); else (None, None)."""
+    folder = os.path.dirname(env_path) or '.'
+    prefix = os.path.basename(env_path) + '.bak'
+    try:
+        names = [n for n in os.listdir(folder) if n.startswith(prefix)]
+    except OSError:
+        return (None, None)
+    found = []
+    for n in names:
+        fp = os.path.join(folder, n)
+        try:
+            found.append((os.stat(fp).st_mtime, fp))
+        except OSError:
+            continue
+    for _mt, fp in sorted(found, reverse=True):
+        try:
+            with open(fp) as f:
+                text = f.read()
+        except OSError:
+            continue
+        if _authentik_env_sane(text):
+            return (fp, text)
+    return (None, None)
+
+
+def _authentik_env_restore_from_backup(env_path, plog):
+    """ops #1332: put the newest good backup back as .env. True when .env is sane afterwards.
+
+    PG_PASS and AUTHENTIK_SECRET_KEY are made once and never change, so any backup that holds
+    them holds the right ones. Later tuning lines come back by themselves: every writer that
+    adds them is idempotent and runs at the next console start. A damaged file that still has
+    bytes is kept beside it as `.env.damaged.<time>` (0600)."""
+    bak, text = _authentik_env_newest_good_backup(env_path)
+    if not bak:
+        return False
+    try:
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                damaged = f.read()
+            if damaged.strip():
+                with _open_secret_w(f"{env_path}.damaged.{int(time.time())}") as f:
+                    f.write(damaged)
+        with _open_secret_w(env_path) as f:
+            f.write(text)
+    except Exception as e:
+        plog(f"  authentik .env: could not restore from {os.path.basename(bak)}: {e}")
+        return False
+    plog(f"  ⚠ authentik .env was missing or damaged: restored from {os.path.basename(bak)} "
+         f"(the database password and secret key are the original ones)")
+    return True
+
+
+def _authentik_db_volume_exists():
+    """ops #1332: True / False when Docker says whether the Authentik Postgres volume exists
+    (compose project 'authentik' for ~/authentik, volume 'database'); None when Docker cannot say."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'volume', 'ls', '-q', '--filter', 'name=authentik_database']),
+                           capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    return 'authentik_database' in (r.stdout or '').split()
+
+
+def _authentik_env_guard_before_mint(env_path, plog):
+    """ops #1332: never make new database and secret-key values over an existing database.
+
+    Postgres keeps the password it was first started with, inside its volume. A new PG_PASS in
+    a fresh .env locks Authentik out of its own database, and a new AUTHENTIK_SECRET_KEY breaks
+    every stored secret. Returns 'ok' when it is safe to carry on (a .env that is fine, or no
+    database volume to protect), 'restored' when .env came back from a backup, or 'refuse'."""
+    text = ''
+    if os.path.exists(env_path):
+        try:
+            with open(env_path) as f:
+                text = f.read()
+        except OSError:
+            text = ''
+        if _authentik_env_sane(text):
+            return 'ok'
+    if _authentik_db_volume_exists() is not True:
+        return 'ok'
+    if _authentik_env_restore_from_backup(env_path, plog):
+        return 'restored'
+    plog("\u2717 Stopped: this box still holds the database of an earlier Authentik install "
+         "(Docker volume authentik_database), but ~/authentik/.env is missing or damaged and no good backup was found.")
+    plog("  Deploying now would make new passwords, and Authentik could no longer open its own database.")
+    plog("  To keep the old data: put your old .env file back in ~/authentik, then Deploy again.")
+    plog("  To start over with an empty Authentik (this deletes the old users and settings): "
+         "run  docker volume rm authentik_database  and Deploy again.")
+    return 'refuse'
 
 
 def _read_own_or_priv(path):
@@ -1686,7 +1941,7 @@ def clear_legacy_session_cookie(response):
     return response
 
 
-VERSION = "10.4.9-alpha"
+VERSION = "10.4.10-alpha"
 GITHUB_REPO = "takwerx/infra-TAK"
 
 # --- AGPL section 13: offer the Corresponding Source to network users ---------
@@ -1781,6 +2036,9 @@ CLOUDTAK_VETTED_RELEASE = "13.127.0"    # OFFLINE FALLBACK ONLY since v10.1.17 �
 # tests/test_cloudtak_major_cap_ops1074.py
 CLOUDTAK_MAX_MAJOR = 14
 CADDYFILE_PATH = "/etc/caddy/Caddyfile"
+# ops #1343: the Caddyfile as it was before infra-TAK first regenerated it (see
+# _caddy_save_first_copy). Never read by Caddy or by us; it is there for a person to restore from.
+CADDYFILE_FIRST_COPY_PATH = CADDYFILE_PATH + ".infratak-prev"
 # Caddy's certificate store, and the issuer subdirectory Let's Encrypt lands in.
 # Caddy namespaces the store by the ACME directory URL, so the issuer name is NOT a
 # constant — see _caddy_acme_cert_base(). Never hardcode the LE name at a call site.
@@ -3857,6 +4115,7 @@ def _tak_is_bundle_dir(path):
     return _tak_bundle_dockerfiles(path)[0] is not None
 
 TAK_DB_CONTAINER = 'takserver-db'    # db container name
+TAK_DB_IMAGE = 'takserver_db'        # db image tag (ops #1326)
 TAK_DOCKER_NET = 'takserver'         # docker network
 TAK_DB_VOLUME = 'takserver_pgsql'    # named volume for postgres data
 TAK_DOCKER_ROOT = os.path.join(os.path.expanduser('~'), 'tak-docker')  # unzip target
@@ -5703,6 +5962,19 @@ def _detect_modules_uncached():
             'route': _sim_desc['route'], 'priority': _sim_desc['priority'], 'conflicts': [],
             'requires_modules': list(_sim_desc.get('requires_modules') or [])}
 
+    # MeshRelay PTT server — registry-resident (modules/meshrelay.py), ops #973.
+    _mr_desc = mod_registry.MODULES.get('meshrelay')
+    if _mr_desc:
+        try:
+            _mr_state = _mr_desc['detect'](mod_registry.get_ctx())
+        except Exception:
+            _mr_state = {}
+        modules['meshrelay'] = {'name': _mr_desc['name'],
+            'installed': bool(_mr_state.get('installed')), 'running': bool(_mr_state.get('running')),
+            'description': _mr_desc['description'], 'icon': _mr_desc['icon'],
+            'route': _mr_desc['route'], 'priority': _mr_desc['priority'], 'conflicts': [],
+            'requires_modules': list(_mr_desc.get('requires_modules') or [])}
+
     # TAK Client Feed — registry-resident (modules/clientfeed.py), v10.1.76.
     # Tile identity + probes come from the descriptor, not an inline block.
     _ef_desc = mod_registry.MODULES.get('clientfeed')
@@ -6230,6 +6502,20 @@ def _root_console_bar(settings):
             'bg': '#2b2411', 'border': 'rgba(234,179,8,.45)', 'html': body}
 
 
+def _legacy_remote_assist_bar(settings):
+    """Spec for the "old Remote Assist install left in place" bar, or None (ops #1343).
+    The startup migration that used to delete it (and its database volume) now only sets
+    legacy_remote_assist_notice. The flag clears itself at the next start once the old
+    ~/cfd-remote-assist folder is gone. No I/O on the render path."""
+    if not (settings or {}).get('legacy_remote_assist_notice'):
+        return None
+    body = ('⚠ An old Remote Assist install (~/cfd-remote-assist, from before v10.0.1) was left in '
+            'place on purpose: its database holds Remote Assist data. Back up what you need, then '
+            'remove that folder and install EUD Remote Assist from the Remote Assist page.')
+    return {'cls': 'legra-banner', 'key': 'legacy-remote-assist', 'fg': '#eab308',
+            'bg': '#2b2411', 'border': 'rgba(234,179,8,.45)', 'html': body}
+
+
 def _tak_cert_names_bar(settings):
     """Spec for the "TAK Server's certificate doesn't include <domain>" bar, or None.
 
@@ -6291,7 +6577,8 @@ def render_notice_bars(settings):
 
 def _render_notice_bars_inner(settings):
     specs = [b for b in (_gd_alert_bar(settings), _no_retention_bar(settings),
-                         _tak_cert_names_bar(settings), _root_console_bar(settings)) if b]
+                         _tak_cert_names_bar(settings), _root_console_bar(settings),
+                         _legacy_remote_assist_bar(settings)) if b]
     if not specs:
         return ''
     base = _custom_banner_height(settings or {})
@@ -6392,6 +6679,9 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     simm = modules.get('simulator', {})
     if simm.get('installed'):
         parts.append(link('/simulator', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F3AF</span><span>TAK Simulator</span>', 'TAK Simulator'))
+    mrm = modules.get('meshrelay', {})
+    if mrm.get('installed'):
+        parts.append(link('/meshrelay', '<span class="nav-icon" style="font-size:22px;line-height:1;display:block">\U0001F4FB</span><span>MeshRelay</span>', 'MeshRelay'))
     cf = modules.get('clientfeed', {})
     if cf.get('installed'):
         parts.append(link('/clientfeed', '<img src="/static/logos/tak-client-skittle.png" alt="" class="nav-icon" style="height:22px;width:22px;object-fit:contain;display:block"><span>TAK Client Feed</span>', 'TAK Client Feed'))
@@ -11836,9 +12126,36 @@ def support_diagnostics_email():
     return jsonify({'success': True, 'message': f'Sent to {to}'})
 
 
+def _release_version_tuple(v):
+    """(10, 4, 9) from '10.4.9-alpha', 'v10.4.9' ...; None when it is not a plain version."""
+    try:
+        return tuple(int(p) for p in str(v or '').strip().lstrip('v').replace('-alpha', '').replace('-beta', '').split('.'))
+    except ValueError:
+        return None
+
+
+def _console_ahead_of_main_message(latest, running=None):
+    """ops #1330: '' unless the console runs a NEWER version than the newest main release
+    `latest`. A dev box switched to the main channel then says "Up to date" while it holds code
+    main does not have, and the parts pinned per channel (NetBird, Authentik) follow main's older
+    values. Plain words, shown on the console page. Never raises."""
+    cur = _release_version_tuple(VERSION if running is None else running)
+    new = _release_version_tuple(latest)
+    if not cur or not new or cur <= new:
+        return ''
+    return (f'This server runs {VERSION}, which is newer than the newest main release '
+            f'({str(latest).strip().lstrip("v")}). Main has older versions of some parts, such as '
+            'NetBird and Authentik, and staying on main can move those parts back to them. '
+            'Switch to the dev channel to stay on this code.')
+
+
 def _update_check_response(data):
     """Return JSON response with no-cache headers so FQDN/proxy path never serves stale update badge."""
     from flask import make_response
+    if isinstance(data, dict) and data.get('channel') == 'main' and not data.get('check_failed'):
+        _ahead = _console_ahead_of_main_message(data.get('latest'))
+        if _ahead:
+            data = {**data, 'ahead_of_channel': True, 'ahead_message': _ahead}
     r = make_response(jsonify(data))
     r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
     r.headers['Pragma'] = 'no-cache'
@@ -12153,29 +12470,12 @@ def update_check():
             return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No tags found', 'body': '', 'update_available': False, 'check_failed': True})
         # Only surface tags that are actually on the main branch so that tags
         # pushed on dev before a merge-to-main don't show as "update available".
-        try:
-            main_req = urllib.request.Request(
-                f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=main&per_page=100',
-                headers=gh_headers
-            )
-            main_resp = urllib.request.urlopen(main_req, timeout=5)
-            main_commits = {c['sha'] for c in json.loads(main_resp.read().decode())}
-        except Exception:
-            main_commits = None  # fall back: don't filter if we can't reach main
-        versions = []
-        for tag in data:
-            if main_commits is not None and tag.get('commit', {}).get('sha') not in main_commits:
-                continue
-            name = tag.get('name', '').lstrip('v').replace('-alpha','').replace('-beta','')
-            parts = name.split('.')
-            try:
-                versions.append((tuple(int(p) for p in parts), tag))
-            except (ValueError, IndexError):
-                continue
-        if not versions:
+        # ops #1329: Update Now (_fetch_latest_tag_name) uses the SAME rule, so the tag it
+        # installs is the tag this check offers. None = main unreadable: tags are not filtered.
+        main_commits = _main_commit_shas(gh_headers)
+        latest_tag = _select_latest_release_tag(data, main_commits)
+        if latest_tag is None:
             return _update_check_response({'current': VERSION, 'latest': None, 'channel': 'main', 'error': 'No version tags', 'body': '', 'update_available': False, 'check_failed': True})
-        versions.sort(key=lambda x: x[0], reverse=True)
-        latest_tag = versions[0][1]
         latest = latest_tag.get('name', '').lstrip('v')
         try:
             latest_tuple = _parse_version_tuple(latest)
@@ -12231,18 +12531,10 @@ def _fetch_latest_tag_name():
         data = json.loads(resp.read().decode())
         if not data:
             return None
-        versions = []
-        for tag in data:
-            name = tag.get('name', '').lstrip('v').replace('-alpha', '').replace('-beta', '')
-            parts = name.split('.')
-            try:
-                versions.append((tuple(int(p) for p in parts), tag.get('name', '')))
-            except (ValueError, IndexError):
-                continue
-        if not versions:
-            return None
-        versions.sort(key=lambda x: x[0], reverse=True)
-        return versions[0][1]  # full tag name e.g. v0.2.3-alpha
+        # ops #1329: the same main-channel rule as update_check (a tag counts only when its
+        # commit is on main). Before, this took the highest tag whatever branch it sat on.
+        tag = _select_latest_release_tag(data, _main_commit_shas())
+        return tag.get('name', '') if tag else None  # full tag name e.g. v0.2.3-alpha
     except Exception:
         # ops #1217: the API refused (60 an hour per IP). Update Now used to fall back to
         # origin/main here, i.e. to something other than the newest release. git is not limited.
@@ -12331,6 +12623,342 @@ def _repo_ownership_selfheal(trigger=''):
     return offenders
 
 
+# ops #1329: Update Now checks the NEW release before it moves the console's own tree.
+#
+# Until now the click fetched, moved HEAD (`git checkout --force`), and only then ran a pip call
+# for gunicorn and PyYAML. A release that bumped any other pinned library (requirements.txt) was
+# never installed, so the console crash-looped after the restart (Restart=always, and the
+# Rollback button needs a working console). A pip error or timeout after HEAD moved left a new
+# tree under old code with no restart scheduled. Now, with HEAD still where it was:
+#   1. read the new tree out of git into a scratch folder (`git archive`, nothing is checked out),
+#   2. install its requirements.txt into the console venv (skipped when every pin is already
+#      installed, so a healthy or offline box needs no network and no write access),
+#   3. compile every .py file of the new tree and check that each library imported at the top of
+#      app.py and modules/ can be found.
+# A failure in 2 or 3 stops the click with HEAD where it was. The check itself breaking (git
+# archive fails, the checker times out) is logged and does NOT stop the update: it can only add
+# protection, never remove the ability to update.
+_UPDATE_PIP_TIMEOUT_S = 300
+_UPDATE_RESTART_DELAY_S = 2
+_UPDATE_RESTART_WAIT_S = 6
+_UPDATE_TREE_CHECK_TIMEOUT_S = 240
+
+# Run with the venv python. argv: requirements file. Prints a JSON list of the pins that are not met.
+_UPDATE_REQ_CHECK_PY = r'''
+import json, re, sys
+from importlib import metadata
+try:
+    from packaging.requirements import Requirement
+except Exception:
+    from pip._vendor.packaging.requirements import Requirement
+text = open(sys.argv[1], encoding='utf-8').read().replace('\\\n', ' ')
+unmet = []
+for raw in text.splitlines():
+    line = re.sub(r'\s--hash=\S+', '', raw.split('#', 1)[0]).strip()
+    if not line or line.startswith('-'):
+        continue
+    req = Requirement(line)
+    if req.marker is not None and not req.marker.evaluate():
+        continue
+    pins = [s.version for s in req.specifier if s.operator == '==']
+    try:
+        have = metadata.version(req.name)
+    except metadata.PackageNotFoundError:
+        unmet.append(req.name + ' (missing)')
+        continue
+    if pins and have != pins[0]:
+        unmet.append('%s %s, wanted %s' % (req.name, have, pins[0]))
+print(json.dumps(unmet))
+'''
+
+# Run with the venv python, cwd = the new tree. Compiles every .py file there and lists the libraries
+# imported at module level (not inside try/def) that this python cannot find.
+_UPDATE_TREE_CHECK_PY = r'''
+import ast, importlib.util, json, os, sys
+tree_dir = os.getcwd()
+sys.path.insert(0, tree_dir)
+files = [f for f in sorted(os.listdir(tree_dir)) if f.endswith('.py')]
+for sub in ('modules', 'broker'):
+    d = os.path.join(tree_dir, sub)
+    if os.path.isdir(d):
+        files += [os.path.join(sub, f) for f in sorted(os.listdir(d)) if f.endswith('.py')]
+# Names that are the tree's own files (broker/ and modules/ scripts import their neighbours by plain
+# name, e.g. `from takwerx_broker import ...`): never a missing library.
+local = set()
+for rel in files:
+    local.add(os.path.splitext(os.path.basename(rel))[0])
+for e in os.listdir(tree_dir):
+    if os.path.isdir(os.path.join(tree_dir, e)):
+        local.add(e)
+bad, missing = [], {}
+for rel in files:
+    try:
+        with open(os.path.join(tree_dir, rel), encoding='utf-8') as fh:
+            src = fh.read()
+        mod = ast.parse(src, rel)
+        compile(mod, rel, 'exec')
+    except (SyntaxError, ValueError, RecursionError, MemoryError) as e:
+        bad.append('%s: %s' % (rel, str(e)[:160]))
+        continue
+    for node in mod.body:
+        names = []
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            names = [node.module]
+        for n in names:
+            top = n.split('.')[0]
+            if top == '__future__' or top in local:
+                continue
+            try:
+                found = importlib.util.find_spec(top) is not None
+            except (ImportError, ValueError):
+                found = False
+            if not found:
+                missing.setdefault(top, rel)
+print(json.dumps({'compile_errors': bad, 'missing_imports': missing}))
+'''
+
+
+def _update_console_python(console_dir):
+    """(python, pip) of the console venv, or (sys.executable, None) on a box with no venv."""
+    py = os.path.join(console_dir, '.venv', 'bin', 'python')
+    pip = os.path.join(console_dir, '.venv', 'bin', 'pip')
+    if os.path.exists(py) and os.path.exists(pip):
+        return py, pip
+    return _sys.executable, None
+
+
+def _update_safe_extract(tar_path, dest):
+    """Unpack a `git archive` tar into dest. Refuses absolute paths, '..', links that leave dest."""
+    import tarfile
+    root = os.path.realpath(dest)
+    with tarfile.open(tar_path) as tf:
+        members = tf.getmembers()
+        for m in members:
+            target = os.path.realpath(os.path.join(root, m.name))
+            if not (target == root or target.startswith(root + os.sep)):
+                raise ValueError(f'unsafe path in archive: {m.name}')
+            if m.issym() or m.islnk():
+                link = os.path.realpath(os.path.join(os.path.dirname(target), m.linkname))
+                if not (link == root or link.startswith(root + os.sep)):
+                    raise ValueError(f'unsafe link in archive: {m.name}')
+        for m in members:
+            try:
+                tf.extract(m, root, filter='data')    # Python 3.12+ (and later 3.9-3.11 patches)
+            except TypeError:
+                tf.extract(m, root)
+
+
+def _update_preflight_tree(console_dir, target_ref, git_cfg=None, scratch_parent=None, log=None):
+    """Steps 1 to 3 above, on the tree `target_ref` points at, BEFORE HEAD moves.
+
+    Returns (ok, message). ok=False only for a real verdict (a pin that cannot be installed, a
+    file that does not compile, a library nobody can import); message is plain words for the
+    customer and says nothing was changed."""
+    log = log or (lambda m: print(m, flush=True))
+    git_cfg = git_cfg or ['git', '-c', f'safe.directory={console_dir}']
+    py, pip = _update_console_python(console_dir)
+    parent = scratch_parent
+    if not parent:
+        _p = '/var/lib/takwerx-console'
+        parent = _p if os.path.isdir(_p) and os.access(_p, os.W_OK) else None
+    scratch = None
+    try:
+        scratch = tempfile.mkdtemp(prefix='update-tree-', dir=parent)
+        tar = os.path.join(scratch, 'tree.tar')
+        tree = os.path.join(scratch, 'tree')
+        os.makedirs(tree)
+        a = subprocess.run(git_cfg + ['archive', '--format=tar', '-o', tar, target_ref],
+                           cwd=console_dir, capture_output=True, text=True, timeout=180,
+                           env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+        if a.returncode != 0:
+            log(f"Update Now: pre-check skipped, git archive failed: {(a.stderr or '').strip()[:200]}")
+            shutil.rmtree(scratch, ignore_errors=True)
+            return True, ''
+        _update_safe_extract(tar, tree)
+        os.unlink(tar)
+    except Exception as e:
+        log(f"Update Now: pre-check skipped, could not read the new tree: {str(e)[:200]}")
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+        return True, ''
+    try:
+        req = os.path.join(tree, 'requirements.txt')
+        if pip and os.path.exists(req):
+            unmet = None
+            try:
+                c = subprocess.run([py, '-I', '-c', _UPDATE_REQ_CHECK_PY, req], capture_output=True,
+                                   text=True, timeout=60)
+                if c.returncode == 0:
+                    unmet = json.loads((c.stdout or '').strip().splitlines()[-1])
+            except Exception as e:
+                log(f"Update Now: could not compare the installed libraries with the new pins ({str(e)[:120]}); installing them")
+            if unmet == []:
+                log('Update Now: every library the new release pins is already installed')
+            else:
+                if unmet:
+                    log('Update Now: installing the new release pins: ' + ', '.join(unmet)[:300])
+                try:
+                    p = subprocess.run([pip, 'install', '--quiet', '--disable-pip-version-check', '-r', req],
+                                       capture_output=True, text=True, timeout=_UPDATE_PIP_TIMEOUT_S)
+                    rc, err = p.returncode, (p.stderr or p.stdout or '')
+                except subprocess.TimeoutExpired:
+                    rc, err = 124, f'pip did not finish in {_UPDATE_PIP_TIMEOUT_S} seconds'
+                except Exception as e:
+                    rc, err = 1, str(e)
+                if rc != 0:
+                    last = ([ln for ln in err.strip().splitlines() if ln.strip()] or [''])[-1][:200]
+                    log(f'Update Now: pip install of the new pins failed (rc={rc}): {last}')
+                    return False, (
+                        'Update stopped before anything was changed: the new release needs software '
+                        'libraries that could not be installed on this server'
+                        + (f' ({last})' if last else '') + '. Check that this server can reach '
+                        'pypi.org, then click Update Now again.')
+        try:
+            c = subprocess.run([py, '-I', '-c', _UPDATE_TREE_CHECK_PY], cwd=tree, capture_output=True,
+                               text=True, timeout=_UPDATE_TREE_CHECK_TIMEOUT_S)
+            res = json.loads((c.stdout or '').strip().splitlines()[-1]) if c.returncode == 0 else None
+        except Exception as e:
+            res = None
+            log(f"Update Now: pre-check of the new tree skipped ({str(e)[:160]})")
+        if res is None:
+            return True, ''
+        if res.get('compile_errors') or res.get('missing_imports'):
+            what = '; '.join(res.get('compile_errors') or [])
+            if res.get('missing_imports'):
+                what += ('; ' if what else '') + 'missing library: ' + ', '.join(
+                    f'{k} (needed by {v})' for k, v in sorted(res['missing_imports'].items()))
+            log(f'Update Now: the new release failed its pre-check: {what[:500]}')
+            return False, (
+                'Update stopped before anything was changed: the new release failed its safety check '
+                f'({what[:240]}). This is a fault in the release, not on your server. Your console is '
+                'unchanged. Please report it on GitHub.')
+        return True, ''
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _update_clear_stale_git_locks(console_dir, now=None, max_age_s=600):
+    """Remove a leftover .git/index.lock (or HEAD.lock) from a cut-off checkout. Returns the names
+    removed. Only locks older than max_age_s go: a git command of ours finishes well inside that,
+    and Update Now holds its own single-flight lock, so no checkout of ours is running."""
+    now = time.time() if now is None else now
+    removed = []
+    for name in ('index.lock', 'HEAD.lock'):
+        p = os.path.join(console_dir, '.git', name)
+        try:
+            age = now - os.path.getmtime(p)
+        except OSError:
+            continue
+        if age < max_age_s:
+            continue
+        try:
+            os.unlink(p)
+            removed.append(name)
+            print(f"Update Now: removed a stale .git/{name} (age {int(age)}s)", flush=True)
+        except OSError as e:
+            print(f"Update Now: could not remove .git/{name}: {e}", flush=True)
+    return removed
+
+
+def _update_plain_git_error(err):
+    """Customer words for the git lock error Update Now used to show raw."""
+    low = (err or '').lower()
+    if '.lock' in low and ('file exists' in low or 'unable to create' in low or 'another git process' in low):
+        return ('Another git command is still running on this server, so the update was not applied. '
+                'Nothing was changed. Wait a few minutes and click Update Now again.')
+    return err
+
+
+def _update_rollback_snapshot(prev, running_version, head_tag, now_utc, head_sha=''):
+    """The `console_rollback` record to save at the start of an Update Now click.
+
+    ops #1329: if an earlier click already recorded this RUNNING version and it is still the
+    version running, keep that record. Click one moves HEAD; when the restart never comes,
+    click two used to read the NEW tag from HEAD and make it the rollback target.
+    ops #1330: the record also holds the commit (`sha`) and a `label`; the tag is set only when
+    HEAD is exactly on one. The `v{version}` guess stays only when git could say neither."""
+    prev = prev if isinstance(prev, dict) else {}
+    if (prev.get('available') and (prev.get('tag') or prev.get('sha'))
+            and prev.get('version') == running_version):
+        return prev
+    tag = head_tag or ('' if head_sha else f'v{running_version}')
+    return {
+        'available': True,
+        'version': running_version,
+        'tag': tag,
+        'sha': head_sha,
+        'label': tag or f'{running_version} ({head_sha[:7]})',
+        'snapshot_at': now_utc,
+    }
+
+
+def _tag_version_tuple(name):
+    n = (name or '').lstrip('v').replace('-alpha', '').replace('-beta', '')
+    return tuple(int(p) for p in n.split('.'))
+
+
+def _main_commit_shas(gh_headers=None):
+    """SHAs of the last 100 commits on main (GitHub API), or None when they cannot be read."""
+    try:
+        req = urllib.request.Request(
+            f'https://api.github.com/repos/{GITHUB_REPO}/commits?sha=main&per_page=100',
+            headers=gh_headers or {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'infra-TAK'})
+        resp = urllib.request.urlopen(req, timeout=5)
+        return {c['sha'] for c in json.loads(resp.read().decode())}
+    except Exception:
+        return None
+
+
+def _select_latest_release_tag(tags, main_commits):
+    """The newest tag (API tag dict) on the main channel. ops #1329: ONE rule for the update check
+    and for Update Now. A tag counts only when its commit is on main (`main_commits`, None when
+    main could not be read: then the list is trusted, as the check always did). Update Now used
+    to take the highest tag with no such filter, so a tag pushed on dev could be installed on the
+    main channel that the check never offered."""
+    best = None
+    for tag in tags or []:
+        if main_commits is not None and (tag.get('commit') or {}).get('sha') not in main_commits:
+            continue
+        try:
+            vt = _tag_version_tuple(tag.get('name', ''))
+        except (ValueError, IndexError):
+            continue
+        if best is None or vt > best[0]:
+            best = (vt, tag)
+    return best[1] if best else None
+
+
+def _post_update_in_progress(lock_path='/tmp/takwerx-post-update.lock', now=None, max_age_s=1800,
+                             pid_alive=None):
+    """Seconds the post-update auto-deploy has been running, or None when it is not running.
+
+    ops #1329: the Update Now lock is deleted when the console starts, so it no longer covers the
+    minutes the new console spends re-deploying Guard Dog, Authentik and Node-RED. That thread
+    keeps its own lock file (pid and version) from before it starts until it ends; a second
+    Update Now click during that time checked out the next release and killed the deploy half
+    way. Same staleness rule as the thread's own check: holder dead, or older than 30 minutes."""
+    now = time.time() if now is None else now
+    if pid_alive is None:
+        def pid_alive(pid):
+            try:
+                os.kill(pid, 0)
+                return True
+            except (ProcessLookupError, PermissionError):
+                return False
+    try:
+        age = now - os.path.getmtime(lock_path)
+        with open(lock_path) as fh:
+            parts = fh.read().split()
+        pid = int(parts[0]) if parts else 0
+    except (OSError, ValueError, IndexError):
+        return None
+    if age > max_age_s or pid <= 0 or not pid_alive(pid):
+        return None
+    return int(age)
+
+
 # ops #489: Update Now's `git fetch` ran with one fixed 60 s limit and, when it expired, showed
 # the customer Python's raw "Command [...] timed out after 60 seconds". Boxes on slow or shared
 # links (small teams behind one NAT, satellite, government proxies) hit that, and the same click
@@ -12408,6 +13036,21 @@ def update_apply():
                       f'has {_free_b // (1024 * 1024)} MB. Free disk first — see Guard Dog '
                       '> Database maintenance (CoT) > Diagnose. ' + _FREE_SPACE_BACKUPS_HINT),
         }), 400
+
+    # ops #1329 (item 8): the Update Now lock below is deleted when the console starts, so it does
+    # not cover the minutes the NEW console spends re-deploying Guard Dog, Authentik and Node-RED.
+    # A second click then checked out the next release and killed that deploy half way. Refuse
+    # until it ends (it keeps its own lock; stale after 30 minutes, same as its own rule).
+    _pu_age = _post_update_in_progress()
+    if _pu_age is not None:
+        return jsonify({
+            'success': False,
+            'in_progress': True,
+            'started_seconds_ago': _pu_age,
+            'error': ('The last update is still finishing its setup on this server (about '
+                      f'{max(1, _pu_age // 60)} min so far). Nothing was changed. Wait a few minutes '
+                      'and click Update Now again.'),
+        }), 409
 
     # v0.9.24 Item 1: Update Now single-flight lock.
     # Field incident on test8 (2026-05-16): operator double-clicked "Update Now"
@@ -12524,21 +13167,13 @@ def update_apply():
 
     # v0.9.3: Record current version for one-step rollback before updating
     try:
-        _pre_update_version = VERSION
         _s = load_settings()
-        # Determine the current git tag so rollback can fetch it
-        _cur_tag_r = subprocess.run(
-            ['git', f'--git-dir={os.path.join(console_dir, ".git")}',
-             f'--work-tree={console_dir}', 'describe', '--tags', '--exact-match'],
-            capture_output=True, text=True, timeout=10
-        )
-        _cur_tag = (_cur_tag_r.stdout or '').strip() if _cur_tag_r.returncode == 0 else f'v{VERSION}'
-        _s['console_rollback'] = {
-            'available':   True,
-            'version':     VERSION,
-            'tag':         _cur_tag,
-            'snapshot_at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-        }
+        # ops #1329 (item 4): after an interrupted click (HEAD moved, restart never came) HEAD
+        # names the NEW tag; a second click used to record that as the rollback target. The
+        # helper keeps the record the first click made for the version that is running.
+        # ops #1330: it also stores the commit, and a tag only when HEAD is exactly on one.
+        _s['console_rollback'] = _console_rollback_snapshot(
+            console_dir, VERSION, _s.get('console_rollback'))
         save_settings(_s)
     except Exception:
         pass
@@ -12584,13 +13219,20 @@ def update_apply():
                 if verify_tag.returncode == 0:
                     target_ref = f'refs/tags/{tag_name}'
 
-            # Fallback: track origin/main if tag lookup fails.
+            # ops #1329 (item 6): no fallback to the tip of origin/main. The check offers only a
+            # release tag on main; main's tip is not always one. Say so and change nothing.
             if not target_ref:
-                fetch_main = _git_fetch_retry(_git, ['fetch', 'origin', '+main:refs/remotes/origin/main'])
-                if fetch_main.returncode != 0:
-                    return _fail_release_lock(_error_payload(_git_err(fetch_main)))
-                target_ref = 'refs/remotes/origin/main'
-            target_label = tag_name or 'origin/main'
+                return _fail_release_lock({
+                    'success': False,
+                    'error': ('Could not find the newest release on GitHub. Nothing was changed. '
+                              'Click Update Now again in a minute or two.')})
+            target_label = tag_name
+
+        # ops #1329 (items 1-3): with HEAD still where it was, read the new tree, install the
+        # libraries it pins and compile-check it. A verdict of "no" stops here, nothing changed.
+        _pf_ok, _pf_msg = _update_preflight_tree(console_dir, target_ref, git_cfg=git_cfg)
+        if not _pf_ok:
+            return _fail_release_lock({'success': False, 'error': _pf_msg})
 
         # v10.1.4 WS13: heal foreign-owned repo entries BEFORE the checkout — a
         # past root-shell git op leaves root-owned dirs that make the checkout
@@ -12598,7 +13240,14 @@ def update_apply():
         # HEAD still moves → box runs mixed versions).
         _repo_ownership_selfheal('update-apply')
 
+        # ops #1329 (item 5): a checkout cut off by a power loss or a kill leaves .git/index.lock,
+        # and every later click returned raw git text until someone cleared it over SSH.
+        _update_clear_stale_git_locks(console_dir)
+
         checkout = _git(['checkout', '--force', target_ref], timeout=30)
+        if checkout.returncode != 0 and '.lock' in _git_err(checkout).lower():
+            if _update_clear_stale_git_locks(console_dir):
+                checkout = _git(['checkout', '--force', target_ref], timeout=30)
         if checkout.returncode != 0 and 'unable to unlink' in _git_err(checkout).lower():
             # Ownership poisoning surfaced mid-checkout (pre-checkout heal missed
             # or could not complete — e.g. broker briefly unreachable). Heal and
@@ -12607,7 +13256,7 @@ def update_apply():
             checkout = _git(['checkout', '--force', target_ref], timeout=30)
         if checkout.returncode != 0:
             err = _git_err(checkout)
-            payload = _error_payload(err)
+            payload = _error_payload(_update_plain_git_error(err))
             if 'unable to unlink' in err.lower():
                 # WS13: never show a customer raw git stderr with no next step.
                 # HEAD has moved and the new app.py is staged; the startup heal
@@ -12622,8 +13271,25 @@ def update_apply():
             return _fail_release_lock(payload)
 
         update_cache.update({'latest': None, 'checked': 0, 'notes': '', 'body': ''})
-        _ensure_gunicorn_upgrade(console_dir)
-        _detached_console_restart()
+        # HEAD has moved: nothing below may stop the restart. The pins are installed already (the
+        # pre-check above); this keeps the systemd unit upgrade and the gunicorn/PyYAML top-up.
+        # ops #1329 (item 2): a pip timeout here used to raise, leaving a new tree under old code
+        # with no restart scheduled.
+        try:
+            _ensure_gunicorn_upgrade(console_dir)
+        except Exception as _eg:
+            print(f"Update Now: venv top-up failed (non-fatal, restarting anyway): {str(_eg)[:200]}", flush=True)
+        # ops #1329 (item 7): learn whether the restart command itself failed. A restart that
+        # works kills this process first, so waiting here costs a few seconds and nothing else.
+        _restart = {'event': threading.Event(), 'ok': None, 'error': ''}
+        _detached_console_restart(delay=_UPDATE_RESTART_DELAY_S, result=_restart)
+        if _restart['event'].wait(timeout=_UPDATE_RESTART_WAIT_S) and _restart['ok'] is False:
+            return _fail_release_lock({
+                'success': False,
+                'restart_failed': True,
+                'error': (f'The update to {target_label} is installed, but this console could not restart '
+                          f'itself ({_restart["error"]}). Click Update Now again to retry the restart, or '
+                          'use the Reboot button on the Console page.')})
         return jsonify({
             'success': True,
             'output': f'Updated to {target_label}',
@@ -13125,6 +13791,229 @@ def console_migrate_nonroot_status_api():
     return jsonify({'state': state, 'nonroot': nonroot, 'detail': detail})
 
 
+# ops #1330: the Rollback never changes anything until it knows the release it goes back to is on
+# this box, checks out FIRST, and only then runs the module steps that older release needs. Before,
+# three module steps (MediaMTX editor passwords to plain text, ATLAS identity headers, the
+# MediaMTX remote HLS port) ran before the checkout and the `git fetch` answer was thrown away: a
+# checkout that failed (no network and no local tag, a tag that never existed) left the console
+# on the new version with those three changes applied.
+_ROLLBACK_REPO_URL = 'https://github.com/takwerx/infra-TAK.git'
+_ROLLBACK_REF_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+_ROLLBACK_SHA_RE = re.compile(r'[0-9a-f]{40}')
+
+# The pinned versions the older release puts back when it runs its own start-up checks after the
+# rollback (its code is not ours to change). Plain constants in app.py, read from the old release
+# with git and compared with this one. NetBird is listed for the update channel the box is on.
+_ROLLBACK_PIN_WATCH = (
+    ('NetBird server', 'NETBIRD_SERVER_IMAGE', 'main'),
+    ('NetBird dashboard', 'NETBIRD_DASHBOARD_IMAGE', 'main'),
+    ('NetBird server', 'NETBIRD_SERVER_DEV_IMAGE', 'dev'),
+    ('NetBird dashboard', 'NETBIRD_DASHBOARD_DEV_IMAGE', 'dev'),
+    ('Authentik redis', 'AUTHENTIK_REDIS_IMAGE', ''),
+    ('Authentik connection pool', '_AUTHENTIK_PGBOUNCER_IMAGE', ''),
+    ('Node-RED', 'NODERED_IMAGE', ''),
+    ('WebODM', 'WEBODM_VERSION', ''),
+    ('CloudTAK media server', 'MEDIA_INFRA_IMAGE', ''),
+    ('CloudTAK database', 'POSTGIS_IMAGE', ''),
+    ('TURN server', 'COTURN_IMAGE', ''),
+    ('MediaMTX web editor', 'MEDIAMTX_EDITOR_REF', ''),
+)
+
+
+def _console_rollback_snapshot(console_dir, version, prev=None):
+    """The record Update Now keeps for the Rollback button, taken before the update moves HEAD.
+    The tag is set only when HEAD is exactly on one. It used to fall back to `v{version}`, which
+    on a dev box (an untagged commit, with the same version string as the next release) is a tag
+    that does not exist yet or sits on another commit. The commit is recorded too, so the
+    Rollback goes to what really ran (ops #1330). `prev` is the record already saved: a second
+    click after an interrupted update keeps it (ops #1329, see _update_rollback_snapshot).
+    Raises when git cannot be run."""
+    def _git_out(*args):
+        r = subprocess.run(
+            ['git', f'--git-dir={os.path.join(console_dir, ".git")}', f'--work-tree={console_dir}'] + list(args),
+            capture_output=True, text=True, timeout=10)
+        return (r.stdout or '').strip() if r.returncode == 0 else ''
+    tag = _git_out('describe', '--tags', '--exact-match')
+    sha = _git_out('rev-parse', 'HEAD').lower()
+    if not _ROLLBACK_SHA_RE.fullmatch(sha):
+        sha = ''
+    return _update_rollback_snapshot(
+        prev, version, tag, datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), head_sha=sha)
+
+
+def _rollback_git(console_dir, args, timeout=30):
+    return subprocess.run(
+        ['git', '-c', f'safe.directory={console_dir}'] + list(args),
+        cwd=console_dir, capture_output=True, text=True, timeout=timeout,
+        env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'})
+
+
+def _rollback_resolve_target(console_dir, tag, sha):
+    """The commit a Rollback goes back to, made sure to be on this box. Returns (commit, error);
+    error is '' when it is. Changes nothing but the local tag list (the fetch)."""
+    why = ''
+    if tag:
+        try:
+            f = _rollback_git(console_dir, ['fetch', _ROLLBACK_REPO_URL,
+                                            f'refs/tags/{tag}:refs/tags/{tag}'], timeout=60)
+            if f.returncode != 0:
+                why = ((f.stderr or f.stdout or '').strip().splitlines() or ['git fetch failed'])[-1][:160]
+        except Exception as e:
+            why = str(e)[:160]
+    have_tag = ''
+    if tag:
+        try:
+            r = _rollback_git(console_dir, ['rev-parse', '-q', '--verify', f'refs/tags/{tag}^{{commit}}'], timeout=15)
+            out = (r.stdout or '').strip().lower()
+            have_tag = out if r.returncode == 0 and _ROLLBACK_SHA_RE.fullmatch(out) else ''
+        except Exception:
+            have_tag = ''
+    have_sha = ''
+    if sha:
+        try:
+            r = _rollback_git(console_dir, ['cat-file', '-e', f'{sha}^{{commit}}'], timeout=15)
+            have_sha = sha if r.returncode == 0 else ''
+        except Exception:
+            have_sha = ''
+    # What really ran wins over a tag that moved.
+    if have_sha:
+        if have_tag and have_tag != have_sha:
+            print(f'Rollback: tag {tag} now points to {have_tag[:7]}, not to the {have_sha[:7]} that ran: '
+                  'going back to the one that ran', flush=True)
+        return have_sha, ''
+    if have_tag:
+        return have_tag, ''
+    name = tag or (sha[:7] if sha else 'the previous version')
+    return '', (f'Could not get {name} onto this server' + (f' ({why})' if why else '') + '.')
+
+
+def _rollback_current_ref(console_dir):
+    """Where the console checkout is now, in a form `git checkout` takes back: the branch name,
+    else the commit. '' when git cannot say."""
+    try:
+        b = _rollback_git(console_dir, ['symbolic-ref', '-q', '--short', 'HEAD'], timeout=15)
+        name = (b.stdout or '').strip()
+        if b.returncode == 0 and _ROLLBACK_REF_RE.fullmatch(name):
+            return name
+        h = _rollback_git(console_dir, ['rev-parse', 'HEAD'], timeout=15)
+        c = (h.stdout or '').strip().lower()
+        return c if h.returncode == 0 and _ROLLBACK_SHA_RE.fullmatch(c) else ''
+    except Exception:
+        return ''
+
+
+def _console_release_const(console_dir, ref, name):
+    """The plain string constant `name` as release `ref` holds it in app.py ('' when it has none
+    or git cannot read it). Read from git's copy, never from the checkout."""
+    if not _ROLLBACK_REF_RE.fullmatch(str(ref or '')) or not re.fullmatch(r'[A-Z_][A-Z0-9_]*', str(name or '')):
+        return ''
+    try:
+        r = _rollback_git(console_dir, ['grep', '-h', '-E', rf'^{name}[[:space:]]*=', ref, '--', 'app.py'])
+    except Exception:
+        return ''
+    m = re.search(rf'''^{name}\s*=\s*["']([^"']+)["']''', r.stdout or '', re.M)
+    return m.group(1) if m else ''
+
+
+def _rollback_pin_short(v):
+    v = str(v or '')
+    return v.rsplit(':', 1)[-1] if ':' in v else v
+
+
+def _rollback_pin_changes(console_dir, ref, channel, current):
+    """[(name, this version, older release)] for every watched pin the older release `ref` sets
+    to something else. `current` maps constant name to the value this console holds."""
+    out = []
+    for label, const, only_channel in _ROLLBACK_PIN_WATCH:
+        if only_channel and only_channel != channel:
+            continue
+        now = str(current.get(const) or '')
+        then = _console_release_const(console_dir, ref, const)
+        if now and then and now != then:
+            out.append((label, _rollback_pin_short(now), _rollback_pin_short(then)))
+    return out
+
+
+def _rollback_redis_hazard(console_dir, ref, label, compose_image, seen_version):
+    """Plain words when the older release `ref` would break this box's Authentik redis, else ''.
+    ops #1306 / #1330: before 10.4.9 a floating redis tag (alpine, latest, 8) was pinned back to
+    the pin with no look at the version it really ran. The older release does that again after the
+    rollback, and a redis that ran something newer cannot read the dump it saved ("Can't handle
+    RDB format version"): redis crash-loops and Authentik sign-in stops. The older code cannot be
+    changed, so say it first. `compose_image`: the redis `image:` of ~/authentik/docker-compose.yml
+    ('' when there is none); `seen_version`: REDIS_VERSION of the running container ('' unknown)."""
+    if _console_release_app_has(console_dir, ref, 'def _authentik_redis_seen_version(') is not False:
+        return ''              # that release looks at the version first (True), or git cannot say (None)
+    m = re.fullmatch(r'(?:docker\.io/)?(?:library/)?redis(?::([\w.-]+))?', str(compose_image or '').strip().strip('\'"'))
+    if not m:
+        return ''
+    tag = m.group(1) or 'latest'
+    if not (tag in ('alpine', 'latest') or re.fullmatch(r'\d+(?:\.\d+)?(?:-alpine)?', tag)):
+        return ''              # an exact version or another image: the older release leaves it alone
+    sv = re.match(r'(\d+)\.(\d+)\.(\d+)', str(seen_version or ''))
+    pin = re.match(r'.*?(\d+)\.(\d+)\.(\d+)', AUTHENTIK_REDIS_IMAGE.rsplit(':', 1)[-1])
+    if not sv or not pin or tuple(int(x) for x in sv.groups()) <= tuple(int(x) for x in pin.groups()):
+        return ''
+    return (f'Authentik redis on this server runs {".".join(sv.groups())} on the floating tag "{tag}". '
+            f'{label} sets a floating redis back to {AUTHENTIK_REDIS_IMAGE.rsplit(":", 1)[-1]}, which '
+            f'cannot read what {".".join(sv.groups())} saved, so redis would stop and Authentik '
+            'sign-in would fail until you press Update Now again.')
+
+
+def _rollback_redis_hazard_here(console_dir, ref, label):
+    """_rollback_redis_hazard with this box's own answers. Never raises: no answer, no warning."""
+    try:
+        compose = os.path.expanduser('~/authentik/docker-compose.yml')
+        if not os.path.exists(compose):
+            return ''
+        with open(compose, encoding='utf-8') as f:
+            im = re.search(r'(?m)^\s*image:\s*[\'"]?([^\s\'"#]*redis[^\s\'"#]*)', f.read())
+        if not im:
+            return ''
+        seen = _authentik_redis_seen_version(im.group(1))
+        return _rollback_redis_hazard(console_dir, ref, label, im.group(1), seen or '')
+    except Exception:
+        return ''
+
+
+def _rollback_pin_message(label, changes, hazards=()):
+    """Plain words for the operator: what the older release puts back by itself, and what it
+    would break on this server."""
+    out = []
+    if changes:
+        lines = '; '.join(f'{n} {then} (this version {now})' for n, now, then in changes)
+        out.append(f'{label} runs its own start-up checks and may set these back to the versions it was '
+                   f'tested with: {lines}. If this server already runs a newer one of them, check it after '
+                   'the rollback.')
+    out.extend(h for h in hazards if h)
+    return ' '.join(out)
+
+
+@app.route('/api/console/rollback/preview')
+@login_required
+def console_rollback_preview_api():
+    """What the Rollback button would do, in plain words, before it is pressed (ops #1330).
+    Reads only. Never fails the page: a problem comes back as an empty list."""
+    console_dir = os.path.dirname(os.path.abspath(__file__))
+    rb = (load_settings().get('console_rollback') or {})
+    if not rb.get('available'):
+        return jsonify({'ok': True, 'available': False, 'changes': [], 'message': ''})
+    tag = str(rb.get('tag') or '').strip()
+    sha = str(rb.get('sha') or '').strip().lower()
+    ref = sha if _ROLLBACK_SHA_RE.fullmatch(sha) else tag
+    label = rb.get('label') or tag or sha[:7] or 'the previous version'
+    channel = (load_settings().get('update_channel') or 'main').strip().lower()
+    try:
+        changes = _rollback_pin_changes(console_dir, ref, channel, globals())
+    except Exception:
+        changes = []
+    hazards = [h for h in (_rollback_redis_hazard_here(console_dir, ref, label),) if h]
+    return jsonify({'ok': True, 'available': True, 'label': label,
+                    'changes': [{'name': n, 'now': a, 'then': b} for n, a, b in changes],
+                    'hazards': hazards,
+                    'message': _rollback_pin_message(label, changes, hazards)})
+
+
 @app.route('/api/console/rollback', methods=['POST'])
 @login_required
 def console_rollback_api():
@@ -13144,32 +14033,51 @@ def console_rollback_api():
     rb = s.get('console_rollback') or {}
     if not rb.get('available'):
         return jsonify({'ok': False, 'error': 'No rollback available (no snapshot recorded before last update)'}), 400
-    prev_tag = rb.get('tag', '').strip()
-    if not prev_tag:
+    prev_tag = str(rb.get('tag') or '').strip()
+    prev_sha = str(rb.get('sha') or '').strip().lower()
+    if prev_sha and not _ROLLBACK_SHA_RE.fullmatch(prev_sha):
+        prev_sha = ''
+    if prev_tag and not _ROLLBACK_REF_RE.fullmatch(prev_tag):
+        prev_tag = ''           # a stored value that looks like a git option never reaches git
+    if not prev_tag and not prev_sha:
         return jsonify({'ok': False, 'error': 'Rollback tag not recorded'}), 400
+    label = prev_tag or str(rb.get('label') or '') or prev_sha[:7]
     try:
-        git_cfg = ['git', '-c', f'safe.directory={console_dir}']
-        # Fetch the tag from origin
-        fetch_r = subprocess.run(
-            git_cfg + ['fetch', 'https://github.com/takwerx/infra-TAK.git',
-                       f'refs/tags/{prev_tag}:refs/tags/{prev_tag}'],
-            cwd=console_dir, capture_output=True, text=True, timeout=60,
-            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
-        )
-        # ops #917: a release that pins a web editor older than password hashing (2.1.15) would,
+        # ops #1330: 1. Make sure the release is here. Nothing on this box changes if it is not.
+        target, why = _rollback_resolve_target(console_dir, prev_tag, prev_sha)
+        if not target:
+            return jsonify({'ok': False, 'error': why + ' Nothing was changed.'}), 500
+        # What the older release will need (read from git, before anything moves).
+        orig_ref = _rollback_current_ref(console_dir)
+        redis_hazard = _rollback_redis_hazard_here(console_dir, target, f'Version {label}')
+        # 2. Check out FIRST. If this fails nothing else has been touched.
+        checkout_r = _rollback_git(console_dir, ['checkout', '--force', target])
+        if checkout_r.returncode != 0:
+            err = (checkout_r.stderr or '').strip() or 'git checkout failed'
+            return jsonify({'ok': False, 'error': err}), 500
+        # 3. ops #917: a release that pins a web editor older than password hashing (2.1.15) would,
         # on its "Patch web editor", put back an editor that cannot read hashed passwords. Give
-        # the accounts plain-text passwords first (the editor's own rollback does the same).
-        # Done before the checkout so a failure here leaves the console as it was.
+        # the accounts plain-text passwords first (the editor's own rollback does the same). When
+        # that cannot be done the rollback stops and the checkout is put back.
         editor_reset = {'state': 'none', 'count': 0}
-        if _mediamtx_editor_ref_lacks_hashing(_console_release_editor_ref(console_dir, prev_tag)):
+        if _mediamtx_editor_ref_lacks_hashing(_console_release_editor_ref(console_dir, target)):
             editor_reset = _mediamtx_editor_unhash_for_rollback(s)
             if editor_reset['state'] == 'fail':
+                back = None
+                if orig_ref:
+                    back = _rollback_git(console_dir, ['checkout', '--force', orig_ref])
+                if back is not None and back.returncode == 0:
+                    return jsonify({'ok': False, 'error': (
+                        'Rollback stopped: the MediaMTX web editor passwords could not be changed '
+                        'for the older version. Nothing was changed.')}), 500
                 return jsonify({'ok': False, 'error': (
                     'Rollback stopped: the MediaMTX web editor passwords could not be changed '
-                    'for the older version. Nothing was changed.')}), 500
+                    'for the older version, and the console files could not be put back. Press '
+                    'Rollback again, or restart the console, to finish going back to '
+                    f'{label}.')}), 500
         # ops #1151: an older release cannot keep ATLAS on Authentik's signed token (its
         # Caddyfile does not pass the token and its Authentik reconfigure takes the signing
-        # key off). Put such a deployment back on the identity headers first, or it refuses
+        # key off). Put such a deployment back on the identity headers, or it refuses
         # every administrator after the rollback. A failure here does not stop the rollback.
         atlas_reset = {}
         try:
@@ -13178,31 +14086,32 @@ def console_rollback_api():
                 atlas_reset = _atlas_rb(
                     mod_registry.get_ctx(),
                     lambda m: print(f'Rollback: ATLAS {m}', flush=True),
-                    _console_release_has_file(console_dir, prev_tag,
+                    _console_release_has_file(console_dir, target,
                                               'modules/atlas_signed_identity.py')) or {}
         except Exception as _arb:
             print(f'Rollback: ATLAS sign-in step error (non-fatal): {str(_arb)[:160]}', flush=True)
         # ops #1149: a release without the closed HLS port on a remote MediaMTX box gets the
-        # port back (bind and firewall rule) before the checkout. A failure does not stop the
-        # rollback.
+        # port back (bind and firewall rule). A failure does not stop the rollback.
         hls_port_reset = 'none'
         try:
-            hls_port_reset = _mediamtx_remote_hls_port_before_rollback(s, console_dir, prev_tag)
+            hls_port_reset = _mediamtx_remote_hls_port_before_rollback(s, console_dir, target)
         except Exception as _hpr:
             print(f'Rollback: MediaMTX HLS port step error (non-fatal): {str(_hpr)[:160]}', flush=True)
-        checkout_r = subprocess.run(
-            git_cfg + ['checkout', '--force', prev_tag],
-            cwd=console_dir, capture_output=True, text=True, timeout=30,
-            env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
-        )
-        if checkout_r.returncode != 0:
-            err = (checkout_r.stderr or '').strip() or 'git checkout failed'
-            return jsonify({'ok': False, 'error': err}), 500
-        # Clear rollback availability (one rollback per update)
+        # Clear rollback availability (one rollback per update). Settings are read again: the
+        # steps above can take minutes.
+        s = load_settings()
         s['console_rollback'] = {'available': False}
         save_settings(s)
+        try:
+            pin_note = _rollback_pin_message(
+                f'Version {label}',
+                _rollback_pin_changes(console_dir, target,
+                                      (s.get('update_channel') or 'main').strip().lower(), globals()),
+                [redis_hazard])
+        except Exception:
+            pin_note = ''
         _detached_console_restart()
-        message = f'Rolled back to {prev_tag}. Console is restarting.'
+        message = f'Rolled back to {label}. Console is restarting.'
         if editor_reset['state'] == 'reset':
             message += (' The MediaMTX web editor in that version cannot read the new password '
                         'format, so its accounts got new passwords. The admin password is on '
@@ -13215,8 +14124,10 @@ def console_rollback_api():
         if 'failed' in atlas_reset.values():
             message += (' ATLAS could not be set back to the sign-in of that version. If the '
                         'ATLAS console refuses administrators, press Update Now again.')
+        if pin_note:
+            message += ' ' + pin_note
         return jsonify({
-            'ok': True, 'tag': prev_tag,
+            'ok': True, 'tag': label,
             'message': message,
             'editor_passwords_reset': editor_reset['count'],
         })
@@ -14254,6 +15165,51 @@ def _pg_keepalive_sh(conf_expr):
     )
 
 
+# ops #1338: restart the PostgreSQL that SERVES the database port, never "15".
+# After the TAK 5.8 split migration Server One keeps the old PostgreSQL 15 cluster, stopped, as
+# the rollback next to PostgreSQL 18. `pg_ctlcluster 15 main restart || systemctl restart
+# postgresql` therefore succeeded on the OLD cluster whenever 18 was down, and the fallback that
+# would have started 18 never ran. This function (run on Server One over SSH) asks
+# pg_lsclusters: the cluster configured on the database port wins, the newest major wins a tie
+# or a missing match, and an older cluster is never picked while a newer one exists. Without
+# pg_lsclusters (RHEL, PGDG units) it picks the active `postgresql-N` unit, else the newest.
+# tak-remotedb-watch.sh carries the SAME text (a test keeps them identical).
+_PG_CTL_SH = r"""pgctl() {
+A="$1"; P="${2:-5432}"; S=""
+if command -v pg_lsclusters >/dev/null 2>&1; then
+  L=$(pg_lsclusters -h 2>/dev/null)
+  S=$(printf '%s\n' "$L" | awk -v p="$P" '$3==p {print $1" "$2}' | sort -n | tail -1)
+  [ -n "$S" ] || S=$(printf '%s\n' "$L" | awk 'NF {print $1" "$2}' | sort -n | tail -1)
+fi
+if [ -n "$S" ]; then
+  set -- $S
+  sudo -n pg_ctlcluster "$1" "$2" "$A" 2>&1 || sudo -n systemctl "$A" "postgresql@$1-$2" 2>&1
+  return $?
+fi
+U=""
+for u in $(systemctl list-units --all --type=service --no-legend 'postgresql-*.service' 2>/dev/null | awk '{print $1}' | sed 's/\.service$//' | sort -V -r); do
+  systemctl is-active --quiet "$u" 2>/dev/null && { U="$u"; break; }
+done
+[ -n "$U" ] || U=$(systemctl list-unit-files --no-legend 'postgresql-*.service' 2>/dev/null | awk '{print $1}' | sed 's/\.service$//' | sort -V | tail -1)
+[ -n "$U" ] || U=postgresql
+sudo -n systemctl "$A" "$U" 2>&1
+}
+"""
+
+
+def _pg_ctl_cmd(action, db_port=5432):
+    """Remote shell text that start/stop/restart/reloads Server One's serving PostgreSQL
+    (see _PG_CTL_SH). `action` is one of four literals and the port is forced to an int, so
+    nothing a request carries reaches the shell."""
+    if action not in ('start', 'stop', 'restart', 'reload'):
+        raise ValueError('bad PostgreSQL action: %r' % (action,))
+    try:
+        port = int(str(db_port).strip() or 5432)
+    except (TypeError, ValueError):
+        port = 5432
+    return _PG_CTL_SH + 'pgctl %s %d' % (action, port)
+
+
 def _setup_server_one_rhel(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     """RHEL/Rocky Server One (DB box) setup — the dnf/PGDG/.noarch.rpm/systemctl/firewalld/
     /var/lib/pgsql mirror of the Debian _setup_server_one, per TAK Server Config Guide 5.7
@@ -14618,11 +15574,11 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     if db_pkg_path and db_pkg_name:
         # Fix any corrupted pg_hba.conf before trying to start PG
         _ssh_probe(s1, (
-            'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | head -1); '
+            'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | sort -V | tail -1); '
             '[ -n "$PG_MAIN" ] && [ -f "$PG_MAIN/pg_hba.conf" ] && '
             'sudo sed -i "s/md5host/md5\\nhost/g" "$PG_MAIN/pg_hba.conf" 2>/dev/null; true'
         ), timeout=10)
-        _ssh_probe(s1, 'sudo pg_ctlcluster 15 main start 2>/dev/null; true', timeout=20)
+        _ssh_probe(s1, _pg_ctl_cmd('start', db_port) + ' >/dev/null 2>&1; true', timeout=20)
         already_ok = False
         verify_cmd = 'sudo -u postgres psql -lqt 2>/dev/null | grep -q cot && systemctl is-active postgresql >/dev/null 2>&1 && echo PG_OK'
         vok, vout = _ssh_probe(s1, verify_cmd, timeout=10)
@@ -14646,12 +15602,13 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
             ok, out = _ssh_probe(s1, install_cmd, timeout=600)
             log.append(out or '')
             if not ok:
-                _ssh_probe(s1, 'sudo pg_ctlcluster 15 main start 2>/dev/null; true', timeout=20)
+                _ssh_probe(s1, _pg_ctl_cmd('start', db_port) + ' >/dev/null 2>&1; true', timeout=20)
                 vok, vout = _ssh_probe(s1, verify_cmd, timeout=10)
                 if not (vok and 'PG_OK' in (vout or '')):
                     diag_cmd = (
-                        'echo "--- cluster start attempt ---"; '
-                        'sudo pg_ctlcluster 15 main start 2>&1; '
+                        _PG_CTL_SH +
+                        'echo "--- cluster start attempt ---"; ' +
+                        'pgctl start %d; ' % int(db_port) +
                         'echo "--- cluster logs ---"; '
                         'sudo cat /var/lib/postgresql/15/main/log/$(ls -t /var/lib/postgresql/15/main/log/ 2>/dev/null | head -1) 2>/dev/null | tail -30 || echo "no cluster logs"; '
                         'echo "--- postgresql.conf listen ---"; '
@@ -14689,7 +15646,7 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
     # Step 2: Configure PostgreSQL for remote access
     # Fix any previously corrupted pg_hba.conf lines (e.g. "md5host" from missing newline)
     pg_config_cmd = (
-        'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | head -1) && '
+        'PG_MAIN=$(find /etc/postgresql -type d -name main 2>/dev/null | sort -V | tail -1) && '
         '[ -n "$PG_MAIN" ] && [ -f "$PG_MAIN/postgresql.conf" ] && '
         "sudo sed -i '/^\\s*#*\\s*listen_addresses\\s*=/d' \"$PG_MAIN/postgresql.conf\" && "
         "printf \"\\nlisten_addresses = '*'\\n\" | sudo tee -a \"$PG_MAIN/postgresql.conf\" > /dev/null && "
@@ -14698,9 +15655,10 @@ def _setup_server_one(s1, core_ip, db_port, db_pkg_path=None, db_pkg_name=None):
         # v10.1.9 W1: fresh splits get hostssl+SCRAM (encrypted wire); retrofit boxes keep their
         # existing plaintext line here — _enable_server_one_db_tls handles their upgrade.
         f'(grep -q "^host.*{core_ip}/32" "$PG_MAIN/pg_hba.conf" 2>/dev/null || '
-        f'printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && '
-        '(sudo pg_ctlcluster 15 main restart 2>/dev/null || sudo systemctl restart postgresql 2>/dev/null || true)'
+        f'printf "\\nhostssl all all {core_ip}/32 scram-sha-256\\n" | sudo tee -a "$PG_MAIN/pg_hba.conf" > /dev/null) && ' +
+        '(pgctl restart %d >/dev/null 2>&1 || true)' % int(db_port)
     )
+    pg_config_cmd = _PG_CTL_SH + pg_config_cmd
     ok, out = _ssh_probe(s1, pg_config_cmd, timeout=30)
     if not ok:
         log.append('PostgreSQL remote-access config failed: ' + (out or ''))
@@ -16940,17 +17898,49 @@ def netbird_control_api():
         # or the briefly-shipped :latest that broke auth), so rewrite the compose to the vetted
         # pin BEFORE pull — Update always converges the box onto the tested image, never chases
         # upstream latest. (Bumping the pin in a release is what actually moves NetBird forward.)
-        _netbird_sync_compose_image_tags(nb_dir)
-        pull = _sp.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
-                       capture_output=True, text=True, cwd=nb_dir, timeout=600)
-        if pull.returncode != 0:
-            err = (pull.stderr or pull.stdout or 'docker compose pull failed').strip()[:400]
-            return jsonify({'success': False, 'error': err}), 500
+        #
+        # ops #1327: the order is (1) pull the pinned images by name, (2) back up data/, (3) only then
+        # rewrite the compose and recreate. A failed pull stops here with the compose and the
+        # running container untouched. Update no longer runs _netbird_finalize_account_store: it
+        # reset the operator's "users need approval" setting on every Update. It runs only while
+        # this install still owes it (netbird_finalize_pending, set when a deploy created the owner).
+        _s = load_settings()
+        _srv_img, _dash_img = _get_netbird_target_images(_s)
+        _compose_path = os.path.join(nb_dir, 'docker-compose.yml')
+        try:
+            with open(_compose_path) as _f:
+                _old_txt = _f.read()
+        except Exception:
+            _old_txt = _read_priv(_compose_path)
+        _backup = None
+        _same = _netbird_compose_on_target(_old_txt, _srv_img, _dash_img)
+        if not _same:
+            _ok, _backup, _msg = _netbird_prepare_image_change(nb_dir, _old_txt, _srv_img, _dash_img, lambda _m: None)
+            if not _ok:
+                return jsonify({'success': False, 'error': f'NetBird was not changed: {_msg}'[:400]}), 500
+        _wrote = _netbird_sync_compose_image_tags(nb_dir)
+        if not _same and not _wrote:
+            # the backup stopped the server; start it as it was and say so
+            _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), capture_output=True, text=True,
+                    cwd=nb_dir, timeout=180)
+            return jsonify({'success': False, 'error': 'NetBird was not changed: could not rewrite '
+                            'docker-compose.yml'}), 500
+        if _same:
+            pull = _sp.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=600)
+            if pull.returncode != 0:
+                err = (pull.stderr or pull.stdout or 'docker compose pull failed').strip()[:400]
+                return jsonify({'success': False, 'error': err}), 500
         try:
             _netbird_recreate_containers(nb_dir, lambda _m: None)
-            _netbird_finalize_account_store()
+            if _s.get('netbird_finalize_pending') and _netbird_finalize_account_store():
+                _s.pop('netbird_finalize_pending', None)
+                save_settings(_s)
         except Exception as ex:
-            return jsonify({'success': False, 'error': str(ex)[:300]}), 500
+            if not _same:
+                _netbird_revert_compose(nb_dir, _old_txt, lambda _m: None)
+            _hint = f' (data backup: {os.path.basename(_backup)})' if _backup else ''
+            return jsonify({'success': False, 'error': (str(ex)[:300] + _hint)}), 500
         time.sleep(2)
         r_status = _sp.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server']),
                              capture_output=True, text=True)
@@ -17035,6 +18025,7 @@ def netbird_uninstall_api():
             if 'netbird_pat' in settings:
                 del settings['netbird_pat']
             settings.pop('netbird_admin_email', None)
+            settings.pop('netbird_finalize_pending', None)  # ops #1327: the account is gone with the data
             save_settings(settings)
             # Regenerate caddyfile and reload
             generate_caddyfile(settings)
@@ -17618,8 +18609,8 @@ def connectivity_anchor_disconnect_api():
 # remote code (CLAUDE.md supply-chain rule). WHEN YOU EDIT connectivity-anchor-
 # bootstrap.sh: commit it, then update BOTH the commit SHA in the URL and the digest
 # below (`git show <sha>:scripts/connectivity-anchor-bootstrap.sh | shasum -a 256`).
-_CONN_ANCHOR_BOOTSTRAP_COMMIT = '1e2d5e85f65dd7ca0b9891e9daab650353ad7304'
-_CONN_ANCHOR_BOOTSTRAP_SHA256 = '32a5b17458f0a8bcd97141464c9754ef05b9afb2d0d03f59577f738b9db61142'
+_CONN_ANCHOR_BOOTSTRAP_COMMIT = 'ff8c12efd2a3a710f50f602d9ebc3cc173b0ffe5'
+_CONN_ANCHOR_BOOTSTRAP_SHA256 = '6f51526762ed0ab4133772d49ca30bc2a84c5c39f47bf5f42ab233c18a70b741'
 _CONN_ANCHOR_BOOTSTRAP_RAW = ('https://raw.githubusercontent.com/takwerx/infra-TAK/'
                               + _CONN_ANCHOR_BOOTSTRAP_COMMIT
                               + '/scripts/connectivity-anchor-bootstrap.sh')
@@ -21163,6 +22154,7 @@ def guarddog_page():
         {'id': 'takportal', 'name': 'TAK Portal', 'monitored': modules.get('takportal', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'takportal_ctr', 'interval': '1 min', 'desc': 'Checks TAK Portal container is running. Alert and auto-restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'mediamtx', 'name': 'MediaMTX', 'monitored': modules.get('mediamtx', {}).get('installed'), 'monitors': [{'name': 'Service', 'id': 'mediamtx_svc', 'interval': '1 min', 'desc': 'Checks systemd mediamtx. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'tak_video_restreamer', 'name': 'TAK Video Restreamer', 'monitored': modules.get('tak_video_restreamer', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'tvr_http', 'interval': '1 min', 'desc': 'Checks tak-video-restreamer container health (GET /login on port 3100). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
+        {'id': 'meshrelay', 'name': 'MeshRelay', 'monitored': modules.get('meshrelay', {}).get('installed'), 'monitors': [{'name': 'Service / login / dashboard', 'id': 'meshrelay_http', 'interval': '1 min', 'desc': 'Checks the ptt-server service is running, the dashboard answers on its loopback port, and config.json still requires a login (auth_enabled true) and keeps the dashboard on 127.0.0.1 (web_bind). Fails if anyone turns the login off or opens the dashboard port to the outside.'}]},
         {'id': 'simulator', 'name': 'TAK Simulator', 'monitored': modules.get('simulator', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'simulator_ctr', 'interval': '1 min', 'desc': 'Checks the tak-simulator container is running (liveness only). A scenario that is not running is normal and never alerts.'}]},
         {'id': 'nodered', 'name': 'Node-RED', 'monitored': modules.get('nodered', {}).get('installed'), 'monitors': [{'name': 'Container / HTTP', 'id': 'nodered_http', 'interval': '1 min', 'desc': 'Checks Node-RED HTTP (1880). Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops.'}]},
         {'id': 'cloudtak', 'name': 'CloudTAK', 'monitored': modules.get('cloudtak', {}).get('installed'), 'monitors': [{'name': 'Container', 'id': 'cloudtak_ctr', 'interval': '1 min', 'desc': "Checks CloudTAK container. Alert and restart after 3 failures. 15 min boot skip + cooldown to avoid restart loops. Also repairs CloudTAK by itself when it was recreated without the infra-TAK settings (e.g. by a TAK Portal marketplace install), at most 3 times an hour; emails only if that repair does not work."}]},
@@ -23865,6 +24857,49 @@ def _f2b_sshd_logpath():
     return ''
 
 
+def _f2b_sshd_section_logpath_to_journal(text, exists=None):
+    """Rewrite a dead `logpath` of the [sshd] jail, and only that jail (ops #1342).
+
+    Returns (new_text, changed). Only lines inside the `[sshd]` section are touched: a
+    `logpath` whose file is missing becomes `backend  = systemd`, and the `backend = auto`
+    that came with it (_f2b_pin_file_backend) is dropped so the section names one backend.
+    Every other section in the same file (another jail, [DEFAULT]) keeps its own
+    `logpath` and `backend` lines, even when its file is missing: those jails tail files
+    that may be absent until their module is deployed. Before this the check was
+    `'[sshd]' in text` for the whole file, then every missing `logpath` in it was rewritten."""
+    exists = exists or os.path.exists
+    out, section, hit = [], None, False
+
+    for line in text.splitlines(True):
+        sm = re.match(r'^\s*\[([^\]]+)\]\s*$', line)
+        if sm:
+            section = sm.group(1).strip()
+            out.append(line)
+            continue
+        if section == 'sshd':
+            m = re.match(r'^\s*logpath\s*=\s*(\S+)\s*$', line)
+            if m and not exists(m.group(1)):
+                if not hit:
+                    out.append('backend  = systemd\n')   # journal instead of a dead file
+                hit = True
+                continue
+        out.append(line)
+    if not hit:
+        return text, False
+    # Drop the file backend(s) of the [sshd] section; ours stays. Done in a second pass
+    # because a `backend = auto` line can come before or after the logpath line.
+    final, section = [], None
+    for line in out:
+        sm = re.match(r'^\s*\[([^\]]+)\]\s*$', line)
+        if sm:
+            section = sm.group(1).strip()
+        elif (section == 'sshd' and line != 'backend  = systemd\n'
+              and re.match(r'^\s*backend\s*=', line)):
+            continue
+        final.append(line)
+    return ''.join(final), True
+
+
 def _f2b_selfheal_sshd_backend(plog=None):
     """Repair an sshd jail pointing at a syslog file this box does not have.
 
@@ -23895,21 +24930,10 @@ def _f2b_selfheal_sshd_backend(plog=None):
             continue
         if '[sshd]' not in text:
             continue
-        out, hit = [], False
-        for line in text.splitlines(True):
-            m = re.match(r'^\s*logpath\s*=\s*(\S+)\s*$', line)
-            if m and not os.path.exists(m.group(1)):
-                out.append('backend  = systemd\n')   # journal instead of a dead file
-                hit = True
-            else:
-                out.append(line)
+        new_text, hit = _f2b_sshd_section_logpath_to_journal(text)
         if hit:
-            # The jail now has one source, the journal. Drop the `backend = auto` that came
-            # with the logpath (_f2b_pin_file_backend) so the file names one backend only.
-            out = [l for l in out if l == 'backend  = systemd\n'
-                   or not re.match(r'^\s*backend\s*=', l)]
             try:
-                _write_priv(path, ''.join(out))
+                _write_priv(path, new_text)
                 changed.append(os.path.basename(path))
             except Exception as e:
                 _log(f"fail2ban self-heal: could not rewrite {path}: {e}")
@@ -23943,6 +24967,20 @@ def _f2b_selfheal_sshd_backend(plog=None):
 # the jail as configured. A security control that cannot fire must never be
 # reachable by a code path that leaves no trace.
 _F2B_OWNED_FILTERS = {
+    'meshrelay-auth': (
+        "[Definition]\n"
+        "# ops #973 — MeshRelay phone logins. Read from the app's own source (server.go, v4.6.0):\n"
+        "#     Auth failed: unknown user NAME from 1.2.3.4:5000\n"
+        "#     Auth failed: wrong password for user NAME from 1.2.3.4:5000\n"
+        "#     JOIN rejected: NAME from 1.2.3.4:5000 (not authenticated)\n"
+        "# Phones talk UDP straight to the app (no proxy), so this is the real client address.\n"
+        "# NAME is typed by the sender and can contain anything, so the address is taken from the\n"
+        "# END of the line: the app writes it last and the pattern is anchored there, so a name\n"
+        "# like 'x from 8.8.8.8:1' cannot make the jail ban someone else.\n"
+        "failregex = ^.*Auth failed: (?:unknown user|wrong password for user) .* from <HOST>:\\d+\\s*$\n"
+        "            ^.*JOIN rejected: .* from <HOST>:\\d+ \\(not authenticated\\)\\s*$\n"
+        "ignoreregex =\n"
+    ),
     'clientfeed': (
         "[Definition]\n"
         "# v10.1.77 — TAK Client Feed. The producer is _clientfeed_log_failure() in app.py,\n"
@@ -26085,6 +27123,21 @@ def fail2ban_status_api():
         return jsonify({'available': False, 'error': str(e)[:200]})
 
 
+@app.route('/api/fail2ban/ban-summary', methods=['GET', 'POST'])
+@login_required
+def fail2ban_ban_summary_api():
+    """ops #1395: the opt-in daily ban summary mail. Default OFF. Routine bans are never
+    mailed one by one; this is the only ban mail an owner can ask for. The ban notifier
+    (infratak-f2b-notify) reads settings.f2b_daily_summary on every ban."""
+    s = load_settings()
+    if request.method == 'POST':
+        data = request.get_json(force=True, silent=True) or {}
+        s['f2b_daily_summary'] = bool(data.get('enabled', False))
+        save_settings(s)
+    return jsonify({'ok': True, 'enabled': bool(s.get('f2b_daily_summary', False)),
+                    'alert_email_set': bool((s.get('guarddog_alert_email') or '').strip())})
+
+
 @app.route('/api/fail2ban/authentik/config', methods=['POST'])
 @login_required
 def fail2ban_authentik_toggle_api():
@@ -26828,6 +27881,95 @@ def _f2b_disarm_clientfeed_jail():
             subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
                            capture_output=True, text=True, timeout=45)
             removed = True
+        return (True, 'jail removed' if removed else 'no jail present')
+    except Exception as e:
+        return (False, 'jail removal failed: %s' % str(e)[:200])
+
+
+# ops #973 — MeshRelay phone-login jail. Fleet constants, not a UI knob. A phone that fails a
+# login 10 times in 10 minutes is a guesser; a typo or two is not.
+MESHRELAY_F2B_MAXRETRY = 10
+MESHRELAY_F2B_FINDTIME = 600
+MESHRELAY_F2B_BANTIME = 3600
+
+
+# ops #973 (Security, ops #980): phones talk UDP, and a UDP source address can be forged, so a
+# line like "Auth failed ... from <victim ip>" can be made by anyone. The jail therefore never
+# blocks: its only action writes a Guard Dog log line. (A name with a new line can fake a whole
+# journal line too.) Ryan is asked to log names with %q; until then nothing here can cut off a
+# real phone.
+MESHRELAY_F2B_ACTION = 'infratak-meshrelay-alert'
+MESHRELAY_F2B_ACTION_PATH = '/etc/fail2ban/action.d/infratak-meshrelay-alert.conf'
+_MESHRELAY_ALERT_ACTION = (
+    "[Definition]\n"
+    "# Alert only. No iptables, no block: the sender address of a UDP packet can be forged.\n"
+    "actionban  = mkdir -p /var/log/takguard"
+    " && echo \"`/bin/date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ`"
+    " | fail2ban: Alert only, nothing blocked: many failed MeshRelay phone logins name <ip>"
+    " (the address may be forged)\""
+    " >> /var/log/takguard/restarts.log\n"
+    "actionunban =\n"
+)
+
+
+def _f2b_arm_meshrelay_jail(log_fn=None):
+    """Write the meshrelay-auth filter + alert-only jail, reload fail2ban, check it loaded.
+    (ok, message).
+
+    Reads the ptt-server journal (no log file to prepare, no Caddy change, so nothing here can
+    stop Caddy). It never blocks anyone: see the note above MESHRELAY_F2B_ACTION. fail2ban
+    missing is not an error: MeshRelay works, it is just unwatched, and the message says so."""
+    if not _f2b_is_available():
+        return (False, 'fail2ban is not installed — MeshRelay works, but repeated bad phone '
+                       'logins raise no alert. Deploy the fail2ban module to arm it.')
+    try:
+        _makedirs_priv('/etc/fail2ban/filter.d', exist_ok=True)
+        _makedirs_priv('/etc/fail2ban/jail.d', exist_ok=True)
+        _makedirs_priv('/etc/fail2ban/action.d', exist_ok=True)
+        _write_priv('/etc/fail2ban/filter.d/meshrelay-auth.conf', _F2B_OWNED_FILTERS['meshrelay-auth'])
+        _write_priv(MESHRELAY_F2B_ACTION_PATH, _MESHRELAY_ALERT_ACTION)
+        jail_conf = (
+            "[meshrelay-auth]\n"
+            "enabled  = true\n"
+            "filter   = meshrelay-auth\n"
+            "backend  = systemd\n"
+            "journalmatch = _SYSTEMD_UNIT=ptt-server.service\n"
+            f"maxretry = {MESHRELAY_F2B_MAXRETRY}\n"
+            f"findtime = {MESHRELAY_F2B_FINDTIME}\n"
+            f"bantime  = {MESHRELAY_F2B_BANTIME}\n"
+            f"ignoreip = {_f2b_trusted_ignoreip()}\n"
+            f"action   = {MESHRELAY_F2B_ACTION}\n"
+        )
+        _write_priv('/etc/fail2ban/jail.d/infratak-meshrelay-auth.conf', jail_conf)
+        r = subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']),
+                           capture_output=True, text=True, timeout=45)
+        if r.returncode != 0:
+            return (False, 'jail written but fail2ban reload failed: %s' % ((r.stderr or r.stdout or '')[:160]))
+        v = subprocess.run(_sudo_wrap(['fail2ban-client', 'status', 'meshrelay-auth']),
+                           capture_output=True, text=True, timeout=20)
+        if v.returncode != 0:
+            return (False, 'jail written and fail2ban reloaded, but the jail did not load: %s'
+                    % ((v.stderr or v.stdout or '')[:160]))
+        return (True, 'alert-only jail armed and loaded (%d failures in %ds raise one Guard Dog alert '
+                      'per address per %ds; nobody is blocked)'
+                % (MESHRELAY_F2B_MAXRETRY, MESHRELAY_F2B_FINDTIME, MESHRELAY_F2B_BANTIME))
+    except Exception as e:
+        return (False, 'jail setup failed: %s' % str(e)[:200])
+
+
+def _f2b_disarm_meshrelay_jail():
+    """Remove the meshrelay-auth jail + filter and reload. (ok, message)."""
+    if not _f2b_is_available():
+        return (True, 'fail2ban not installed — nothing to remove')
+    try:
+        removed = _f2b_remove_jail('infratak-meshrelay-auth.conf', 'MeshRelay uninstalled')
+        fpath = '/etc/fail2ban/filter.d/meshrelay-auth.conf'
+        for gone in (fpath, MESHRELAY_F2B_ACTION_PATH):
+            if _exists_priv(gone):
+                subprocess.run(_sudo_wrap(['rm', '-f', gone]), capture_output=True, timeout=10)
+                removed = True
+        if removed:
+            subprocess.run(_sudo_wrap(['fail2ban-client', 'reload']), capture_output=True, text=True, timeout=45)
         return (True, 'jail removed' if removed else 'no jail present')
     except Exception as e:
         return (False, 'jail removal failed: %s' % str(e)[:200])
@@ -28320,6 +29462,9 @@ def fail2ban_uninstall_api():
             '/etc/fail2ban/action.d/infratak-guarddog-takserver.conf',
             '/etc/systemd/system/authentik-log-forwarder.service',
             '/usr/local/sbin/infratak-f2b-notify',
+            '/var/lib/fail2ban/infratak-f2b-notify-state.json',
+            '/var/lib/fail2ban/infratak-f2b-notify-state.json.lock',
+            '/var/lib/fail2ban/infratak-f2b-notify-state.json.tmp',
         ]:
             subprocess.run(_sudo_wrap(['rm', '-f', path]), capture_output=True)  # v10.0.5 non-root
         subprocess.run(_sudo_wrap(['systemctl', 'daemon-reload']), capture_output=True)
@@ -28469,6 +29614,7 @@ def _guarddog_service_monitor_ids(settings):
         'takportal': ['takportal_ctr'],
         'mediamtx': ['mediamtx_svc'],
         'tak_video_restreamer': ['tvr_http'],
+        'meshrelay': ['meshrelay_http'],
         'simulator': ['simulator_ctr'],
         'nodered': ['nodered_http'],
         'cloudtak': ['cloudtak_ctr'],
@@ -28501,6 +29647,8 @@ def _guarddog_monitored_service_ids(settings):
         ids.append('tak_video_restreamer')
     if modules.get('simulator', {}).get('installed'):
         ids.append('simulator')
+    if modules.get('meshrelay', {}).get('installed'):
+        ids.append('meshrelay')
     if modules.get('nodered', {}).get('installed'):
         ids.append('nodered')
     if modules.get('cloudtak', {}).get('installed'):
@@ -29161,6 +30309,18 @@ def _monitor_health_check(monitor_id):
                 req = urllib.request.Request('http://127.0.0.1:3100/login', method='GET')
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     return resp.status == 200
+            except Exception:
+                return False
+        if monitor_id == 'meshrelay_http':
+            # ops #973: running, dashboard up, the login still required (auth_enabled true) and the
+            # dashboard bound to loopback (web_bind). Also drops a first admin password that is
+            # 24 hours old: this check runs every half minute, so it does not wait for a page view.
+            try:
+                try:
+                    mod_registry.meshrelay.expire_first_password(mod_registry.get_ctx())
+                except Exception:
+                    pass
+                return bool(mod_registry.meshrelay.health(mod_registry.get_ctx())[0])
             except Exception:
                 return False
         if monitor_id == 'simulator_ctr':
@@ -31560,7 +32720,7 @@ def _tak_messaging_starts():
     return int(s) if s.isdigit() else 0
 
 
-def _tak_db_refresh_backup(pgbin, pw, say, stamp):
+def _tak_db_refresh_backup(pgbin, pw, say, stamp, prefix='pre-dbrefresh'):
     """(path, '') of a backup of the `cot` database, or ('', why). Container installs have no
     PostgreSQL client on the host (the broker's pg_restore op answers "not found on trusted PATH": field
     test, ARM box, Nov 14), so the whole proof runs INSIDE the database container: `pg_dump -Fc`, then
@@ -31582,7 +32742,7 @@ def _tak_db_refresh_backup(pgbin, pw, say, stamp):
             or int(nums[0]) <= 0 or int(nums[1]) <= 0:
         return '', 'pg_restore could not read the dump back'
     toc, size = int(nums[0]), int(nums[1])
-    dest_dir = os.path.join(TAK_DOCKER_ROOT, 'snapshots', f'pre-dbrefresh-{stamp}')
+    dest_dir = os.path.join(TAK_DOCKER_ROOT, 'snapshots', f'{prefix}-{stamp}')
     dest = os.path.join(dest_dir, 'cot.pgdump')
     try:
         os.makedirs(dest_dir, mode=0o700, exist_ok=True)
@@ -32299,6 +33459,7 @@ _MODULE_UPDATE_ROWS = (
     ('tak_video_restreamer', 'TAK Video Restreamer', None, False,
      'TAK Video Restreamer page → Update Now.'),
     ('simulator', 'TAK Simulator', None, False, 'TAK Simulator page → Rebuild Now.'),
+    ('meshrelay', 'MeshRelay', None, False, 'MeshRelay page → Update.'),
 )
 
 
@@ -32324,6 +33485,8 @@ def _module_update_info(key):
         return mod_registry.tvr.get_version_info(mod_registry.get_ctx())
     if key == 'simulator':
         return mod_registry.simulator.get_version_info(mod_registry.get_ctx())
+    if key == 'meshrelay':
+        return mod_registry.meshrelay.get_version_info(mod_registry.get_ctx())
     return {}
 
 
@@ -34552,6 +35715,105 @@ def _fedhub_copy_file(cfg, src, dst_dir, timeout=300):
         return False, str(e)
 
 
+_FEDHUB_KEEP_UPDATE_BACKUPS = 3      # ops #1339: newest pre-update backups kept on the hub host
+
+
+def _fedhub_cert_files_present(names):
+    """ops #1339 — the names in a hub's certs/files that mean "this hub already has certificates".
+
+    Any keystore (.jks), PKCS12 (.p12) or CA file (ca.pem, root-ca.pem) counts. The old test
+    looked only for <hostname>.jks, so a hub whose keystore has another name (a manual install
+    keeps the vendor name takserver.jks; a renamed host keeps the old host name) was taken for a
+    hub with no certificates and its CA was made again."""
+    return sorted(n for n in names if n.lower().endswith(('.jks', '.p12')) or n in ('ca.pem', 'root-ca.pem'))
+
+
+def _fedhub_read_state(cfg, fh_dir):
+    """ops #1339 — read what a Federation Hub host already holds, before anything is changed.
+
+    Returns a dict: `error` (text, empty when fine), `has_hub` (the folder exists and is not
+    empty), `cert_names` (files in certs/files that are certificates, see
+    _fedhub_cert_files_present), `keystores` (keystoreFile names the hub config points at),
+    `sso_flag` ('true', 'false' or None: the hub's own allowOauth line), `sources` (which of
+    certs/files, certs/cert-metadata.sh, configs, policies exist, for the backup).
+    A listing that fails for a reason other than "no such folder" is an error: the caller stops
+    rather than guess that the hub has no certificates."""
+    st = {'error': '', 'has_hub': False, 'cert_names': [], 'keystores': [], 'sso_flag': None, 'sources': []}
+    q = shlex.quote
+
+    def _ls(path):
+        ok, out = _module_run(cfg, f'sudo ls -1A {q(path)} 2>&1', timeout=30)
+        text = (out or '').strip()
+        if ok:
+            return [n for n in text.splitlines() if n and not n.startswith('ls: ')], ''
+        if 'No such file or directory' in text:
+            return [], ''
+        if _fedhub_sudo_refused(text):
+            return None, 'sudo asked for a password'
+        return None, (text.splitlines()[-1] if text else 'listing failed')[:200]
+
+    top, err = _ls(fh_dir)
+    if top is None:
+        st['error'] = f'could not read {fh_dir}: {err}'
+        return st
+    st['has_hub'] = bool(top)
+    if not top:
+        return st
+    if 'certs' in top:
+        certs, err = _ls(f'{fh_dir}/certs')
+        if certs is None:
+            st['error'] = f'could not read {fh_dir}/certs: {err}'
+            return st
+        if 'cert-metadata.sh' in certs:
+            st['sources'].append('certs/cert-metadata.sh')
+        if 'files' in certs:
+            files, err = _ls(f'{fh_dir}/certs/files')
+            if files is None:
+                st['error'] = f'could not read {fh_dir}/certs/files: {err}'
+                return st
+            st['sources'].append('certs/files')
+            st['cert_names'] = _fedhub_cert_files_present(files)
+    if 'configs' in top:
+        st['sources'].append('configs')
+        ok, out = _module_run(
+            cfg, f'sudo grep -hE "^(keystoreFile|allowOauth):" '
+                 f'{q(fh_dir + "/configs/federation-hub-broker.yml")} '
+                 f'{q(fh_dir + "/configs/federation-hub-ui.yml")} 2>&1', timeout=30)
+        for ln in (out or '').splitlines():
+            m = re.match(r'^keystoreFile:\s*(\S+)', ln)
+            if m:
+                st['keystores'].append(os.path.basename(m.group(1).strip('"\'')))
+                continue
+            m = re.match(r'^allowOauth:\s*(\S+)', ln)
+            if m:
+                st['sso_flag'] = m.group(1).strip('"\'').lower()
+            elif 'Permission denied' in ln:
+                st['error'] = f'could not read the hub config: {ln[:160]}'
+                return st
+    if 'policies' in top:
+        st['sources'].append('policies')
+    return st
+
+
+def _fedhub_backup_cmd(fh_dir, ts, sources):
+    """ops #1339 — shell command: copy the hub's certificates, config and policies aside before an
+    Update. The folder is root-only (it holds the CA keys). Only the newest few are kept.
+    certs/backups is not copied (older Rotate CA sets live there and would grow without end).
+    Uses cp -a, mkdir and chmod, the commands the non-root console's broker already routes."""
+    q = shlex.quote
+    dest = f'backups/pre-update-{ts}'
+    parts = [f'cd {q(fh_dir)}', 'sudo mkdir -p backups', 'sudo chmod 700 backups',
+             f'sudo mkdir {dest}', f'sudo chmod 700 {dest}']
+    if any(s.startswith('certs/') for s in sources):
+        parts.append(f'sudo mkdir {dest}/certs')
+    for s in sources:
+        parts.append(f'sudo cp -a {q(s)} {dest}/{"certs/" if s.startswith("certs/") else ""}')
+    # best effort: a failed prune must never fail the update
+    parts.append(f'(sudo sh -c "ls -1dr backups/pre-update-* 2>/dev/null | tail -n +{_FEDHUB_KEEP_UPDATE_BACKUPS + 1}'
+                 f' | xargs -r rm -rf" || true)')
+    return ' && '.join(parts)
+
+
 def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deploy'):
     """Install/update Federation Hub .deb on local or remote target; register console when successful."""
     def plog(msg):
@@ -34600,6 +35862,33 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             status_dict.update({'running': False, 'complete': True, 'error': True})
             return
         plog(f'Package: {deb_fn}')
+        # ops #1339 — look at what the hub already holds BEFORE the package or any script touches it:
+        # (1) a hub that has certificates keeps them (the old test knew only <hostname>.jks),
+        # (2) the operator's allowOauth stays as set, (3) certificates, config and policies are
+        # copied aside first. If the host cannot be read, stop: nothing has changed yet.
+        fh_dir = '/opt/tak/federation-hub'
+        hub_was_registered = bool(cfg.get('deployed'))
+        hub_state = _fedhub_read_state(cfg, fh_dir)
+        # A registered hub keeps its own allowOauth unless it is already on (then the Authentik
+        # client details are re-synced as before). Only a first deploy turns it on by itself.
+        oauth_left_alone = hub_was_registered and hub_state['has_hub'] and hub_state['sso_flag'] != 'true'
+        if hub_state['error']:
+            plog(f"✗ {hub_state['error']}")
+            plog('✗ Stopped before any change: the update will not guess whether this hub has certificates.')
+            status_dict.update({'running': False, 'complete': True, 'error': True})
+            return
+        if hub_state['has_hub']:
+            if hub_state['cert_names']:
+                plog(f"  Certificates found on the hub ({len(hub_state['cert_names'])} files): they stay as they are.")
+            if hub_state['sources']:
+                bk_ts = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+                ok_bk, bk_out = _module_run(cfg, _fedhub_backup_cmd(fh_dir, bk_ts, hub_state['sources']), timeout=120)
+                if not ok_bk:
+                    plog(f'✗ Could not copy the hub certificates and config aside: {(bk_out or "")[-300:].strip()}')
+                    plog('✗ Stopped before any change. Free disk space on the hub host and try again.')
+                    status_dict.update({'running': False, 'complete': True, 'error': True})
+                    return
+                plog(f'✓ Backup of {", ".join(hub_state["sources"])} saved in {fh_dir}/backups/pre-update-{bk_ts} (root only)')
         if is_remote:
             plog('━━━ Apt lock cleanup on target ━━━')
             _ok_u, out_u = _module_run(cfg, _fedhub_remote_apt_unlock_cmd(), timeout=90)
@@ -34769,7 +36058,17 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
             f'sudo -u tak ./makeCert.sh server {shlex.quote(remote_hostname)} 2>&1 && '
             f'echo y | sudo -u tak ./makeCert.sh client webadmin-fed 2>&1'
         )
-        ok_cert, cert_out = _module_run(cfg, cert_cmds, timeout=120)
+        if hub_state['cert_names']:
+            # ops #1339: the hub already has certificates (any keystore or CA file, whatever its
+            # name). Making them again would replace the hub's CA and break federation trust.
+            ok_cert, cert_out = True, 'CERTS_EXIST'
+            _kn = [k for k in hub_state['keystores'] if k]
+            _missing = [k for k in _kn if k not in hub_state['cert_names']]
+            if _missing:
+                plog(f"⚠ The hub config names keystore {', '.join(sorted(set(_missing)))} but it is not in "
+                     f"{fh_dir}/certs/files. Nothing was regenerated; use Rotate CA to make a new set.")
+        else:
+            ok_cert, cert_out = _module_run(cfg, cert_cmds, timeout=120)
         if cert_out:
             plog(cert_out[-3000:] if len(cert_out) > 3000 else cert_out)
         if not ok_cert:
@@ -34854,6 +36153,9 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                 if not reachable:
                     plog(f'⚠ Skipping auto OAuth enable: Authentik API unreachable ({ak_err})')
                 else:
+                    if oauth_left_alone:
+                        plog(f"✓ Hub sign-in with Authentik left as it was set on the hub (allowOauth: {hub_state['sso_flag'] or 'not set'}). "
+                             f'Use "Enable Authentik login" to turn it on.')
                     client_id, client_secret, _auth_url, _token_url = _ensure_authentik_fedhub_oauth_app(
                         settings, plog=plog
                     )
@@ -34883,7 +36185,7 @@ def _fedhub_run_remote_package_install(log_list, status_dict, phase_label='Deplo
                     else:
                         plog('⚠ keycloak.der generation failed (OAuth may fail until fixed)')
 
-                    if client_id and client_secret:
+                    if client_id and client_secret and not oauth_left_alone:
                         patch_cmd = (
                             f'cd {fh_dir}/configs && '
                             f'sudo sed -i -E "/^keycloak(Auth|Token)Endpoint[[:space:]]*:/d; /^keycloak(Access|Refresh)TokenName[[:space:]]*:/d" federation-hub-ui.yml && '
@@ -38446,6 +39748,7 @@ SERVICE_DOMAIN_DEFAULTS = {
     'netbird': 'netbird',
     'remote_assist': 'remote',
     'atlas': 'atlas',
+    'meshrelay': 'meshrelay',
 }
 
 def _get_service_domain(settings, service_key):
@@ -44169,6 +45472,32 @@ def _nodered_no_sso_lines(nodered_up, login):
             '    }']
 
 
+def _caddy_save_first_copy(prev_text):
+    """Keep the Caddyfile an operator had before infra-TAK first replaced it (ops #1343).
+
+    generate_caddyfile() rewrites the generated part of the file and keeps only what sits
+    below CADDYFILE_USER_BLOCKS_MARKER, so a hand edit above the marker, or a hand-written
+    file with no marker at all, was lost and the only copy was in memory.
+    One copy, written once: an existing copy is never replaced, so it stays the oldest file
+    we saw. The one exception is a file with no marker: that is a hand-written file (never
+    ours), so it is saved even when an older copy exists. Never raises: a failed copy must
+    not stop the regenerate. Returns True when it wrote the copy."""
+    try:
+        text = prev_text.decode('utf-8', 'replace') if isinstance(prev_text, (bytes, bytearray)) else prev_text
+        if not (text or '').strip():
+            return False
+        if CADDYFILE_USER_BLOCKS_MARKER in text:
+            try:
+                _read_priv(CADDYFILE_FIRST_COPY_PATH)
+                return False                    # already holds the oldest copy
+            except Exception:
+                pass
+        _write_priv(CADDYFILE_FIRST_COPY_PATH, text, perm=0o644)
+        return True
+    except Exception:
+        return False
+
+
 def generate_caddyfile(settings=None):
     """Generate Caddyfile based on current settings and deployed services.
     Each service gets its own domain (customizable per-service, defaults to subdomain of base FQDN)."""
@@ -44812,6 +46141,20 @@ def generate_caddyfile(settings=None):
         lines.append("")
         _emit_alias_redirect(_get_service_alias(settings, 'tak_video_restreamer'), tvr_host)
 
+    mr_mod = modules.get('meshrelay', {})
+    if mr_mod.get('installed'):
+        # ops #973: MeshRelay dashboard. Phones use UDP 5000 only, so the whole HTTP host sits
+        # behind Authentik; the app keeps its own login as well. Without Authentik the host
+        # answers 503: the dashboard is never published bare.
+        mr_host = sd.get('meshrelay') or _get_service_domain(settings, 'meshrelay')
+        mr_fa = []
+        if ak:
+            mr_fa = _caddy_forward_auth_lines(ak_up, "        ", app=_fa_app(mr_host))
+        mod_registry.meshrelay.append_caddy_vhost(
+            lines, mr_host, bool(ak), ak_up, _CADDY_STRIP_AUTHENTIK_HEADERS,
+            _emit_outpost_callback_rescue, f"{_pub_url(mr_host, settings)}/", mr_fa)
+        _emit_alias_redirect(_get_service_alias(settings, 'meshrelay'), mr_host)
+
     nb_mod = modules.get('netbird', {})
     if nb_mod.get('installed'):
         nb_host = sd.get('netbird') or _get_service_domain(settings, 'netbird')
@@ -45117,6 +46460,7 @@ def generate_caddyfile(settings=None):
             _caddy_prev = _read_priv(CADDYFILE_PATH)
     except Exception:
         _caddy_prev = None
+    _caddy_save_first_copy(_caddy_prev)      # ops #1343: before the write, or nothing is left to save
     _write_priv(CADDYFILE_PATH, caddyfile)
     # Ask Caddy whether what we just wrote is actually loadable, BEFORE any of the 48
     # `systemctl reload caddy` sites acts on it. A rejected config is restored here rather
@@ -46968,6 +48312,76 @@ def _ak_resolved_authentik_tags(ak_dir=None):
     return True, _ak_tags_from_text(_r.stdout or ''), ''
 
 
+# ops #1322: ONE read-only SSH call that says which Authentik a REMOTE host has. Constant text, no
+# operator input in it. `[[:space:]]` and not `[ \t]`: inside a grep bracket `\t` is a backslash and
+# a `t`, not a tab. Every line it prints starts AKREAD_ so a login banner cannot be mistaken for it.
+_AK_REMOTE_READ_CMD = (
+    "if cd ~/authentik 2>/dev/null; then "
+    "echo \"AKREAD_RUN=$(docker ps --filter name=authentik-server --format '{{.Image}}' 2>/dev/null | head -1)\"; "
+    "if [ -e .env ]; then "
+    "if [ -r .env ]; then echo AKREAD_ENVSTATE=ok; "
+    "echo \"AKREAD_ENV=$(grep -E '^[[:space:]]*AUTHENTIK_TAG[[:space:]]*=' .env 2>/dev/null | tail -1)\"; "
+    "else echo AKREAD_ENVSTATE=unreadable; fi; "
+    "else echo AKREAD_ENVSTATE=missing; fi; "
+    "echo \"AKREAD_COMPOSE=$(grep -oE 'AUTHENTIK_TAG:-[^}]+' docker-compose.yml 2>/dev/null | head -1)\"; "
+    "echo AKREAD_DONE; "
+    "else echo AKREAD_NODIR; fi"
+)
+# YYYY.M.P with an optional -suffix (a release candidate, `-distroless`). All three numbers are
+# required: `2026.8`, `latest` or no tag are floating tags, they can run any later patch, and a tag
+# text that does not say which version runs must never be guessed at.
+_AK_REMOTE_TAG_RE = re.compile(r'^(\d{4})\.(\d{1,2})\.(\d{1,3})(?:-[0-9A-Za-z][0-9A-Za-z.\-]*)?$')
+
+
+def _ak_remote_current_version(remote):
+    """Which Authentik a REMOTE host runs now, read before Update changes anything (ops #1322).
+
+    Returns {'ok': True, 'tag', 'tuple': (year, month, patch), 'what'} or {'ok': False, 'error', 'hint'?}.
+    The RUNNING authentik-server image wins: it is what wrote the database, and a half-finished
+    earlier update (new pin written, old container still up) must still be able to retry. With no
+    container running, what compose would start decides: the `.env` pin when there is one (it
+    overrides the compose default), else the compose default. Anything it cannot read, or that does
+    not name a version, is an error, never a guess. Read-only: no write, no restart."""
+    _host = (remote.get('host') or '').strip()
+    _ok, _out = _ssh_probe(remote, _AK_REMOTE_READ_CMD, timeout=20)
+    if not _ok:
+        return {'ok': False, 'error': f'could not read {_host} over SSH ({(_out or "no answer").strip()[:160]})'}
+    _f = {}
+    for _line in (_out or '').splitlines():
+        if _line.startswith('AKREAD_'):
+            _k, _, _v = _line.partition('=')
+            _f[_k.strip()] = _v.strip()
+    if 'AKREAD_NODIR' in _f:
+        return {'ok': False, 'error': f'there is no ~/authentik folder on {_host}'}
+    if 'AKREAD_DONE' not in _f:
+        return {'ok': False, 'error': f'the read of {_host} did not finish'}
+    _running = _f.get('AKREAD_RUN', '')
+    if _running:
+        _tag = _running.rsplit(':', 1)[1] if ':' in _running else ''
+        _what = 'the running server image'
+    elif _f.get('AKREAD_ENVSTATE') == 'unreadable':
+        return {'ok': False, 'error': f'Authentik is stopped on {_host} and its .env file cannot be read by the SSH user'}
+    else:
+        _tag = _ak_env_tag(env_txt=_f.get('AKREAD_ENV', ''))
+        _what = 'the .env pin'
+        if not _tag:
+            _m = re.match(r'AUTHENTIK_TAG:-(\S+)', _f.get('AKREAD_COMPOSE', ''))
+            _tag = _m.group(1).strip('"\'').lstrip('vV') if _m else ''
+            _what = 'the compose file pin'
+    _tag = (_tag.split() or [''])[0]       # `2026.8.7 # note` in an .env line: first word only
+    _m = _AK_REMOTE_TAG_RE.match(_tag.lstrip('vV'))
+    if not _m:
+        if not _tag:
+            return {'ok': False, 'error': f'{_host} has no Authentik tag in {_what}'}
+        return {'ok': False,
+                'error': (f'{_what} on {_host} names "{_tag[:40]}", which is not a version number, so '
+                          f'infra-TAK cannot tell whether the update would go backwards'),
+                'hint': 'Set AUTHENTIK_TAG on the host to the version that is really running, '
+                        'then press Update again.'}
+    return {'ok': True, 'tag': _tag.lstrip('vV'), 'tuple': tuple(int(_x) for _x in _m.groups()),
+            'what': _what}
+
+
 def _get_authentik_version_info():
     """Return {version: str, update_available: bool, latest: str|None} for Authentik.
 
@@ -47386,20 +48800,19 @@ def _gh_json_cached(url, timeout=15, ttl=_GH_JSON_TTL):
         return hit['data'] if hit else None
 
 
-def _get_mediamtx_editor_version_info(deploy_cfg):
-    """Return {version: str, update_available: bool, latest: str|None} for MediaMTX web editor (takwerx/mediamtx-installer).
-    Current from CURRENT_VERSION in /opt/mediamtx-webeditor/mediamtx_config_editor.py on target."""
+def _mediamtx_editor_installed_version(deploy_cfg):
+    """CURRENT_VERSION of the web editor on the target, without a leading v ('2.1.17'), or ''
+    when it cannot be read. Local: through the broker when the console cannot read the file
+    (ops #643). Remote: grep over SSH. Never raises."""
     import re as _re
-    import urllib.request as _ur
-    out = {'version': '', 'update_available': False, 'latest': None}
-    # Current: grep CURRENT_VERSION from editor script on target
+    version = ''
     cmd = 'grep -oE \'CURRENT_VERSION = "[^"]+"\' /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null | head -1'
     if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
         ok, raw = _module_run(deploy_cfg, cmd, timeout=10)
         if ok and raw:
             m = _re.search(r'"([^"]+)"', raw)
             if m:
-                out['version'] = m.group(1).lstrip('vV')
+                version = m.group(1).lstrip('vV')
     else:
         editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
         if os.path.isfile(editor_path):
@@ -47410,10 +48823,21 @@ def _get_mediamtx_editor_version_info(deploy_cfg):
                     if 'CURRENT_VERSION' in line:
                         m = _re.search(r'["\']([vV]?[^"\']+)["\']', line)
                         if m:
-                            out['version'] = m.group(1).lstrip('vV')
+                            version = m.group(1).lstrip('vV')
                         break
             except Exception:
                 pass
+    return version
+
+
+def _get_mediamtx_editor_version_info(deploy_cfg):
+    """Return {version: str, update_available: bool, latest: str|None} for MediaMTX web editor (takwerx/mediamtx-installer).
+    Current from CURRENT_VERSION in /opt/mediamtx-webeditor/mediamtx_config_editor.py on target."""
+    import re as _re
+    import urllib.request as _ur
+    out = {'version': '', 'update_available': False, 'latest': None}
+    # Current: CURRENT_VERSION in the editor script on target (ops #1341: shared reader)
+    out['version'] = _mediamtx_editor_installed_version(deploy_cfg)
     # Latest from takwerx/mediamtx-installer, via TWO independent sources.
     # The releases API is the authority, but it shares one 60/hour unauthenticated
     # budget with 16 other call sites in this file. raw.githubusercontent.com is a
@@ -48000,6 +49424,8 @@ def get_all_module_versions():
     if modules.get('simulator', {}).get('installed'):
         # v10.1.61: engine ships inside the console — 'update' = rebuild on a version change
         _set('simulator', lambda: mod_registry.simulator.get_version_info(mod_registry.get_ctx()))
+    if modules.get('meshrelay', {}).get('installed'):
+        _set('meshrelay', lambda: mod_registry.meshrelay.get_version_info(mod_registry.get_ctx()))
     if modules.get('netbird', {}).get('installed'):
         _set('netbird', _get_netbird_version_info)
     if modules.get('remote_assist', {}).get('installed'):
@@ -51181,12 +52607,22 @@ def mediamtx_deploy_api():
     # marketplace greys the card, but this route is reachable by direct curl.
     # Fails OPEN: a transient detection error must never brick a deploy.
     try:
-        _tvr_installed = detect_modules(fresh=True).get('tak_video_restreamer', {}).get('installed')
+        _mods = detect_modules(fresh=True)
     except Exception:
-        _tvr_installed = False
+        _mods = {}
+    _tvr_installed = _mods.get('tak_video_restreamer', {}).get('installed')
     if _tvr_installed:
         return jsonify({'error': 'Conflicts with TAK Video Restreamer, which is already '
                                  'installed — uninstall it first, then return here.'}), 409
+    # ops #1341: the UI hides Deploy once MediaMTX is installed, but a direct POST still ran the
+    # whole deploy over the live install: a new mediamtx.yml and the pinned binary over the
+    # operator's paths, users and share links. Same fail-open rule: an unreadable detection
+    # never blocks a first deploy. The answer is written before any setting is saved.
+    if _mods.get('mediamtx', {}).get('installed'):
+        return jsonify({'error': 'MediaMTX is already installed, so Deploy is refused: it would '
+                                 'overwrite your live configuration. To repair the web editor use '
+                                 '"Patch web editor" on this page; to start over, remove MediaMTX '
+                                 'first, then deploy again.'}), 409
     data = request.get_json() or {}
     if data.get('config'):
         settings = load_settings()
@@ -51249,6 +52685,94 @@ def _mediamtx_editor_clone_cmd(dest):
             f'[ "$(git -C {d} rev-parse HEAD)" = {shlex.quote(MEDIAMTX_EDITOR_SHA)} ]')
 
 
+def _mediamtx_version_tuple(v):
+    """'v2.1.17', '2.1.17' -> (2, 1, 17). None when it is not a plain x.y.z (a branch name,
+    an empty string, a text we cannot read)."""
+    m = re.fullmatch(r'\s*[vV]?(\d+)\.(\d+)\.(\d+)\s*', str(v or ''))
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _mediamtx_editor_newer_than_pin(installed):
+    """ops #1341: True when the editor on the box (`installed`, from CURRENT_VERSION) is newer
+    than the release this console pins (MEDIAMTX_EDITOR_REF). Patch web editor must leave such
+    an editor alone: it came from the editor's own Upgrade, and the editor owns users.json
+    (hashed since 2.1.15), the share links and the stream visibility. An unreadable version
+    says nothing, so it is False and Patch refreshes the file as it always did."""
+    have, pin = _mediamtx_version_tuple(installed), _mediamtx_version_tuple(MEDIAMTX_EDITOR_REF)
+    return bool(have and pin and have > pin)
+
+
+def _mediamtx_editor_body_problem(body):
+    """None when `body` is a whole web editor file; else a short reason. A 404 page, a captive
+    portal page and a download cut short all fail here (the cut one at the Python parse)."""
+    import ast as _ast
+    if not isinstance(body, str) or not body.strip():
+        return 'the download was empty'
+    try:
+        _ast.parse(body)
+    except (SyntaxError, ValueError):
+        return 'the download was cut short or is not the editor'
+    if 'app = Flask(' not in body or not re.search(r'CURRENT_VERSION\s*=', body):
+        return 'the download is not the MediaMTX web editor'
+    return None
+
+
+_MEDIAMTX_EDITOR_REMOTE_CHECK = ('import ast,sys; s=open(sys.argv[1]).read(); ast.parse(s); '
+                                 'sys.exit(0 if "app = Flask(" in s and "CURRENT_VERSION" in s else 1)')
+
+
+def _mediamtx_editor_remote_fetch_cmd(dest='/opt/mediamtx-webeditor/mediamtx_config_editor.py'):
+    """Shell text (run as root on the remote host): download the pinned editor to a temp file,
+    check it is the whole editor, and only then copy it over the live file. `cat >` keeps the
+    live file's owner and mode. Exit status is the check's: non-zero leaves the old file."""
+    return (f'mkdir -p {shlex.quote(os.path.dirname(dest))} && t=$(mktemp) && {{ '
+            f"curl -fsSL --retry 1 --max-time 40 {shlex.quote(MEDIAMTX_EDITOR_RAW_URL)} -o \"$t\" "
+            f"&& python3 -c {shlex.quote(_MEDIAMTX_EDITOR_REMOTE_CHECK)} \"$t\" "
+            f'&& cat "$t" > {shlex.quote(dest)}; rc=$?; rm -f "$t"; exit $rc; }}')
+
+
+def _mediamtx_editor_refresh(deploy_cfg, is_remote):
+    """Step 1 of Patch web editor (ops #1341): put the pinned editor on the box.
+
+    Returns (refreshed, note, installed_version). `note` is '' when the file was refreshed, else
+    one plain sentence for the operator. It never raises and never leaves a broken file:
+      * an editor NEWER than the pin is kept (the downgrade the old code did);
+      * the download is checked as a whole editor before it replaces anything (the old code
+        wrote a 404 page into the editor file on a remote host, and kept going on a local
+        failure without saying so)."""
+    import urllib.request
+    editor_path = '/opt/mediamtx-webeditor/mediamtx_config_editor.py'
+    installed = _mediamtx_editor_installed_version(deploy_cfg)
+    pin = MEDIAMTX_EDITOR_REF.lstrip('vV')
+    if _mediamtx_editor_newer_than_pin(installed):
+        return False, (f'The web editor was left at v{installed}: it is newer than the v{pin} that '
+                       'this console ships, and refreshing it would take it back. '), installed
+    if is_remote:
+        ok, out = _module_run_root(deploy_cfg, _mediamtx_editor_remote_fetch_cmd(), timeout=100)
+        if ok:
+            return True, '', installed
+        why = ' '.join((out or '').split())[-120:]
+        return False, ('The web editor could not be downloaded and checked, so the file on the box '
+                       'was kept' + (f' ({why})' if why else '') + '. '), installed
+    try:
+        with urllib.request.urlopen(MEDIAMTX_EDITOR_RAW_URL, timeout=60) as r:
+            content = r.read().decode('utf-8')
+        problem = _mediamtx_editor_body_problem(content)
+        if problem:
+            return False, f'The web editor was not refreshed: {problem}. The file on the box was kept. ', installed
+        # v10.0.5 non-root: apply the bind-hardening patches in Python, then write via the
+        # broker (/opt/mediamtx-webeditor is root-owned on root-era installs; the old
+        # open('w') + `sed -i` failed as takwerx, leaving the editor bound to 0.0.0.0).
+        content = (content.replace('port=5000', 'port=5080')
+                          .replace('9997', '9898')
+                          .replace("host='0.0.0.0'", "host='127.0.0.1'"))
+        _write_priv(editor_path, content)
+        return True, '', installed
+    except Exception as e:
+        return False, ('The web editor could not be downloaded (' + type(e).__name__ +
+                       '), so the file on the box was kept. '), installed
+
+
 @app.route('/api/mediamtx/recovery', methods=['POST'])
 @login_required
 def mediamtx_recovery():
@@ -51268,13 +52792,13 @@ def mediamtx_recovery():
         if not _is_remote:
             _restart_after = _mediamtx_editor_reclaim() or []
         # 1) Refresh editor from upstream so we fix corruption / duplicate UI from old or patched copies
-        if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+        # ops #1341: but never over a newer editor (the editor's own Upgrade), and never from a
+        # download that is not a whole editor. The packages, unit, overlay and restart below
+        # still run either way: this button is also how a box missing Flask is repaired.
+        if _is_remote:
             _mediamtx_remote_clear_staging(deploy_cfg)   # ops #890: before any scp into /tmp
-            _module_run_root(
-                deploy_cfg,
-                "mkdir -p /opt/mediamtx-webeditor && curl -sL '" + MEDIAMTX_EDITOR_RAW_URL + "' -o /opt/mediamtx-webeditor/mediamtx_config_editor.py",
-                timeout=90,
-            )
+        _refreshed, _note, _installed = _mediamtx_editor_refresh(deploy_cfg, bool(_is_remote))
+        if _is_remote:
             # v0.9.12: also bind webedit Flask app to 127.0.0.1 (Tier 3 — Caddy
             # is the only legitimate consumer; upstream defaults to 0.0.0.0).
             _module_run_root(
@@ -51284,19 +52808,6 @@ def mediamtx_recovery():
                 "sed -i \"s/host='0\\.0\\.0\\.0'/host='127.0.0.1'/\" /opt/mediamtx-webeditor/mediamtx_config_editor.py 2>/dev/null",
                 timeout=10,
             )
-        else:
-            try:
-                with urllib.request.urlopen(MEDIAMTX_EDITOR_RAW_URL, timeout=60) as r:
-                    content = r.read().decode('utf-8')
-                # v10.0.5 non-root: apply the bind-hardening patches in Python, then write via the
-                # broker (/opt/mediamtx-webeditor is root-owned on root-era installs; the old
-                # open('w') + `sed -i` failed as takwerx, leaving the editor bound to 0.0.0.0).
-                content = (content.replace('port=5000', 'port=5080')
-                                  .replace('9997', '9898')
-                                  .replace("host='0.0.0.0'", "host='127.0.0.1'"))
-                _write_priv(editor_path, content)
-            except Exception:
-                pass  # keep existing file and just re-apply patches
         # 2) Apply endpoint patch only (keep core External Sources rendering unchanged)
         if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
             for name, script in [
@@ -51412,7 +52923,12 @@ def mediamtx_recovery():
         else:
             msg = ('Patch applied and service restarted, but mediamtx-webeditor may still be down. '
                    'Click **Web editor logs** on this page to see why.')
-        return jsonify({'success': True, 'message': msg, 'webeditor_running': active})
+        # ops #1341: say what was NOT done. A kept newer editor or a failed download is a
+        # success of the other steps, but the operator must not read "patched" as "refreshed".
+        if _note:
+            msg = (_note + msg).strip()
+        return jsonify({'success': True, 'message': msg, 'webeditor_running': active,
+                        'editor_refreshed': bool(_refreshed), 'editor_version': _installed})
     except Exception as e:
         return jsonify({'error': str(e)[:200]}), 500
     finally:
@@ -57184,6 +58700,12 @@ _CT_BUCKET_RE = re.compile(r'^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
 _CT_ENV_LINE_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$')
 _CT_GARAGE_ENDPOINT = 'http://store:3900'
 _CT_MINIO_ENDPOINT = 'http://store:9000'
+# ops #1334: the MinIO program that can read ~/CloudTAK/.docker-store is a Docker image that can
+# never be downloaded again. A copy of it is saved in the CloudTAK folder before the first
+# service is stopped, so no prune or half-finished state can leave the files unreadable.
+_CT_LEGACY_IMAGE_TAR = '.minio-legacy-image.tar'
+_CT_MIGRATE_MARGIN = 1024 ** 3        # free space that must remain after the copy (fleet constant)
+_CT_APP_SERVICES = ['api', 'events', 'tiles', 'retention']   # what the migration stops
 
 
 def _cloudtak_compose_is_garage(cloudtak_dir):
@@ -58485,15 +60007,31 @@ def _cloudtak_print_converge(ct_dir, plog=None):
     return result
 
 
+# ops #1334: what makes ~/CloudTAK more than a checkout: the object store's live data. A re-clone
+# deletes the whole tree, so while either folder exists the tree is repaired in place (only .git is
+# replaced) and nothing else is touched. (.env is not listed: Deploy reads it before the repo prep
+# and writes it back with every secret kept, ops #198.)
+_CT_REMOTE_HAS_DATA_SH = "{ [ -d ~/CloudTAK/.docker-garage ] || [ -d ~/CloudTAK/.docker-store ]; }"
+_CT_LOCAL_DATA_NAMES = ('.docker-garage', '.docker-store')
+
+
+def _cloudtak_has_data(ct_dir):
+    """The names of the data folders / key file a CloudTAK tree holds (see _CT_REMOTE_HAS_DATA_SH)."""
+    return [n for n in _CT_LOCAL_DATA_NAMES if os.path.lexists(os.path.join(ct_dir, n))]
+
+
 def _cloudtak_remote_reclone_sh(release_tag=None):
     """Remote Deploy's repo prep: re-clone ~/CloudTAK (the tag) or pull (no tag). The re-clone
     deletes the whole tree, so the operator's docker-compose.custom.yml (GH #261) is moved aside
     first and put back after — it is theirs, and seeding a fresh one would silently drop their
-    services. A failed clone leaves it in ~/.cloudtak-custom-compose.keep for the next run."""
+    services. A failed clone leaves it in ~/.cloudtak-custom-compose.keep for the next run.
+    ops #1334: a tree that holds data (.docker-garage, .docker-store) is never deleted: a
+    broken checkout there is repaired in place."""
     keep = '~/.cloudtak-custom-compose.keep'
     custom = f'~/CloudTAK/{CLOUDTAK_CUSTOM_COMPOSE}'
     save = f'{{ ! [ -e {custom} -o -L {custom} ] || cp -Pp {custom} {keep}; }} && '
     restore = f' && {{ ! [ -e {keep} -o -L {keep} ] || mv -f {keep} {custom}; }}'
+    repo = 'https://github.com/dfpc-coe/CloudTAK.git'
     if release_tag:
         tag = shlex.quote(release_tag)
         # ops #198: a valid checkout is updated IN PLACE, the same as the local Deploy. The tree
@@ -58505,6 +60043,12 @@ def _cloudtak_remote_reclone_sh(release_tag=None):
             f"cd ~/CloudTAK && git fetch --depth 1 origin tag {tag} && git checkout -f {tag} && "
             "cd ~ && test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml; "
             "else ")
+        repair = (
+            f"if {_CT_REMOTE_HAS_DATA_SH}; then "
+            f"cd ~/CloudTAK && rm -rf .git && git init -q && git remote add origin {repo} && "
+            f"git fetch --depth 1 origin tag {tag} && git checkout -f {tag} && "
+            "cd ~ && test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml; "
+            "else ")
         # Stop a stack that is already there before deleting its tree. The Garage store
         # keeps its data in ~/CloudTAK/.docker-garage and restarts 'always': left running,
         # it came back during the rm -rf, Docker re-created the folder, and Garage
@@ -58512,21 +60056,23 @@ def _cloudtak_remote_reclone_sh(release_tag=None):
         # mismatch (ops #33 box test, redeploy over an existing remote install). ops #348: `stop`,
         # not `down` — `down` orphans postgis' anonymous data volume (users reset, ops #346).
         return (
-            inplace +
+            inplace + repair +
             "if [ -f ~/CloudTAK/docker-compose.yml ] || [ -f ~/CloudTAK/compose.yaml ]; then "
             "(cd ~/CloudTAK && docker compose stop) >/dev/null 2>&1 || true; fi; "
             + save +
-            f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {tag} "
-            "https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK" + restore + " && "
+            f"rm -rf ~/CloudTAK && git clone --depth 1 --branch {tag} {repo} ~/CloudTAK" + restore + " && "
             "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml; "
-            "fi"
+            "fi; fi"
         )
     return (
         "if [ -d ~/CloudTAK/.git ]; then "
         "cd ~/CloudTAK && git pull --rebase --autostash; "
+        f"elif {_CT_REMOTE_HAS_DATA_SH}; then "
+        f"cd ~/CloudTAK && rm -rf .git && git init -q && git remote add origin {repo} && "
+        "git fetch --depth 1 origin HEAD && git checkout -f FETCH_HEAD; "
         "else "
         + save +
-        "rm -rf ~/CloudTAK && git clone --depth 1 https://github.com/dfpc-coe/CloudTAK.git ~/CloudTAK"
+        f"rm -rf ~/CloudTAK && git clone --depth 1 {repo} ~/CloudTAK"
         + restore + "; "
         "fi; "
         "test -f ~/CloudTAK/docker-compose.yml -o -f ~/CloudTAK/compose.yaml"
@@ -58574,7 +60120,87 @@ def _cloudtak_legacy_minio_image(cloudtak_dir):
     return ''
 
 
-def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None):
+def _cloudtak_env_parse_text(text):
+    """KEY -> value from the TEXT of a CloudTAK .env (the remote host's, read over SSH)."""
+    out = {}
+    for ln in (text or '').splitlines():
+        m = _CT_ENV_LINE_RE.match(ln.rstrip('\n'))
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def _cloudtak_keep_legacy_image(cloudtak_dir, img, plog, remote_cfg=None):
+    """ops #1334: save the MinIO image into the CloudTAK folder (docker save), once, BEFORE any
+    service is stopped. MinIO can no longer be downloaded, and the image is unused whenever the
+    store container is Garage, so `docker image prune -af` (or a recreate) would delete the only
+    program that can read .docker-store. Best effort: a box that cannot save it still migrates
+    as before. Returns True when a copy is there."""
+    try:
+        if remote_cfg is not None:
+            ok, _ = _ssh_probe(remote_cfg, f"test -s ~/CloudTAK/{_CT_LEGACY_IMAGE_TAR}", timeout=20)
+            if ok:
+                return True
+            ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && docker save -o {_CT_LEGACY_IMAGE_TAR} {shlex.quote(img)}",
+                                 timeout=900)
+        else:
+            tar = os.path.join(cloudtak_dir, _CT_LEGACY_IMAGE_TAR)
+            if os.path.isfile(tar) and os.path.getsize(tar) > 0:
+                return True
+            rc, _o, err = _cloudtak_docker(['docker', 'save', '-o', tar, img], timeout=900)
+            ok, out = rc == 0, err
+        if ok:
+            plog("  ✓ Saved a copy of the MinIO program in ~/CloudTAK (it cannot be downloaded again)")
+        else:
+            plog(f"  ⚠ Could not save a copy of the MinIO program: {(out or '').strip()[-200:]}")
+        return bool(ok)
+    except Exception as e:
+        plog(f"  ⚠ Could not save a copy of the MinIO program: {str(e)[:200]}")
+        return False
+
+
+def _cloudtak_load_legacy_image(cloudtak_dir, plog, remote_cfg=None):
+    """ops #1334: the MinIO image from the copy `_cloudtak_keep_legacy_image()` saved, for a box
+    where Docker no longer holds it. '' when there is no copy or it will not load."""
+    try:
+        if remote_cfg is not None:
+            ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && test -s {_CT_LEGACY_IMAGE_TAR} && "
+                                 f"docker load -i {_CT_LEGACY_IMAGE_TAR}", timeout=600)
+        else:
+            tar = os.path.join(cloudtak_dir, _CT_LEGACY_IMAGE_TAR)
+            if not (os.path.isfile(tar) and os.path.getsize(tar) > 0):
+                return ''
+            rc, out, err = _cloudtak_docker(['docker', 'load', '-i', tar], timeout=600)
+            ok, out = rc == 0, (out or '') + (err or '')
+        if not ok:
+            return ''
+        for ln in (out or '').splitlines():
+            m = re.match(r'^Loaded image:\s*(\S+)\s*$', ln.strip())
+            if m and 'minio' in m.group(1).lower() and _CT_IMAGE_REF_RE.match(m.group(1)):
+                plog(f"  ✓ Loaded the saved MinIO program ({m.group(1)})")
+                return m.group(1)
+    except Exception:
+        pass
+    return ''
+
+
+def _cloudtak_rclone_bytes(out):
+    """Bytes from `rclone size --json` output, or None when it cannot be read."""
+    m = re.search(r'\{[^{}]*"bytes"\s*:\s*(\d+)[^{}]*\}', out or '')
+    return int(m.group(1)) if m else None
+
+
+def _cloudtak_migrate_space_short(need_bytes, free_bytes):
+    """None when `need_bytes` of new files fit in `free_bytes` with the margin left over, else the
+    number of bytes missing. An unreadable number (None) never blocks, as in the Update check."""
+    if need_bytes is None or free_bytes is None:
+        return None
+    short = need_bytes + _CT_MIGRATE_MARGIN - free_bytes
+    return short if short > 0 else None
+
+
+def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None,
+                                      restart_on_fail=False, remote_cfg=None):
     """Copy .docker-store (MinIO) into Garage, verify, archive. Returns (ok, error).
 
     Upstream's `cloudtak.sh migrate-store`, step for step — stop the services that use the
@@ -58582,92 +60208,170 @@ def _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image=None
     MinIO, move .docker-store aside — with one deliberate difference: `rclone copy --update`
     and `check --one-way` instead of `sync`/`check`, so this can never delete or downgrade a
     file already in Garage. On ANY failure .docker-store is left exactly where it was —
-    nothing is archived until the copy verified."""
+    nothing is archived until the copy verified.
+
+    ops #1334: `remote_cfg` runs the same steps on the remote CloudTAK host (upstream's own
+    script does `rclone sync` there). `restart_on_fail=True` starts the services this function
+    stopped again when it fails, for callers that have no rollback of their own (Deploy, Update
+    config, the startup repair); the Update path rolls the whole stack back instead."""
+    remote = remote_cfg is not None
     bucket = env.get('ASSET_BUCKET', '')
     if not _CT_BUCKET_RE.match(bucket):
         return False, 'ASSET_BUCKET is missing or invalid in CloudTAK .env'
     if not env.get('MINIO_ROOT_USER') or not env.get('MINIO_ROOT_PASSWORD'):
         return False, 'MINIO_ROOT_USER / MINIO_ROOT_PASSWORD are missing from CloudTAK .env — the MinIO data cannot be read'
     img = legacy_image if (legacy_image and _CT_IMAGE_REF_RE.match(legacy_image)) else ''
-    img = img or _cloudtak_legacy_minio_image(cloudtak_dir)
+    if not img and not remote:
+        img = _cloudtak_legacy_minio_image(cloudtak_dir)
+    img = img or _cloudtak_load_legacy_image(cloudtak_dir, plog, remote_cfg)
     if not img:
         return False, ('no MinIO image is cached on this box to read .docker-store with, and MinIO can no '
                        'longer be downloaded from any registry. Your files are safe in ~/CloudTAK/.docker-store.')
     env_path = os.path.join(cloudtak_dir, '.env')
-    _cloudtak_env_set(env_path, {'MINIO_LEGACY_IMAGE': img})
+
+    def _env_img(value):
+        """Put MINIO_LEGACY_IMAGE in .env (compose interpolates it), or drop it (value None)."""
+        if not remote:
+            if value:
+                _cloudtak_env_set(env_path, {'MINIO_LEGACY_IMAGE': value})
+            else:
+                _cloudtak_env_set(env_path, remove=('MINIO_LEGACY_IMAGE',))
+            return
+        if value:
+            q = shlex.quote(value)
+            sh = ("cd ~/CloudTAK && if grep -q '^MINIO_LEGACY_IMAGE=' .env; then "
+                  f"sed -i 's|^MINIO_LEGACY_IMAGE=.*|MINIO_LEGACY_IMAGE='{q}'|' .env; else "
+                  "{ [ -z \"$(tail -c1 .env)\" ] || echo >> .env; }; "
+                  f"echo MINIO_LEGACY_IMAGE={q} >> .env; fi")
+        else:
+            sh = "cd ~/CloudTAK && sed -i '/^MINIO_LEGACY_IMAGE=/d' .env"
+        _ssh_probe(remote_cfg, sh, timeout=30)
+
+    def _run(args, timeout=600):
+        return _cloudtak_compose_at(cloudtak_dir, args, remote_cfg=remote_cfg, timeout=timeout)
+
+    _cloudtak_keep_legacy_image(cloudtak_dir, img, plog, remote_cfg)
+    _env_img(img)
     plog(f"  Moving CloudTAK's files from MinIO to Garage (reading them with {img})")
     plog("  CloudTAK is stopped while the files are copied")
     mig = ['--profile', 'migrate']
 
     def _step(label, args, timeout=600):
-        rc, out = _cloudtak_compose_run(cloudtak_dir, args, timeout=timeout)
+        rc, out = _run(args, timeout=timeout)
         plog(f"  {'✓' if rc == 0 else '✗'} {label}" + ('' if rc == 0 else f": {out.strip()[-400:]}"))
         return rc == 0, out
 
     def _cleanup():
-        _cloudtak_compose_run(cloudtak_dir, mig + ['rm', '-sf', 'minio-legacy'], timeout=120)
+        _run(mig + ['rm', '-sf', 'minio-legacy'], timeout=120)
 
-    ok, _ = _step('Stopped CloudTAK services', ['stop', 'api', 'events', 'tiles', 'retention'])
-    if not ok:
-        return False, 'could not stop the CloudTAK services'
-    ok, out = _step('Started Garage and the legacy MinIO',
-                    mig + ['up', '-d', '--pull', 'missing', 'store', 'minio-legacy'], timeout=900)
-    if not ok:
+    def _fail(msg):
+        """Every failure after the first stop: clean up, and (when asked) start the services again."""
         _cleanup()
-        return False, 'could not start Garage and the legacy MinIO (output above)'
-    rclone = mig + ['run', '--rm', '--quiet-pull', 'migrate']
-    for side in ('garage', 'minio'):
-        for _i in range(30):
-            rc, out = _cloudtak_compose_run(cloudtak_dir, rclone + ['lsd', f'{side}:'], timeout=180)
-            if rc == 0:
-                break
-            time.sleep(2)
-        else:
-            _cleanup()
-            return False, f'the {side} store never answered: ' + out.strip()[-300:]
-    # `copy --update`, NOT upstream's `sync`: sync makes Garage MATCH the source, deleting
-    # whatever the source lacks. If anything ever starts minio-legacy after a migration, docker
-    # recreates .docker-store and MinIO initialises it as a fresh EMPTY store (seen on test12,
-    # 2026-10-07) — a sync from that would wipe Garage. copy never deletes, and --update never
-    # replaces a newer file already in Garage. For a first migration into an empty Garage the
-    # result is identical to sync.
-    ok, out = _step('Copied files from MinIO to Garage',
-                    rclone + ['copy', '--update', '-v', f'minio:{bucket}', f'garage:{bucket}'], timeout=7200)
-    if not ok:
-        _cleanup()
-        return False, 'copying the files failed (rclone output above)'
-    _n = sum(1 for l in out.splitlines() if ': Copied (' in l)
-    plog(f"    {_n} file(s) copied")
-    # --one-way: every MinIO file must be in Garage; files only Garage has are fine.
-    ok, out = _step('Verified every file arrived (rclone check)',
-                    rclone + ['check', '--one-way', '--size-only', f'minio:{bucket}', f'garage:{bucket}'],
-                    timeout=3600)
-    if not ok:
-        _cleanup()
-        return False, 'verification failed — not every file arrived (rclone output above)'
-    _cleanup()
-    src = os.path.join(cloudtak_dir, '.docker-store')
-    archive = os.path.join(cloudtak_dir, '.docker-store-migrated-' + time.strftime('%Y%m%d_%H%M%S'))
+        if restart_on_fail:
+            rc, out = _run(['start'] + _CT_APP_SERVICES, timeout=300)
+            plog("  ✓ CloudTAK was started again. Your files are still in ~/CloudTAK/.docker-store." if rc == 0
+                 else f"  ⚠ CloudTAK could not be started again: {(out or '').strip()[-300:]}")
+        return False, msg
+
     try:
-        os.rename(src, archive)
-    except OSError:
-        r = subprocess.run(_sudo_wrap(['mv', src, archive]), capture_output=True, text=True, timeout=120)
-        if r.returncode != 0:
-            return False, ('files copied and verified, but .docker-store could not be moved aside: '
-                           + (r.stderr or '').strip()[:200])
-    _cloudtak_env_set(env_path, remove=('MINIO_LEGACY_IMAGE',))
-    plog(f"  ✓ Old MinIO data kept at ~/CloudTAK/{os.path.basename(archive)} — remove it once CloudTAK checks out")
-    return True, ''
+        ok, _ = _step('Stopped CloudTAK services', ['stop'] + _CT_APP_SERVICES)
+        if not ok:
+            return _fail('could not stop the CloudTAK services')
+        ok, out = _step('Started Garage and the legacy MinIO',
+                        mig + ['up', '-d', '--pull', 'missing', 'store', 'minio-legacy'], timeout=900)
+        if not ok:
+            return _fail('could not start Garage and the legacy MinIO (output above)')
+        rclone = mig + ['run', '--rm', '--quiet-pull', 'migrate']
+        for side in ('garage', 'minio'):
+            for _i in range(30):
+                rc, out = _run(rclone + ['lsd', f'{side}:'], timeout=180)
+                if rc == 0:
+                    break
+                time.sleep(2)
+            else:
+                return _fail(f'the {side} store never answered: ' + out.strip()[-300:])
+        # ops #1334: the copy needs room. Garage keeps its own copy of every file next to
+        # .docker-store (same disk), and the Update check only sizes the Docker images.
+        rc, out = _run(rclone + ['size', '--json', f'minio:{bucket}'], timeout=1800)
+        src_bytes = _cloudtak_rclone_bytes(out) if rc == 0 else None
+        rc, out = _run(rclone + ['size', '--json', f'garage:{bucket}'], timeout=1800)
+        have_bytes = _cloudtak_rclone_bytes(out) if rc == 0 else 0
+        if src_bytes is not None:
+            if remote:
+                _fid, _free = _cloudtak_fs_free_remote(remote_cfg, '$HOME/CloudTAK')
+            else:
+                _fid, _free = _cloudtak_fs_free_local(cloudtak_dir)
+            _short = _cloudtak_migrate_space_short(max(0, src_bytes - (have_bytes or 0)), _free)
+            if _short:
+                gb = 1024 ** 3
+                plog(f"  ✗ Not enough free disk space to copy CloudTAK's files: they are {src_bytes / gb:.1f} GB, "
+                     f"and {(_free or 0) / gb:.1f} GB is free (about {(_short + gb - 1) // gb:.0f} GB more is needed, "
+                     "with 1 GB to spare). Nothing was moved.")
+                plog("  Free some space (old logs or backups), then run this again. Do NOT run "
+                     "`docker image prune -a`: it would delete the only program that can read these files.")
+                return _fail('not enough free disk space to copy the files')
+        # `copy --update`, NOT upstream's `sync`: sync makes Garage MATCH the source, deleting
+        # whatever the source lacks. If anything ever starts minio-legacy after a migration, docker
+        # recreates .docker-store and MinIO initialises it as a fresh EMPTY store (seen on test12,
+        # 2026-10-07) — a sync from that would wipe Garage. copy never deletes, and --update never
+        # replaces a newer file already in Garage. For a first migration into an empty Garage the
+        # result is identical to sync.
+        ok, out = _step('Copied files from MinIO to Garage',
+                        rclone + ['copy', '--update', '-v', f'minio:{bucket}', f'garage:{bucket}'], timeout=7200)
+        if not ok:
+            return _fail('copying the files failed (rclone output above)')
+        _n = sum(1 for l in out.splitlines() if ': Copied (' in l)
+        plog(f"    {_n} file(s) copied")
+        # --one-way: every MinIO file must be in Garage; files only Garage has are fine.
+        ok, out = _step('Verified every file arrived (rclone check)',
+                        rclone + ['check', '--one-way', '--size-only', f'minio:{bucket}', f'garage:{bucket}'],
+                        timeout=3600)
+        if not ok:
+            return _fail('verification failed — not every file arrived (rclone output above)')
+        _cleanup()
+        archive_name = '.docker-store-migrated-' + time.strftime('%Y%m%d_%H%M%S')
+        if remote:
+            ok, out = _ssh_probe(remote_cfg, f"cd ~/CloudTAK && {{ mv .docker-store {archive_name} || "
+                                 f"sudo -n mv .docker-store {archive_name}; }}", timeout=120)
+            if not ok:
+                return _fail('files copied and verified, but .docker-store could not be moved aside: '
+                             + (out or '').strip()[:200])
+        else:
+            src = os.path.join(cloudtak_dir, '.docker-store')
+            archive = os.path.join(cloudtak_dir, archive_name)
+            try:
+                os.rename(src, archive)
+            except OSError:
+                r = subprocess.run(_sudo_wrap(['mv', src, archive]), capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    return _fail('files copied and verified, but .docker-store could not be moved aside: '
+                                 + (r.stderr or '').strip()[:200])
+        _env_img(None)
+        # the saved MinIO program is not needed any more (the files are in Garage and archived)
+        try:
+            if remote:
+                _ssh_probe(remote_cfg, f"rm -f ~/CloudTAK/{_CT_LEGACY_IMAGE_TAR}", timeout=30)
+            else:
+                subprocess.run(_sudo_wrap(['rm', '-f', os.path.join(cloudtak_dir, _CT_LEGACY_IMAGE_TAR)]),
+                               capture_output=True, text=True, timeout=60)
+        except Exception:
+            pass
+        plog(f"  ✓ Old MinIO data kept at ~/CloudTAK/{archive_name} — remove it once CloudTAK checks out")
+        return True, ''
+    except Exception as e:
+        return _fail(f'migration error: {str(e)[:300]}')
 
 
-def _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=None, start=True):
+def _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=None, start=True, restart_on_fail=False):
     """Bring a Garage-based CloudTAK tree to a working store. Returns (ok, error). Never raises.
 
     No-op for a MinIO-era tree. Otherwise, in upstream's order:
       1. GARAGE_RPC_SECRET (64 hex, not all zeros) and AWS_S3_Endpoint=http://store:3900 in .env
       2. MinIO data still in .docker-store -> _cloudtak_migrate_minio_to_garage()
       3. `docker compose up -d` when start=True
-    The caller decides what a failure means (the Update path rolls back; boot just reports)."""
+    The caller decides what a failure means (the Update path rolls back; boot just reports).
+    ops #1334: `restart_on_fail=True` starts the services the migration stopped when it fails,
+    for the callers with no rollback of their own (Deploy, Update config, the startup repair)."""
     try:
         if not _cloudtak_compose_is_garage(cloudtak_dir):
             return True, ''
@@ -58688,7 +60392,8 @@ def _cloudtak_garage_converge(cloudtak_dir, plog, legacy_image=None, start=True)
             if 'AWS_S3_Endpoint' in upd:
                 plog(f"  ✓ CloudTAK now talks to the Garage store ({_CT_GARAGE_ENDPOINT})")
         if os.path.isdir(os.path.join(cloudtak_dir, '.docker-store')):
-            ok, err = _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image)
+            ok, err = _cloudtak_migrate_minio_to_garage(cloudtak_dir, env, plog, legacy_image,
+                                                         restart_on_fail=restart_on_fail)
             if not ok:
                 return False, err
         if start:
@@ -59491,11 +61196,12 @@ def _cloudtak_remote_compose_is_garage(remote_cfg):
         return False
 
 
-def _cloudtak_remote_garage_sh(legacy_image=''):
+def _cloudtak_remote_garage_sh():
     """Shell for the remote host: secret + endpoint in .env (upstream's ensure_rpc_secret and
-    endpoint rewrite), then upstream's migrate-store when MinIO data is still in .docker-store."""
-    img = legacy_image if (legacy_image and _CT_IMAGE_REF_RE.match(legacy_image)) else ''
-    mig_env = f"MINIO_LEGACY_IMAGE={shlex.quote(img)} " if img else ''
+    endpoint rewrite). ops #1334: it no longer runs upstream's `./cloudtak.sh migrate-store` —
+    that script copies with `rclone sync` (cloudtak.sh in 13.127.0, line 485), which can delete
+    newer Garage files, and it leaves the services stopped when it fails. The move itself is
+    `_cloudtak_migrate_minio_to_garage(remote_cfg=...)`, the same steps as on this box."""
     return (
         "set -e; cd ~/CloudTAK; "
         "cur=$(grep '^GARAGE_RPC_SECRET=' .env | head -n1 | cut -d= -f2-); "
@@ -59504,8 +61210,28 @@ def _cloudtak_remote_garage_sh(legacy_image=''):
         "  sed -i '/^GARAGE_RPC_SECRET=/d' .env; echo \"GARAGE_RPC_SECRET=$s\" >> .env; "
         "  echo 'Generated the Garage store secret (GARAGE_RPC_SECRET)'; fi; "
         "if grep -q '^AWS_S3_Endpoint=' .env; then sed -i 's|^AWS_S3_Endpoint=.*|AWS_S3_Endpoint=http://store:3900|' .env; "
-        "else echo 'AWS_S3_Endpoint=http://store:3900' >> .env; fi; "
-        f"if [ -d .docker-store ]; then {mig_env}./cloudtak.sh migrate-store; fi")
+        "else echo 'AWS_S3_Endpoint=http://store:3900' >> .env; fi")
+
+
+def _cloudtak_remote_garage_converge(remote_cfg, plog, legacy_image='', restart_on_fail=False):
+    """`_cloudtak_garage_converge()` for the remote CloudTAK host: secret and endpoint in .env,
+    then any MinIO data moved into Garage. Returns (ok, error). Never raises."""
+    try:
+        ok, out = _ssh_probe(remote_cfg, _cloudtak_remote_garage_sh(), timeout=300)
+        for _l in (out or '').strip().splitlines()[-10:]:
+            plog(f"  {_l}")
+        if not ok:
+            return False, 'could not write the Garage secret and endpoint to the remote .env'
+        if not _ssh_probe(remote_cfg, "test -d ~/CloudTAK/.docker-store", timeout=20)[0]:
+            return True, ''
+        ok_env, env_text = _ssh_probe(remote_cfg, 'cat ~/CloudTAK/.env', timeout=20)
+        if not ok_env:
+            return False, 'could not read the remote CloudTAK .env'
+        return _cloudtak_migrate_minio_to_garage('~/CloudTAK', _cloudtak_env_parse_text(env_text), plog,
+                                                  legacy_image=legacy_image or None,
+                                                  restart_on_fail=restart_on_fail, remote_cfg=remote_cfg)
+    except Exception as e:
+        return False, f'Garage store setup error on the remote host: {str(e)[:300]}'
 
 
 def _cloudtak_remote_media_bufs(remote_cfg, plog):
@@ -60526,6 +62252,17 @@ def _cloudtak_build_failure_hint(lines, cloudtak_dir=None):
         return []
 
 
+def _cloudtak_version_is_newer(have, release_tag):
+    """True when the CloudTAK version `have` (x.y.z) is newer than the release tag `release_tag`.
+    False when either cannot be read, so a number we cannot read never blocks a Deploy."""
+    try:
+        _have = tuple(int(x) for x in re.findall(r'\d+', have or '')[:3])
+        _want = tuple(int(x) for x in re.findall(r'\d+', release_tag or '')[:3])
+    except Exception:
+        return False
+    return bool(_have and _want and _want < _have)
+
+
 def run_cloudtak_deploy(cfg=None):
     def plog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
@@ -60606,6 +62343,17 @@ def run_cloudtak_deploy(cfg=None):
                     return
                 plog(f"  Old MinIO folder on the remote host: installing {_rt} first (CloudTAK 14 cannot move it into Garage).")
                 remote_release_tag = _rt
+            # ops #1334: the same never-downgrade guard as Update (see the local Deploy).
+            _rv_now = ''
+            try:
+                _rv_now = _cloudtak_running_version(None, remote_cfg=remote_cfg)
+            except Exception:
+                pass
+            if _cloudtak_version_is_newer(_rv_now, remote_release_tag):
+                plog(f"✓ CloudTAK {_rv_now} is newer than the version we test ({remote_release_tag}). Nothing to do.")
+                plog("  Nothing was changed and CloudTAK is still running as before.")
+                cloudtak_deploy_status.update({'running': False, 'error': False})
+                return
             if remote_release_tag:
                 plog(f"  Target: stable release {remote_release_tag} (channel target)")
             else:
@@ -60679,12 +62427,11 @@ def run_cloudtak_deploy(cfg=None):
             plog("✓ Remote .env and override written")
             # v10.2.7: Garage (CloudTAK >= 13.102.0) — secret, endpoint, and any MinIO data moved.
             if _cloudtak_remote_compose_is_garage(remote_cfg):
-                _gok, _gout = _ssh_probe(remote_cfg, _cloudtak_remote_garage_sh(_cloudtak_remote_legacy_image(remote_cfg)),
-                                         timeout=7200)
-                for _l in (_gout or '').strip().splitlines()[-25:]:
-                    plog(f"  {_l}")
+                # ops #1334: on a failure the services the move stopped are started again.
+                _gok, _gerr = _cloudtak_remote_garage_converge(
+                    remote_cfg, plog, legacy_image=_cloudtak_remote_legacy_image(remote_cfg), restart_on_fail=True)
                 if not _gok:
-                    plog("✗ Garage store setup failed on the remote host (output above)")
+                    plog(f"✗ Garage store setup failed on the remote host: {_gerr}")
                     cloudtak_deploy_status.update({'running': False, 'error': True})
                     return
 
@@ -60820,6 +62567,18 @@ def run_cloudtak_deploy(cfg=None):
                 return
             plog(f"  Old MinIO folder found: installing {_dh_tag} first (CloudTAK 14 cannot move it into Garage).")
             release_tag = _dh_tag
+        # ops #1334: Deploy has the same "never downgrade" guard as Update. When the release lookup
+        # fails the pin (13.127.0) is used, and over a CloudTAK 14 box that is a downgrade.
+        _dv_now = ''
+        try:
+            _dv_now = _cloudtak_running_version(cloudtak_dir)
+        except Exception:
+            pass
+        if _cloudtak_version_is_newer(_dv_now, release_tag):
+            plog(f"✓ CloudTAK {_dv_now} is newer than the version we test ({release_tag}). Nothing to do.")
+            plog("  Nothing was changed and CloudTAK is still running as before.")
+            cloudtak_deploy_status.update({'running': False, 'error': False})
+            return
         if os.path.exists(cloudtak_dir):
             # A real checkout needs a VALID repo, not merely a .git directory — a deleted or
             # interrupted CloudTAK can leave a HOLLOW .git (objects/ + info/ but no HEAD/config),
@@ -60936,6 +62695,15 @@ def run_cloudtak_deploy(cfg=None):
         compose_yml = os.path.join(cloudtak_dir, 'docker-compose.yml')
         compose_yaml = os.path.join(cloudtak_dir, 'compose.yaml')
         if not os.path.exists(compose_yml) and not os.path.exists(compose_yaml):
+            # ops #1334: this re-clone deletes the whole tree, and the keep-aside below carries only
+            # plugin state. A tree that holds the object store's data or its keys is never deleted.
+            _held = _cloudtak_has_data(cloudtak_dir)
+            if _held:
+                plog(f"✗ ~/CloudTAK has no docker-compose.yml, and it holds your data ({', '.join(_held)}).")
+                plog("  Nothing was deleted and nothing was changed. A re-clone would delete that data.")
+                plog("  Check that the CloudTAK release could be downloaded (GitHub, DNS), then run Deploy again.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
             plog("  docker-compose.yml missing — re-cloning...")
             # GH #261: the operator's compose file is theirs — carry it across the re-clone.
             # ops #216: and TAK Portal's plugins, route files, overlays and repo copies.
@@ -61203,14 +62971,22 @@ def run_cloudtak_deploy(cfg=None):
             plog("1. Check system resources:")
             plog("     df -h  # Ensure you have ≥20GB free disk")
             plog("     free -h  # Ensure you have ≥8GB free RAM")
+            _held = _cloudtak_has_data(cloudtak_dir)
             plog("2. Clean up docker state:")
             plog(f"     cd {cloudtak_dir} && sudo docker compose down --remove-orphans")
-            plog("     sudo docker system prune -a --volumes  # WARNING: removes ALL unused images/volumes")
+            if _held:
+                # ops #1334: `prune -a` removes the MinIO image that is the only reader of
+                # .docker-store, `--volumes` the database volume, and rm -rf the data folders.
+                plog("     sudo docker builder prune -af   # unused build cache only")
+                plog(f"   Do NOT run `docker system prune -a --volumes` or delete {cloudtak_dir}: it holds your data ({', '.join(_held)}).")
+            else:
+                plog("     sudo docker system prune -a --volumes  # WARNING: removes ALL unused images/volumes")
             plog("3. Retry deploy from console, or manually:")
             plog(f"     cd {cloudtak_dir} && sudo docker compose build --no-cache")
-            plog("4. If failure persists, you may need to re-clone CloudTAK:")
-            plog(f"     sudo rm -rf {cloudtak_dir}")
-            plog("     (then retry deploy from console)")
+            if not _held:
+                plog("4. If failure persists, you may need to re-clone CloudTAK:")
+                plog(f"     sudo rm -rf {cloudtak_dir}")
+                plog("     (then retry deploy from console)")
             plog("")
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
@@ -61223,7 +62999,7 @@ def run_cloudtak_deploy(cfg=None):
         if _cloudtak_compose_is_garage(cloudtak_dir):
             plog("")
             plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
-            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False)
+            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False, restart_on_fail=True)
             if not _gok:
                 plog(f"✗ Garage store setup failed: {_gerr}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -61656,17 +63432,26 @@ def run_cloudtak_redeploy(cfg=None):
                 plog(f"  ⚠ MediaMTX: could not set CloudTAK read access: {_ct_rd_e}")
             # v10.2.7: on a Garage tree (CloudTAK >= 13.102.0) put the secret/endpoint in place and
             # move any MinIO data before `up -d` — the store cannot start otherwise.
-            _g_sh = ''
-            if _cloudtak_remote_compose_is_garage(remote_cfg):
-                _g_sh = '( ' + _cloudtak_remote_garage_sh(_cloudtak_remote_legacy_image(remote_cfg)) + ' ) && '
-            cmd = (
+            # ops #1334: the files move is its own step (it used to ride in this one command), so a
+            # failure starts the stopped services again and says why.
+            ok, out = _ssh_probe(
+                remote_cfg,
                 "mv /tmp/.env ~/CloudTAK/.env && chmod 600 ~/CloudTAK/.env && "
                 "mv /tmp/docker-compose.override.yml ~/CloudTAK/docker-compose.override.yml && "
-                "( " + _cloudtak_remote_custom_compose_sh() + " ) && "   # GH #261
-                + _g_sh +
-                "cd ~/CloudTAK && docker compose up -d"
-            )
-            ok, out = _ssh_probe(remote_cfg, cmd, timeout=7200 if _g_sh else 180)
+                "( " + _cloudtak_remote_custom_compose_sh() + " )",   # GH #261
+                timeout=60)
+            if not ok:
+                plog(f"✗ Could not place the CloudTAK config on the remote host: {(out or '')[:200]}")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
+            if _cloudtak_remote_compose_is_garage(remote_cfg):
+                _gok, _gerr = _cloudtak_remote_garage_converge(
+                    remote_cfg, plog, legacy_image=_cloudtak_remote_legacy_image(remote_cfg), restart_on_fail=True)
+                if not _gok:
+                    plog(f"✗ Garage store setup failed on the remote host: {_gerr}")
+                    cloudtak_deploy_status.update({'running': False, 'error': True})
+                    return
+            ok, out = _ssh_probe(remote_cfg, "cd ~/CloudTAK && docker compose up -d", timeout=180)
             if not ok:
                 plog(f"✗ Restart failed: {(out or '')[:200]}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -61734,7 +63519,7 @@ def run_cloudtak_redeploy(cfg=None):
         # and MinIO data still in .docker-store has to move into Garage first (upstream's
         # migrate-store, same steps). No-op on a MinIO-era tree.
         if _cloudtak_compose_is_garage(cloudtak_dir):
-            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False)
+            _gok, _gerr = _cloudtak_garage_converge(cloudtak_dir, plog, start=False, restart_on_fail=True)
             if not _gok:
                 plog(f"✗ Garage store setup failed: {_gerr}")
                 cloudtak_deploy_status.update({'running': False, 'error': True})
@@ -62695,9 +64480,27 @@ def _cloudtak_update_space_problem(cloudtak_dir, remote_cfg=None):
     return None
 
 
-def _cloudtak_update_space_lines(problem):
-    """The log lines for a refused Update: what is short, that nothing changed, what to do."""
+def _cloudtak_update_space_lines(problem, minio_store=False):
+    """The log lines for a refused Update: what is short, that nothing changed, what to do.
+
+    ops #1334: `minio_store=True` (the box still has ~/CloudTAK/.docker-store) leaves out
+    `docker image prune -af`. The old MinIO program is a Docker image nobody can download any more,
+    it is unused while the store container is Garage, and it is the only thing that can read the
+    files in .docker-store, so that prune would make them unreadable."""
     gb = 1024 ** 3
+    if minio_store:
+        return [
+            f"✗ Not enough free disk space to update CloudTAK: {problem['free'] / gb:.1f} GB free for "
+            f"{problem['what']} ({problem['where']}); the update needs about {problem['need'] / gb:.0f} GB.",
+            "  Nothing was changed. CloudTAK is still running as before.",
+            "  Free some space, then press Update again. A safe way: run `docker builder prune -af` on this",
+            "  server (unused build cache), and delete old logs or backups.",
+            "  Do NOT run `docker image prune -a` or `docker system prune -a` yet: this server still has your",
+            "  files in the old MinIO folder (~/CloudTAK/.docker-store), and the MinIO program that reads",
+            "  them is a Docker image that cannot be downloaded again. Those commands would delete it.",
+            "  Do not delete Docker volumes: they hold your data.",
+            "  " + _FREE_SPACE_BACKUPS_HINT,
+        ]
     return [
         f"✗ Not enough free disk space to update CloudTAK: {problem['free'] / gb:.1f} GB free for "
         f"{problem['what']} ({problem['where']}); the update needs about {problem['need'] / gb:.0f} GB.",
@@ -62802,7 +64605,7 @@ def run_cloudtak_update():
         _space = _cloudtak_update_space_problem(None if is_remote else os.path.expanduser('~/CloudTAK'),
                                                 remote_cfg=(remote_cfg if is_remote else None))
         if _space:
-            for _l in _cloudtak_update_space_lines(_space):
+            for _l in _cloudtak_update_space_lines(_space, minio_store=bool(_store_now)):
                 plog(_l)
             cloudtak_deploy_status.update({'running': False, 'error': True})
             return
@@ -63065,11 +64868,9 @@ def run_cloudtak_update():
             if _cloudtak_remote_compose_is_garage(remote_cfg):
                 plog("")
                 plog("━━━ Object store: Garage (CloudTAK 13.102+) ━━━")
-                _gok, _gout = _ssh_probe(remote_cfg, _cloudtak_remote_garage_sh(legacy_minio_img), timeout=7200)
-                for _l in (_gout or '').strip().splitlines()[-25:]:
-                    plog(f"  {_l}")
+                _gok, _gerr = _cloudtak_remote_garage_converge(remote_cfg, plog, legacy_image=legacy_minio_img)
                 if not _gok:
-                    plog("✗ Garage store setup failed on the remote host (output above)")
+                    plog(f"✗ Garage store setup failed on the remote host: {_gerr}")
                     _cloudtak_remote_garage_rollback(remote_cfg, prev_sha, plog)
                     _cloudtak_restore_images(_ct_snap, plog, remote_cfg=remote_cfg)
                     plog("  Your files are untouched in ~/CloudTAK/.docker-store. Fix the cause above and press Update again.")
@@ -63906,15 +65707,116 @@ WEBODM_DB_VOLUME = '/var/lib/postgresql/data'   # the db/ bind mount inside wo_d
 WEBODM_DB_DUMP_PREFIX = 'backup-infratak-'
 WEBODM_UPGRADE_WAIT_S = 1200   # DB upgrade + first 4.x start; WebODM DBs are small (metadata only)
 WEBODM_PULL_TIMEOUT_S = 1800   # 3.x → 4.x pulls about 6 GB; 300 s ran out on test6 (10.3.10 T&E)
+WEBODM_PENDING_COMPOSE = 'docker-compose.pending.yml'   # the new compose, until its images are pulled and the 9.5 dump is made (ops #1328)
 
 
-def _webodm_pin_images(compose_txt, services=None):
+# Never move a box DOWN onto a pin (ops #1307, same trap as ops #1306). A pin move that goes
+# backwards is only safe while the new version wrote nothing the old one cannot read, and an
+# image whose data is a one-way format (a database schema, a flow store, a saved data file)
+# fails at the next start, in a loop, once the data has moved on. A box can be ahead of a pin
+# two ways: its compose names a newer exact tag, or it names a floating tag (`latest`, `alpine`,
+# `4`) that Docker pulled forward after the pin was written. The second is invisible in the
+# compose file, so the version Docker really ran is read from the container.
+_IMAGE_EXACT_TAG_RE = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)(?:-(\d+))?(?:-[A-Za-z][\w.]*)?$')
+
+
+def _image_ref_parts(ref):
+    """('nodered/node-red', '4.1.18-22') from an image reference. A registry host, the
+    docker.io/library/ prefix and a digest are dropped; no tag means `latest`."""
+    r = str(ref or '').strip().strip('\'"').split('@', 1)[0]
+    r = re.sub(r'^(?:docker\.io/)?(?:library/)?', '', r)
+    head, sep, tag = r.rpartition(':')
+    if not sep or '/' in tag:
+        return r, 'latest'
+    return head, tag or 'latest'
+
+
+def _image_exact_version(tag):
+    """(major, minor, patch, build) of an exact release tag such as `4.1.18-22`, `8.10.3-alpine`
+    or `v0.83.2`, or None for a floating tag (`latest`, `alpine`, `4`, `4.1`)."""
+    m = _IMAGE_EXACT_TAG_RE.match(str(tag or ''))
+    return tuple(int(x or 0) for x in m.groups()) if m else None
+
+
+def _image_ahead_of_pin(current_ref, pin_ref, running_lookup=None):
+    """True when the box already runs something newer than `pin_ref`, so moving it onto the pin
+    would be a downgrade (ops #1307). Only the same image is judged: a mirror or a fork is the
+    operator's. `running_lookup` is called, only for a floating tag, and returns the (major,
+    minor, patch) Docker really ran, or None when that is unknown (then the pin move goes ahead,
+    as before)."""
+    cur_repo, cur_tag = _image_ref_parts(current_ref)
+    pin_repo, pin_tag = _image_ref_parts(pin_ref)
+    pin_ver = _image_exact_version(pin_tag)
+    if cur_repo != pin_repo or pin_ver is None:
+        return False
+    cur_ver = _image_exact_version(cur_tag)
+    if cur_ver is not None:
+        return cur_ver > pin_ver
+    if running_lookup is None:
+        return False
+    try:
+        ran = running_lookup()
+    except Exception:
+        return False
+    return bool(ran) and tuple(ran[:3]) > pin_ver[:3]
+
+
+def _docker_env_version(*targets, env_name, timeout=20):
+    """(major, minor, patch) that `env_name` (for example NODE_RED_VERSION) holds in the first of
+    `targets` Docker knows, a container name or an image reference, or None. A container's
+    environment is the one of the image it was created from, so this is the version that ran,
+    not the one a later pull put on disk. Best-effort; never raises.
+
+    The Go template prints only the one variable asked for: a container's environment holds
+    secrets (Node-RED's .env, database passwords), and they must not pass through this process."""
+    if not re.fullmatch(r'[A-Z][A-Z0-9_]*', env_name or ''):
+        return None
+    fmt = ('{{range .Config.Env}}{{$p := split . "="}}{{if eq (index $p 0) "' + env_name + '"}}'
+           '{{println .}}{{end}}{{end}}')
+    for target in targets:
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'inspect', '--format', fmt, target]),
+                               capture_output=True, text=True, timeout=timeout)
+        except Exception:
+            continue
+        if r.returncode != 0:
+            continue
+        m = re.search(rf'^{re.escape(env_name)}=v?(\d+)\.(\d+)\.(\d+)', r.stdout or '', re.M)
+        if m:
+            return tuple(int(x) for x in m.groups())
+    return None
+
+
+def _webodm_pin_images(compose_txt, services=None, kept=None):
     """Point each WebODM service's `image:` line at its WEBODM_IMAGES pin (every service, or
     only those in `services`). Installs from before the pins carry the floating refs they were
     deployed with; deploy writes the pins fresh, Update and the startup migration rewrite them
-    in place. Idempotent — an already-pinned file comes back unchanged."""
+    in place. Idempotent — an already-pinned file comes back unchanged.
+
+    ops #1307: the webapp and worker (one image, run twice) are left alone when either one is
+    NEWER than the pin, because the database behind them is migrated by the newer WebODM and the
+    older one is not built to read it; the database image is left alone when it is a newer
+    PostgreSQL major than the pin, because a data directory only opens on the major that made
+    it. Each service left alone is appended to `kept` as (service, image). The Celery broker and
+    nodeodx keep nothing on disk, so they always move to their pins."""
+    def _image_line(svc):
+        m = re.search(rf'^  {svc}:\n(?:    [^\n]*\n)*?    image: ([^\n]*)', compose_txt, re.M)
+        return m.group(1).strip() if m else ''
+
+    def _ahead(svc):
+        if svc in ('wo_webapp', 'wo_worker'):
+            return any(_image_ahead_of_pin(_image_line(s), WEBODM_IMAGES[s]) for s in ('wo_webapp', 'wo_worker'))
+        if svc == 'wo_db':
+            cur = re.search(r'webodm_db:(\d+)(?:@|$)', _image_line(svc))
+            return bool(cur) and int(cur.group(1)) > int(re.search(r'webodm_db:(\d+)', WEBODM_IMAGES[svc]).group(1))
+        return False
+
     for svc, image in WEBODM_IMAGES.items():
         if services and svc not in services:
+            continue
+        if _ahead(svc):
+            if kept is not None:
+                kept.append((svc, _image_line(svc)))
             continue
         compose_txt = re.sub(rf'(^  {svc}:\n(?:    [^\n]*\n)*?    image: )[^\n]*',
                              lambda m: m.group(1) + image, compose_txt, count=1, flags=re.M)
@@ -64319,6 +66221,27 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     plog(f'  {(dv or "").strip()}')
     _remote_docker_group(deploy_cfg, plog)
 
+    # ops #1328: a redeploy on a remote host that still runs WebODM 3.x (database on PostgreSQL
+    # 9.5) starts the one-way upgrade with the 4.x images. Same room check and dump as Update,
+    # before anything on the host changes; a data version we do not know stops it here.
+    old_compose = None
+    db_upgrade = False
+    try:
+        has_compose, _ = _module_run(deploy_cfg, f'test -f {compose_path_remote}', timeout=15)
+        if has_compose:
+            ok, old_compose = _module_run(deploy_cfg, f'cat {compose_path_remote}', timeout=15)
+            if not ok or not (old_compose or '').strip():
+                raise RuntimeError(f'could not read {compose_path_remote} on the remote host. Nothing was changed.')
+            plog('━━━ Checking the WebODM database version (remote) ━━━')
+            db_upgrade = _webodm_db_needs_upgrade(wo_dir_remote, cfg=deploy_cfg)
+            if db_upgrade:
+                plog('  This redeploy upgrades the WebODM database (PostgreSQL 9.5 → 18). A backup is made first.')
+                _webodm_prepare_db_upgrade(wo_dir_remote, old_compose, plog, cfg=deploy_cfg)
+    except Exception as e:
+        plog(f'✗ {e}')
+        _webodm_deploy_status.update({'running': False, 'error': str(e)})
+        return
+
     # Create directory structure on remote
     plog('━━━ Creating directories (remote) ━━━')
     # local_settings.py must exist before `compose up` — Docker would otherwise
@@ -64378,20 +66301,7 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         f'      - "0.0.0.0:{wo_port}:8000"',
     )
     compose_content = wo_compose
-    import tempfile as _tf
-    with _tf.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as tf:
-        tf.write(compose_content)
-        tmp_compose = tf.name
-    ok1, _ = _module_copy(deploy_cfg, tmp_compose, compose_path_remote, log_fn=plog)
-    try:
-        os.unlink(tmp_compose)
-    except Exception:
-        pass
-    if not ok1:
-        plog('✗ Failed to copy docker-compose.yml to remote')
-        _webodm_deploy_status.update({'running': False, 'error': True})
-        return
-    plog('✓ docker-compose.yml written')
+    plog('✓ docker-compose.yml ready (written after the images are pulled)')
 
     # ops #629: lock the WebODM port to the console BEFORE the container publishes it. The ufw
     # lines further down never applied (Docker's published ports skip ufw), so the port was
@@ -64404,18 +66314,16 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
         _webodm_deploy_status.update({'running': False, 'error': True})
         return
 
-    # Pull images on remote
-    plog('━━━ Pulling WebODM images (remote — may take several minutes) ━━━')
-    ok, out = _module_run(deploy_cfg, f'docker compose -f {compose_path_remote} pull 2>&1', timeout=600, log_fn=plog)
-    if not ok:
-        plog(f'  Pull warning (non-fatal): {(out or "")[-200:]}')
-
-    # Start containers on remote
-    plog('━━━ Starting WebODM containers (remote) ━━━')
-    ok, out = _module_run(deploy_cfg, f'docker compose -f {compose_path_remote} up -d 2>&1', timeout=120, log_fn=plog)
-    if not ok:
-        plog(f'✗ docker compose up failed: {(out or "")[-300:]}')
-        _webodm_deploy_status.update({'running': False, 'error': True})
+    # ops #1328: pull from a side file, dump a 3.x database, then write the compose and start,
+    # in the one routine Update uses. The pull is no longer non-fatal and no longer cut at 600 s
+    # (a 3.x to 4.x pull is about 6 GB), and `up -d` no longer runs on a half-pulled set.
+    plog('━━━ Pulling WebODM images and starting the containers (remote — may take several minutes) ━━━')
+    try:
+        _webodm_move_to_new_images(wo_dir_remote, compose_path_remote, old_compose, compose_content,
+                                   db_upgrade, plog, cfg=deploy_cfg)
+    except Exception as e:
+        plog(f'✗ {e}')
+        _webodm_deploy_status.update({'running': False, 'error': str(e)})
         return
     plog('✓ WebODM containers started')
 
@@ -64518,6 +66426,19 @@ def _run_webodm_deploy(settings):
         _webodm_deploy_status.update({'running': False, 'error': True})
         return
     try:
+        # ops #1328: a Reapply on a 3.x box (database on PostgreSQL 9.5) starts the one-way upgrade
+        # to 18 with the 4.x images, so it gets the same room check and dump as Update, before
+        # anything on the box changes. A data version this console does not know stops it here.
+        old_compose = None
+        db_upgrade = False
+        if os.path.exists(compose_path):
+            old_compose = _read_priv(compose_path)
+            plog('Checking the WebODM database version…')
+            db_upgrade = _webodm_db_needs_upgrade(wo_dir)
+            if db_upgrade:
+                plog('This Reapply upgrades the WebODM database (PostgreSQL 9.5 → 18). A backup is made first.')
+                _webodm_prepare_db_upgrade(wo_dir, old_compose, plog)
+
         plog('Creating directories…')
         for sub in ['', 'plugins', 'media', 'db']:
             os.makedirs(os.path.join(wo_dir, sub) if sub else wo_dir, exist_ok=True)
@@ -64576,15 +66497,6 @@ def _run_webodm_deploy(settings):
             wo_odm_mem=_odm_mem,
             images=WEBODM_IMAGES,
         )
-        with open(compose_path, 'w') as f:
-            f.write(compose_content)
-
-        plog('Pulling images (this may take several minutes)…')
-        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'pull']),
-                    capture_output=True, text=True, timeout=300,
-                    cwd=wo_dir)
-        if r.returncode != 0:
-            plog(f'Pull warning (non-fatal): {r.stderr[:200]}')
 
         plog('Hardening firewall — blocking direct access to WebODM ports…')
         if _distro_family() == 'rhel':
@@ -64598,11 +66510,10 @@ def _run_webodm_deploy(settings):
             for _wo_ufw_port in [wo_port, 3001]:
                 _sp.run(_sudo_wrap(['ufw', 'deny', f'{_wo_ufw_port}/tcp']), capture_output=True)
 
-        plog('Starting WebODM containers…')
-        r = _sp.run(_sudo_wrap(['docker', 'compose', '-f', compose_path, 'up', '-d']),
-                    capture_output=True, text=True, timeout=120, cwd=wo_dir)
-        if r.returncode != 0:
-            raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
+        # ops #1328: pull, dump (3.x data) and only then write the compose and start, in the one
+        # routine Update uses. A pull that fails or times out stops the deploy with the old compose
+        # still on disk.
+        _webodm_move_to_new_images(wo_dir, compose_path, old_compose, compose_content, db_upgrade, plog)
 
         plog('Waiting for WebODM to become ready (up to 90 s)…')
         import time as _time
@@ -64785,38 +66696,101 @@ def _webodm_dir():
         pass
     return home
 
-def _webodm_compose(wo_dir, action, timeout=300):
+class _WebodmResult:
+    """What a WebODM command gave back, the same shape for a local run and an SSH run."""
+    def __init__(self, returncode=0, stdout='', stderr=''):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+def _webodm_remote(cfg):
+    return bool(cfg) and cfg.get('target_mode') == 'remote'
+
+
+def _webodm_run(cfg, argv, timeout=60):
+    """Run one command on the WebODM host: this box (through the broker on a non-root console),
+    or the remote host of a remote deploy (cfg = its deployment config, over SSH)."""
+    if _webodm_remote(cfg):
+        ok, out = _module_run(cfg, ' '.join(shlex.quote(a) for a in argv), timeout=timeout)
+        return _WebodmResult(0 if ok else 1, out or '', '')
+    return subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout)
+
+
+def _webodm_compose(wo_dir, action, timeout=300, cfg=None):
     """Run `docker compose <action>` in the WebODM dir via the broker — root reaches /root on a
-    flipped box (takwerx can't); --project-directory replaces the old bash-cd (denied)."""
+    flipped box (takwerx can't); --project-directory replaces the old bash-cd (denied). With
+    `cfg` of a remote deploy it runs on the remote host."""
+    if _webodm_remote(cfg):
+        return _webodm_run(cfg, ['docker', 'compose', '--project-directory', wo_dir] + shlex.split(action),
+                           timeout=timeout)
     return _broker_compose(wo_dir, action, timeout=timeout)
 
-def _webodm_db_sh(cmd, timeout=60):
+
+def _webodm_put_file(cfg, path, content):
+    """Write a file on the WebODM host (the remote host over scp for a remote deploy)."""
+    if not _webodm_remote(cfg):
+        _write_priv(path, content)
+        return
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as tf:
+        tf.write(content)
+        tmp = tf.name
+    try:
+        ok, _ = _module_copy(cfg, tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if not ok:
+        raise RuntimeError(f'could not write {path} on the remote host')
+
+
+def _webodm_db_sh(cmd, timeout=60, cfg=None):
     """Run `sh -c cmd` as postgres inside wo_db (through the broker on a non-root box)."""
-    return subprocess.run(_sudo_wrap(['docker', 'exec', '-u', 'postgres', 'wo_db', 'sh', '-c', cmd]),
-                          capture_output=True, text=True, timeout=timeout)
+    return _webodm_run(cfg, ['docker', 'exec', '-u', 'postgres', 'wo_db', 'sh', '-c', cmd], timeout=timeout)
 
 
-def _webodm_db_needs_upgrade(wo_dir):
-    """True when wo_db holds a PostgreSQL 9.5 data dir (WebODM 3.x) that the 4.x image will
-    upgrade, False when it is already on 18. Starts wo_db first if it is down. Raises when the
-    database can't be read: Update must not start a one-way upgrade it can't back up."""
+def _webodm_db_data_probe():
+    """Shell text that prints what the db volume holds: `18`, `9.5` (or another version read from
+    PG_VERSION), the numbers of any other version folders, or `none` for an empty volume."""
     v = WEBODM_DB_VOLUME
-    probe = f'if [ -s {v}/18/PG_VERSION ]; then echo 18; else cat {v}/PG_VERSION; fi'
-    for attempt in range(13):
-        r = _webodm_db_sh(probe, timeout=15)
-        ver = (r.stdout or '').strip()
-        if r.returncode == 0 and ver:
-            return ver == '9.5'
-        if attempt == 0:
-            _webodm_compose(wo_dir, 'up -d wo_db', timeout=120)
-        time.sleep(5)
-    raise RuntimeError('could not read the WebODM database version (is wo_db running?). Nothing was changed.')
+    return (f'if [ -s {v}/18/PG_VERSION ]; then echo 18; elif [ -s {v}/PG_VERSION ]; then cat {v}/PG_VERSION; '
+            f'else o=$(cd {v} && for d in [0-9]*; do [ -s "$d/PG_VERSION" ] && printf "%s " "$d"; done); '
+            f'echo "${{o:-none}}"; fi')
 
 
-def _webodm_db_room_check(plog):
+def _webodm_db_needs_upgrade(wo_dir, cfg=None):
+    """True when the WebODM database is PostgreSQL 9.5 (WebODM 3.x), which the 4.x image upgrades
+    one way on its first start; False when it is already on 18 or the volume is empty. Raises when
+    the data can't be read or holds any other version: Deploy and Update must not start a one-way
+    upgrade they can't back up, and a version we don't know would start under the 18 image.
+    Reads the volume inside the running wo_db, else in a one-off container with a shell as its
+    entrypoint (no database start, so no upgrade, whatever image the compose file names)."""
+    probe = _webodm_db_data_probe()
+    ver = ''
+    r = _webodm_db_sh(probe, timeout=30, cfg=cfg)
+    if r.returncode == 0 and (r.stdout or '').strip():
+        ver = (r.stdout or '').strip().splitlines()[-1].strip()
+    else:
+        script = probe.replace("'", "'\\''")
+        r = _webodm_compose(wo_dir, f"run --rm --no-deps -T --entrypoint sh wo_db -c '{script}'",
+                            timeout=600, cfg=cfg)
+        if r.returncode == 0 and (r.stdout or '').strip():
+            ver = (r.stdout or '').strip().splitlines()[-1].strip()
+    if not ver:
+        raise RuntimeError('could not read the WebODM database version. Nothing was changed.')
+    if ver == '9.5':
+        return True
+    if ver in ('18', 'none'):
+        return False
+    raise RuntimeError(f'the WebODM database holds PostgreSQL data this console does not know how to move '
+                       f'(version {ver[:20]}). Nothing was changed. Ask for help on GitHub before pressing '
+                       f'Update or Reapply again.')
+
+
+def _webodm_db_room_check(plog, cfg=None):
     """Before the 9.5 → 18 upgrade: raise (nothing changed yet) unless the db volume has room."""
     v = WEBODM_DB_VOLUME
-    r = _webodm_db_sh(f'du -sk {v}; df -Pk {v}', timeout=120)
+    r = _webodm_db_sh(f'du -sk {v}; df -Pk {v}', timeout=120, cfg=cfg)
     try:
         lines = r.stdout.strip().splitlines()
         used_kb, free_kb = int(lines[0].split()[0]), int(lines[-1].split()[3])
@@ -64832,50 +66806,72 @@ def _webodm_db_room_check(plog):
                            + _FREE_SPACE_BACKUPS_HINT)
 
 
-def _webodm_backup_db_95():
+def _webodm_prepare_db_upgrade(wo_dir, old_compose, plog, cfg=None):
+    """Before the 9.5 → 18 move, with nothing changed yet: make sure the 9.5 database is running
+    (the room check and the dump run inside it), then check there is room. A stopped wo_db is
+    started from the compose file on disk, but only while that file still names the old image:
+    started from a compose that names the 4.x image it would begin the one-way upgrade itself,
+    with no dump (a half-finished earlier update leaves that state)."""
+    for attempt in range(13):
+        r = _webodm_db_sh('true', timeout=15, cfg=cfg)
+        if r.returncode == 0:
+            break
+        if attempt == 0:
+            if re.search(r'^    image: webodm/webodm_db:18', old_compose or '', re.M):
+                raise RuntimeError('WebODM\'s database is stopped and its compose file already names the new '
+                                   'WebODM version (an earlier update did not finish). Nothing was changed. '
+                                   'Start it with: docker start wo_db, then press Update or Reapply again.')
+            _webodm_compose(wo_dir, 'up -d wo_db', timeout=120, cfg=cfg)
+        time.sleep(5)
+    else:
+        raise RuntimeError('could not start the WebODM database to back it up. Nothing was changed.')
+    _webodm_db_room_check(plog, cfg)
+
+
+def _webodm_backup_db_95(cfg=None):
     """pg_dumpall the 9.5 database into the db volume root (the upgrade leaves `backup-*` names
     in place) and check the dump holds WebODM's database. Returns its path under the WebODM dir."""
     v = WEBODM_DB_VOLUME
     name =f'{WEBODM_DB_DUMP_PREFIX}{time.strftime("%Y%m%d-%H%M%S")}-pg95.sql'
     r = _webodm_db_sh(f'pg_dumpall -U postgres -f {v}/{name} && gzip {v}/{name} && '
-                      f'gzip -cd {v}/{name}.gz | grep -c "^CREATE DATABASE webodm_dev"', timeout=1800)
-    if r.returncode != 0 or (r.stdout or '').strip() != '1':
+                      f'gzip -cd {v}/{name}.gz | grep -c "^CREATE DATABASE webodm_dev"', timeout=1800, cfg=cfg)
+    if r.returncode != 0 or (r.stdout or '').strip().splitlines()[-1:] != ['1']:
         raise RuntimeError(f'database backup failed: {(r.stderr or r.stdout or "")[:300]}')
     return f'db/{name}.gz'
 
 
-def _webodm_answers():
+def _webodm_answers(cfg=None):
     """True when Django in the webapp container answers HTTP. WebODM 4.x answers /api/ with
     403 to a caller that isn't signed in (3.x: 200), so `curl -f` reads a healthy 4.x as down."""
     try:
-        r = subprocess.run(_sudo_wrap(['docker', 'exec', 'webapp', 'curl', '-s', '-o', '/dev/null',
-                                       '-w', '%{http_code}', '--max-time', '5', 'http://localhost:8000/api/']),
-                           capture_output=True, text=True, timeout=20)
+        r = _webodm_run(cfg, ['docker', 'exec', 'webapp', 'curl', '-s', '-o', '/dev/null',
+                              '-w', '%{http_code}', '--max-time', '5', 'http://localhost:8000/api/'], timeout=20)
     except Exception:
         return False
-    return r.returncode == 0 and (r.stdout or '').strip()[:1] in ('2', '3', '4')
+    out = (r.stdout or '').strip().splitlines()[-1:]
+    return r.returncode == 0 and bool(out) and out[0][:1] in ('2', '3', '4')
 
 
-def _webodm_wait_upgraded(deadline_s):
+def _webodm_wait_upgraded(deadline_s, cfg=None):
     """Wait for the first 4.x start: (True, '') once the webapp answers, (False, why) when the
     DB upgrade reports a failure or the time runs out."""
     end = time.time() + deadline_s
     while time.time() < end:
-        r = subprocess.run(_sudo_wrap(['docker', 'logs', 'wo_db']), capture_output=True, text=True, timeout=30)
+        r = _webodm_run(cfg, ['docker', 'logs', 'wo_db'], timeout=30)
         if 'UPGRADE FAILED' in (r.stdout or '') + (r.stderr or ''):
             return False, 'the database upgrade failed (details: db/upgrade.log)'
-        if _webodm_answers():
+        if _webodm_answers(cfg):
             return True, ''
         time.sleep(15)
     return False, f'WebODM did not answer within {deadline_s // 60} minutes'
 
 
-def _webodm_restore_95(wo_dir, compose_path, old_compose, plog):
-    """Undo a failed 3.x → 4.x Update: put the untouched 9.5 copy (db/backup-9.5) back in the
+def _webodm_restore_95(wo_dir, compose_path, old_compose, plog, cfg=None):
+    """Undo a failed 3.x → 4.x move: put the untouched 9.5 copy (db/backup-9.5) back in the
     volume root, rewrite the old compose and start 3.x again. Runs in a one-off wo_db container
     (the 18 image has bash) so the console never touches the uid-999 data dir itself."""
     plog('Putting the previous WebODM version back…')
-    _webodm_compose(wo_dir, 'stop', timeout=180)
+    _webodm_compose(wo_dir, 'stop', timeout=180, cfg=cfg)
     v = WEBODM_DB_VOLUME
     # The copy is renamed once restored: the next upgrade reuses a `backup-9.5` it finds instead
     # of copying again, and this one would miss whatever 3.x writes from now on.
@@ -64883,17 +66879,81 @@ def _webodm_restore_95(wo_dir, compose_path, old_compose, plog):
               f'find . -mindepth 1 -maxdepth 1 ! -name "backup-*" ! -name upgrade.log ! -name lost+found '
               f'-exec rm -rf {{}} +; cp -a backup-9.5/. .; mv backup-9.5 backup-9.5-restored-$(date +%Y%m%d%H%M%S); '
               f'fi; test "$(cat PG_VERSION)" = 9.5')
-    r = _webodm_compose(wo_dir, f"run --rm --no-deps -T --entrypoint bash wo_db -c '{script}'", timeout=1800)
+    r = _webodm_compose(wo_dir, f"run --rm --no-deps -T --entrypoint bash wo_db -c '{script}'", timeout=1800, cfg=cfg)
     if r.returncode != 0:
-        raise RuntimeError(f'could not put the 9.5 database back: {(r.stderr or "")[:300]}. '
+        raise RuntimeError(f'could not put the 9.5 database back: {(r.stderr or r.stdout or "")[:300]}. '
                            f'The untouched copy is in db/backup-9.5 and the dump in db/{WEBODM_DB_DUMP_PREFIX}*.')
-    _write_priv(compose_path, old_compose)
-    r = _webodm_compose(wo_dir, 'up -d', timeout=180)
+    _webodm_put_file(cfg, compose_path, old_compose)
+    r = _webodm_compose(wo_dir, 'up -d', timeout=180, cfg=cfg)
     if r.returncode != 0:
-        raise RuntimeError(f'docker compose up failed: {(r.stderr or "")[:300]}')
-    ok, _why = _webodm_wait_upgraded(300)
+        raise RuntimeError(f'docker compose up failed: {(r.stderr or r.stdout or "")[:300]}')
+    ok, _why = _webodm_wait_upgraded(300, cfg)
     plog('  ✓ Previous WebODM version is running again with its data' if ok else
          '  ⚠ Previous WebODM version started but does not answer yet — check: docker logs webapp')
+
+
+def _webodm_move_to_new_images(wo_dir, compose_path, old_compose, new_compose, db_upgrade, plog, cfg=None):
+    """The one way every path (Update, Deploy/Reapply, remote deploy) puts the new WebODM images
+    on a box (ops #1328). The compose file on disk is written LAST: the new images are pulled
+    from a side file, and the 9.5 database is dumped, before it changes. A console that dies
+    during the pull or the dump leaves the compose on what the box runs, so no later `up -d`
+    (Reapply, restart) can start the one-way upgrade with no room check and no backup.
+    `old_compose` is None on a fresh install. Raises with plain words; the previous version and
+    its data are back before it does, when the failure came after the upgrade could have begun."""
+    pending = f'{wo_dir}/{WEBODM_PENDING_COMPOSE}'
+
+    def _drop_pending():
+        try:
+            _webodm_run(cfg, ['rm', '-f', pending], timeout=30)
+        except Exception:
+            pass
+
+    plog(f'Pulling WebODM {WEBODM_VERSION} images (this may take several minutes)…')
+    try:
+        _webodm_put_file(cfg, pending, new_compose)
+        r = _webodm_compose(wo_dir, f'-f {shlex.quote(pending)} pull', timeout=WEBODM_PULL_TIMEOUT_S, cfg=cfg)
+    except BaseException:
+        _drop_pending()   # a time limit too: the compose on disk was never touched
+        raise
+    plog((r.stdout or '')[-500:] or '(no output)')
+    if r.returncode != 0:
+        _drop_pending()
+        raise RuntimeError(f'docker compose pull failed: {(r.stderr or r.stdout or "")[-300:]}')   # the end holds the error, the start holds compose warnings
+    if db_upgrade:
+        plog('Stopping WebODM and backing up its database…')
+        try:
+            _webodm_run(cfg, ['docker', 'stop', 'webapp', 'wo_worker'], timeout=180)
+            dump = _webodm_backup_db_95(cfg)
+        except BaseException:
+            _drop_pending()
+            _webodm_compose(wo_dir, 'up -d', timeout=180, cfg=cfg)   # the compose on disk is still 3.x
+            raise
+        plog(f'  ✓ Database backed up to {wo_dir}/{dump}')
+    try:
+        _webodm_put_file(cfg, compose_path, new_compose)
+    finally:
+        _drop_pending()
+    plog('Restarting containers with new images…')
+    try:
+        r = _webodm_compose(wo_dir, 'up -d', timeout=180, cfg=cfg)
+        plog((r.stdout or '')[-300:] or '(no output)')
+        if r.returncode != 0:
+            raise RuntimeError(f'docker compose up failed: {(r.stderr or r.stdout or "")[-300:]}')
+        if db_upgrade:
+            plog('Upgrading the database and starting WebODM (a few minutes)…')
+            ok, why = _webodm_wait_upgraded(WEBODM_UPGRADE_WAIT_S, cfg)
+            if not ok:
+                raise RuntimeError(why)
+    except Exception as e:
+        if not db_upgrade:
+            raise
+        # 4.x may already be upgrading the 9.5 data: any failure from here on, a time limit
+        # too, goes back to 3.x and the untouched 9.5 copy (upstream writes it atomically).
+        plog(f'  ✗ {e}')
+        _webodm_restore_95(wo_dir, compose_path, old_compose, plog, cfg)
+        raise RuntimeError(f'WebODM {WEBODM_VERSION} update failed ({e}); the previous version and its data are back.')
+    if db_upgrade:
+        plog('  ✓ Database upgraded. The old 9.5 copy is kept in db/backup-9.5.')
 
 
 def _run_webodm_update():
@@ -64907,9 +66967,13 @@ def _run_webodm_update():
         # Update means "move to the tested pins", not "pull whatever :latest is today" (ops #92).
         compose_path = os.path.join(wo_dir, 'docker-compose.yml')
         compose_txt = _read_priv(compose_path)
-        pinned = _webodm_pin_images(compose_txt)
+        kept = []   # ops #1307: services already newer than their pin are never moved back
+        pinned = _webodm_pin_images(compose_txt, kept=kept)
         if pinned != compose_txt:
             plog(f'Pinned WebODM images to the tested set (WebODM {WEBODM_VERSION}, {WEBODM_IMAGES["wo_broker"]})')
+        for _svc, _cur in kept:
+            plog(f'Kept {_svc} on {_cur}: it is newer than the tested pin ({WEBODM_IMAGES[_svc]}), '
+                 'and an older version cannot read the data the newer one already wrote')
         stripped = _webodm_strip_olefile(pinned)
         if stripped != pinned:
             plog('Applied WebODM security update to the webapp/worker entrypoints (ops #206)')
@@ -64917,55 +66981,8 @@ def _run_webodm_update():
         db_upgrade = _webodm_db_needs_upgrade(wo_dir)
         if db_upgrade:
             plog('This update upgrades the WebODM database (PostgreSQL 9.5 → 18). A backup is made first.')
-            _webodm_db_room_check(plog)
-        if stripped != compose_txt:
-            _write_priv(compose_path, stripped)
-        plog(f'Pulling WebODM {WEBODM_VERSION} images…')
-        # However the pull ends short of success (a non-zero exit, or TimeoutExpired: test6 in
-        # the 10.3.10 T&E), the old compose goes back. Left on the new pins, the next `up -d`
-        # in this dir would start 4.x on the 9.5 data with no room check and no backup.
-        pulled = False
-        try:
-            r = _webodm_compose(wo_dir, 'pull', timeout=WEBODM_PULL_TIMEOUT_S)
-            pulled = r.returncode == 0
-        finally:
-            if not pulled and stripped != compose_txt:
-                _write_priv(compose_path, compose_txt)   # leave the box on what it runs
-        plog(r.stdout[-500:] if r.stdout else '(no output)')
-        if not pulled:
-            raise RuntimeError(f'docker compose pull failed: {(r.stderr or "")[:300]}')
-        if db_upgrade:
-            plog('Stopping WebODM and backing up its database…')
-            try:
-                subprocess.run(_sudo_wrap(['docker', 'stop', 'webapp', 'wo_worker']),
-                               capture_output=True, text=True, timeout=180)
-                dump = _webodm_backup_db_95()
-            except Exception:
-                _write_priv(compose_path, compose_txt)
-                _webodm_compose(wo_dir, 'up -d', timeout=180)
-                raise
-            plog(f'  ✓ Database backed up to {os.path.join(wo_dir, dump)}')
-        plog('Restarting containers with new images…')
-        try:
-            r = _webodm_compose(wo_dir, 'up -d', timeout=180)
-            plog(r.stdout[-300:] if r.stdout else '(no output)')
-            if r.returncode != 0:
-                raise RuntimeError(f'docker compose up failed: {(r.stderr or "")[:300]}')
-            if db_upgrade:
-                plog('Upgrading the database and starting WebODM (a few minutes)…')
-                ok, why = _webodm_wait_upgraded(WEBODM_UPGRADE_WAIT_S)
-                if not ok:
-                    raise RuntimeError(why)
-        except Exception as e:
-            if not db_upgrade:
-                raise
-            # 4.x may already be upgrading the 9.5 data: any failure from here on, a time limit
-            # too, goes back to 3.x and the untouched 9.5 copy (upstream writes it atomically).
-            plog(f'  ✗ {e}')
-            _webodm_restore_95(wo_dir, compose_path, compose_txt, plog)
-            raise RuntimeError(f'WebODM {WEBODM_VERSION} update failed ({e}); the previous version and its data are back.')
-        if db_upgrade:
-            plog('  ✓ Database upgraded. The old 9.5 copy is kept in db/backup-9.5.')
+            _webodm_prepare_db_upgrade(wo_dir, compose_txt, plog)
+        _webodm_move_to_new_images(wo_dir, compose_path, compose_txt, stripped, db_upgrade, plog)
         plog('Update complete.')
         _webodm_update_status.update({'running': False, 'complete': True, 'error': False})
     except Exception as e:
@@ -66949,6 +68966,134 @@ def _ensure_authentik_tvr_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_
     return True
 
 
+_MESHRELAY_RUN_USER = 'ptt'
+
+
+def _meshrelay_account_ready():
+    """True when the `ptt` account exists and is fit. Same rule as the broker's
+    `_meshrelay_account_problem` (Security, ops #980): not root, no login shell, its own group
+    as the primary group, and no other group at all."""
+    try:
+        import pwd, grp
+        pw = pwd.getpwnam(_MESHRELAY_RUN_USER)
+    except (KeyError, ImportError):
+        return False
+    if pw.pw_uid == 0 or pw.pw_gid == 0:
+        return False
+    if pw.pw_shell not in ('/usr/sbin/nologin', '/sbin/nologin', '/bin/false', '/usr/bin/false'):
+        return False
+    try:
+        if grp.getgrgid(pw.pw_gid).gr_name != _MESHRELAY_RUN_USER:
+            return False
+    except KeyError:
+        return False
+    if any(_MESHRELAY_RUN_USER in g.gr_mem and g.gr_name != _MESHRELAY_RUN_USER for g in grp.getgrall()):
+        return False
+    return True
+
+
+def _ensure_meshrelay_account(plog=None):
+    """ops #973: create the `ptt` account the MeshRelay unit runs as. True when it is there
+    and fit. Through the broker on a non-root console, directly as root otherwise. Never raises."""
+    def _log(m):
+        if plog:
+            plog(m)
+    try:
+        if _meshrelay_account_ready():
+            return True
+        if _broker_socket_present():
+            resp = _broker_request({'op': 'meshrelay_account'}, timeout=60)
+            if not resp.get('ok'):
+                _log(f"  ⚠ ptt account: {resp.get('error') or 'broker refused'}")
+        elif os.geteuid() == 0:
+            subprocess.run(['groupadd', '--system', _MESHRELAY_RUN_USER], capture_output=True, timeout=30)
+            subprocess.run(['useradd', '--system', '-g', _MESHRELAY_RUN_USER, '-M', '-d', '/nonexistent',
+                            '-s', '/usr/sbin/nologin', _MESHRELAY_RUN_USER], capture_output=True, timeout=30)
+        ok = _meshrelay_account_ready()
+        if ok:
+            _log("  ✓ ptt system account ready (MeshRelay does not run as the console's account)")
+        return ok
+    except Exception as e:
+        _log(f"  ⚠ ptt account error: {e}")
+        return False
+
+
+def _ensure_authentik_meshrelay_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
+    """ops #973: MeshRelay proxy provider + application in Authentik, added to the embedded
+    outpost. Same pattern as TAK Video Restreamer; Caddy forward_auth protects the dashboard host."""
+    if not fqdn or not ak_token:
+        return False
+    def log(msg):
+        if plog:
+            plog(msg)
+    import urllib.request as _urlreq
+    _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    _ak_url = _get_authentik_api_url(settings) if settings else 'http://127.0.0.1:9090'
+    try:
+        if not flow_pk or not inv_flow_pk:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
+            flows = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
+            flow_pk = next((f['pk'] for f in flows if 'implicit' in f.get('slug', '')), flows[0]['pk'] if flows else None)
+            req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
+            inv_flows = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
+            inv_flow_pk = next((f['pk'] for f in inv_flows if 'provider' not in f.get('slug', '')), inv_flows[0]['pk'] if inv_flows else None)
+        if not flow_pk or not inv_flow_pk:
+            log("  ⚠ No authorization/invalidation flow — skipping MeshRelay proxy provider")
+            return False
+        host = f'https://{_pub_hostport(_get_service_domain(settings, "meshrelay") if settings else f"meshrelay.{fqdn}")}'
+        cookie = f'.{fqdn.split(":")[0]}'
+        provider_pk = None
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/',
+                data=json.dumps({'name': 'MeshRelay Proxy', 'authorization_flow': flow_pk,
+                    'invalidation_flow': inv_flow_pk, 'external_host': host, 'mode': 'forward_single',
+                    'access_token_validity': _PROXY_SESSION_VALIDITY, 'cookie_domain': cookie}).encode(),
+                headers=_ak_headers, method='POST')
+            provider_pk = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['pk']
+            log("  ✓ Proxy provider created")
+        except Exception as e:
+            if getattr(e, 'code', None) != 400:
+                raise
+            req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search=MeshRelay', headers=_ak_headers)
+            results = json.loads(_urlreq.urlopen(req, timeout=10).read().decode())['results']
+            if results:
+                provider_pk = results[0]['pk']
+                # Authentik 2026.8.5 validates a partial update as if `mode` were its default
+                # (`proxy`) and refuses a body without it: HTTP 400 "Internal host cannot be
+                # empty" (ops #708). Found again on a box by a second MeshRelay Deploy (ops #973).
+                req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
+                    data=json.dumps({'name': 'MeshRelay Proxy', 'authorization_flow': flow_pk,
+                        'invalidation_flow': inv_flow_pk, 'mode': 'forward_single',
+                        'access_token_validity': _proxy_session_validity_to_write(
+                            results[0].get('access_token_validity')),
+                        'external_host': host, 'cookie_domain': cookie}).encode(),
+                    headers=_ak_headers, method='PATCH')
+                _urlreq.urlopen(req, timeout=10)
+                log("  ✓ Proxy provider already exists (external_host updated)")
+        if not provider_pk:
+            log("  ⚠ Could not create or find the MeshRelay proxy provider")
+            return False
+        try:
+            req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                data=json.dumps({'name': 'MeshRelay', 'slug': 'meshrelay',
+                    'provider': provider_pk, 'open_in_new_tab': True}).encode(),
+                headers=_ak_headers, method='POST')
+            _urlreq.urlopen(req, timeout=10)
+            log("  ✓ Application 'MeshRelay' created")
+        except Exception as e:
+            if getattr(e, 'code', None) != 400:
+                raise
+            req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/meshrelay/',
+                data=json.dumps({'provider': provider_pk}).encode(), headers=_ak_headers, method='PATCH')
+            _urlreq.urlopen(req, timeout=10)
+            log("  ✓ Application 'MeshRelay' updated")
+        _outpost_add_providers_safe(_ak_url, _ak_headers, [provider_pk], plog=log)
+        return True
+    except Exception as e:
+        log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
+        return False
+
+
 def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
     """Create Federation Hub proxy provider + application in Authentik, add to embedded outpost.
     Same pattern as Node-RED / MediaMTX — Caddy forward_auth protects the route."""
@@ -67669,21 +69814,51 @@ def _netbird_mgmt_request(path, method='GET', data=None, token=None, base='http:
     return _req.urlopen(req, timeout=timeout, context=ctx)
 
 
+def _netbird_compose_image_tags(txt):
+    """The image tags a NetBird compose names: {'server': [...], 'dashboard': [...]}. One entry per
+    `image:` line; a line with no tag gives None (Docker reads that as :latest). Parsed as whole
+    tokens, so `0.82.1` is never found inside `0.82.10` (ops #1327)."""
+    import re as _re
+    out = {'server': [], 'dashboard': []}
+    for key, name in (('server', 'netbirdio/netbird-server'), ('dashboard', 'netbirdio/dashboard')):
+        pat = _re.compile(r'^[ \t]*image:[ \t]*["\']?' + _re.escape(name)
+                          + r'(?::([^\s"\'#]+))?(?![\w./:-])', _re.M)
+        out[key] = [m.group(1) for m in pat.finditer(txt or '')]
+    return out
+
+
+def _netbird_compose_on_target(txt, srv_img, dash_img):
+    """True when EVERY netbird-server and dashboard image line in the compose names exactly the
+    tag of the target images, and each is named at least once. An exact tag compare: a text match
+    found 0.82.1 inside 0.82.10, and a tag-less line counted as the pin (ops #1327)."""
+    tags = _netbird_compose_image_tags(txt)
+    want_srv = srv_img.rsplit(':', 1)[-1]
+    want_dash = dash_img.rsplit(':', 1)[-1]
+    return (bool(tags['server']) and all(t == want_srv for t in tags['server'])
+            and bool(tags['dashboard']) and all(t == want_dash for t in tags['dashboard']))
+
+
 def _netbird_sync_compose_image_tags(nb_dir):
-    """Rewrite the NetBird compose's image: tags to the current NETBIRD_SERVER_IMAGE /
-    NETBIRD_DASHBOARD_IMAGE constants (the vetted PIN). A box may carry a different tag on disk —
-    an older pin, or the broken :latest a box was briefly moved to — so pin the compose before
-    any `docker compose pull` so it fetches exactly the vetted image. Idempotent; best-effort."""
+    """Rewrite the NetBird compose's image: tags to the current target images (the PIN for this
+    box's update channel). A box may carry a different tag on disk — an older pin, the broken
+    :latest a box was briefly moved to, a tag-less line — so pin the compose before the container
+    is recreated. Idempotent; best-effort. Callers pull the images FIRST (ops #1327): this rewrite
+    never runs ahead of a pull."""
     import re as _re
     compose = os.path.join(nb_dir, 'docker-compose.yml')
     try:
         with open(compose) as f:
             txt = f.read()
     except Exception:
-        return False
+        try:
+            txt = _read_priv(compose)
+        except Exception:
+            return False
     _srv_img, _dash_img = _get_netbird_target_images()
-    new = _re.sub(r'(image:\s*)netbirdio/netbird-server:\S+', rf'\1{_srv_img}', txt)
-    new = _re.sub(r'(image:\s*)netbirdio/dashboard:\S+', rf'\1{_dash_img}', new)
+    new = _re.sub(r'(?m)^([ \t]*image:[ \t]*["\']?)netbirdio/netbird-server(?::[^\s"\'#]+)?(?![\w./:-])',
+                  lambda m: m.group(1) + _srv_img, txt)
+    new = _re.sub(r'(?m)^([ \t]*image:[ \t]*["\']?)netbirdio/dashboard(?::[^\s"\'#]+)?(?![\w./:-])',
+                  lambda m: m.group(1) + _dash_img, new)
     if new == txt:
         return False  # already current — nothing to do
     try:
@@ -67697,6 +69872,179 @@ def _netbird_sync_compose_image_tags(nb_dir):
             return True
         except Exception:
             return False
+
+
+def _netbird_pull_images(images, plog):
+    """Pull each image BY NAME and report (ok, message). A failed pull is not fatal when the image
+    is already on this box (an offline box, a registry blip): the compose will name exactly that
+    image. A failed pull of an image that is NOT on the box stops the caller before it touches
+    the compose or the container (ops #1327: the heal used to rewrite the compose first, so a
+    failed pull left the new tag named over the old container)."""
+    for img in images:
+        try:
+            r = subprocess.run(_sudo_wrap(['docker', 'pull', img]),
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode == 0:
+                continue
+            err = (r.stderr or r.stdout or 'docker pull failed').strip()[:200]
+        except Exception as e:
+            err = str(e)[:200]
+        try:
+            have = subprocess.run(_sudo_wrap(['docker', 'image', 'inspect', img]),
+                                  capture_output=True, text=True, timeout=30)
+            on_disk = have.returncode == 0
+        except Exception:
+            on_disk = False
+        if on_disk:
+            plog(f'  ⚠ netbird: could not pull {img} ({err}); using the copy already on this box')
+            continue
+        return False, f'could not pull {img}: {err}'
+    return True, ''
+
+
+def _netbird_data_fingerprint(root):
+    """(relative path, size, mtime_ns) of every file under root — what a stopped store looks like."""
+    out = []
+    for dp, _dn, fns in os.walk(root):
+        for fn in fns:
+            p = os.path.join(dp, fn)
+            try:
+                st = os.lstat(p)
+            except OSError:
+                continue
+            out.append((os.path.relpath(p, root), st.st_size, st.st_mtime_ns))
+    return sorted(out)
+
+
+def _netbird_backup_data(nb_dir, from_label, plog):
+    """Copy ~/netbird/data (store.db, idp.db, the rest) to ~/netbird/data.bak-<from_label> BEFORE a
+    NetBird image change (ops #1327). NetBird 0.83 migrates the store and upstream names no way
+    back, so this copy is the only way to undo it.
+
+    The server is stopped for the copy so the files are consistent (a live SQLite copy can be torn).
+    The caller recreates it right after with the new image. Returns (ok, backup_path_or_None, msg).
+    On ANY failure the server is started again and nothing has changed: no backup, no image change.
+    An identical earlier backup is reused (a heal that retries every boot adds no copies); the 5
+    newest backups are kept."""
+    import shutil as _sh
+    import sqlite3 as _sq
+    import re as _re
+    from datetime import datetime as _dt
+    data = os.path.join(nb_dir, 'data')
+    try:
+        has_data = os.path.isdir(data) and bool(os.listdir(data))
+    except OSError:
+        has_data = False
+    if not has_data:
+        return True, None, 'no NetBird data to back up'
+
+    def _start_again():
+        try:
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'start', 'netbird-server']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=120)
+        except Exception:
+            pass
+
+    label = _re.sub(r'[^0-9A-Za-z._-]', '_', (from_label or '').strip()) or 'unknown'
+    try:
+        subprocess.run(_sudo_wrap(['docker', 'compose', 'stop', 'netbird-server']),
+                       capture_output=True, text=True, cwd=nb_dir, timeout=120)
+        st = subprocess.run(_sudo_wrap(['docker', 'inspect', '-f', '{{.State.Running}}', 'netbird-server']),
+                            capture_output=True, text=True, timeout=30)
+        if st.returncode == 0 and st.stdout.strip() == 'true':
+            return False, None, 'could not stop netbird-server for a consistent copy'
+    except Exception as e:
+        _start_again()
+        return False, None, f'could not stop netbird-server: {str(e)[:120]}'
+
+    dest = None
+    try:
+        fp = _netbird_data_fingerprint(data)
+        for name in sorted(os.listdir(nb_dir)):
+            old = os.path.join(nb_dir, name)
+            if name.startswith('data.bak-') and os.path.isdir(old) and _netbird_data_fingerprint(old) == fp:
+                plog(f'  ✓ netbird: data already backed up in {name}')
+                return True, old, 'already backed up'
+        need = sum(sz for _p, sz, _m in fp)
+        free = _sh.disk_usage(nb_dir).free
+        if free < int(need * 1.1) + 50 * 1024 * 1024:
+            _start_again()
+            return False, None, (f'not enough free disk for a backup of the NetBird data '
+                                 f'({need // (1024 * 1024)} MB needed, {free // (1024 * 1024)} MB free)')
+        dest = os.path.join(nb_dir, f'data.bak-{label}')
+        if os.path.exists(dest):
+            dest += '-' + _dt.utcnow().strftime('%Y%m%d-%H%M%S')
+        try:
+            _sh.copytree(data, dest, symlinks=True, copy_function=_sh.copy2)
+        except Exception:
+            # root-owned files the console cannot read: copy as root through the broker.
+            _sh.rmtree(dest, ignore_errors=True)
+            r = subprocess.run(_sudo_wrap(['cp', '-a', data, dest]),
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout or 'cp failed').strip()[:160])
+        try:
+            os.chmod(dest, 0o700)
+            os.utime(dest, None)  # copytree gave it the source folder's time; "newest" must mean newest
+        except OSError:
+            pass
+        if _netbird_data_fingerprint(dest) != fp:
+            raise RuntimeError('the copy does not match the data')
+        db = os.path.join(dest, 'store.db')
+        if os.path.isfile(db):
+            conn = _sq.connect(f'file:{db}?mode=ro&immutable=1', uri=True, timeout=5)
+            try:
+                conn.execute('SELECT count(*) FROM sqlite_master').fetchone()
+            finally:
+                conn.close()
+    except Exception as e:
+        if dest:
+            _sh.rmtree(dest, ignore_errors=True)
+        _start_again()
+        return False, None, f'backup of the NetBird data failed: {str(e)[:160]}'
+
+    try:
+        baks = sorted((os.path.join(nb_dir, n) for n in os.listdir(nb_dir) if n.startswith('data.bak-')),
+                      key=lambda p: os.path.getmtime(p), reverse=True)
+        for old in baks[5:]:
+            if old != dest:
+                _sh.rmtree(old, ignore_errors=True)
+    except OSError:
+        pass
+    plog(f'  ✓ netbird: backed up data/ to {os.path.basename(dest)} ({need // (1024 * 1024)} MB). '
+         f'To go back: stop netbird-server, copy it over data/, put the old image tags in docker-compose.yml, up -d')
+    return True, dest, 'backed up'
+
+
+def _netbird_prepare_image_change(nb_dir, compose_txt, srv_img, dash_img, plog):
+    """Everything that must succeed BEFORE the compose names a new NetBird image (ops #1327):
+    pull both images by name, then back up the data. Returns (ok, backup_path_or_None, msg). When
+    ok is False nothing has changed and netbird-server is running as before."""
+    ok, msg = _netbird_pull_images([srv_img, dash_img], plog)
+    if not ok:
+        return False, None, msg
+    cur = (_netbird_compose_image_tags(compose_txt)['server'] or [None])[0]
+    return _netbird_backup_data(nb_dir, cur or 'untagged', plog)
+
+
+def _netbird_revert_compose(nb_dir, old_txt, plog):
+    """The new image would not start: put the previous compose text back and bring the old
+    container up again, so the box keeps running (the backup is untouched either way)."""
+    compose = os.path.join(nb_dir, 'docker-compose.yml')
+    try:
+        try:
+            with open(compose, 'w') as f:
+                f.write(old_txt)
+        except Exception:
+            _write_priv(compose, old_txt)
+        r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=180)
+        plog('  netbird: put the previous compose back' + ('' if r.returncode == 0
+             else f' — start failed: {(r.stderr or r.stdout or "").strip()[:160]}'))
+        return r.returncode == 0
+    except Exception as e:
+        plog(f'  ⚠ netbird: could not put the previous compose back: {str(e)[:120]}')
+        return False
 
 
 def _netbird_store_key_needed(server_image):
@@ -67922,8 +70270,9 @@ def _heal_netbird_pinned_image(plog=None):
     """v10.0.9: roll a NetBird box back onto the vetted pin if its compose carries a different
     image tag — e.g. the briefly-shipped :latest that jumped server 0.72.3→"24.04" / dashboard
     v2.39→v2.90 and broke auth fleet-wide (401 'token invalid'). Detects drift from the on-disk
-    compose tag, rewrites to the pin, pulls, and recreates so the box self-heals on the next
-    console boot. Idempotent: a box already on the pin is a no-op (no pull, no restart).
+    compose tag (an exact tag compare, ops #1327), pulls the pin, backs up the data, rewrites the
+    compose to the pin and recreates, so the box self-heals on the next console boot. Idempotent:
+    a box already on the pin is a no-op (no pull, no stop, no backup, no restart).
     Best-effort; never raises. (Recovery proven manually on test6/8/12 2026-07-06 — 0.72.3 starts
     clean against the newer-migrated store.db and the 401s stop.)"""
     _log = plog or (lambda m: print(m, flush=True))
@@ -67945,22 +70294,49 @@ def _heal_netbird_pinned_image(plog=None):
             except Exception:
                 return False
         _srv_img, _dash_img = _get_netbird_target_images()
-        if _srv_img in txt and _dash_img in txt:
+        if _netbird_compose_on_target(txt, _srv_img, _dash_img):
             return False  # already on this channel's target — healthy, no-op
         _pin_kind = 'dev' if _srv_img == NETBIRD_SERVER_DEV_IMAGE and NETBIRD_SERVER_DEV_IMAGE != NETBIRD_SERVER_IMAGE else 'vetted'
         _log(f"  netbird: compose off the {_pin_kind} pin — restoring {_srv_img} + recreating")
-        _netbird_sync_compose_image_tags(nb_dir)
-        subprocess.run(_sudo_wrap(['docker', 'compose', 'pull', 'netbird-server', 'dashboard']),
-                       capture_output=True, text=True, cwd=nb_dir, timeout=600)
+        # ops #1327: pull FIRST and back the data up, THEN rewrite the compose. Before, the compose
+        # was rewritten before the pull and the pull was not checked, so a failed pull left the new
+        # tag named over the old container (the next `up -d` swapped the image silently), and a
+        # move to 0.83 migrated the store with no copy of the old one.
+        _ok, _bak, _msg = _netbird_prepare_image_change(nb_dir, txt, _srv_img, _dash_img, _log)
+        if not _ok:
+            _log(f"  ⚠ netbird: image NOT changed ({_msg}); NetBird keeps running as it was. "
+                 "The next console start tries again.")
+            return False
+        # ops #1307: this heal goes DOWN on purpose (it pulls a box off a bad newer image, and
+        # 0.83.2 -> 0.82.1 on a migrated store was drilled, ops #1088). When it does, say so once
+        # in plain words, so nobody reads a version going back as a fault.
+        _cur_srv = re.search(r'netbirdio/netbird-server:[^\s\'"]+', txt)
+        if _cur_srv and _image_ahead_of_pin(_cur_srv.group(0), _srv_img):
+            _log(f"  netbird: moved NetBird down from {_cur_srv.group(0).rsplit(':', 1)[-1]} to "
+                 f"{_srv_img.rsplit(':', 1)[-1]}: this box ran a newer version than the tested "
+                 f"one for its update channel, so it goes back to the tested one")
+        _wrote = _netbird_sync_compose_image_tags(nb_dir)
+        if not _wrote:
+            _log("  ⚠ netbird: could not rewrite docker-compose.yml; starting NetBird as it was")
         r = subprocess.run(_sudo_wrap(['docker', 'compose', 'up', '-d']),
                            capture_output=True, text=True, cwd=nb_dir, timeout=180)
-        if r.returncode == 0:
+        if r.returncode == 0 and _wrote:
             _log(f"  ✓ netbird: restored to {_pin_kind} pin + recreated")
             return True
-        _log(f"  ⚠ netbird: pin restore recreate failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+        if r.returncode != 0:
+            _log(f"  ⚠ netbird: pin restore recreate failed: {(r.stderr or r.stdout or '').strip()[:200]}")
+            if _wrote:
+                _netbird_revert_compose(nb_dir, txt, _log)
+            if _bak:
+                _log(f"  netbird: data backup kept in {os.path.basename(_bak)}")
         return False
     except Exception as e:
         _log(f"  netbird: pin-restore heal error (non-fatal): {e}")
+        try:  # the backup stops the server for its copy: never leave it stopped
+            subprocess.run(_sudo_wrap(['docker', 'compose', 'start', 'netbird-server']),
+                           capture_output=True, text=True, cwd=nb_dir, timeout=120)
+        except Exception:
+            pass
         return False
 
 
@@ -68146,12 +70522,17 @@ def _netbird_complete_setup(settings, plog):
         resp = _netbird_mgmt_request('/api/setup', method='POST', data=body, timeout=30)
         result = json.loads(resp.read().decode())
         pat = result.get('personal_access_token') or ''
+        # ops #1327: THIS deploy created the account, so the onboarding / approval gates it starts
+        # with are ours to clear (once). A redeploy or Update of an existing account never sets
+        # this, so it never touches an approval setting the operator chose.
+        settings['netbird_finalize_pending'] = True
         if pat:
             settings['netbird_pat'] = pat
             settings['netbird_admin_email'] = email
             save_settings(settings)
             plog(f'  ✓ Setup complete — PAT saved (user={email})')
             return pat
+        save_settings(settings)
         plog(f'  ⚠ Setup returned 200 without PAT (keys: {list(result.keys())})')
         return None
     except urllib.error.HTTPError as e:
@@ -68555,8 +70936,28 @@ def _run_netbird_deploy(settings):
         # /api/setup then created the owner WITHOUT a PAT or an account, Authentik was never
         # registered, and the deploy still reported success. The flag only matters while
         # setup is required, and Step 5 rewrites the compose without it.
-        _nb_target_srv, _ = _get_netbird_target_images()
+        _nb_target_srv, _nb_target_dash = _get_netbird_target_images()
         nb_store_key = _ensure_netbird_store_key_setting(settings) if _netbird_store_key_needed(_nb_target_srv) else None
+        # ops #1327: a redeploy over an existing NetBird that changes the image (or finds a store
+        # with no compose) pulls the new images and backs up data/ BEFORE the compose is rewritten.
+        _old_compose = os.path.join(nb_dir, 'docker-compose.yml')
+        _old_txt = None
+        if os.path.isfile(_old_compose):
+            try:
+                with open(_old_compose) as _f:
+                    _old_txt = _f.read()
+            except Exception:
+                try:
+                    _old_txt = _read_priv(_old_compose)
+                except Exception:
+                    _old_txt = None
+        _store_exists = os.path.isfile(os.path.join(nb_dir, 'data', 'store.db'))
+        if (_old_txt is not None and not _netbird_compose_on_target(_old_txt, _nb_target_srv, _nb_target_dash)) \
+                or (_old_txt is None and _store_exists):
+            _ok, _bak, _msg = _netbird_prepare_image_change(nb_dir, _old_txt or '', _nb_target_srv,
+                                                            _nb_target_dash, plog)
+            if not _ok:
+                raise RuntimeError(f'NetBird image not changed: {_msg}. The running NetBird was left as it was.')
         _netbird_write_compose(nb_dir, netbird_domain, auth_secret, setup_pat_enabled=True, store_key=nb_store_key)
         plog(f'  ✓ Wrote ~/netbird config (embedded IdP at https://{_pub_hostport(netbird_domain)}/oauth2)')
 
@@ -68564,6 +70965,8 @@ def _run_netbird_deploy(settings):
         _sp.run(_sudo_wrap(['docker', 'compose', 'pull']), capture_output=True, text=True, cwd=nb_dir)
         r = _sp.run(_sudo_wrap(['docker', 'compose', 'up', '-d']), capture_output=True, text=True, cwd=nb_dir)
         if r.returncode != 0:
+            if _old_txt:
+                _netbird_revert_compose(nb_dir, _old_txt, plog)
             raise RuntimeError(f'docker compose up failed: {r.stderr[:300]}')
         # netbird-server reads the host CA bundle through a single-file bind mount, and
         # update-ca-certificates swaps that file, so a container started before a CA was installed
@@ -68614,7 +71017,15 @@ def _run_netbird_deploy(settings):
 
         plog('  Recreating containers to apply config...')
         _netbird_recreate_containers(nb_dir, plog)
-        _netbird_finalize_account_store(plog)
+        # ops #1327: clear the onboarding / approval gates only when this install still owes it
+        # (a deploy created the owner and the clear has not happened yet). A redeploy of a working
+        # account left "users need approval" alone.
+        if settings.get('netbird_finalize_pending'):
+            if _netbird_finalize_account_store(plog):
+                settings.pop('netbird_finalize_pending', None)
+                save_settings(settings)
+        else:
+            plog('  ✓ Account approval settings left as they are')
         plog('✓ Click Authentik on the NetBird login page to sign in')
 
         plog('')
@@ -68659,7 +71070,7 @@ _AUTHENTIK_DEFAULT_ACCESS_TOKEN_VALIDITY = 'hours=1'
 # provider on the box belongs to the operator.
 _INFRATAK_PROXY_PROVIDER_NAMES = frozenset({
     'infra-TAK', 'TAK Portal Proxy', 'Node-RED Proxy', 'MediaMTX', 'Federation Hub Proxy',
-    'WebODM Proxy', 'TAK Video Restreamer Proxy', 'ATLAS MDM Proxy',
+    'WebODM Proxy', 'TAK Video Restreamer Proxy', 'ATLAS MDM Proxy', 'MeshRelay Proxy',
 })
 
 
@@ -69606,6 +72017,41 @@ def _nodered_port_holders_as_conflicts(port=1880):
 # on Node 24, a bigger change.
 NODERED_IMAGE = 'nodered/node-red:4.1.18-22'
 _NODERED_IMAGE_LINE_RE = re.compile(r'^(\s*image:\s*)nodered/node-red:\S+[ \t]*$', re.M)
+
+
+def _nodered_remote_image_cmd():
+    """The shell script that moves a REMOTE Node-RED onto NODERED_IMAGE (run over ssh in the
+    post-update step). It mirrors the local rule in _auto_nodered (ops #1307): a compose that
+    already names a newer exact tag, or a floating tag whose container ran a newer Node-RED, is
+    left alone, because an older Node-RED is not built to open flows a newer one saved.
+
+    Versions are compared with `sort -V` (GNU coreutils, on every host we deploy to) after
+    turning `4.1.18-22` into `4.1.18.22` (a floating tag's container version has no build part,
+    so `4.1.18` sorts below the pin and `5.0.10` above it, the same as the Python helper)."""
+    _pin_key = NODERED_IMAGE.split(':', 1)[1].replace('-', '.')
+    return (
+        'cd ~/node-red 2>/dev/null && test -f docker-compose.yml || '
+        '{ echo "[remote-nr] no compose — skipped"; exit 0; }; '
+        f'if grep -qF "image: {NODERED_IMAGE}" docker-compose.yml; '
+        f'then echo "[remote-nr] already on {NODERED_IMAGE}"; exit 0; fi; '
+        # the tag the compose names now; an exact tag is its own version, a floating one is
+        # judged by the Node-RED its container really ran
+        'cur=$(sed -n -E "s#^[[:space:]]*image:[[:space:]]*nodered/node-red:([^[:space:]]+).*#\\1#p" '
+        'docker-compose.yml | head -n 1); '
+        'if printf "%s" "$cur" | grep -qE "^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9]+)?(-[A-Za-z][A-Za-z0-9._]*)?$"; '
+        'then key=$(printf "%s" "$cur" | sed -E "s/^v//; s/-[A-Za-z][A-Za-z0-9._]*$//; s/-/./g"); '
+        # only NODE_RED_VERSION is printed: the container's environment holds its .env secrets
+        "else key=$(docker inspect nodered --format '{{range .Config.Env}}{{$p := split . \"=\"}}"
+        "{{if eq (index $p 0) \"NODE_RED_VERSION\"}}{{println .}}{{end}}{{end}}' 2>/dev/null "
+        '| sed -n -E "s/^NODE_RED_VERSION=v?([0-9]+\\.[0-9]+\\.[0-9]+).*/\\1/p" | head -n 1); fi; '
+        f'if [ -n "$key" ] && [ "$key" != "{_pin_key}" ] '
+        f'&& [ "$(printf "%s\\n%s\\n" "$key" "{_pin_key}" | sort -V | tail -n 1)" = "$key" ]; '
+        'then echo "[remote-nr] $cur (version $key) is newer than the pin — left alone (never a downgrade)"; exit 0; fi; '
+        'sed -i -E "s#^([[:space:]]*image:[[:space:]]*)nodered/node-red:[^[:space:]]+[[:space:]]*\\$'
+        f'#\\1{NODERED_IMAGE}#" docker-compose.yml && '
+        'docker compose pull --quiet 2>&1 && '
+        'docker compose up -d 2>&1'
+    )
 
 
 def _nodered_foreign_listener_lines(domain, port=1880, pulled=False):
@@ -71776,10 +74222,37 @@ def authentik_control():
             if not _ak_tag_is_sane(latest):
                 return jsonify({'error': f'Refusing to update: target release '
                                          f'"{latest}" is not a valid Authentik version.'}), 500
+            # ops #1322: never walk a remote host BACKWARDS either (the local branch has refused
+            # this since v10.1.39). Authentik's database migrations do not go back, so an older
+            # server may not start. Read first; the first write is the `sed` below. A host we
+            # cannot read is refused, not guessed at.
+            _mod_result_step('authentik', 'read the version on the remote host (remote)')
+            _rh = (remote.get('host') or '').strip()
+            _cur = _ak_remote_current_version(remote)
+            if not _cur['ok']:
+                _hint = _cur.get('hint') or 'Fix that, then press Update again.'
+                return jsonify({'error': f'Refusing to update {_rh}: {_cur["error"]}. '
+                                         f'Nothing was changed. {_hint}'}), 500
+            _cur_t = (_cur['tuple'] + (0, 0, 0))[:3]
+            _tgt_t = (_ak_ver_tuple(latest) + (0, 0, 0))[:3]
+            if _cur_t > _tgt_t:
+                return jsonify({'error': f'Refusing to downgrade Authentik on {_rh}: v{_cur["tag"]} '
+                                         f'({_cur["what"]}), this channel targets v{latest}. '
+                                         f'Nothing was changed. Promote the vetted release instead of '
+                                         f'downgrading a live IdP.'}), 409
             # v10.2.8 W10b: remember the tag this host is pinned to now, so a failure can restore it.
-            _rp_ok, _rp_out = _ssh_probe(remote, f"cd {ak_dir} && grep -oE 'AUTHENTIK_TAG:-[^}}]+' docker-compose.yml | head -1 | cut -d- -f2", timeout=10)
+            # ops #1359: strip only the `AUTHENTIK_TAG:-` prefix. `cut -d- -f2` split on EVERY dash, so a
+            # pin such as 2026.11.0-rc2 or 2026.8.7-distroless came back as 2026.11.0 / 2026.8.7 and
+            # the restore wrote a different tag than the host had.
+            _rp_ok, _rp_out = _ssh_probe(remote, f"cd {ak_dir} && grep -oE 'AUTHENTIK_TAG:-[^}}]+' docker-compose.yml | head -1 | sed 's/^AUTHENTIK_TAG:-//'", timeout=10)
             _remote_prev = (_rp_out or '').strip().splitlines()[0].strip() if _rp_ok and (_rp_out or '').strip() else ''
-            if not _ak_tag_is_sane(_remote_prev):
+            # The old `_ak_tag_is_sane` (digits and dots only) refused a pin with a suffix, so the restore
+            # would do nothing. Allow YYYY.M[.P] plus an optional `-suffix` of letters, digits, dots and
+            # dashes. No slash, ampersand, quote, space or newline passes, so the value is safe inside the
+            # `sed 's/.../.../'` below. `latest`, `2026` and a `v` prefix stay refused (not restored).
+            # Inline on purpose: a new module-level name would have to be added to every test that cuts
+            # `authentik_control` out of app.py by name.
+            if not re.fullmatch(r'\d{4}(?:\.\d{1,3}){1,3}(?:-[0-9A-Za-z][0-9A-Za-z.\-]{0,40})?', _remote_prev):
                 _remote_prev = ''
 
             def _remote_restore_pin():
@@ -76179,7 +78652,7 @@ def _ensure_authentik_gunicorn_timeout(plog, value=120):
 
         import time as _t
         backup_path = f'{env_path}.bak.gunicorn-timeout.{int(_t.time())}'
-        with open(backup_path, 'w') as _f:
+        with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
 
         new_line = f'GUNICORN_CMD_ARGS=--timeout={int(value)}\n'
@@ -76303,7 +78776,7 @@ def _ensure_authentik_pg_persistent_connections(plog, max_age=10, health_checks=
 
         import time as _t
         backup_path = f'{env_path}.bak.pg-persistent-conn.{int(_t.time())}'
-        with open(backup_path, 'w') as _f:
+        with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
 
         appended = []
@@ -76418,7 +78891,7 @@ def _patch_authentik_conn_max_age_60_to_10(plog=None):
 
         import time as _t
         backup_path = f'{ak_env}.bak.conn-max-age-60to10.{int(_t.time())}'
-        with open(backup_path, 'w') as _f:
+        with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
 
         new_text = env_text.replace(
@@ -76528,7 +79001,7 @@ def _patch_authentik_web_max_requests_to_1000(plog=None):
 
         import time as _t
         backup_path = f'{ak_env}.bak.max-requests-1000.{int(_t.time())}'
-        with open(backup_path, 'w') as _f:
+        with _open_secret_w(backup_path) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(env_text)
 
         new_text = env_text
@@ -76691,7 +79164,7 @@ def _patch_authentik_max_requests_snap_to_baseline_if_pgbouncer(plog=None):
 
         _new_jitter = max(5, _baseline // 20)
         _backup = f'{ak_env}.bak.snap-to-baseline.{_now}'
-        with open(_backup, 'w') as _f:
+        with _open_secret_w(_backup) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(_env_text)
 
         _new_text = re.sub(
@@ -78154,6 +80627,23 @@ def _authentik_apply_official_tunings(plog):
         plog(f"  authentik tunings: read error: {e}")
         return False
 
+    try:
+        _n = _authentik_tighten_env_backups(ak_dir)         # ops #1332: old backups are 0644 and hold the secrets
+        if _n:
+            plog(f"  authentik tunings: made {_n} old .env backup file(s) private (mode 600)")
+    except Exception:
+        pass
+
+    # ops #1332: never build on a .env that lost its secrets (an empty or cut-short file).
+    if not _authentik_env_sane(content):
+        if _authentik_env_restore_from_backup(env_path, plog):
+            with open(env_path) as f:
+                content = f.read()
+        else:
+            plog("  \u2717 authentik tunings: ~/authentik/.env has no PG_PASS or AUTHENTIK_SECRET_KEY and no good "
+                 "backup was found — changed nothing. Put the old .env back, then restart the console.")
+            return False
+
     lines = content.splitlines()
     actions = []
 
@@ -78232,6 +80722,9 @@ def _authentik_apply_official_tunings(plog):
         return False
 
     try:
+        _bak = f"{env_path}.bak.tunings.{int(time.time())}"      # ops #1332: this writer kept no backup
+        with _open_secret_w(_bak) as f:
+            f.write(content)
         with _open_secret_w(env_path) as f:
             f.write(new_content)
         plog("  authentik tunings: .env updated:")
@@ -84418,7 +86911,7 @@ def _authentik_max_requests_autotune_apply(plog, new_max, new_jitter, reason):
             return False
 
         _backup = f"{ak_env}.bak.autotune.{_now}"
-        with open(_backup, 'w') as _f:
+        with _open_secret_w(_backup) as _f:   # ops #1332: 0600, the backup holds the secrets
             _f.write(_txt)
 
         _new_txt = re.sub(
@@ -86231,6 +88724,16 @@ def _authentik_fix_trusted_proxy_cidrs(plog):
         plog(f"  trusted proxy CIDRs: read error: {e}")
         return False
 
+    # ops #1332: never build on a .env that lost its secrets (an empty or cut-short file).
+    if not _authentik_env_sane(content):
+        if _authentik_env_restore_from_backup(env_path, plog):
+            with open(env_path) as f:
+                content = f.read()
+        else:
+            plog("  \u2717 trusted proxy CIDRs: ~/authentik/.env has no PG_PASS or AUTHENTIK_SECRET_KEY and no good "
+                 "backup was found — changed nothing. Put the old .env back, then restart the console.")
+            return False
+
     key = 'AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS'
     value = AK_TRUSTED_PROXY_CIDRS
 
@@ -86251,6 +88754,8 @@ def _authentik_fix_trusted_proxy_cidrs(plog):
 
     new_content = content.rstrip('\n') + f'\n{key}={value}\n'
     try:
+        with _open_secret_w(f"{env_path}.bak.trusted-proxy.{int(time.time())}") as f:   # ops #1332: no backup before
+            f.write(content)
         with _open_secret_w(env_path) as f:
             f.write(new_content)
         plog(f"  trusted proxy CIDRs: appended {key}={value}")
@@ -87412,6 +89917,8 @@ def run_authentik_deploy(reconfigure=False):
                     env_lines = f.readlines()
                 has_cookie_domain = any(line.strip().startswith('AUTHENTIK_COOKIE_DOMAIN=') for line in env_lines)
                 if not has_cookie_domain:
+                    with _open_secret_w(f"{env_path}.bak.cookie-domain.{int(time.time())}") as f:   # ops #1332
+                        f.write(''.join(env_lines))
                     with _open_secret_w(env_path) as f:
                         for line in env_lines:
                             f.write(line)
@@ -87627,6 +90134,11 @@ def run_authentik_deploy(reconfigure=False):
             plog("")
             plog("\u2501\u2501\u2501 Step 3/10: Generating Configuration \u2501\u2501\u2501")
             ldap_svc_pass = None
+            # ops #1332: a missing or damaged .env over an existing database volume must not
+            # make new passwords (Postgres keeps the old one inside the volume).
+            if _authentik_env_guard_before_mint(env_path, plog) == 'refuse':
+                authentik_deploy_status.update({'running': False, 'error': True})
+                return
             if not os.path.exists(env_path):
                 pg_pass = subprocess.run('openssl rand -base64 36 | tr -d "\\n"', shell=True, capture_output=True, text=True).stdout.strip()[:90]
                 secret_key = subprocess.run('openssl rand -hex 32', shell=True, capture_output=True, text=True).stdout.strip()
@@ -88345,9 +90857,12 @@ entries:
                         import secrets as _ldap_secrets
                         ldap_svc_password = _ldap_secrets.token_urlsafe(24)
                         try:
-                            with open(env_path, 'a') as _env_f:
+                            with open(env_path) as _env_r:      # ops #1332: whole-file atomic write, not a bare append
+                                _env_now = _env_r.read()
+                            with _open_secret_w(env_path) as _env_f:
                                 _env_f.write(
-                                    '\n# Auto-generated by infra-TAK v0.9.12 (was previously a shared hardcoded fallback).\n'
+                                    _env_now + ('' if _env_now.endswith('\n') or not _env_now else '\n')
+                                    + '\n# Auto-generated by infra-TAK v0.9.12 (was previously a shared hardcoded fallback).\n'
                                     f'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD={ldap_svc_password}\n'
                                 )
                             plog("  ⚠ AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD was missing — generated and saved a new value to ~/authentik/.env")
@@ -98598,7 +101113,7 @@ def takserver_control():
         s1 = tak_cfg.get('server_one', {})
         if s1.get('host'):
             pg_action = 'restart' if action == 'restart' else action
-            db_cmd = f'sudo pg_ctlcluster 15 main {pg_action} 2>&1 || sudo systemctl {pg_action} postgresql 2>&1'
+            db_cmd = _pg_ctl_cmd(pg_action, (tak_cfg.get('database') or {}).get('port') or 5432)
             ok, out = _ssh_probe(s1, db_cmd, timeout=30)
             verify_ok, verify_out = _ssh_probe(s1, 'pg_isready -q && echo DB_OK', timeout=10)
             db_running = verify_ok and 'DB_OK' in (verify_out or '')
@@ -100832,7 +103347,7 @@ def run_takserver_58_container_migration(zip_path, log=None, status=None):
         #    it would have preserved is already gone, so its fresh init builds 5.8's schema.
         #    It writes the SAME status dict the Update panel polls, so it is told not to
         #    mark the job complete — the data has not moved yet.
-        run_takserver_upgrade_container(zip_path, mark_complete=False)
+        run_takserver_upgrade_container(zip_path, mark_complete=False, migration=True)
         if upgrade_status.get('error'):
             return fail('The container rebuild failed — see the output above.',
                         f'Your PostgreSQL 15 data is intact in volume {old_vol} and the export '
@@ -102424,6 +104939,137 @@ def _cot_stall_report():
     return out
 
 
+# ── ops #1337: a rollback must not destroy what it cannot put back ───────────────────────────
+def _tak_pg_major_local():
+    """PostgreSQL major (15, 18, …) of the cluster that holds the cot database on this box,
+    or None when it cannot be read. Fixed SQL only (see _pg_exec)."""
+    try:
+        r = _pg_exec(['psql', '-tAX', '-d', 'postgres', '-c', 'show server_version_num'], timeout=30)
+        v = (r.stdout or '').strip() if (r is not None and r.returncode == 0) else ''
+        return int(v) // 10000 if v.isdigit() else None
+    except Exception:
+        return None
+
+
+def _tak_cot_table_oid():
+    """pg_class oid of the cot table `schema_version`, or None when it is not there.
+
+    `pg_restore --clean` drops and creates every table, so after a restore that really ran
+    this oid is a new one. The same oid after pg_restore means it restored nothing (it
+    refused the archive and exited 1, the same code it uses for harmless warnings)."""
+    try:
+        r = _pg_exec(['psql', '-tAX', '-d', 'cot', '-c',
+                      "select oid from pg_class where relname = 'schema_version' "
+                      "and relkind = 'r' and relnamespace = 'public'::regnamespace"], timeout=30)
+        v = (r.stdout or '').strip() if (r is not None and r.returncode == 0) else ''
+        return int(v) if v.isdigit() else None
+    except Exception:
+        return None
+
+
+_PG_RESTORE_REFUSED_RE = re.compile(
+    r'unsupported version|archive was made by a newer|input file is too short|'
+    r'does not appear to be a valid archive|not a valid archive', re.I)
+
+
+def _tak_pg_restore_refused(stderr):
+    """True when pg_restore's own words say it refused the archive. Its exit code cannot say
+    so: 1 is both "refused" and "restored with ignorable warnings"."""
+    return bool(stderr and _PG_RESTORE_REFUSED_RE.search(stderr))
+
+
+def _tak_rollback_dump_too_new(snap_meta, installed_major):
+    """Text that refuses a rollback when the snapshot's database dump came from a NEWER
+    PostgreSQL major than the one installed here, else ''. An older dump into a newer server
+    is fine (and gets the schema update afterwards). Nothing is known for a snapshot made
+    before this check, or for a remote database: then the after-restore check decides."""
+    try:
+        dumped = int((snap_meta or {}).get('db_pg_major'))
+        here = int(installed_major)
+    except (TypeError, ValueError):
+        return ''
+    if dumped > here:
+        return (f"This snapshot's database was dumped from PostgreSQL {dumped}, but this server runs "
+                f"PostgreSQL {here}. A newer dump cannot be restored into an older server. "
+                f"Nothing was changed.")
+    return ''
+
+
+def _tak_swap_certs(certs_src, certs_dst):
+    """Put the snapshot's certificate folder in place of the live one without a gap.
+
+    The old code ran `rm -rf` on the live folder first and copied after. A copy that failed
+    (disk full) left the box with no certificates, and the log still ended "restored".
+    Now: copy beside the live folder, and only when that landed move the live folder aside,
+    move the copy in and remove the old one. Any failure puts the old folder back.
+    Returns (True, '') or (False, reason); on False the live certificates are untouched."""
+    new_dir, old_dir = certs_dst + '.rb-new', certs_dst + '.rb-old'
+
+    def _run(argv, timeout=300):
+        r = subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout)
+        return r.returncode, ((r.stderr or r.stdout or '').strip()[:200])
+
+    _run(['rm', '-rf', new_dir], 60)
+    _run(['rm', '-rf', old_dir], 60)
+    rc, err = _run(['cp', '-rp', certs_src, new_dir])
+    if rc != 0:
+        _run(['rm', '-rf', new_dir], 60)
+        return False, f"could not copy the snapshot's certificates ({err or 'cp failed'})"
+    had_live = _run(['test', '-e', certs_dst], 15)[0] == 0
+    if had_live:
+        rc, err = _run(['mv', certs_dst, old_dir], 60)
+        if rc != 0:
+            _run(['rm', '-rf', new_dir], 60)
+            return False, f"could not move the current certificates aside ({err or 'mv failed'})"
+    rc, err = _run(['mv', new_dir, certs_dst], 60)
+    if rc != 0:
+        if had_live:
+            _run(['mv', old_dir, certs_dst], 60)
+        _run(['rm', '-rf', new_dir], 60)
+        return False, f"could not move the restored certificates into place ({err or 'mv failed'})"
+    if had_live:
+        _run(['rm', '-rf', old_dir], 60)
+    return True, ''
+
+
+def _tak_prune_snapshots(source, keep):
+    """Keep the newest `keep` snapshots whose settings source is `source`; delete the rest."""
+    try:
+        s = load_settings()
+        sn = s.get('tak_snapshots') or []
+        mine = sorted([x for x in sn if x.get('source') == source],
+                      key=lambda x: x.get('taken_at', ''), reverse=True)
+        for victim in mine[keep:]:
+            ok, lab = _validate_snapshot_label(victim.get('label', ''))
+            if not ok:
+                continue
+            subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(SNAPSHOT_DIR, lab)]),
+                           capture_output=True, timeout=60)
+            sn = [x for x in sn if x.get('label') != lab]
+        s['tak_snapshots'] = sn
+        save_settings(s)
+    except Exception:
+        pass
+
+
+def _tak_downgrade_needs_dump(pkg_filename, snap_result):
+    """Text that refuses an update when the package is OLDER than the installed TAK Server and
+    the snapshot just taken holds no database dump (ops #1337), else ''.
+
+    An older package runs on a database a newer one has already migrated; the dump is the only
+    way back. A normal upgrade with no dump keeps its warning; a downgrade does not go ahead."""
+    try:
+        if not _tak_package_downgrade(pkg_filename):
+            return ''
+    except Exception:
+        return ''
+    if isinstance(snap_result, dict) and snap_result.get('db_dump'):
+        return ''
+    return ("This update installs an OLDER TAK Server than the one installed, and the snapshot taken "
+            "first holds no database dump, so the database could not be put back. Nothing was changed. "
+            "Fix the database backup first (see the snapshot log), then run the update again.")
+
+
 def _tak_snapshot(label, plog=None):
     """Create a TAK Server snapshot at /opt/tak/snapshots/<label>/.
 
@@ -102727,6 +105373,22 @@ def _tak_snapshot(label, plog=None):
     except Exception as e:
         plog(f"  snapshot: pg_dump exception: {e}")
 
+    # ops #1337: what the dump holds, so a rollback can refuse a dump from a newer PostgreSQL
+    # and prove afterwards that the restore really changed the database. Local database only
+    # (a remote one is not read with these helpers). A value that cannot be read is left out.
+    try:
+        if meta.get('db_dump'):
+            _sn_cfg = _get_tak_deployment_config(load_settings())
+            if _sn_cfg.get('mode') not in ('two_server', 'external_db'):
+                _m = _tak_pg_major_local()
+                _v = _tak58_schema_version()
+                if _m:
+                    meta['db_pg_major'] = _m
+                if _v is not None:
+                    meta['db_schema_version'] = _v
+    except Exception as _me:
+        plog(f"  snapshot: could not record the database version ({str(_me)[:120]})")
+
     # 5. Certificates
     certs_src = '/opt/tak/certs/files'
     certs_dst = os.path.join(snap_path, 'certs')
@@ -102875,6 +105537,46 @@ def _tak_rollback(label, plog=None):
         if not _via_broker:
             return False, f"Snapshot '{label}' has no cot.pgdump — cannot restore database"
 
+    # ops #1337: refuse, before anything is touched, a dump from a newer PostgreSQL than the one
+    # here (pg_restore exits 1 for that, which this function used to read as "warnings").
+    _rb_meta = {}
+    try:
+        _rb_meta = next((sn for sn in (load_settings().get('tak_snapshots') or [])
+                         if sn.get('label') == label), {}) or {}
+    except Exception:
+        _rb_meta = {}
+    _rb_cfg0 = _get_tak_deployment_config(load_settings())
+    _rb_local_db = _rb_cfg0.get('mode') not in ('two_server', 'external_db')
+    if _rb_local_db and _rb_meta.get('db_pg_major'):
+        _too_new = _tak_rollback_dump_too_new(_rb_meta, _tak_pg_major_local())
+        if _too_new:
+            plog(f"  rollback [{label}]: refused — {_too_new}")
+            return False, _too_new
+
+    # ops #1337: a rollback is the one action that deletes the current state. Take a snapshot of
+    # it first, so a bad rollback can itself be undone. Best effort: a database that cannot be
+    # dumped (the reason for many rollbacks) must not stop the rollback, so a failure only warns.
+    _safety = 'pre-rollback-' + datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    plog(f"  rollback: saving the current state first [{_safety}]…")
+    try:
+        _sf_ok, _sf_res = _tak_snapshot(_safety, plog)
+        if _sf_ok:
+            try:
+                _ss = load_settings()
+                for sn in (_ss.get('tak_snapshots') or []):
+                    if sn.get('label') == _safety:
+                        sn['source'] = 'pre-rollback'
+                save_settings(_ss)
+            except Exception:
+                pass
+            _tak_prune_snapshots('pre-rollback', 2)
+            if not (isinstance(_sf_res, dict) and _sf_res.get('db_dump')):
+                plog("  ⚠ rollback: the saved current state has NO database dump — the database cannot be undone")
+        else:
+            plog(f"  ⚠ rollback: could not save the current state first ({str(_sf_res)[:160]}) — going on")
+    except Exception as _sf_e:
+        plog(f"  ⚠ rollback: could not save the current state first ({str(_sf_e)[:160]}) — going on")
+
     # ops #839: the container's user ids are read while it is still running. A stopped
     # container cannot be asked with `docker exec`; the restore used to chown the whole
     # certificate folder to a made-up uid 1000 then.
@@ -102896,6 +105598,10 @@ def _tak_rollback(label, plog=None):
             plog(f"  rollback: could not start takserver: {str(_e)[:200]}")
         return False, 'takserver did not stop within 180 s — nothing was restored'
 
+    # ops #1337: files that did not come back are reported at the end; "restored" is no longer
+    # printed over a copy that failed.
+    _file_errs = []
+
     # 3. Restore CoreConfig.xml
     cc_src = os.path.join(snap_path, 'CoreConfig.xml')
     if os.path.exists(cc_src):
@@ -102904,6 +105610,7 @@ def _tak_rollback(label, plog=None):
             plog("  rollback: CoreConfig.xml restored")
         except Exception as e:
             plog(f"  rollback: CoreConfig restore failed: {e}")
+            _file_errs.append('CoreConfig.xml')
 
     # 3b. Restore UserAuthenticationFile.xml (flat-file users incl. optional Phase 1A nodered).
     uaf_src = os.path.join(snap_path, 'UserAuthenticationFile.xml')
@@ -102924,6 +105631,7 @@ def _tak_rollback(label, plog=None):
             plog("  rollback: UserAuthenticationFile.xml restored")
         except Exception as e:
             plog(f"  rollback: UserAuthenticationFile.xml restore failed: {e}")
+            _file_errs.append('UserAuthenticationFile.xml')
     else:
         plog("  rollback: snapshot has no UserAuthenticationFile.xml — leaving current file in place")
 
@@ -102935,14 +105643,17 @@ def _tak_rollback(label, plog=None):
             plog("  rollback: takserver.default restored")
         except Exception as e:
             plog(f"  rollback: takserver.default restore failed: {e}")
+            _file_errs.append('takserver.default')
 
     # 5. Restore certs
     certs_src = os.path.join(snap_path, 'certs')
     certs_dst = '/opt/tak/certs/files'
     if os.path.isdir(certs_src):
         try:
-            subprocess.run(_sudo_wrap(['rm','-rf',certs_dst]), capture_output=True)
-            subprocess.run(_sudo_wrap(['cp','-rp',certs_src,certs_dst]), capture_output=True, check=True)
+            # ops #1337: copy beside the live folder and swap; a failed copy keeps the old certs.
+            _sw_ok, _sw_err = _tak_swap_certs(certs_src, certs_dst)
+            if not _sw_ok:
+                raise RuntimeError(_sw_err + ' — the current certificates are still in place')
             # Restore ownership (tak:tak) on certs
             # v10.1.67: same — a recursive chown to a hardcoded 1000 would leave the LE p12
             # (mode 0640) unreadable by a hardened container and break the next renewal.
@@ -102967,6 +105678,7 @@ def _tak_rollback(label, plog=None):
                 plog(f"  rollback: CA key lockdown skipped: {str(_lk_e)[:120]}")
         except Exception as e:
             plog(f"  rollback: certs restore failed: {e}")
+            _file_errs.append('certificates')
 
     # 6. pg_restore
     # In two-server mode stream the dump to Server One and restore there.
@@ -102999,6 +105711,8 @@ def _tak_rollback(label, plog=None):
     _db_err = None
     if not _rb_two_server and not _tak_rollback_prepare_local_db(plog):
         _db_err = 'the local database could not be prepared for the restore (see above)'
+    # ops #1337: the id of one table, read before the restore. pg_restore --clean makes a new one.
+    _rb_oid_before = _tak_cot_table_oid() if (not _rb_two_server and not _db_err) else None
     plog("  rollback: restoring PostgreSQL cot database…")
     try:
         _rb_s1 = _rb_tak_cfg.get('server_one', {})
@@ -103020,12 +105734,15 @@ def _tak_rollback(label, plog=None):
                 r2 = subprocess.run(_rb_ssh, stdin=_f, capture_output=True, timeout=300)
             if r2.returncode in (0, 1):
                 stderr = (r2.stderr or b'').decode()[:200]
+                if _tak_pg_restore_refused(stderr):
+                    _db_err = 'pg_restore on Server One refused the dump (see above)'
                 if stderr:
                     plog(f"  rollback: pg_restore (remote) warnings (non-fatal): {stderr}")
                 else:
                     plog("  rollback: pg_restore (remote) successful")
             else:
                 plog(f"  rollback: remote pg_restore failed (exit {r2.returncode}): {(r2.stderr or b'').decode()[:200]}")
+                _db_err = 'pg_restore on Server One failed (see above)'
         elif _broker_should_route() and _broker_available():
             # v10.0.8 non-root single-server: broker pg_restore op — the broker
             # opens the dump as root and feeds pg_restore/docker-exec itself, so
@@ -103036,6 +105753,8 @@ def _tak_rollback(label, plog=None):
                                     'timeout': 600}, timeout=630)
             if resp.get('ok') and resp.get('returncode') in (0, 1):
                 stderr = (resp.get('stderr') or '')[:200]
+                if _tak_pg_restore_refused(stderr):
+                    _db_err = 'pg_restore refused the dump (see above)'
                 if stderr:
                     plog(f"  rollback: pg_restore warnings (non-fatal): {stderr}")
                 else:
@@ -103058,6 +105777,8 @@ def _tak_rollback(label, plog=None):
                 )
                 if r2.returncode in (0, 1):
                     stderr = (r2.stderr or b'').decode()[:400]
+                    if _tak_pg_restore_refused(stderr):
+                        _db_err = 'pg_restore refused the dump (see above)'
                     if stderr:
                         plog(f"  rollback: pg_restore warnings (non-fatal): {stderr[:200]}")
                     else:
@@ -103080,6 +105801,8 @@ def _tak_rollback(label, plog=None):
                                     stdin=_f, capture_output=True, timeout=600)
             if r2.returncode in (0, 1):
                 stderr = (r2.stderr or b'').decode()[:400]
+                if _tak_pg_restore_refused(stderr):
+                    _db_err = 'pg_restore refused the dump (see above)'
                 if stderr:
                     plog(f"  rollback: pg_restore warnings (non-fatal): {stderr[:200]}")
                 else:
@@ -103103,8 +105826,18 @@ def _tak_rollback(label, plog=None):
     # migration does.
     if not _rb_two_server and not _db_err:
         _sv = _tak58_schema_version()
+        _want_sv = _rb_meta.get('db_schema_version')
+        _oid_after = _tak_cot_table_oid()
         if _sv is None:
             _db_err = 'the cot database has no TAK schema after pg_restore — nothing was restored'
+        elif isinstance(_want_sv, int) and _sv != _want_sv:
+            # ops #1337: the snapshot says which schema its dump held. A different one now means
+            # the dump did not land (old data left in place passes the "has a schema" check).
+            _db_err = (f"the cot database is on schema version {_sv}, but the snapshot's dump held "
+                       f"{_want_sv} — the dump was not restored")
+        elif _rb_oid_before is not None and _oid_after is not None and _oid_after == _rb_oid_before:
+            _db_err = ('pg_restore changed nothing in the cot database (its tables are the same ones '
+                       'as before) — the dump was not restored')
         else:
             plog(f"  rollback: cot database restored (schema_version {_sv})")
             _inst = _tak_artifact_version('takserver_' + (_get_takserver_version_info().get('version') or ''))
@@ -103139,6 +105872,14 @@ def _tak_rollback(label, plog=None):
         plog(f"  rollback: Node-RED restart error (non-fatal): {_e_nr}")
 
     _pkg_note = _tak_rollback_package_note(label)
+    if _file_errs:
+        # ops #1337: never print "restored" over a copy that failed.
+        _fe = ', '.join(_file_errs)
+        if _db_err:
+            plog(f"  ✗ rollback [{label}]: NOT fully restored. Files not restored: {_fe}. Database NOT restored. {_pkg_note}")
+            return False, f"{_fe} were not restored, and the database was not restored: {_db_err}"
+        plog(f"  ✗ rollback [{label}]: database restored, but these files were NOT restored: {_fe}. {_pkg_note}")
+        return False, f"these files were not restored: {_fe} (see the log above)"
     if _db_err:
         plog(f"  ✗ rollback [{label}]: config files and certs restored, database NOT restored. {_pkg_note}")
         return False, _db_err
@@ -103926,6 +106667,29 @@ def _stack_restore_nodered(dest, label, plog):
         f"{k}={len(after.get(k) or [])}" for k in _NODERED_CFG_LISTS) + " — nothing dropped")
 
 
+def _console_version_tuple(v):
+    """'10.4.9-alpha' -> (10, 4, 9); None when no x.y.z can be read."""
+    m = re.search(r'(\d+)\.(\d+)\.(\d+)', str(v or ''))
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def _stack_restore_too_new(backup_version, running_version=None):
+    """Why a backup cannot be restored by this console, or '' when it can (ops #1343).
+
+    A backup holds auth.json, update_channel, last_console_version and a pg_restore --clean
+    dump from the console that made it. Put onto an older console (after a rollback, or dev
+    to main) it loads a newer database dump into an older image and a newer settings layout
+    into older code. Refuse; the way forward is to update the console first. A version that
+    cannot be read is not refused: backups made before the manifest carried one still work."""
+    have = _console_version_tuple(running_version if running_version is not None else VERSION)
+    made = _console_version_tuple(backup_version)
+    if made and have and made > have:
+        return (f'this backup was made by infra-TAK {backup_version}, which is newer than this '
+                f'console ({running_version if running_version is not None else VERSION}). '
+                'Update the console first, then restore it — nothing was changed')
+    return ''
+
+
 def _stack_restore(label, plog=None):
     """Restore a full-stack backup onto this box. (True, summary) or (False, error/summary)."""
     import io as _io
@@ -103942,6 +106706,9 @@ def _stack_restore(label, plog=None):
         return False, 'manifest label does not match the backup'
     if not manifest.get('ok'):
         return False, f"this backup is incomplete ({', '.join(manifest.get('failed') or [])}) — refusing to restore it"
+    _too_new = _stack_restore_too_new(manifest.get('infratak_version'))
+    if _too_new:
+        return False, _too_new
     parts = {p['name']: p for p in manifest.get('parts') or []}
     plog(f"  restore [{label}]: backup from {manifest.get('created')} on {manifest.get('os')} "
          f"(infra-TAK {manifest.get('infratak_version')})")
@@ -104666,6 +107433,12 @@ def run_takserver_upgrade(pkg_path):
             ulog(f"  Detail: {snap_result}")
             upgrade_status.update({'running': False, 'complete': False, 'error': True})
             return
+        # ops #1337: an OLDER package with no database dump to go back to does not go ahead.
+        _dg_msg = _tak_downgrade_needs_dump(pkg_name, snap_result)
+        if _dg_msg:
+            ulog(f"✗ {_dg_msg}")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True})
+            return
 
         wait_for_unattended_upgrade_worker(ulog, upgrade_log)
         wait_for_apt_lock(ulog, upgrade_log)
@@ -104778,6 +107551,11 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
                 if sn.get('label') == snap_label: sn['source'] = 'pre-upgrade'
             save_settings(_s)
         except Exception: pass
+        # ops #1337: an OLDER package with no database dump to go back to does not go ahead.
+        _dg_msg = _tak_downgrade_needs_dump(os.path.basename(rpm_path), snap_result)
+        if _dg_msg:
+            ulog(f"✗ {_dg_msg}")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
 
         # Ensure the build repo + postgres module state the guide requires (idempotent on an
         # already-installed box; powertools/CRB on Rocky, codeready-builder on RHEL).
@@ -104844,7 +107622,264 @@ def run_takserver_upgrade_rhel(rpm_path, external_db=None):
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
 
 
-def run_takserver_upgrade_container(zip_path, mark_complete=True):
+# ==========================================================================
+# ops #1326 — the Docker TAK Server update checks everything BEFORE it touches anything
+# ==========================================================================
+# It used to `docker rm -f` both TAK containers first, unpack the zip next, delete the old
+# bundle folder before the build, and build last. A build that failed (registry unreachable,
+# disk full) left TAK down, the old folder gone with its snapshots and setenv.sh, and no way
+# to press Update again. A 5.7 zip on a 5.8 box built a PostgreSQL 15 image on a PostgreSQL 18
+# volume and started an empty database. Measured on a real 5.8 R105 ARM box, ops #1311/#1326.
+# Order now: read-only checks, backup outside the bundle, unpack, carry over, BUILD (TAK keeps
+# running), then stop + swap, then delete the old folder last, and only when the new TAK is up.
+
+_TAK_UPDATE_BACKUP_KEEP = 2
+_TAK_UPDATE_BACKUP_RE = re.compile(r'^pre-update-\d{8}-\d{6}$')
+_TAK_SETENV_HEAP_A = '# >>> infra-TAK managed heap >>>'
+_TAK_SETENV_HEAP_B = '# <<< infra-TAK managed heap <<<'
+
+
+def _tak_dockerfile_pg_major(text):
+    """PostgreSQL major a TAK database Dockerfile builds, or None. Pure.
+    5.7 and older: `FROM postgres:15.1`. 5.8 hardened (UBI + PGDG): `postgresql18-server`."""
+    t = text or ''
+    for pat in (r'^\s*FROM\s+(?:\S+/)?postgres:(\d+)', r'postgresql-?(\d+)-server',
+                r'/usr/pgsql-(\d+)/bin'):
+        m = re.search(pat, t, re.I | re.M)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _tak_zip_bundle_info(zip_path):
+    """Read-only look inside a takserver-docker zip. Returns {'top', 'app_df', 'db_df',
+    'hardened', 'pg_major'}. Raises ValueError (plain words) when it is not an official bundle."""
+    import zipfile
+    try:
+        zf = zipfile.ZipFile(zip_path)
+    except Exception:
+        raise ValueError('The uploaded file is not a readable zip.')
+    with zf:
+        names = zf.namelist()
+        tops = {n.split('/')[0] for n in names if n.strip('/')}
+        if len(tops) != 1:
+            raise ValueError('The zip does not hold one takserver-docker folder, so it is not an '
+                             'official takserver-docker zip.')
+        top = next(iter(tops))
+        for app_df, db_df in _TAK_DOCKERFILES:
+            if f'{top}/{app_df}' in names and f'{top}/{db_df}' in names:
+                text = zf.read(f'{top}/{db_df}')[:400000].decode('utf-8', 'replace')
+                return {'top': top, 'app_df': app_df, 'db_df': db_df,
+                        'hardened': 'hardened' in db_df.lower(),
+                        'pg_major': _tak_dockerfile_pg_major(text)}
+    raise ValueError('The zip has no TAK Server Dockerfiles, so it is not an official '
+                     'takserver-docker zip.')
+
+
+def _tak_db_volume_layout(volume=None):
+    """What the TAK database volume holds, read without changing it.
+    {'exists': False} when there is no such volume; {'exists': True, 'root': N|None,
+    'legacy': N|None} where `root` is the PostgreSQL major of a cluster at the volume root
+    (5.8 hardened layout) and `legacy` the major of a cluster at <volume>/<N>/data (5.7 layout);
+    None when the volume exists but could not be read."""
+    vol = volume or TAK_DB_VOLUME
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'volume', 'inspect', vol]),
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            return {'exists': False, 'root': None, 'legacy': None}
+        script = ('r=none; [ -s /from/PG_VERSION ] && r=$(cat /from/PG_VERSION); l=none; '
+                  'for f in /from/*/data/PG_VERSION; do [ -s "$f" ] && l=$(cat "$f"); done; '
+                  'echo "ROOT=$r LEGACY=$l"')
+        r = subprocess.run(_sudo_wrap([
+            'docker', 'run', '--rm', '--user', '0', '-v', f'{vol}:/from',
+            '--entrypoint', 'sh', TAK_CONTAINER, '-c', script],),
+            capture_output=True, text=True, timeout=180)
+    except Exception:
+        return None
+    m = re.search(r'ROOT=(\S+)\s+LEGACY=(\S+)', r.stdout or '') if r.returncode == 0 else None
+    if not m:
+        return None
+
+    def major(s):
+        d = re.match(r'(\d+)', s)
+        return int(d.group(1)) if d else None
+    return {'exists': True, 'root': major(m.group(1)), 'legacy': major(m.group(2))}
+
+
+def _tak_volume_check(hardened, image_major, vol):
+    """(ok, plain-words refusal) — can an image of `image_major`, laid out for the hardened
+    (volume root) or legacy (<volume>/N/data) bundle, start on the database volume described
+    by `vol` without creating an empty or incompatible database? Pure."""
+    if vol is None:
+        return False, ('The database volume could not be read, so the update cannot check that '
+                       'the new version matches your data. Nothing was changed.')
+    if not vol.get('exists'):
+        return True, ''
+    here, other = (vol.get('root'), vol.get('legacy')) if hardened else \
+                  (vol.get('legacy'), vol.get('root'))
+    if here is None and other is None:
+        return True, ''                                   # empty volume: a fresh database
+    if here is None:
+        return False, ('Your database (PostgreSQL %d) is stored in a different layout than this '
+                       'zip uses. Starting it would create a new, EMPTY database and TAK Server '
+                       'would look empty. Nothing was changed. Upload the zip for the TAK Server '
+                       'version you run, or a newer one of the same major version.' % other)
+    if image_major is not None and image_major != here:
+        return False, ('This zip builds PostgreSQL %d but your data is PostgreSQL %d, and '
+                       'PostgreSQL will not start on data from another major version. Nothing '
+                       'was changed.%s' % (image_major, here,
+                                           ' A TAK Server 5.8 zip on a 5.7 server goes through '
+                                           'the 5.8 migration, not this button.'
+                                           if image_major > here else ''))
+    return True, ''
+
+
+def _tak_container_update_preflight(zip_path, old_ctx, ulog, check_volume=True):
+    """Everything the container update can know BEFORE it touches anything. Returns
+    (info, error): `error` is a plain-words refusal (nothing was changed) or ''."""
+    try:
+        info = _tak_zip_bundle_info(zip_path)
+    except ValueError as e:
+        return None, str(e)
+    if info['top'] == os.path.basename(old_ctx):
+        return None, ('This zip is the version that is already installed (%s). Nothing was '
+                      'changed. Upload a different takserver-docker zip.' % info['top'])
+    cur = _tak_release_key(os.path.basename(old_ctx))
+    new = _tak_release_key(os.path.basename(zip_path)) or _tak_release_key(info['top'])
+    if cur and new and new < cur:
+        if new[:2] < cur[:2]:
+            return None, ('This zip is TAK Server %d.%d, which is older than the %d.%d you run. '
+                          'The database does not go back with the package, so nothing was '
+                          'changed. Upload a %d.%d zip, or restore a snapshot from Snapshots & '
+                          'Recovery.' % (new[0], new[1], cur[0], cur[1], cur[0], cur[1]))
+        ulog('⚠ DOWNGRADE: %s is OLDER than the installed %s. Installing it on purpose; the '
+             'database is not changed by the image.'
+             % (_tak_fmt_release(new), _tak_fmt_release(cur)))
+    if check_volume:
+        vol = _tak_db_volume_layout()
+        ok, why = _tak_volume_check(info['hardened'], info['pg_major'], vol)
+        if not ok:
+            return None, why
+        ulog('  ✓ The zip matches the database volume (PostgreSQL %s).'
+             % (info['pg_major'] or 'version not stated'))
+    return info, ''
+
+
+def _tak_pre_update_backup(stamp, old_tak, ulog):
+    """Backup OUTSIDE the bundle before a container update. Returns (ok, folder).
+    The cot database is dumped and read back (only when the database container runs; a stopped
+    one has nothing to dump and its volume is not touched by the update), and the config files
+    are copied. Pruned to the newest _TAK_UPDATE_BACKUP_KEEP folders."""
+    root = os.path.join(TAK_DOCKER_ROOT, 'snapshots')
+    dest_dir = os.path.join(root, f'pre-update-{stamp}')
+    try:
+        os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+        os.chmod(dest_dir, 0o700)
+    except PermissionError:
+        _makedirs_priv(dest_dir, mode=0o700)
+    except Exception as e:
+        ulog(f'✗ Could not create the backup folder: {str(e)[:120]}')
+        return False, ''
+    for f in ('CoreConfig.xml', 'UserAuthenticationFile.xml', 'setenv.sh'):
+        src = os.path.join(old_tak, f)
+        if os.path.exists(src):
+            _pg_run(['cp', '-p', src, os.path.join(dest_dir, f)], timeout=60)
+            _pg_run(['chmod', '600', os.path.join(dest_dir, f)], timeout=30)
+    r = _pg_run(['docker', 'inspect', '-f', '{{.State.Running}}', TAK_DB_CONTAINER], timeout=60)
+    if r.returncode != 0 or (r.stdout or '').strip() != 'true':
+        ulog('  ⚠ The database container is not running, so no database dump was made. '
+             'Config files were copied to %s. The database volume itself is not touched.' % dest_dir)
+        return True, dest_dir
+    pw = _tak58_db_password()
+    pgbin = None
+    for major in (TAK_PG_MAJOR, 15):
+        pgbin = _tak58_container_pgbin(TAK_DB_CONTAINER, major)
+        if pgbin:
+            break
+    if not pw or not pgbin:
+        ulog('✗ The database is running but could not be backed up (password or PostgreSQL '
+             'tools not found). Nothing was changed.')
+        return False, dest_dir
+    path, why = _tak_db_refresh_backup(pgbin, pw, ulog, stamp, prefix='pre-update')
+    if not path:
+        ulog('✗ The database backup failed (%s). Nothing was changed.' % why)
+        _pg_run(['rm', '-rf', dest_dir], timeout=120)     # an unfinished backup folder is not a backup
+        return False, dest_dir
+    try:
+        kept = sorted(d for d in os.listdir(root) if _TAK_UPDATE_BACKUP_RE.match(d))
+        for old in kept[:-_TAK_UPDATE_BACKUP_KEEP]:
+            _pg_run(['rm', '-rf', os.path.join(root, old)], timeout=120)
+    except Exception:
+        pass
+    ulog('  ✓ Backup saved in %s (database dump + config files)' % dest_dir)
+    return True, dest_dir
+
+
+def _tak_setenv_carry(old_tak, new_tak, backup_dir, ulog):
+    """Put infra-TAK's own blocks (heap, Java pin) from the old setenv.sh into the NEW bundle's
+    stock setenv.sh. Third-party file: never copy the whole old file over the new one. The old
+    file stays in the backup folder."""
+    try:
+        old = _read_priv(os.path.join(old_tak, 'setenv.sh'))
+    except Exception:
+        return
+    try:
+        new = _read_priv(os.path.join(new_tak, 'setenv.sh'))
+    except Exception:
+        new = None
+    if not old or new is None:
+        return
+    def block(a, b):
+        m = re.search(rf'{re.escape(a)}.*?{re.escape(b)}\n?', old, re.S)
+        return m.group(0) if m else ''
+    heap = block(_TAK_SETENV_HEAP_A, _TAK_SETENV_HEAP_B)
+    jvm = block(_TAK_SETENV_JVM_A, _TAK_SETENV_JVM_B)
+    out = new
+    for a, b in ((_TAK_SETENV_HEAP_A, _TAK_SETENV_HEAP_B), (_TAK_SETENV_JVM_A, _TAK_SETENV_JVM_B)):
+        out = re.sub(rf'{re.escape(a)}.*?{re.escape(b)}\n?', '', out, flags=re.S)
+    if jvm:
+        out = out + ('' if out.endswith('\n') else '\n') + jvm   # appended, as the pin writes it
+    if heap:
+        out = heap + out                                          # prepended, as set-heap writes it
+    if out != new:
+        try:
+            _write_priv(os.path.join(new_tak, 'setenv.sh'), out)
+            ulog('  ✓ Heap and Java settings carried into the new setenv.sh')
+        except Exception as e:
+            ulog(f'  ⚠ Could not carry the setenv.sh settings ({str(e)[:100]}). '
+                 f'Your old file is in {backup_dir or "the old bundle"}.')
+
+
+def _tak_carry_missing(old_dir, new_dir, ulog, label, move=False):
+    """Copy (or move) every entry of old_dir that new_dir does not already have. Never
+    replaces anything the new bundle ships. Returns True when nothing failed."""
+    if not os.path.isdir(old_dir):
+        return True
+    r = _pg_run(['ls', old_dir], timeout=30)
+    if r.returncode != 0:
+        ulog(f'  ⚠ Could not list {old_dir}')
+        return False
+    _pg_run(['mkdir', '-p', new_dir], timeout=30)
+    r2 = _pg_run(['ls', new_dir], timeout=30)
+    have = set((r2.stdout or '').split('\n')) if r2.returncode == 0 else set()
+    ok, n = True, 0
+    for name in (r.stdout or '').split('\n'):
+        if not name or name.startswith('-') or name in have:
+            continue
+        cmd = ['mv'] if move else ['cp', '-rp']
+        c = _pg_run(cmd + [os.path.join(old_dir, name), os.path.join(new_dir, name)], timeout=900)
+        if c.returncode != 0:
+            ulog(f'  ⚠ Could not carry {label}/{name}: {(c.stderr or c.stdout or "").strip()[:120]}')
+            ok = False
+        else:
+            n += 1
+    if n:
+        ulog(f'  ✓ {n} item(s) of {label} carried over')
+    return ok
+
+
+def run_takserver_upgrade_container(zip_path, mark_complete=True, migration=False):
     """v10.0.1 — DATA-PRESERVING container upgrade. Rebuilds the TAK Server image from the new
     takserver-docker-*.zip and recreates the containers while KEEPING the database (the
     TAK_DB_VOLUME named volume) and the existing CA/certs + CoreConfig + UserAuthenticationFile.
@@ -104854,10 +107889,17 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
     upgrade_log/upgrade_status (the Update panel). SACRED: the DB volume must never be removed
     on this path — that is the whole point of an upgrade vs a redeploy.
 
+    ops #1326 order: checks and a backup first (nothing changed), then unpack, carry over, build
+    (TAK keeps running), then stop and swap, and the old bundle folder is deleted LAST, only once
+    the new TAK is up. A failure before the swap leaves the old TAK running; a failure in the swap
+    puts the old images, link and containers back.
+
     mark_complete=False leaves upgrade_status 'running' at the end: the 5.8 container
     migration calls this as a STEP (rebuild) and has the data import still to do, and
     the Update panel stops polling — and reloads the page as "Update complete" — the
-    moment it sees running=False."""
+    moment it sees running=False. `migration=True` is that caller: it already exported the
+    database and removed the old containers and volume, so the volume check, the backup and
+    the swap rollback do not apply (the old PostgreSQL 15 data is in its own rollback volume)."""
     def ulog(msg):
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         upgrade_log.append(entry); print(entry, flush=True)
@@ -104869,6 +107911,11 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
             return r.returncode == 0
         except Exception as e:
             ulog(f"    ! {str(e)[:160]}"); return False
+    def dk(argv, timeout=120):
+        try:
+            return subprocess.run(_sudo_wrap(argv), capture_output=True, text=True, timeout=timeout).returncode == 0
+        except Exception:
+            return False
     def _fail(msg):
         ulog(f"✗ {msg}")
         upgrade_status.update({'running': False, 'complete': False, 'error': True})
@@ -104879,36 +107926,50 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         ulog("=" * 50)
         old_tak = os.path.realpath('/opt/tak')        # current bundle's tak/ dir
         old_ctx = os.path.dirname(old_tak)            # current bundle dir (inside TAK_DOCKER_ROOT)
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        kept_msg = ('The database was not touched.' if migration
+                    else 'TAK Server was not stopped and still runs the old version.')
 
-        # 1) Stop+remove the OLD containers — NOT the volume (the DB stays in TAK_DB_VOLUME).
-        ulog("Step 1/6: Stopping current containers (database volume kept)...")
-        subprocess.run(_sudo_wrap(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER]), capture_output=True, timeout=90)
+        # 1) Read-only checks. Nothing is changed until these pass.
+        ulog("Step 1/7: Checking the zip against this server (nothing is changed yet)...")
+        info, err = _tak_container_update_preflight(zip_path, old_ctx, ulog, check_volume=not migration)
+        if err:
+            return _fail(err)
 
-        # 2) Extract the new bundle ALONGSIDE the old (no wipe — keeps the old certs reachable for
+        # 2) Backup outside the bundle (the 5.8 migration made its own export).
+        backup_dir = ''
+        if not migration:
+            ulog("Step 2/7: Saving a backup outside the bundle folder...")
+            _ok, backup_dir = _tak_pre_update_backup(stamp, old_tak, ulog)
+            if not _ok:
+                return _fail("The backup failed, so the update stopped before changing anything. "
+                             + kept_msg)
+
+        # 3) Extract the new bundle ALONGSIDE the old (no wipe — keeps the old certs reachable for
         #    an in-place broker copy; both dirs are inside the allowlisted ~/tak-docker root).
-        ulog("Step 2/6: Unpacking new bundle...")
+        ulog("Step 3/7: Unpacking new bundle...")
+        new_ctx = os.path.join(TAK_DOCKER_ROOT, info['top'])
+        new_tak = os.path.join(new_ctx, 'tak')
+
+        def _drop_new(why):
+            """Failure BEFORE the swap: remove the half-prepared new folder, old TAK is untouched."""
+            if os.path.realpath('/opt/tak') != os.path.realpath(new_tak):
+                subprocess.run(_sudo_wrap(['rm', '-rf', new_ctx]), capture_output=True, timeout=120)
+            return _fail(f"{why} {kept_msg} The old bundle folder was not changed.")
         try:
             import zipfile
             with zipfile.ZipFile(zip_path) as zf:
                 _safe_extract_zip(zf, TAK_DOCKER_ROOT, apply_modes=True)
         except Exception as e:
-            return _fail(f"Failed to extract the new bundle: {str(e)[:160]}")
+            return _drop_new(f"Failed to extract the new bundle: {str(e)[:160]}.")
         _tak_bundle_repair_exec_bits(TAK_DOCKER_ROOT, ulog)
-        entries = [d for d in os.listdir(TAK_DOCKER_ROOT)
-                   if os.path.isdir(os.path.join(TAK_DOCKER_ROOT, d)) and 'docker' in d.lower()
-                   and _tak_is_bundle_dir(os.path.join(TAK_DOCKER_ROOT, d))
-                   and os.path.join(TAK_DOCKER_ROOT, d) != old_ctx]
-        entries.sort(key=lambda d: os.path.getmtime(os.path.join(TAK_DOCKER_ROOT, d)), reverse=True)
-        if not entries:
-            return _fail("No NEW takserver-docker bundle found (same version as installed, or not an official zip). "
-                         "Upload a different takserver-docker-*.zip. The old install is untouched.")
-        new_ctx = os.path.join(TAK_DOCKER_ROOT, entries[0])
-        new_tak = os.path.join(new_ctx, 'tak')
-        ulog(f"✓ New bundle: {entries[0]}")
+        if not _tak_is_bundle_dir(new_ctx):
+            return _drop_new("No takserver-docker bundle found after unpacking (not an official zip).")
+        ulog(f"✓ New bundle: {info['top']}")
 
-        # 3) Carry the PRESERVED certs / CoreConfig / UserAuth over old -> new (in place, broker),
-        #    re-point /opt/tak, then drop the old bundle dir.
-        ulog("Step 3/6: Carrying over certs + CoreConfig (preserved)...")
+        # 4) Carry the PRESERVED certs / CoreConfig / UserAuthenticationFile over old -> new (in
+        #    place, broker). Copies only: the old folder is not changed or deleted here.
+        ulog("Step 4/7: Carrying over certs, CoreConfig, settings and plugins (preserved)...")
         subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=30)
         subprocess.run(_sudo_wrap(['mkdir', '-p', os.path.join(new_tak, 'certs')]), capture_output=True, timeout=10)
         subprocess.run(_sudo_wrap(['cp', '-rp', os.path.join(old_tak, 'certs', 'files'), os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=120)
@@ -104916,18 +107977,19 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
             subprocess.run(_sudo_wrap(['cp', '-p', os.path.join(old_tak, f), os.path.join(new_tak, f)]), capture_output=True, timeout=30)
         _carry_cert_metadata(old_tak, new_tak, ulog)
         if not os.path.exists(os.path.join(new_tak, 'certs', 'files', 'takserver.jks')):
-            return _fail("Certs did not carry over (takserver.jks missing in new bundle) — aborting before swap. Old install untouched.")
-        subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
-        rc(f'ln -sfn {shlex.quote(new_tak)} /opt/tak', timeout=15)
-        if old_ctx and old_ctx != new_ctx:
-            subprocess.run(_sudo_wrap(['rm', '-rf', old_ctx]), capture_output=True, timeout=60)
-        ulog("✓ certs + CoreConfig carried over; /opt/tak re-pointed")
+            return _drop_new("Certs did not carry over (takserver.jks missing in new bundle).")
+        _tak_setenv_carry(old_tak, new_tak, backup_dir, ulog)
+        _tak_carry_missing(os.path.join(old_tak, 'lib'), os.path.join(new_tak, 'lib'), ulog, 'plugin jars')
+        _tak_carry_missing(os.path.join(old_tak, 'conf', 'plugins'),
+                           os.path.join(new_tak, 'conf', 'plugins'), ulog, 'plugin settings')
+        ulog("✓ certs + CoreConfig carried over (old folder untouched)")
 
-        # 4) Build the new-version images.
-        ulog("Step 4/6: Building new TAK Server images (minutes on arm64)...")
+        # 5) Build the new-version images under TEMPORARY tags. TAK keeps running. Tags `takserver`
+        #    and `takserver_db` still name the OLD images; they move only after both builds work.
+        ulog("Step 5/7: Building new TAK Server images (minutes on arm64; TAK Server keeps running)...")
         _app_df, _db_df = _tak_bundle_dockerfiles(new_ctx)
         if not _app_df:
-            return _fail('No TAK Dockerfiles under %s/docker - is this an official takserver-docker zip?' % new_ctx)
+            return _drop_new('No TAK Dockerfiles under %s/docker - is this an official takserver-docker zip?' % new_ctx)
         # Both, and in this order: the resolver picks WHICH Dockerfile (5.8 hardened renamed
         # them — GH #66), the patcher fixes the stock one's EOL bullseye sources (GH #69). The
         # patcher targets Dockerfile.takserver-db by name and returns False when it is absent,
@@ -104937,39 +107999,85 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
         _patch_tak_hardened_java_pin(new_ctx, _app_df, ulog)   # ops #963 — pinned Temurin build never moves
         _patch_tak_db_pgdg_releasever(new_ctx, _db_df, ulog)   # ops #686 — PGDG lags new RHEL minors
         _patch_tak_dockerfile_cacerts(new_ctx, _app_df, ulog)   # ops #200 — JDK's own CA roots
-        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t takserver_db -f {shlex.quote(_db_df)} . 2>&1'):
-            return _fail("DB image build failed.")
-        if not rc(f'cd {shlex.quote(new_ctx)} && docker build --pull -t {TAK_CONTAINER} -f {shlex.quote(_app_df)} . 2>&1'):
-            return _fail("TAK Server image build failed.")
+        db_new, app_new = f'{TAK_DB_IMAGE}:build-{stamp}', f'{TAK_CONTAINER}:build-{stamp}'
+        db_old, app_old = f'{TAK_DB_IMAGE}:pre-update-{stamp}', f'{TAK_CONTAINER}:pre-update-{stamp}'
+        # Keep the OLD images reachable by a tag of their own, so a swap that fails can put them back.
+        had_db, had_app = dk(['docker', 'tag', TAK_DB_IMAGE, db_old]), dk(['docker', 'tag', TAK_CONTAINER, app_old])
+        def _drop_tags(*tags):
+            for t in tags:
+                dk(['docker', 'image', 'rm', t], 120)
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build -t {db_new} -f {shlex.quote(_db_df)} . 2>&1'):
+            _drop_tags(db_new, db_old, app_old)
+            return _drop_new("DB image build failed.")
+        if not rc(f'cd {shlex.quote(new_ctx)} && docker build --pull -t {app_new} -f {shlex.quote(_app_df)} . 2>&1'):
+            _drop_tags(db_new, app_new, db_old, app_old)
+            return _drop_new("TAK Server image build failed.")
         ulog("✓ Images built")
+
+        # 6) Stop and swap. Downtime starts here.
+        ulog("Step 6/7: Stopping the old containers and starting the new ones (DB volume reused)...")
+        def _start_stack(ctx, tak_dir):
+            """Create + start both containers on the SAME volume + network. True when every
+            docker command worked. NO `docker volume rm`."""
+            ok = rc(f'docker network inspect {TAK_DOCKER_NET} >/dev/null 2>&1 || docker network create {TAK_DOCKER_NET}', timeout=30)
+            ok &= rc(f'docker run {_tak_db_volume_mount(ctx)} '
+                     f'-v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
+                     f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d {TAK_DB_IMAGE}', timeout=120)
+            time.sleep(8)
+            # CREATE (not run -d) so the Authentik LDAP network is attached BEFORE the JVM starts.
+            # If TAK boots without the LDAP net reachable, it loads its group cache EMPTY -> every user
+            # resolves to "not a member of any group" -> "no channels", needing a manual restart+resync.
+            # create -> connect the LDAP net -> start guarantees LDAP (ldap://authentik-ldap-1:3389) is
+            # resolvable from the first boot, so groups load and webadmin/EUD channels work hands-off.
+            ok &= rc(f'docker create -v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always '
+                     f'-p 8089:8089 -p 8443:8443 -p 8446:8446 --network {TAK_DOCKER_NET} '
+                     f'--name {TAK_CONTAINER} {TAK_CONTAINER}', timeout=60)
+            _aknet, _aklname = _ensure_tak_on_authentik_network()  # connect LDAP net to the created (not-yet-started) container
+            if _aknet:
+                ulog(f"✓ Joined Authentik network ({_aknet}) before start — LDAP/groups reachable from boot")
+            ok &= rc(f'docker start {TAK_CONTAINER}', timeout=90)
+            return ok
+        subprocess.run(_sudo_wrap(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER]), capture_output=True, timeout=90)
+        subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
+        rc(f'ln -sfn {shlex.quote(new_tak)} /opt/tak', timeout=15)
+        dk(['docker', 'tag', db_new, TAK_DB_IMAGE]); dk(['docker', 'tag', app_new, TAK_CONTAINER])
         # The hardened 5.8 images run as tak:0 / postgres:0, not root, and the tree they
         # mount was written by the console user (and the certs carried over from the old
         # bundle keep their old ownership). Same fix as the deploy path, same reason —
         # a no-op on the pre-hardened images, which run as root inside the container.
         _container_own_tree(new_tak, ulog)
+        if not _start_stack(new_ctx, new_tak):
+            if migration:
+                return _fail("The new containers did not start. The database was not touched; see the output above.")
+            ulog("✗ The new containers did not start. Putting the old version back...")
+            dk(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER], 90)
+            subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
+            rc(f'ln -sfn {shlex.quote(old_tak)} /opt/tak', timeout=15)
+            if had_db: dk(['docker', 'tag', db_old, TAK_DB_IMAGE])
+            if had_app: dk(['docker', 'tag', app_old, TAK_CONTAINER])
+            _back = False
+            for _try in (1, 2):          # a port the failed start held can need a moment to free up
+                if not (had_db and had_app):
+                    break
+                if _try == 2:
+                    ulog("  Trying the old version once more in 30 seconds...")
+                    time.sleep(30)
+                    dk(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER], 90)
+                if _start_stack(old_ctx, old_tak):
+                    _back = True
+                    break
+            if _back:
+                subprocess.run(_sudo_wrap(['rm', '-rf', new_ctx]), capture_output=True, timeout=120)
+                _drop_tags(db_new, app_new, db_old, app_old)
+                return _fail("The new version did not start, so the old version is running again. "
+                             "Nothing was lost. The backup is in %s." % (backup_dir or 'the old bundle'))
+            return _fail("The new version did not start and the old one could not be restarted "
+                         "automatically. The database volume %s is untouched. Old images: %s and %s. "
+                         "Old bundle folder: %s. Backup: %s."
+                         % (TAK_DB_VOLUME, db_old, app_old, old_ctx, backup_dir or 'none'))
 
-        # 5) Recreate the containers on the SAME volume + network. NO `docker volume rm`.
-        ulog("Step 5/6: Recreating containers (DB volume reused)...")
-        rc(f'docker network inspect {TAK_DOCKER_NET} >/dev/null 2>&1 || docker network create {TAK_DOCKER_NET}', timeout=30)
-        rc(f'docker run {_tak_db_volume_mount(new_ctx)} '
-           f'-v {shlex.quote(new_tak)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
-           f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d takserver_db', timeout=120)
-        time.sleep(8)
-        # CREATE (not run -d) so the Authentik LDAP network is attached BEFORE the JVM starts.
-        # If TAK boots without the LDAP net reachable, it loads its group cache EMPTY -> every user
-        # resolves to "not a member of any group" -> "no channels", needing a manual restart+resync.
-        # create -> connect the LDAP net -> start guarantees LDAP (ldap://authentik-ldap-1:3389) is
-        # resolvable from the first boot, so groups load and webadmin/EUD channels work hands-off.
-        rc(f'docker create -v {shlex.quote(new_tak)}:/opt/tak:z --restart=always '
-           f'-p 8089:8089 -p 8443:8443 -p 8446:8446 --network {TAK_DOCKER_NET} '
-           f'--name {TAK_CONTAINER} {TAK_CONTAINER}', timeout=60)
-        _aknet, _aklname = _ensure_tak_on_authentik_network()  # connect LDAP net to the created (not-yet-started) container
-        if _aknet:
-            ulog(f"✓ Joined Authentik network ({_aknet}) before start — LDAP/groups reachable from boot")
-        rc(f'docker start {TAK_CONTAINER}', timeout=90)
-
-        # 6) Wait for messaging (TAK runs its schema migrations here against the preserved DB).
-        ulog("Step 6/6: Waiting for messaging microservice (schema migration; up to 10 min)...")
+        # 7) Wait for messaging (TAK runs its schema migrations here against the preserved DB).
+        ulog("Step 7/7: Waiting for messaging microservice (schema migration; up to 10 min)...")
         _up = False
         for waited in range(0, 600, 10):
             time.sleep(10)
@@ -104979,8 +108087,28 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True):
             if waited and waited % 60 == 0:
                 upgrade_log.append(f"  ⏳ {waited//60} min …")
         if not _up:
-            ulog("⚠ Did not see messaging start within 10 min — check `docker logs takserver`. DB + certs were preserved (no data loss).")
+            ulog("⚠ Did not see messaging start within 10 min — check `docker logs takserver`. DB + certs were preserved (no data loss). "
+                 f"The old bundle folder was KEPT at {old_ctx}.")
         _tak_repair_container_healthchecks(ulog)
+        # The new TAK is up: only now move the files that live only in the old bundle (snapshots,
+        # previous logs) and delete the old folder. Anything that fails to move keeps the folder.
+        if _up and old_ctx and old_ctx != new_ctx:
+            ulog("Moving snapshots and previous logs into the new bundle, then removing the old folder...")
+            _mv_ok = _tak_carry_missing(os.path.join(old_tak, 'snapshots'),
+                                        os.path.join(new_tak, 'snapshots'), ulog, 'snapshots', move=True)
+            _logs_old = os.path.join(old_tak, 'logs')
+            if os.path.isdir(_logs_old):
+                _prev = os.path.join(new_tak, 'logs', f'before-update-{stamp}')
+                _mv_ok &= dk(['mkdir', '-p', os.path.join(new_tak, 'logs')], 30) and \
+                          dk(['mv', _logs_old, _prev], 300)
+            if _mv_ok:
+                subprocess.run(_sudo_wrap(['rm', '-rf', old_ctx]), capture_output=True, timeout=300)
+                _drop_tags(db_new, app_new, db_old, app_old)
+                ulog("✓ old bundle folder removed; /opt/tak points to the new bundle")
+            else:
+                ulog(f"⚠ Some files could not be moved, so the old folder was KEPT at {old_ctx}.")
+        else:
+            _drop_tags(db_new, app_new)
         # Re-sync the TAK Portal to the recreated TAK JVM — the rotation does this (Step 7) and
         # it's exactly what 'patches the Portal back to working' on native. The upgrade recreated
         # the containers, so the Portal must refresh its client cert + CA and reconnect, or
@@ -105551,7 +108679,7 @@ def run_takserver_upgrade_two_server(core_pkg_path, db_pkg_path, s1_cfg, tak_cfg
                     upgrade_log.append("  " + line)
         if not ok:
             # Verify PG is still running (SchemaManager may exit non-zero with warnings)
-            _ssh_probe(s1_cfg, 'sudo pg_ctlcluster 15 main start 2>/dev/null; true', timeout=20)
+            _ssh_probe(s1_cfg, _pg_ctl_cmd('start', db_port) + ' >/dev/null 2>&1; true', timeout=20)
             verify_cmd = 'sudo -u postgres psql -lqt 2>/dev/null | grep -q cot && pg_isready -q && echo PG_OK'
             vok, vout = _ssh_probe(s1_cfg, verify_cmd, timeout=10)
             if vok and 'PG_OK' in (vout or ''):
@@ -105701,6 +108829,11 @@ def run_takserver_upgrade_two_server_rhel(core_rpm_path, db_rpm_path, s1_cfg, ta
                 if sn.get('label') == snap_label: sn['source'] = 'pre-upgrade'
             save_settings(_s)
         except Exception: pass
+        # ops #1337: an OLDER package with no database dump to go back to does not go ahead.
+        _dg_msg = _tak_downgrade_needs_dump(os.path.basename(core_rpm_path), snap_result)
+        if _dg_msg:
+            ulog(f"✗ {_dg_msg}")
+            upgrade_status.update({'running': False, 'complete': False, 'error': True}); return
 
         # heap backup (native RHEL keeps JVM heap in /etc/default/takserver, same as .deb)
         heap_backup = None
@@ -115403,6 +118536,14 @@ def run_full_uninstall():
             plog(f"⚠ TAK Video Restreamer removal error (non-fatal): {e}")
         plog("✓ TAK Video Restreamer removed")
 
+        # 1b2. MeshRelay — ops #973: registry uninstall path (modules/meshrelay.py).
+        plog("━━━ MeshRelay ━━━")
+        try:
+            mod_registry.uninstall_module('meshrelay', log_fn=plog)
+        except Exception as e:
+            plog(f"⚠ MeshRelay removal error (non-fatal): {e}")
+        plog("✓ MeshRelay removed")
+
         # 1c. TAK Simulator — v10.1.61: registry uninstall path (modules/simulator.py).
         plog("━━━ TAK Simulator ━━━")
         try:
@@ -116035,6 +119176,22 @@ def _java_alternative_state(fam=None):
         return '', ''
 
 
+# ops #1343: TAK Server releases the JDK 17 pin below is known to be right for (5.x). A newer
+# major may need a newer Java, so the pin is left alone for it rather than forced.
+_TAK_JVM_PIN_MAX_MAJOR = 5
+
+
+def _tak_jvm_pin_applies(version):
+    """(True, '') when the JDK 17 pin is right for this TAK Server version string, else
+    (False, why). An unreadable version still pins: that is what every box did before."""
+    t = _os_upgrade_tak_version_tuple(version)
+    if t is None:
+        return True, ''
+    if t[0] > _TAK_JVM_PIN_MAX_MAJOR:
+        return False, f'TAK Server {t[0]}.{t[1]} is newer than the 5.x line JDK 17 is known to suit'
+    return True, ''
+
+
 def _pin_takserver_jvm(plog=None):
     """Pin native TAK Server to its own JDK 17. Idempotent; safe to re-run every startup.
 
@@ -116078,6 +119235,13 @@ def _pin_takserver_jvm(plog=None):
         return {'skipped': 'no native TAK on this host'}
     if _tak_is_container():
         return {'skipped': 'container TAK — JVM lives in the image'}
+    try:
+        _pin_ok, _pin_why = _tak_jvm_pin_applies(_get_takserver_version_info().get('version'))
+    except Exception:
+        _pin_ok, _pin_why = True, ''
+    if not _pin_ok:
+        _log(f"JDK 17 pin skipped, no change made: {_pin_why}")
+        return {'skipped': _pin_why}
 
     home, jbin = _resolve_java17_home()
     if not home:
@@ -116410,6 +119574,38 @@ def _gd_refresh_mtx_cert_sync():
     return changed
 
 
+_GD_VERSION_KEY = 'guarddog_rendered_by'
+
+
+def _gd_console_downgrade(prev, current=None):
+    """True when the scripts on the box were last rendered by a NEWER console than this one."""
+    p = _console_version_tuple(prev)
+    c = _console_version_tuple(current if current is not None else VERSION)
+    return bool(p and c and p > c)
+
+
+def _gd_stamp_console_version():
+    """Record which console rendered the Guard Dog scripts, and say so in the journal when
+    this console is OLDER than the one that rendered them (ops #1343). A console that is
+    rolled back, or moved from dev to main, re-renders every script from its own templates,
+    on purpose: the scripts then match the console that runs them. Until now nothing on the
+    box said it had happened. The stamp is a settings key: the broker refuses console writes
+    into /opt/tak-guarddog (root installs those scripts itself), so a stamp file there never
+    landed on a non-root box (nuc, 2026-11-27). Never raises."""
+    try:
+        s = load_settings()
+        prev = str(s.get(_GD_VERSION_KEY) or '').strip()
+        if _gd_console_downgrade(prev):
+            print(f"Guard Dog: scripts were last rendered by infra-TAK {prev}; this console is "
+                  f"{VERSION} (older: a rollback or a channel change). They now match this console.",
+                  flush=True)
+        if prev != VERSION:
+            s[_GD_VERSION_KEY] = VERSION
+            save_settings(s)
+    except Exception as _e:
+        print(f"Guard Dog: console version stamp not written (non-fatal): {_e}", flush=True)
+
+
 def _auto_update_guarddog():
     """If Guard Dog is installed, re-copy scripts and reload timers so updates take effect on console restart."""
     if not os.path.exists('/opt/tak-guarddog'):
@@ -116503,6 +119699,7 @@ def _auto_update_guarddog():
                 updated += 1
                 if name == _GD_HEALTH_SCRIPT:
                     _gd_restart_health_endpoint()   # ops #815
+        _gd_stamp_console_version()
         # ops #845: the SMS scripts are optional (installed when SMS is saved), so the loop
         # above skips them. A box that already had SMS set up then kept the old sms_send.py
         # (plain HTTP to a console that answers HTTPS only, so no alert text was ever sent)
@@ -117821,6 +121018,23 @@ for _rh_sub, _rh_ctr in (
     _startup_rehome_module(_rh_sub, _rh_ctr)
 
 
+def _tree_has_files_or_unreadable(d):
+    """True when the folder holds a file, OR when any part of it could not be read.
+
+    os.walk() skips a folder it cannot list unless told otherwise, so a tree whose files sit in
+    an unreadable folder read as empty, and the Cesium re-home then removed it as an "empty
+    stub" (ops #1343). Not being able to look is not the same as nothing being there: when in
+    doubt the caller must leave the folder alone."""
+    unreadable = []
+    try:
+        for _r, _dd, _ff in os.walk(d, onerror=unreadable.append):
+            if _ff:
+                return True
+    except Exception:
+        return True
+    return bool(unreadable)
+
+
 def _startup_rehome_cesium():
     """v10.0.5: re-home the Cesium 3D-Tiles static dir on a FLIPPED Ubuntu box. The tiles are served
     by Caddy (file_server root ~/cesium-tiles) and managed by the console, but a root-era install
@@ -117841,15 +121055,7 @@ def _startup_rehome_cesium():
                 time.sleep(0.25)
         if subprocess.run(_sudo_wrap(['test', '-d', src]), capture_output=True, timeout=10).returncode != 0:
             return  # no root-era tiles to migrate
-        def _has_files(d):
-            try:
-                for _r, _dd, _ff in os.walk(d):
-                    if _ff:
-                        return True
-            except Exception:
-                pass
-            return False
-        if os.path.isdir(home) and _has_files(home):
+        if os.path.isdir(home) and _tree_has_files_or_unreadable(home):
             return  # ~/cesium-tiles already holds real tiles — don't clobber
         if os.path.isdir(home):
             subprocess.run(_sudo_wrap(['rm', '-rf', home]), capture_output=True, timeout=30)  # clear empty stub
@@ -122133,15 +125339,33 @@ def _fail2ban_install_and_configure(plog):
 # The ban notifier fail2ban runs as root. Module level so the startup converge can bring
 # an existing box's copy up to date: the hook below writes it once and never again.
 _F2B_NOTIFY_SCRIPT = r'''#!/usr/bin/env python3
-"""infratak-f2b-notify: email alert when fail2ban bans an IP (Authentik / TAK Server jails).
+"""infratak-f2b-notify: runs after every fail2ban ban (ops #1395).
 Called by fail2ban action: infratak-f2b-notify <ip> [jail]
 Reads guarddog_alert_email + email_relay from infra-TAK settings.json.
 Sends via localhost:25 (same Postfix relay Guard Dog uses). Exits cleanly
 if email is not configured so fail2ban does not treat it as an error.
+
+A public box is probed by bots all day, so a ban is NOT a reason to email (10.4.7 to
+10.4.9 mailed every one: about 25 mails in 6 hours on test6). The ban is still logged
+by the action (dashboard line) and fail2ban. This script mails only when a person is
+needed:
+  - a TAK Server jail ban where the device showed a client certificate (a real device
+    is locked out), or
+  - an SSH jail ban after failed passwords for a real local account (not root, not a
+    system account).
+A name or address is mailed once a day, and a box is mailed at most 3 times a day, so
+even a real attack cannot flood the inbox. Everything else is routine: no email.
+Optional (default off, settings f2b_daily_summary): one summary mail a day.
 """
-import sys, os, re, json, smtplib, subprocess
+import sys, os, re, json, smtplib, subprocess, ipaddress, pwd, time
 from email.mime.text import MIMEText
 from datetime import datetime, timezone
+
+STATE_PATH = '/var/lib/fail2ban/infratak-f2b-notify-state.json'
+F2B_LOG = '/var/log/fail2ban.log'
+PERSON_DAY_CAP = 3
+PERSON_COOLDOWN = 86400
+SUMMARY_EVERY = 86400
 
 
 def _find_settings():
@@ -122218,16 +125442,9 @@ def _duration_label(seconds):
     return f'{max(1, seconds // 60)} min'
 
 
-def _tak_reason(ip, jail='takserver'):
-    badcert = jail == 'takserver-badcert'
-    bantime = 600 if badcert else 3600
-    try:
-        with open(TAK_BADCERT_JAIL if badcert else TAK_JAIL) as f:
-            m = re.search(r'^bantime\s*=\s*(\d+)', f.read(), re.M)
-        if m:
-            bantime = int(m.group(1))
-    except Exception:
-        pass
+def _tak_scan(ip):
+    """(kind, certificate subject) for one address, read from the TAK log. The subject is
+    '' when the device never showed a client certificate (a scanner)."""
     kinds, subject = {}, ''
     try:
         with open(TAK_LOG, 'rb') as f:
@@ -122244,7 +125461,20 @@ def _tak_reason(ip, jail='takserver'):
                     subject = s.group(1).strip()[:200]
     except Exception:
         pass
-    kind = max(kinds, key=kinds.get) if kinds else 'other'
+    return (max(kinds, key=kinds.get) if kinds else 'other'), subject
+
+
+def _tak_reason(ip, jail='takserver'):
+    badcert = jail == 'takserver-badcert'
+    bantime = 600 if badcert else 3600
+    try:
+        with open(TAK_BADCERT_JAIL if badcert else TAK_JAIL) as f:
+            m = re.search(r'^bantime\s*=\s*(\d+)', f.read(), re.M)
+        if m:
+            bantime = int(m.group(1))
+    except Exception:
+        pass
+    kind, subject = _tak_scan(ip)
     if badcert:
         return (_tak_explain(ip, kind, subject, _duration_label(bantime), jail) +
                 "\n\nOnly TAK streaming is blocked (8089, 8443, federation). Enrollment (8446), "
@@ -122254,9 +125484,229 @@ def _tak_reason(ip, jail='takserver'):
             "from that address.")
 
 
+def _tail_text(path, nbytes):
+    """Last nbytes of a log file as text, '' when it cannot be read."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - nbytes))
+            return f.read().decode('utf-8', 'replace')
+    except Exception:
+        return ''
+
+
+def _resolve_jail(ip, hint):
+    """Which jail made this ban. The shared Guard Dog action passes 'authentik' for every
+    jail (sshd, console, takportal, mediamtx, clientfeed...), so the name is read from
+    fail2ban's own log: it writes `[jail] Ban IP` BEFORE it runs the actions. The TAK
+    actions name their jail correctly and are trusted as given."""
+    if hint in ('takserver', 'takserver-badcert'):
+        return hint
+    found = None
+    pat = re.compile(r'\[([^\]\s]+)\] Ban ' + re.escape(ip) + r'\s*$')
+    for line in _tail_text(F2B_LOG, 256 * 1024).splitlines():
+        m = pat.search(line)
+        if m:
+            found = m.group(1)
+    return found or hint
+
+
+def _clean(text, limit=60):
+    """Attacker-controlled text (certificate names) kept to plain characters, so it can
+    sit in a mail subject."""
+    return re.sub(r'[^A-Za-z0-9 ._@=,-]', '', text or '')[:limit].strip()
+
+
+def _cert_name(subject):
+    m = re.search(r'CN=([^,;]+)', subject or '')
+    return _clean(m.group(1) if m else subject)
+
+
+_SSH_FAIL_RE = re.compile(
+    r'Failed (?:password|keyboard-interactive/pam|publickey) for (?!invalid user )(\S+) '
+    r'from (\S+) port')
+
+
+def _ssh_log_text():
+    for p in ('/var/log/auth.log', '/var/log/secure'):
+        if os.path.exists(p):
+            return _tail_text(p, 4 * 1024 * 1024)
+    try:   # no auth file (journal only)
+        r = subprocess.run(['journalctl', '-t', 'sshd', '--since', '2 hours ago',
+                            '--no-pager', '-o', 'cat'],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout
+    except Exception:
+        return ''
+
+
+def _is_real_account(name, console_uid):
+    """A human account on this box: exists, not root, has a login shell, and is a normal
+    user (uid 1000 up) or the console's own user. Bots guess root, admin, postgres,
+    oracle and the like; those are not real accounts here and stay routine."""
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,32}', name or ''):
+        return False
+    try:
+        pw = pwd.getpwnam(name)
+    except KeyError:
+        return False
+    if pw.pw_uid == 0 or pw.pw_name == 'root':
+        return False
+    if pw.pw_shell.endswith(('nologin', 'false')) or not pw.pw_shell:
+        return False
+    return 1000 <= pw.pw_uid < 60000 or pw.pw_uid == console_uid
+
+
+def _ssh_real_user(ip, console_uid):
+    for line in _ssh_log_text().splitlines():
+        m = _SSH_FAIL_RE.search(line)
+        if m and m.group(2) == ip and _is_real_account(m.group(1), console_uid):
+            return m.group(1)
+    return ''
+
+
+def _person_needed(ip, jail, console_uid):
+    """(key, subject line, text) when this ban needs a person, else None (routine)."""
+    j = jail.lower()
+    if j in ('takserver', 'takserver-badcert'):
+        kind, subject = _tak_scan(ip)
+        if subject:
+            name = _cert_name(subject)
+            return ('tak:' + name, f'a TAK device ({name}) is blocked',
+                    'A device that showed a TAK certificate was blocked. A real user may '
+                    'be locked out.\n\n' + _tak_reason(ip, j))
+    if j == 'sshd':
+        user = _ssh_real_user(ip, console_uid)
+        if user:
+            return ('ssh:' + user, f'SSH password failures on account {user}',
+                    f'{ip} failed SSH passwords for the real account "{user}" on this '
+                    f'server, so it is blocked.\n\nBots guess names like root and admin. '
+                    f'This was a real account here. It may be someone mistyping, or '
+                    f'someone trying to get in.')
+    return None
+
+
+def _locked_state(fn):
+    """Run fn(state) with the state file locked; returns (result, ok). Several copies of
+    this script run at once in a burst, so the read-change-write must be one step."""
+    import fcntl
+    lock = None
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        lock = open(STATE_PATH + '.lock', 'a')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(STATE_PATH) as f:
+                st = json.load(f)
+            if not isinstance(st, dict):
+                st = {}
+        except Exception:
+            st = {}
+        result = fn(st)
+        tmp = STATE_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(st, f)
+        os.replace(tmp, STATE_PATH)
+        return result, True
+    except Exception as e:
+        print(f"infratak-f2b-notify: state file unusable: {e}", file=sys.stderr)
+        return None, False
+    finally:
+        if lock:
+            lock.close()
+
+
+def _person_gate(st, key, now):
+    """'send', 'repeat' (this name was mailed in the last day) or 'cap' (3 mails today)."""
+    sent = [t for t in st.get('person_sent', []) if now - t < 86400]
+    seen = {k: t for k, t in st.get('person_seen', {}).items() if now - t < PERSON_COOLDOWN}
+    verdict = 'send'
+    if key in seen:
+        verdict = 'repeat'
+    elif len(sent) >= PERSON_DAY_CAP:
+        verdict = 'cap'
+    else:
+        sent.append(now)
+        seen[key] = now
+    st['person_sent'], st['person_seen'] = sent, seen
+    return verdict
+
+
+def _person_undo(st, key, now):
+    """The mail did not go out: give the slot back so the next ban can try again."""
+    if isinstance(st.get('person_seen'), dict):
+        st['person_seen'].pop(key, None)
+    if st.get('person_sent'):
+        st['person_sent'].pop()
+
+
+def _summary_gate(st, now):
+    """True once per 24 hours (and records it)."""
+    if now - float(st.get('summary_at', 0) or 0) < SUMMARY_EVERY:
+        return False
+    st['summary_at'] = now
+    return True
+
+
+def _recent_bans(now, window=86400):
+    """[(jail, ip)] for bans in the last day, from fail2ban's own log."""
+    pat = re.compile(r'^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ .*\[([^\]\s]+)\] Ban (\S+)\s*$')
+    out = []
+    for line in _tail_text(F2B_LOG, 8 * 1024 * 1024).splitlines():
+        m = pat.match(line)
+        if not m:
+            continue
+        try:
+            t = time.mktime(time.strptime(m.group(1), '%Y-%m-%d %H:%M:%S'))
+        except Exception:
+            continue
+        if 0 <= now - t <= window:
+            out.append((m.group(2), m.group(3)))
+    return out
+
+
+def _summary_text(server_id, bans):
+    by_jail, by_ip = {}, {}
+    for jail, ip in bans:
+        by_jail[jail] = by_jail.get(jail, 0) + 1
+        by_ip[ip] = by_ip.get(ip, 0) + 1
+    jails = ', '.join(f'{j} {n}' for j, n in sorted(by_jail.items(), key=lambda x: -x[1]))
+    top = '\n'.join(f'  {ip}  ({n} bans)' for ip, n in
+                    sorted(by_ip.items(), key=lambda x: -x[1])[:5])
+    return (f'fail2ban summary for {server_id}, last 24 hours:\n\n'
+            f'  Bans:     {len(bans)} from {len(by_ip)} addresses\n'
+            f'  By jail:  {jails}\n\n'
+            f'Top sources:\n{top}\n\n'
+            f'Routine bans are not mailed one by one. See the Fail2ban page in your '
+            f'infra-TAK console for the full list. You turned this summary on there.\n')
+
+
+def _send(settings, recipients, subject, body):
+    relay = settings.get('email_relay', {})
+    from_addr = relay.get('from_addr', 'noreply@localhost')
+    from_name = relay.get('from_name', 'Guard Dog')
+    msg = MIMEText(body, 'plain', 'utf-8')
+    msg['From'] = f'{from_name} <{from_addr}>'
+    msg['To'] = ', '.join(recipients)
+    msg['Subject'] = subject
+    try:
+        with smtplib.SMTP('localhost', 25, timeout=15) as smtp:
+            smtp.sendmail(from_addr, recipients, msg.as_string())
+        print(f"infratak-f2b-notify: alert sent to {msg['To']}", file=sys.stderr)
+        return True
+    except Exception as e:
+        print(f"infratak-f2b-notify: email failed: {e}", file=sys.stderr)
+        return False
+
+
 def main():
     ip   = sys.argv[1] if len(sys.argv) > 1 else 'unknown'
-    jail = sys.argv[2] if len(sys.argv) > 2 else 'authentik'
+    hint = sys.argv[2] if len(sys.argv) > 2 else 'authentik'
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        print("infratak-f2b-notify: no valid address given — no email sent", file=sys.stderr)
+        sys.exit(0)
     settings_path = _find_settings()
     if not settings_path:
         print("infratak-f2b-notify: settings.json not found — no email sent",
@@ -122298,51 +125748,58 @@ def main():
                   file=sys.stderr)
             sys.exit(0)
 
-    relay     = settings.get('email_relay', {})
-    from_addr = relay.get('from_addr', 'noreply@localhost')
-    from_name = relay.get('from_name', 'Guard Dog')
     server_id = (settings.get('server_nickname') or
                  settings.get('fqdn') or
                  settings.get('server_ip', 'infra-TAK'))
+    # guarddog_alert_email may hold several comma-joined addresses (v10.1.30).
+    recipients = [a for a in re.split(r'[,;\s]+', to_addr) if a]
+    now = time.time()
+    jail = _resolve_jail(ip, hint)
+
+    # Opt-in daily summary (default off). It rides on the next ban after 24 hours, so no
+    # timer is needed: a box that has no bans has nothing to report.
+    if settings.get('f2b_daily_summary'):
+        due, ok = _locked_state(lambda st: _summary_gate(st, now))
+        bans = _recent_bans(now) if (ok and due) else []
+        if bans:
+            if not _send(settings, recipients,
+                         f'[{server_id}] fail2ban: {len(bans)} ban' + ('' if len(bans) == 1 else 's') + ' in the last 24 hours',
+                         _summary_text(server_id, bans)):
+                _locked_state(lambda st: st.update(summary_at=0))
+
+    try:
+        console_uid = os.stat(settings_path).st_uid
+    except Exception:
+        console_uid = -1
+    need = _person_needed(ip, jail, console_uid)
+    if not need:
+        print(f"infratak-f2b-notify: routine ban of {ip} ({jail}) — no email sent",
+              file=sys.stderr)
+        sys.exit(0)
+    key, headline, detail = need
+    verdict, ok = _locked_state(lambda st: _person_gate(st, key, now))
+    if ok and verdict != 'send':
+        print(f"infratak-f2b-notify: {key} already mailed today or 3 mails sent today "
+              f"({verdict}) — no email sent", file=sys.stderr)
+        sys.exit(0)
+
     ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-
-    _reasons = {
-        'authentik':  'Too many failed Authentik login attempts',
-        'takserver':  'Too many failed TAK Server connection attempts (scanner or bad certificate)',
-        'takserver-badcert': 'A flood of TAK Server connections with a refused certificate',
-    }
-    reason     = _reasons.get(jail.lower(), f'Too many failed {jail} attempts')
     jail_label = {'authentik': 'Authentik', 'takserver': 'TAK Server',
-                  'takserver-badcert': 'TAK Server, refused certificate'}.get(jail.lower(), jail)
-    explain    = (_tak_reason(ip, jail.lower()) + '\n\n'
-                  if jail.lower() in ('takserver', 'takserver-badcert') else '')
-
-    subject = f'[{server_id}] fail2ban: Banned {ip} ({jail_label})'
+                  'takserver-badcert': 'TAK Server, refused certificate',
+                  'sshd': 'SSH'}.get(jail.lower(), _clean(jail))
     body = (
-        f'fail2ban has banned the following IP address:\n\n'
+        f'fail2ban blocked an address and this one needs a person to look at it:\n\n'
         f'  IP:     {ip}\n'
         f'  Jail:   {jail_label}\n'
         f'  Server: {server_id}\n'
-        f'  Time:   {ts}\n'
-        f'  Reason: {reason}\n\n'
-        f'{explain}'
+        f'  Time:   {ts}\n\n'
+        f'{detail}\n\n'
+        f'Routine bans (bots and scanners) are no longer emailed. They stay on the '
+        f'Fail2ban page and in the Guard Dog log.\n'
         f'To unban this IP, open your infra-TAK console → Fail2ban page.\n'
     )
-
-    # guarddog_alert_email may hold several comma-joined addresses (v10.1.30).
-    recipients = [a for a in re.split(r'[,;\s]+', to_addr) if a]
-
-    msg = MIMEText(body, 'plain', 'utf-8')
-    msg['From'] = f'{from_name} <{from_addr}>'
-    msg['To'] = ', '.join(recipients)
-    msg['Subject'] = subject
-
-    try:
-        with smtplib.SMTP('localhost', 25, timeout=15) as smtp:
-            smtp.sendmail(from_addr, recipients, msg.as_string())
-        print(f"infratak-f2b-notify: alert sent to {msg['To']}", file=sys.stderr)
-    except Exception as e:
-        print(f"infratak-f2b-notify: email failed: {e}", file=sys.stderr)
+    if not _send(settings, recipients, f'[{server_id}] fail2ban: {headline}', body) and ok:
+        _locked_state(lambda st: _person_undo(st, key, now))
 
 
 if __name__ == '__main__':
@@ -122679,6 +126136,27 @@ def _ensure_console_restart_timer(settings=None):
         return f'console-restart timer warning: {str(_e)[:120]}'
 
 
+def _takserver_started_before_package():
+    """ops #1337: True when TAK Server was last STARTED before the package's files were last
+    unpacked (so what runs is still the OLD code), False when it started after, None when that
+    cannot be told. The unit is a SysV init script (Type=forking, MainPID 0), so there is no
+    process to read: use the time systemd says the unit became active, against dpkg's file list
+    (rewritten at every unpack)."""
+    try:
+        for unit in ('takserver', 'takserver-noplugins'):
+            r = subprocess.run(['systemctl', 'show', '-p', 'ActiveEnterTimestampMonotonic', '--value', unit],
+                               capture_output=True, text=True, timeout=5)
+            v = (r.stdout or '').strip()
+            if not (v.isdigit() and int(v) > 0):
+                continue
+            uptime = float(open('/proc/uptime').read().split()[0])
+            active_since = time.time() - (uptime - int(v) / 1e6)
+            return active_since < os.path.getmtime('/var/lib/dpkg/info/takserver.list')
+        return None
+    except Exception:
+        return None
+
+
 def _selfheal_takserver_half_configured(plog=None):
     """v0.9.44: silently clear a `takserver` dpkg 'half-configured' state WITHOUT
     running the .deb postinstall.
@@ -122731,6 +126209,17 @@ def _selfheal_takserver_half_configured(plog=None):
         _log('takserver self-heal: half-configured but service not active — leaving for manual review.')
         return
 
+    # ops #1337: `run_takserver_upgrade` runs apt while the OLD TAK Server is still running, so
+    # after a postinst that failed the unit is active too. Skipping the postinst then also skips
+    # its database setup and schema step, and the next restart runs the new code on the old
+    # schema. A TAK Server that started before the package was unpacked is the old code: do not
+    # clear the state; the update has to be run again.
+    if _takserver_started_before_package():
+        _log('takserver self-heal: the running TAK Server started before this package was unpacked, '
+             'so the package postinstall (database setup) never finished — NOT clearing the '
+             'half-configured state. Run the TAK Server update again.')
+        return
+
     postinst = '/var/lib/dpkg/info/takserver.postinst'
     if not os.path.isfile(postinst):
         return
@@ -122760,6 +126249,22 @@ def _selfheal_takserver_half_configured(plog=None):
         if st == 'install ok installed':
             _log('takserver self-heal: cleared dpkg half-configured state '
                  '(TAK Server untouched, apt unblocked).')
+            # ops #1337: the postinst was skipped, and with it TAK's database setup. Run that
+            # setup now (SchemaManager; it changes nothing on a schema that is current) and
+            # read the schema back, so new code never runs on an old schema unnoticed.
+            # Local cot database only; a remote one is not read here.
+            try:
+                if _tak58_schema_version() is not None:
+                    _before = _tak58_schema_version()
+                    _rc = _tak58_run_setup_db()
+                    _after = _tak58_schema_version()
+                    _log(f'takserver self-heal: TAK database setup exit {_rc}, '
+                         f'schema_version {_before} -> {_after}.')
+                    if _rc != 0 or _after is None:
+                        _log('takserver self-heal: ⚠ the database setup did not finish cleanly — '
+                             'run the TAK Server update again.')
+            except Exception as _se:
+                _log(f'takserver self-heal: database setup check error ({str(_se)[:120]}).')
         else:
             _log(f'takserver self-heal: state still "{st}" after configure — manual review.')
     except Exception:
@@ -123875,7 +127380,10 @@ def _startup_migrations():
                       "migrations may fail and will retry on the next console restart", flush=True)
 
         # v10.2.2 W2: was a side effect of every detect_modules() call.
-        _cleanup_caddy_leftovers()
+        try:
+            _cleanup_caddy_leftovers()
+        except Exception as _step_e:
+            print(f'Startup migration: step "_cleanup_caddy_leftovers()" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         s = load_settings()
         settings_dirty = False
@@ -124049,22 +127557,25 @@ def _startup_migrations():
 
         # ops #630 — a remote MediaMTX box's firewall may be off. SSH to another box can take
         # minutes, so in the background: it must never hold up the console's start.
-        _mtx_remote_fw_t = threading.Thread(target=_startup_converge_mediamtx_remote_firewall, daemon=True,
-                                            name='startup-mediamtx-remote-fw')
-        _mtx_remote_fw_t.start()
-        # ops #1107 — the stream site file (and the editor's Authentik token and address) on a
-        # remote MediaMTX box, the same pass _startup_converge_mediamtx_overlay() does for a
-        # local one. After the firewall check, never beside it: that check may stop the editor.
-        # ops #1110 — then the video road: once the editor there serves /hls-proxy/, Caddy
-        # sends video through the sign-in (_startup_converge_mediamtx_remote_hls_road runs
-        # _startup_converge_mediamtx_overlay_remote first, in the same thread).
-        _mtx_remote_road_t = threading.Thread(target=_startup_converge_mediamtx_remote_hls_road, args=(_mtx_remote_fw_t,),
-                                              daemon=True, name='startup-mediamtx-remote-overlay')
-        _mtx_remote_road_t.start()
-        # ops #1149 — then the HLS port on that box: closed to the console once the running
-        # Caddy no longer reads it. After the road pass, never beside it.
-        threading.Thread(target=_startup_converge_mediamtx_remote_hls_port, args=(_mtx_remote_road_t,),
-                         daemon=True, name='startup-mediamtx-remote-hls-port').start()
+        try:
+            _mtx_remote_fw_t = threading.Thread(target=_startup_converge_mediamtx_remote_firewall, daemon=True,
+                                                name='startup-mediamtx-remote-fw')
+            _mtx_remote_fw_t.start()
+            # ops #1107 — the stream site file (and the editor's Authentik token and address) on a
+            # remote MediaMTX box, the same pass _startup_converge_mediamtx_overlay() does for a
+            # local one. After the firewall check, never beside it: that check may stop the editor.
+            # ops #1110 — then the video road: once the editor there serves /hls-proxy/, Caddy
+            # sends video through the sign-in (_startup_converge_mediamtx_remote_hls_road runs
+            # _startup_converge_mediamtx_overlay_remote first, in the same thread).
+            _mtx_remote_road_t = threading.Thread(target=_startup_converge_mediamtx_remote_hls_road, args=(_mtx_remote_fw_t,),
+                                                  daemon=True, name='startup-mediamtx-remote-overlay')
+            _mtx_remote_road_t.start()
+            # ops #1149 — then the HLS port on that box: closed to the console once the running
+            # Caddy no longer reads it. After the road pass, never beside it.
+            threading.Thread(target=_startup_converge_mediamtx_remote_hls_port, args=(_mtx_remote_road_t,),
+                             daemon=True, name='startup-mediamtx-remote-hls-port').start()
+        except Exception as _step_e:
+            print(f'Startup migration: step "_mtx_remote_fw_t = threading.Thread(target=_startu" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         try:
             _startup_converge_mediamtx_ssl()
@@ -124237,27 +127748,30 @@ def _startup_migrations():
             print(f"Startup migration: split DB keepalive launch error (non-fatal): {_sdk_e}", flush=True)
 
         # Fix fedhub web_ui_port default for Caddy upstream (remote hub HTTP web UI is 8080)
-        fh_raw = s.get('fedhub_deployment', {})
-        if fh_raw.get('deployed') or fh_raw.get('web_ui_port') in (8446, '8446', None):
-            wp = fh_raw.get('web_ui_port')
-            if wp in (8446, '8446', None):
-                fh_raw['web_ui_port'] = 8080
-                s['fedhub_deployment'] = fh_raw
-                settings_dirty = True
-                print("Startup migration: fixed fedhub web_ui_port → 8080")
+        try:
+            fh_raw = s.get('fedhub_deployment', {})
+            if fh_raw.get('deployed') or fh_raw.get('web_ui_port') in (8446, '8446', None):
+                wp = fh_raw.get('web_ui_port')
+                if wp in (8446, '8446', None):
+                    fh_raw['web_ui_port'] = 8080
+                    s['fedhub_deployment'] = fh_raw
+                    settings_dirty = True
+                    print("Startup migration: fixed fedhub web_ui_port → 8080")
 
-        if settings_dirty:
-            save_settings(s)
-            s = load_settings()
+            if settings_dirty:
+                save_settings(s)
+                s = load_settings()
 
-        # Build normalized cfg after settings normalization
-        fh_cfg = _get_fedhub_deployment_config(s)
+            # Build normalized cfg after settings normalization
+            fh_cfg = _get_fedhub_deployment_config(s)
 
-        # Always regenerate Caddyfile when Fed Hub is deployed (port fixes, Fed Hub vhost, etc.)
-        if fh_cfg.get('deployed') and (s.get('fqdn') or '').strip():
-            generate_caddyfile(s)
-            _caddy_reload()
-            print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+            # Always regenerate Caddyfile when Fed Hub is deployed (port fixes, Fed Hub vhost, etc.)
+            if fh_cfg.get('deployed') and (s.get('fqdn') or '').strip():
+                generate_caddyfile(s)
+                _caddy_reload()
+                print("Startup migration: Caddyfile regenerated + Caddy reloaded")
+        except Exception as _step_e:
+            print(f'Startup migration: step "fh_raw = s.get(fedhub_deployment )" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.1.1 (one-time per box): heal the /hls-proxy TLS upstream fleet-wide.
         # The non-root console computed hls_encrypted=False (it can't traverse
@@ -124295,30 +127809,33 @@ def _startup_migrations():
         # retry with a short backoff, VERIFY the strip is actually in generate's returned
         # content (a successful return means the file write succeeded too — generate raises
         # if the broker write fails), and only stamp the flag on a confirmed application.
-        if (s.get('fqdn') or '').strip() and not s.get('caddy_xauth_strip_v1'):
-            _applied = False
-            _last_err = None
-            for _xs_attempt in range(6):
-                try:
-                    _cf = generate_caddyfile(s)
-                    if _cf and 'request_header -X-Authentik' in _cf:
-                        _caddy_reload()
-                        _applied = True
-                        break
-                    _last_err = 'strip absent from generated Caddyfile'
-                except Exception as _xs_e:
-                    _last_err = str(_xs_e)[:160]
-                time.sleep(4)
-            if _applied:
-                s['caddy_xauth_strip_v1'] = True
-                save_settings(s)
-                s = load_settings()
-                print("Startup migration: Caddyfile regenerated to strip client X-Authentik-* (auth-bypass fix)")
-            else:
-                # Flag intentionally NOT set → retries on the next restart. Loud, so the
-                # box being left exposed is visible in the journal.
-                print(f"Startup migration: ⚠ SECURITY: X-Authentik strip NOT applied after retries "
-                      f"(box may be exposed until next restart): {_last_err}", flush=True)
+        try:
+            if (s.get('fqdn') or '').strip() and not s.get('caddy_xauth_strip_v1'):
+                _applied = False
+                _last_err = None
+                for _xs_attempt in range(6):
+                    try:
+                        _cf = generate_caddyfile(s)
+                        if _cf and 'request_header -X-Authentik' in _cf:
+                            _caddy_reload()
+                            _applied = True
+                            break
+                        _last_err = 'strip absent from generated Caddyfile'
+                    except Exception as _xs_e:
+                        _last_err = str(_xs_e)[:160]
+                    time.sleep(4)
+                if _applied:
+                    s['caddy_xauth_strip_v1'] = True
+                    save_settings(s)
+                    s = load_settings()
+                    print("Startup migration: Caddyfile regenerated to strip client X-Authentik-* (auth-bypass fix)")
+                else:
+                    # Flag intentionally NOT set → retries on the next restart. Loud, so the
+                    # box being left exposed is visible in the journal.
+                    print(f"Startup migration: ⚠ SECURITY: X-Authentik strip NOT applied after retries "
+                          f"(box may be exposed until next restart): {_last_err}", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if (s.get(fqdn) or ).strip() and not s.get(caddy_x" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.2.6 SECURITY (one-time per box, retry-until-applied): the MediaMTX vhost strips
         # client X-Authentik-* on every route — a forged admin group header used to earn an
@@ -124326,40 +127843,43 @@ def _startup_migrations():
         # editor overlay so logged-in viewers can play. See _emit_mediamtx_site. MUST stay
         # after _startup_converge_mediamtx_overlay(): only the overlay it ships forwards
         # MediaMTX's ?session= query, and the old one cannot play past the first playlist.
-        if (s.get('fqdn') or '').strip() and not s.get('caddy_mtx_hls_overlay_v1'):
-            _applied = False
-            _last_err = None
-            for _mh_attempt in range(6):
-                try:
-                    _mh_mods = detect_modules(fresh=True)
-                    if not (_mh_mods.get('mediamtx', {}).get('installed')
-                            and _mh_mods.get('authentik', {}).get('installed')):
-                        # Nothing to converge; a later deploy regenerates with the new vhost.
-                        _applied = True
-                        break
-                    generate_caddyfile(s)
-                    # Read back the LIVE file: a Caddyfile Caddy rejects is restored to the
-                    # previous one (_caddy_validate_or_restore) while generate still returns
-                    # the new text, so checking that would stamp a box that never changed.
-                    _cf = _read_priv(CADDYFILE_PATH) or ''
-                    _mtx_blk = _cf.split('# MediaMTX Web Console', 1)[-1].split('\n}\n', 1)[0]
-                    if '# MediaMTX Web Console' in _cf and 'request_header -X-Authentik-Groups' in _mtx_blk:
-                        _caddy_reload()
-                        _applied = True
-                        break
-                    _last_err = 'MediaMTX vhost header strip absent from the live Caddyfile (rejected and restored?)'
-                except Exception as _mh_e:
-                    _last_err = str(_mh_e)[:160]
-                time.sleep(4)
-            if _applied:
-                s['caddy_mtx_hls_overlay_v1'] = True
-                save_settings(s)
-                s = load_settings()
-                print("Startup migration: MediaMTX vhost — client X-Authentik-* stripped, "
-                      "/hls-proxy through the login to the editor overlay", flush=True)
-            else:
-                print(f"Startup migration: ⚠ SECURITY: MediaMTX vhost NOT regenerated after retries "
-                      f"(retries next restart): {_last_err}", flush=True)
+        try:
+            if (s.get('fqdn') or '').strip() and not s.get('caddy_mtx_hls_overlay_v1'):
+                _applied = False
+                _last_err = None
+                for _mh_attempt in range(6):
+                    try:
+                        _mh_mods = detect_modules(fresh=True)
+                        if not (_mh_mods.get('mediamtx', {}).get('installed')
+                                and _mh_mods.get('authentik', {}).get('installed')):
+                            # Nothing to converge; a later deploy regenerates with the new vhost.
+                            _applied = True
+                            break
+                        generate_caddyfile(s)
+                        # Read back the LIVE file: a Caddyfile Caddy rejects is restored to the
+                        # previous one (_caddy_validate_or_restore) while generate still returns
+                        # the new text, so checking that would stamp a box that never changed.
+                        _cf = _read_priv(CADDYFILE_PATH) or ''
+                        _mtx_blk = _cf.split('# MediaMTX Web Console', 1)[-1].split('\n}\n', 1)[0]
+                        if '# MediaMTX Web Console' in _cf and 'request_header -X-Authentik-Groups' in _mtx_blk:
+                            _caddy_reload()
+                            _applied = True
+                            break
+                        _last_err = 'MediaMTX vhost header strip absent from the live Caddyfile (rejected and restored?)'
+                    except Exception as _mh_e:
+                        _last_err = str(_mh_e)[:160]
+                    time.sleep(4)
+                if _applied:
+                    s['caddy_mtx_hls_overlay_v1'] = True
+                    save_settings(s)
+                    s = load_settings()
+                    print("Startup migration: MediaMTX vhost — client X-Authentik-* stripped, "
+                          "/hls-proxy through the login to the editor overlay", flush=True)
+                else:
+                    print(f"Startup migration: ⚠ SECURITY: MediaMTX vhost NOT regenerated after retries "
+                          f"(retries next restart): {_last_err}", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if (s.get(fqdn) or ).strip() and not s.get(caddy_m" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # ops #150: the NetBird vhost sent signal to :10000 (nothing listens there on the
         # combined server) and the relay WebSocket over h2c (502), so peers registered but
@@ -124387,90 +127907,96 @@ def _startup_migrations():
         # carry the X-Infratak-Proxy-Auth secret, VERIFY the generated content,
         # reload Caddy, and only then flip enforce on — so SSO never breaks from
         # the console requiring a header Caddy isn't injecting yet.
-        if not s.get('caddy_proxy_auth_gate_v1'):
-            if not (s.get('fqdn') or '').strip():
-                # No FQDN → no Caddy-fronted console → no legitimate forward_auth
-                # source for X-Authentik-* headers. Arm immediately: any loopback
-                # request bearing that header on this box is forged.
-                _pa = _proxy_auth_state(create=True)
-                _pa['enforce'] = True
-                _save_proxy_auth_state(_pa)
-                s['caddy_proxy_auth_gate_v1'] = True
-                save_settings(s)
-                s = load_settings()
-                print("Startup migration: proxy-auth gate armed (no FQDN — header SSO requires Caddy)", flush=True)
-            else:
-                _pa_applied = False
-                _pa_err = None
-                for _pa_try in range(6):
-                    try:
-                        _cf = generate_caddyfile(s)
-                        # Console forward_auth is uniquely 'forward_auth @needs_sso';
-                        # if it is emitted, the secret injection must be too. The
-                        # client strip must be present in every posture.
-                        _pa_ok = bool(_cf) and 'request_header -X-Infratak-Proxy-Auth' in _cf and \
-                            (('forward_auth @needs_sso' not in _cf
-                              and 'route @needs_sso' not in _cf)    # ops #1108 form
-                             or 'request_header @needs_sso X-Infratak-Proxy-Auth' in _cf) and \
-                            'route /api/console/restart-safe*' in _cf  # S2 edge block rides the same regen
-                        if _pa_ok:
-                            _caddy_reload()
-                            _pa_applied = True
-                            break
-                        _pa_err = 'proxy-auth directives absent from generated Caddyfile'
-                    except Exception as _pa_e:
-                        _pa_err = str(_pa_e)[:160]
-                    time.sleep(4)
-                if _pa_applied:
+        try:
+            if not s.get('caddy_proxy_auth_gate_v1'):
+                if not (s.get('fqdn') or '').strip():
+                    # No FQDN → no Caddy-fronted console → no legitimate forward_auth
+                    # source for X-Authentik-* headers. Arm immediately: any loopback
+                    # request bearing that header on this box is forged.
                     _pa = _proxy_auth_state(create=True)
                     _pa['enforce'] = True
                     _save_proxy_auth_state(_pa)
                     s['caddy_proxy_auth_gate_v1'] = True
                     save_settings(s)
                     s = load_settings()
-                    print("Startup migration: proxy-auth gate armed (Caddy injects X-Infratak-Proxy-Auth on forward_auth)", flush=True)
+                    print("Startup migration: proxy-auth gate armed (no FQDN — header SSO requires Caddy)", flush=True)
                 else:
-                    # Not armed → the 10.1.0 client-header strip remains the (sole)
-                    # defense; retry on the next restart. Loud on purpose.
-                    print(f"Startup migration: ⚠ SECURITY: proxy-auth gate NOT armed after retries "
-                          f"(strip-only defense until next restart): {_pa_err}", flush=True)
+                    _pa_applied = False
+                    _pa_err = None
+                    for _pa_try in range(6):
+                        try:
+                            _cf = generate_caddyfile(s)
+                            # Console forward_auth is uniquely 'forward_auth @needs_sso';
+                            # if it is emitted, the secret injection must be too. The
+                            # client strip must be present in every posture.
+                            _pa_ok = bool(_cf) and 'request_header -X-Infratak-Proxy-Auth' in _cf and \
+                                (('forward_auth @needs_sso' not in _cf
+                                  and 'route @needs_sso' not in _cf)    # ops #1108 form
+                                 or 'request_header @needs_sso X-Infratak-Proxy-Auth' in _cf) and \
+                                'route /api/console/restart-safe*' in _cf  # S2 edge block rides the same regen
+                            if _pa_ok:
+                                _caddy_reload()
+                                _pa_applied = True
+                                break
+                            _pa_err = 'proxy-auth directives absent from generated Caddyfile'
+                        except Exception as _pa_e:
+                            _pa_err = str(_pa_e)[:160]
+                        time.sleep(4)
+                    if _pa_applied:
+                        _pa = _proxy_auth_state(create=True)
+                        _pa['enforce'] = True
+                        _save_proxy_auth_state(_pa)
+                        s['caddy_proxy_auth_gate_v1'] = True
+                        save_settings(s)
+                        s = load_settings()
+                        print("Startup migration: proxy-auth gate armed (Caddy injects X-Infratak-Proxy-Auth on forward_auth)", flush=True)
+                    else:
+                        # Not armed → the 10.1.0 client-header strip remains the (sole)
+                        # defense; retry on the next restart. Loud on purpose.
+                        print(f"Startup migration: ⚠ SECURITY: proxy-auth gate NOT armed after retries "
+                              f"(strip-only defense until next restart): {_pa_err}", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if not s.get(caddy_proxy_auth_gate_v1)" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.1.28: outpost-callback rescue page (572f6c4). A code-only change to
         # generate_caddyfile does nothing until the file is regenerated, and a manual
         # git pull + restart skips the Update-Now regen path — so converge here, the
         # same one-shot-flag shape as the migrations above. Regenerate, verify the
         # rescue route is in the output, reload Caddy, stamp the flag.
-        if (s.get('fqdn') or '').strip() and not s.get('caddy_cb_rescue_v2'):
-            _cbr_applied = False
-            _cbr_err = None
-            for _cbr_try in range(6):
-                try:
-                    _cf = generate_caddyfile(s)
-                    if not _cf:
-                        _cbr_err = 'generate returned empty'
-                    elif 'reverse_proxy /outpost.goauthentik.io/' not in _cf:
-                        # No vhost proxies the outpost (Authentik not installed) — nothing
-                        # to rescue; the regen itself is still the converge. Stamp and stop.
-                        _cbr_applied = True
-                        break
-                    elif 'route /outpost.goauthentik.io/callback*' in _cf:
-                        _caddy_reload()
-                        _cbr_applied = True
-                        break
-                    else:
-                        _cbr_err = 'rescue route absent from generated Caddyfile'
-                except Exception as _cbr_e:
-                    _cbr_err = str(_cbr_e)[:160]
-                time.sleep(4)
-            if _cbr_applied:
-                s['caddy_cb_rescue_v2'] = True
-                save_settings(s)
-                s = load_settings()
-                print("Startup migration: Caddyfile regenerated with outpost-callback rescue page", flush=True)
-            else:
-                # Flag not set → retried on next restart. Non-security: the old behavior
-                # (bare 400 on a cross-browser reset landing) persists until then.
-                print(f"Startup migration: callback-rescue regen not applied: {_cbr_err}", flush=True)
+        try:
+            if (s.get('fqdn') or '').strip() and not s.get('caddy_cb_rescue_v2'):
+                _cbr_applied = False
+                _cbr_err = None
+                for _cbr_try in range(6):
+                    try:
+                        _cf = generate_caddyfile(s)
+                        if not _cf:
+                            _cbr_err = 'generate returned empty'
+                        elif 'reverse_proxy /outpost.goauthentik.io/' not in _cf:
+                            # No vhost proxies the outpost (Authentik not installed) — nothing
+                            # to rescue; the regen itself is still the converge. Stamp and stop.
+                            _cbr_applied = True
+                            break
+                        elif 'route /outpost.goauthentik.io/callback*' in _cf:
+                            _caddy_reload()
+                            _cbr_applied = True
+                            break
+                        else:
+                            _cbr_err = 'rescue route absent from generated Caddyfile'
+                    except Exception as _cbr_e:
+                        _cbr_err = str(_cbr_e)[:160]
+                    time.sleep(4)
+                if _cbr_applied:
+                    s['caddy_cb_rescue_v2'] = True
+                    save_settings(s)
+                    s = load_settings()
+                    print("Startup migration: Caddyfile regenerated with outpost-callback rescue page", flush=True)
+                else:
+                    # Flag not set → retried on next restart. Non-security: the old behavior
+                    # (bare 400 on a cross-browser reset landing) persists until then.
+                    print(f"Startup migration: callback-rescue regen not applied: {_cbr_err}", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if (s.get(fqdn) or ).strip() and not s.get(caddy_c" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.1.28: Authentik-side convergence, same one-button rule. The cookie_domain sweep
         # (2acf95f) and the recovery-flow changes (show-password field, dedicated identification
@@ -124483,40 +128009,43 @@ def _startup_migrations():
         # the v1 stamp set, so without a new key the recovery-flow change below (reset now
         # ends SIGNED OUT on every box, not just W1-hardened ones) would never reach them —
         # the exact "new code, still-broken flow" trap this block exists to prevent.
-        if not s.get('ak_cookie_recovery_converge_v2'):
-            _akc_done = False
-            _akc_err = None
-            try:
-                _ak_tok = (_get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
-                           or _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or '').strip()
-            except Exception:
-                _ak_tok = ''
-            if not _ak_tok:
-                # No Authentik on this box (or no token yet) → nothing to converge. Stamp:
-                # a later Authentik deploy runs both ensures itself as part of its own flow.
-                _akc_done = True
-            else:
-                _ak_hdr = {'Authorization': f'Bearer {_ak_tok}', 'Content-Type': 'application/json'}
-                for _akc_try in range(3):
-                    try:
-                        _ensure_proxy_providers_cookie_domain(
-                            'http://127.0.0.1:9090', _ak_hdr, (s.get('fqdn') or '').strip())
-                        _ensure_authentik_recovery_flow('http://127.0.0.1:9090', _ak_hdr)
-                        _akc_done = True
-                        break
-                    except Exception as _akc_e:
-                        _akc_err = str(_akc_e)[:160]
-                    time.sleep(5)
-            if _akc_done:
-                s['ak_cookie_recovery_converge_v2'] = True
-                save_settings(s)
-                s = load_settings()
-                print("Startup migration: Authentik proxy cookie_domain normalized + recovery flow "
-                      "converged (reset now ends signed-out on every box)", flush=True)
-            else:
-                # Authentik containers may still be starting on a fresh boot — leave the flag
-                # unset so the next restart retries rather than silently skipping forever.
-                print(f"Startup migration: Authentik converge deferred (retries next restart): {_akc_err}", flush=True)
+        try:
+            if not s.get('ak_cookie_recovery_converge_v2'):
+                _akc_done = False
+                _akc_err = None
+                try:
+                    _ak_tok = (_get_authentik_env_value(s, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                               or _get_authentik_env_value(s, 'AUTHENTIK_TOKEN') or '').strip()
+                except Exception:
+                    _ak_tok = ''
+                if not _ak_tok:
+                    # No Authentik on this box (or no token yet) → nothing to converge. Stamp:
+                    # a later Authentik deploy runs both ensures itself as part of its own flow.
+                    _akc_done = True
+                else:
+                    _ak_hdr = {'Authorization': f'Bearer {_ak_tok}', 'Content-Type': 'application/json'}
+                    for _akc_try in range(3):
+                        try:
+                            _ensure_proxy_providers_cookie_domain(
+                                'http://127.0.0.1:9090', _ak_hdr, (s.get('fqdn') or '').strip())
+                            _ensure_authentik_recovery_flow('http://127.0.0.1:9090', _ak_hdr)
+                            _akc_done = True
+                            break
+                        except Exception as _akc_e:
+                            _akc_err = str(_akc_e)[:160]
+                        time.sleep(5)
+                if _akc_done:
+                    s['ak_cookie_recovery_converge_v2'] = True
+                    save_settings(s)
+                    s = load_settings()
+                    print("Startup migration: Authentik proxy cookie_domain normalized + recovery flow "
+                          "converged (reset now ends signed-out on every box)", flush=True)
+                else:
+                    # Authentik containers may still be starting on a fresh boot — leave the flag
+                    # unset so the next restart retries rather than silently skipping forever.
+                    print(f"Startup migration: Authentik converge deferred (retries next restart): {_akc_err}", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if not s.get(ak_cookie_recovery_converge_v2)" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.1.28: arm the Setup AP's offline dependencies on boxes that were already
         # configured before this fix. tak-setup-ap.sh installed hostapd/dnsmasq lazily at
@@ -124546,47 +128075,29 @@ def _startup_migrations():
             except Exception as _sae:
                 print('Startup migration: Setup AP arming error: %s' % str(_sae)[:160], flush=True)
 
-        # v10.0.1: one-time teardown of the legacy 'cfd-remote-assist' install so a fresh
-        # 'eud-remote-assist' install is clean. The module was renamed cfd→eud; the in-console
-        # Update/Uninstall buttons now target eud paths and can no longer see an old cfd stack,
-        # so a box that installed Remote Assist before the rename would be stranded (old
-        # containers hold ports 8767/8448 → a fresh eud deploy collides). We remove the old
-        # compose stack + DB volume, force-kill any lingering cfd-remote-assist-* containers,
-        # deregister the old Authentik app/provider, drop the source dir, and mark the module
-        # not-installed so the operator reinstalls fresh (= eud). Idempotent: the old dir is
-        # removed at the end, and the guard requires it present with no eud dir yet, so this
-        # runs at most once and is a no-op on fresh boxes.
+        # v10.0.1 renamed the Remote Assist module cfd -> eud. It used to tear the old install
+        # down here, with `docker compose down -v`, which deletes the Remote Assist database
+        # volume with no prompt. ops #1343: a startup migration must never delete data nobody
+        # asked it to. If the old folder is still there (and no eud one), leave everything as it
+        # is, say so in the journal and on a console bar, and let the operator decide.
         _ra_old_dir = os.path.expanduser('~/cfd-remote-assist')
         _ra_new_dir = os.path.expanduser('~/eud-remote-assist')
-        if os.path.isdir(_ra_old_dir) and not os.path.isdir(_ra_new_dir):
-            try:
-                print("Startup migration: tearing down legacy cfd-remote-assist install (renamed to eud)", flush=True)
-                _old_compose = os.path.join(_ra_old_dir, 'docker-compose.yml')
-                if os.path.exists(_old_compose):
-                    subprocess.run(_sudo_wrap(['docker', 'compose', '-f', _old_compose, 'down', '-v', '--remove-orphans']),
-                                   capture_output=True, timeout=120)
-                # Belt-and-suspenders: force-remove any container still named cfd-remote-assist-*
-                _ra_old_ids = subprocess.run(_sudo_wrap(['docker', 'ps', '-aq', '--filter', 'name=cfd-remote-assist']),
-                                             capture_output=True, text=True, timeout=15).stdout.split()
-                if _ra_old_ids:
-                    subprocess.run(_sudo_wrap(['docker', 'rm', '-f', *_ra_old_ids]), capture_output=True, timeout=60)
-                # Deregister the old Authentik application + provider (legacy slug/name).
-                try:
-                    _deregister_authentik_oauth2_app(s, 'cfd-remote-assist', 'CFD Remote Assist')
-                except Exception:
-                    pass
-                shutil.rmtree(_ra_old_dir, ignore_errors=True)
-                # Reflect reality: no RA install until the operator reinstalls fresh (= eud).
-                s['remote_assist_enabled'] = False
+        try:
+            if os.path.isdir(_ra_old_dir) and not os.path.isdir(_ra_new_dir):
+                if not s.get('legacy_remote_assist_notice'):
+                    print("Startup migration: legacy cfd-remote-assist install found. NOT removed: its "
+                          "database volume holds Remote Assist data. Back it up, then remove "
+                          "~/cfd-remote-assist yourself, and install EUD Remote Assist from the console.",
+                          flush=True)
+                    s['legacy_remote_assist_notice'] = True
+                    save_settings(s)
+                    s = load_settings()
+            elif s.get('legacy_remote_assist_notice'):
+                s.pop('legacy_remote_assist_notice', None)      # the operator dealt with it
                 save_settings(s)
                 s = load_settings()
-                # Drop the now-dead RA vhost from Caddy so its subdomain doesn't 502.
-                if (s.get('fqdn') or '').strip():
-                    generate_caddyfile(s)
-                    _caddy_reload()
-                print("Startup migration: legacy cfd-remote-assist removed — reinstall EUD Remote Assist from the console to recreate it", flush=True)
-            except Exception as e:
-                print(f"Startup migration: error tearing down legacy cfd-remote-assist: {e}", flush=True)
+        except Exception as e:
+            print(f"Startup migration: legacy cfd-remote-assist check failed: {e}", flush=True)
 
         # v0.9.61: inject OIDC_ADMIN_GROUP into existing remote assist .env
         if s.get('remote_assist_enabled') or 'remote_assist' in s.get('modules', {}):
@@ -124620,136 +128131,145 @@ def _startup_migrations():
                 print(f"Startup migration: error opening RA device port in firewalld: {e}", flush=True)
 
         # Ensure cesium-tiles dir exists + is servable when the module is enabled.
-        if s.get('cesium_tiles_enabled'):
-            _cesium_ensure_dir()  # idempotent: create + (RHEL) caddy-readable perms + SELinux label
-            # RHEL self-heal: a box enabled before the path move still has a Caddyfile
-            # pointing at the non-traversable ~/cesium-tiles (Caddy 403). If the cesium
-            # vhost root is stale, regenerate + reload so it serves the new dir.
-            if (s.get('fqdn') or '').strip():
-                try:
-                    with open(CADDYFILE_PATH) as _cf:
-                        _cad = _cf.read()
-                except Exception:
-                    _cad = ''
-                if 'cesium' in _cad.lower() and _cesium_dir() not in _cad:
-                    generate_caddyfile(s)
-                    _caddy_reload(timeout=60)
-                    print("Startup migration: cesium vhost repointed to caddy-readable dir + Caddy reloaded", flush=True)
+        try:
+            if s.get('cesium_tiles_enabled'):
+                _cesium_ensure_dir()  # idempotent: create + (RHEL) caddy-readable perms + SELinux label
+                # RHEL self-heal: a box enabled before the path move still has a Caddyfile
+                # pointing at the non-traversable ~/cesium-tiles (Caddy 403). If the cesium
+                # vhost root is stale, regenerate + reload so it serves the new dir.
+                if (s.get('fqdn') or '').strip():
+                    try:
+                        with open(CADDYFILE_PATH) as _cf:
+                            _cad = _cf.read()
+                    except Exception:
+                        _cad = ''
+                    if 'cesium' in _cad.lower() and _cesium_dir() not in _cad:
+                        generate_caddyfile(s)
+                        _caddy_reload(timeout=60)
+                        print("Startup migration: cesium vhost repointed to caddy-readable dir + Caddy reloaded", flush=True)
+        except Exception as _step_e:
+            print(f'Startup migration: step "if s.get(cesium_tiles_enabled)" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # Ensure webodm working directories exist when the module is enabled
-        if s.get('webodm_enabled'):
-            for _wo_sub in ['', 'plugins', 'media', 'db']:
-                _wo_path = os.path.expanduser(f'~/webodm/{_wo_sub}') if _wo_sub else os.path.expanduser('~/webodm')
-                if not os.path.isdir(_wo_path):
-                    os.makedirs(_wo_path, exist_ok=True)
-                    print(f"Startup migration: created ~/webodm/{_wo_sub}")
+        try:
+            if s.get('webodm_enabled'):
+                for _wo_sub in ['', 'plugins', 'media', 'db']:
+                    _wo_path = os.path.expanduser(f'~/webodm/{_wo_sub}') if _wo_sub else os.path.expanduser('~/webodm')
+                    if not os.path.isdir(_wo_path):
+                        os.makedirs(_wo_path, exist_ok=True)
+                        print(f"Startup migration: created ~/webodm/{_wo_sub}")
+        except Exception as _step_e:
+            print(f'Startup migration: step "if s.get(webodm_enabled)" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # Harden existing WebODM installs: patch compose port bindings + UFW deny
         # Fixes 0.0.0.0:{wo_port}:8000 → 127.0.0.1:{wo_port}:8000 per PORT-EXPOSURE-POLICY.md Tier 3
         # ops #92 / #101 W5: a box flipped from root keeps WebODM in /root/webodm, which the
         # console can't read or stat — resolve it with _webodm_dir() and go through the broker
         # there, or the flipped box is skipped and keeps EOL redis until someone presses Update.
-        _wo_dir = _webodm_dir()
-        # (on a root box ~/webodm IS /root/webodm: plain file I/O, and no WebODM = no file = skip)
-        _wo_priv = (_wo_dir == '/root/webodm'
-                    and _wo_dir != os.path.join(os.path.expanduser('~'), 'webodm'))
-        _wo_compose = os.path.join(_wo_dir, 'docker-compose.yml')
-        if _wo_priv or os.path.exists(_wo_compose):
-            try:
-                import re as _re_wo
-                if _wo_priv:
-                    _wo_txt = _read_priv(_wo_compose)
-                else:
-                    with open(_wo_compose) as _f:
-                        _wo_txt = _f.read()
-                # Patch webapp port binding if it's still 0.0.0.0 (no loopback prefix)
-                _wo_patched = _re_wo.sub(
-                    r'- "(\d+):8000"',
-                    r'- "127.0.0.1:\1:8000"',
-                    _wo_txt
-                )
-                # Remove any host-side nodeodm port mapping (Docker-internal only).
-                # Also strip the now-empty `ports:` key to avoid YAML validation errors.
-                _wo_patched = _re_wo.sub(
-                    r'[ \t]*- "127\.0\.0\.1:3001:3000"\n', '', _wo_patched
-                )
-                _wo_patched = _re_wo.sub(
-                    r'[ \t]+ports:\n(?=[ \t]+(restart:|oom_score_adj:))', '', _wo_patched
-                )
-                # Inject WO_DATABASE_HOST=wo_db if missing — fixes "could not translate host name db"
-                # when our compose uses wo_db as the container name instead of WebODM's default "db"
-                # (upstream settings.py reads os.environ.get('WO_DATABASE_HOST', 'db'))
-                if 'WO_DATABASE_HOST' not in _wo_patched:
-                    _wo_patched = _wo_patched.replace(
-                        '- WO_BROKER=redis://wo_broker',
-                        '- WO_DATABASE_HOST=wo_db\n      - WO_BROKER=redis://wo_broker'
-                    )
-                # GH #32 self-heal: normalize the wo_nodeodm block to the fleet ODM cap —
-                # cpus + mem_limit (host protection) + --max_concurrency (NodeODX thread cap
-                # so a job COMPLETES within the cap instead of spawning host-core-count
-                # threads and OOM-killing). Boxes deployed before the cap landed get it here
-                # on the next console restart — no redeploy. Idempotent: the regex rewrites
-                # the wo_nodeodm block to target, so an already-capped box produces no diff
-                # (the write+recreate below only fires when the file actually changed).
-                _wo_cap_changed = False
-                _wo_deploy_cfg = _get_module_deployment_config(s, 'webodm_deployment')
-                if _wo_deploy_cfg.get('target_mode') != 'remote' and '  wo_nodeodm:' in _wo_patched:
-                    _wo_cpus, _wo_mem = _webodm_odm_limits(os.cpu_count() or 4, _wo_deploy_cfg)
-
-                    def _wo_nodeodm_block(_m):
-                        # Keep the image the box already runs: moving NodeODX to the pin is a
-                        # large pull, so it happens on Update/redeploy, not on a console restart.
-                        _img = _re_wo.search(r'^    image: ([^\n]*)$', _m.group(0), _re_wo.M)
-                        return (
-                            '  wo_nodeodm:\n'
-                            f'    image: {_img.group(1) if _img else WEBODM_IMAGES["wo_nodeodm"]}\n'
-                            '    container_name: wo_nodeodm\n'
-                            f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
-                            f'    cpus: {_wo_cpus}\n'
-                            f'    mem_limit: {_wo_mem}g\n'
-                            '    restart: unless-stopped\n'
-                            '    oom_score_adj: 250\n'
-                        )
-                    _wo_before_cap = _wo_patched
+        try:
+            _wo_dir = _webodm_dir()
+            # (on a root box ~/webodm IS /root/webodm: plain file I/O, and no WebODM = no file = skip)
+            _wo_priv = (_wo_dir == '/root/webodm'
+                        and _wo_dir != os.path.join(os.path.expanduser('~'), 'webodm'))
+            _wo_compose = os.path.join(_wo_dir, 'docker-compose.yml')
+            if _wo_priv or os.path.exists(_wo_compose):
+                try:
+                    import re as _re_wo
+                    if _wo_priv:
+                        _wo_txt = _read_priv(_wo_compose)
+                    else:
+                        with open(_wo_compose) as _f:
+                            _wo_txt = _f.read()
+                    # Patch webapp port binding if it's still 0.0.0.0 (no loopback prefix)
                     _wo_patched = _re_wo.sub(
-                        r'  wo_nodeodm:\n(?:    [^\n]*\n)*',
-                        _wo_nodeodm_block,
-                        _wo_patched,
-                        count=1,
+                        r'- "(\d+):8000"',
+                        r'- "127.0.0.1:\1:8000"',
+                        _wo_txt
                     )
-                    _wo_cap_changed = (_wo_patched != _wo_before_cap)
-                # ops #92: move the Celery broker off EOL redis:7.0.10 on the next console
-                # restart — a small image, and only wo_broker is recreated. The WebODM images
-                # move to their pins on Update/redeploy (large pulls + DB migrations).
-                _wo_before_redis = _wo_patched
-                _wo_patched = _webodm_pin_images(_wo_patched, services=('wo_broker',))
-                _wo_redis_changed = (_wo_patched != _wo_before_redis)
-                # ops #206: security update — webapp/worker are recreated once, on this restart.
-                _wo_before_ole = _wo_patched
-                _wo_patched = _webodm_strip_olefile(_wo_patched)
-                _wo_ole_changed = (_wo_patched != _wo_before_ole)
-                if _wo_patched != _wo_txt:
-                    if _wo_priv:
-                        _write_priv(_wo_compose, _wo_patched)
-                    else:
-                        with open(_wo_compose, 'w') as _f:
-                            _f.write(_wo_patched)
-                    print(f"Startup migration: hardened {_wo_compose} port bindings + WO_DB_HOST (Tier 3/4)")
-                    if _wo_cap_changed:
-                        print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
-                    if _wo_redis_changed:
-                        print(f"Startup migration: ✓ WebODM broker pinned to {WEBODM_IMAGES['wo_broker']} (was EOL redis 7.0)")
-                    if _wo_ole_changed:
-                        print("Startup migration: ✓ WebODM security update applied to webapp/worker (ops #206)")
-                    if _wo_priv:
-                        # root's dir: no cwd into /root, so compose runs via the broker
-                        _webodm_compose(_wo_dir, 'up -d', timeout=120)
-                    else:
-                        import subprocess as _sp_wo
-                        _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
-                                   capture_output=True, timeout=120, cwd=_wo_dir)
-            except Exception as _wo_e:
-                print(f"Startup migration: webodm compose harden warning: {_wo_e}")
+                    # Remove any host-side nodeodm port mapping (Docker-internal only).
+                    # Also strip the now-empty `ports:` key to avoid YAML validation errors.
+                    _wo_patched = _re_wo.sub(
+                        r'[ \t]*- "127\.0\.0\.1:3001:3000"\n', '', _wo_patched
+                    )
+                    _wo_patched = _re_wo.sub(
+                        r'[ \t]+ports:\n(?=[ \t]+(restart:|oom_score_adj:))', '', _wo_patched
+                    )
+                    # Inject WO_DATABASE_HOST=wo_db if missing — fixes "could not translate host name db"
+                    # when our compose uses wo_db as the container name instead of WebODM's default "db"
+                    # (upstream settings.py reads os.environ.get('WO_DATABASE_HOST', 'db'))
+                    if 'WO_DATABASE_HOST' not in _wo_patched:
+                        _wo_patched = _wo_patched.replace(
+                            '- WO_BROKER=redis://wo_broker',
+                            '- WO_DATABASE_HOST=wo_db\n      - WO_BROKER=redis://wo_broker'
+                        )
+                    # GH #32 self-heal: normalize the wo_nodeodm block to the fleet ODM cap —
+                    # cpus + mem_limit (host protection) + --max_concurrency (NodeODX thread cap
+                    # so a job COMPLETES within the cap instead of spawning host-core-count
+                    # threads and OOM-killing). Boxes deployed before the cap landed get it here
+                    # on the next console restart — no redeploy. Idempotent: the regex rewrites
+                    # the wo_nodeodm block to target, so an already-capped box produces no diff
+                    # (the write+recreate below only fires when the file actually changed).
+                    _wo_cap_changed = False
+                    _wo_deploy_cfg = _get_module_deployment_config(s, 'webodm_deployment')
+                    if _wo_deploy_cfg.get('target_mode') != 'remote' and '  wo_nodeodm:' in _wo_patched:
+                        _wo_cpus, _wo_mem = _webodm_odm_limits(os.cpu_count() or 4, _wo_deploy_cfg)
+
+                        def _wo_nodeodm_block(_m):
+                            # Keep the image the box already runs: moving NodeODX to the pin is a
+                            # large pull, so it happens on Update/redeploy, not on a console restart.
+                            _img = _re_wo.search(r'^    image: ([^\n]*)$', _m.group(0), _re_wo.M)
+                            return (
+                                '  wo_nodeodm:\n'
+                                f'    image: {_img.group(1) if _img else WEBODM_IMAGES["wo_nodeodm"]}\n'
+                                '    container_name: wo_nodeodm\n'
+                                f'    command: ["--max_concurrency", "{_wo_cpus}"]\n'
+                                f'    cpus: {_wo_cpus}\n'
+                                f'    mem_limit: {_wo_mem}g\n'
+                                '    restart: unless-stopped\n'
+                                '    oom_score_adj: 250\n'
+                            )
+                        _wo_before_cap = _wo_patched
+                        _wo_patched = _re_wo.sub(
+                            r'  wo_nodeodm:\n(?:    [^\n]*\n)*',
+                            _wo_nodeodm_block,
+                            _wo_patched,
+                            count=1,
+                        )
+                        _wo_cap_changed = (_wo_patched != _wo_before_cap)
+                    # ops #92: move the Celery broker off EOL redis:7.0.10 on the next console
+                    # restart — a small image, and only wo_broker is recreated. The WebODM images
+                    # move to their pins on Update/redeploy (large pulls + DB migrations).
+                    _wo_before_redis = _wo_patched
+                    _wo_patched = _webodm_pin_images(_wo_patched, services=('wo_broker',))
+                    _wo_redis_changed = (_wo_patched != _wo_before_redis)
+                    # ops #206: security update — webapp/worker are recreated once, on this restart.
+                    _wo_before_ole = _wo_patched
+                    _wo_patched = _webodm_strip_olefile(_wo_patched)
+                    _wo_ole_changed = (_wo_patched != _wo_before_ole)
+                    if _wo_patched != _wo_txt:
+                        if _wo_priv:
+                            _write_priv(_wo_compose, _wo_patched)
+                        else:
+                            with open(_wo_compose, 'w') as _f:
+                                _f.write(_wo_patched)
+                        print(f"Startup migration: hardened {_wo_compose} port bindings + WO_DB_HOST (Tier 3/4)")
+                        if _wo_cap_changed:
+                            print(f"Startup migration: ✓ WebODM ODM cap applied to wo_nodeodm — {_wo_cpus} cores / {_wo_mem}g / max_concurrency {_wo_cpus}")
+                        if _wo_redis_changed:
+                            print(f"Startup migration: ✓ WebODM broker pinned to {WEBODM_IMAGES['wo_broker']} (was EOL redis 7.0)")
+                        if _wo_ole_changed:
+                            print("Startup migration: ✓ WebODM security update applied to webapp/worker (ops #206)")
+                        if _wo_priv:
+                            # root's dir: no cwd into /root, so compose runs via the broker
+                            _webodm_compose(_wo_dir, 'up -d', timeout=120)
+                        else:
+                            import subprocess as _sp_wo
+                            _sp_wo.run(['docker', 'compose', '-f', _wo_compose, 'up', '-d'],
+                                       capture_output=True, timeout=120, cwd=_wo_dir)
+                except Exception as _wo_e:
+                    print(f"Startup migration: webodm compose harden warning: {_wo_e}")
+        except Exception as _step_e:
+            print(f'Startup migration: step "_wo_dir = _webodm_dir()" failed, next steps still run (ops #1343): {_step_e}', flush=True)
         # UFW deny belt-and-braces for WebODM ports
         if s.get('webodm_enabled'):
             try:
@@ -124761,20 +128281,23 @@ def _startup_migrations():
                 pass
 
         # Keep guarddog.conf in sync with settings.json DB host (prevents stale IP after migration)
-        tak_cfg = _get_tak_deployment_config(s)
-        if tak_cfg.get('mode') == 'two_server' and os.path.exists('/opt/tak-guarddog'):
-            sg_ok, sg_msg = _sync_guarddog_remote_db_from_settings(s)
-            if sg_ok and 'synced' in (sg_msg or ''):
-                print(f"Startup migration: guarddog.conf synced — {sg_msg}")
-        elif os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
-            # GH #101: every other box too. A split box whose settings don't say two_server
-            # never reached the sync above, so its guarddog.conf kept no database section
-            # through every update. The writer takes the topology from TAK's CoreConfig.
-            sg_ok, sg_msg = _write_guarddog_conf(s)
-            print(f"Startup migration: guarddog.conf {sg_msg}")
-            if sg_ok and sg_msg.startswith('written'):
-                subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'tak-health.service']),
-                               capture_output=True, timeout=20)
+        try:
+            tak_cfg = _get_tak_deployment_config(s)
+            if tak_cfg.get('mode') == 'two_server' and os.path.exists('/opt/tak-guarddog'):
+                sg_ok, sg_msg = _sync_guarddog_remote_db_from_settings(s)
+                if sg_ok and 'synced' in (sg_msg or ''):
+                    print(f"Startup migration: guarddog.conf synced — {sg_msg}")
+            elif os.path.exists('/opt/tak-guarddog') and os.path.exists('/opt/tak'):
+                # GH #101: every other box too. A split box whose settings don't say two_server
+                # never reached the sync above, so its guarddog.conf kept no database section
+                # through every update. The writer takes the topology from TAK's CoreConfig.
+                sg_ok, sg_msg = _write_guarddog_conf(s)
+                print(f"Startup migration: guarddog.conf {sg_msg}")
+                if sg_ok and sg_msg.startswith('written'):
+                    subprocess.run(_sudo_wrap(['systemctl', 'try-restart', 'tak-health.service']),
+                                   capture_output=True, timeout=20)
+        except Exception as _step_e:
+            print(f'Startup migration: step "tak_cfg = _get_tak_deployment_config(s)" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # Ensure the shared infratak Docker network exists and containers are connected
         # (cheap idempotent check — runs every startup so restarts/recreates don't break Portal→Authentik)
@@ -125360,7 +128883,10 @@ def _startup_migrations():
 
         # ops #644 — restrict TAK Portal's SSH key line (written with no options before this
         # release) and keep its from= in step with the portal's Docker networks. Never adds trust.
-        _heal_takportal_ssh_key(lambda m: print(f"Startup migration: {m}", flush=True))
+        try:
+            _heal_takportal_ssh_key(lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _step_e:
+            print(f'Startup migration: step "_heal_takportal_ssh_key(lambda m print(fStartup mi" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v10.1.4 (WS2): persist NetBird's store-encryption key BEFORE any image converge —
         # a 0.73+ server booted without server.store.encryptionKey mints an ephemeral key
@@ -125545,8 +129071,11 @@ def _startup_migrations():
 
         # ops #1159: the sign-in length infra-TAK always asked for (24 hours) never
         # reached Authentik, so existing providers sit on its one-hour default.
-        _ensure_authentik_proxy_session_length(
-            lambda m: print(f"Startup migration: {m}", flush=True))
+        try:
+            _ensure_authentik_proxy_session_length(
+                lambda m: print(f"Startup migration: {m}", flush=True))
+        except Exception as _step_e:
+            print(f'Startup migration: step "_ensure_authentik_proxy_session_length(" failed, next steps still run (ops #1343): {_step_e}', flush=True)
 
         # v0.9.31: Fleet-uniform self-heal for the FULL Authentik forward_auth chain
         # (proxy provider + application + embedded-outpost membership) for every
@@ -125756,7 +129285,10 @@ def _startup_migrations():
             print(f"Startup migration: sign-in check converge error (non-fatal): {_fa_err}",
                   flush=True)
         # ops #1108: after the Authentik steps above, so the provider hosts are final.
-        _caddy_app_lock_converge()
+        try:
+            _caddy_app_lock_converge()
+        except Exception as _step_e:
+            print(f'Startup migration: step "_caddy_app_lock_converge()" failed, next steps still run (ops #1343): {_step_e}', flush=True)
         try:
             _startup_caddy_selfheal()
         except Exception as _cs_err:
@@ -126031,6 +129563,48 @@ def _post_update_service_recovery_sweep(plog):
         'units_started': started_units,
         'errors': errors,
     }
+
+
+# ops #1330: the post-update run is stamped (`last_console_version` / `last_console_sha`) only
+# when it finished. It used to be stamped in a `finally`, so a run that raised (docker or the
+# broker not up yet after a reboot, a bug in one step) was marked done, and the next start took
+# the "same version" branch and never ran it again; only a killed process re-ran it. Now a raised
+# run is not stamped and runs again at the next console start. A bug that raises every time
+# would re-run a full post-update on every boot for ever, so after this many starts in a row for
+# the same version and commit the run is stamped anyway and the journal says why.
+_POST_UPDATE_MAX_FAILED_STARTS = 3
+
+
+def _post_update_finish_settings(s, ok, version, sha, error=''):
+    """Record how a post-update run ended in the settings dict `s` (changed in place; the caller
+    saves it). Returns (stamped, journal_message). `ok`: the run returned. Not ok: it raised."""
+    sha = sha or ''
+    if ok:
+        s['last_console_version'] = version
+        if sha:
+            s['last_console_sha'] = sha
+        s.pop('post_update_failed', None)
+        return True, f"last_console_version saved as {version} (sha {sha[:7] or 'n/a'})"
+    key = f"{version}@{sha or 'n/a'}"
+    prev = s.get('post_update_failed') if isinstance(s.get('post_update_failed'), dict) else {}
+    try:
+        count = (int(prev.get('count') or 0) + 1) if prev.get('key') == key else 1
+    except (TypeError, ValueError):
+        count = 1
+    s['post_update_failed'] = {
+        'key': key, 'count': count, 'error': str(error or '')[:300],
+        'at': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+    }
+    if count >= _POST_UPDATE_MAX_FAILED_STARTS:
+        s['last_console_version'] = version
+        if sha:
+            s['last_console_sha'] = sha
+        return True, (f"post-update for {version} (sha {sha[:7] or 'n/a'}) failed {count} starts in a "
+                      f"row, last error: {str(error)[:200]}. Giving up: saved last_console_version "
+                      f"anyway, so it does not run again on every boot.")
+    return False, (f"post-update for {version} (sha {sha[:7] or 'n/a'}) did NOT finish ({str(error)[:200]}). "
+                   f"last_console_version is not saved, so it runs again at the next console start "
+                   f"(failed {count} of {_POST_UPDATE_MAX_FAILED_STARTS}).")
 
 
 def _post_update_auto_deploy():
@@ -126648,7 +130222,19 @@ def _post_update_auto_deploy():
                         # Every box converges on NODERED_IMAGE (the same tag a Redeploy
                         # writes) — :latest, the old 4.0 pin, or any other tag.
                         _nr_img_m = _NODERED_IMAGE_LINE_RE.search(content)
-                        _nr_img_changed = bool(_nr_img_m) and \
+                        # ops #1307: never move a box DOWN onto the pin. A newer exact tag, or a
+                        # floating tag (`latest`) whose container ran a newer Node-RED (5.x on
+                        # Node 24 today), keeps its image: flows saved by the newer Node-RED are
+                        # not guaranteed to open on the older one.
+                        _nr_cur_img = (_nr_img_m.group(0).strip()[len('image:'):].strip()
+                                       if _nr_img_m else '')
+                        _nr_keep_img = bool(_nr_img_m) and _image_ahead_of_pin(
+                            _nr_cur_img, NODERED_IMAGE,
+                            lambda: _docker_env_version('nodered', _nr_cur_img, env_name='NODE_RED_VERSION'))
+                        if _nr_keep_img:
+                            print(f"Post-update: Node-RED image {_nr_cur_img} is newer than the pin "
+                                  f"{NODERED_IMAGE} — left alone (never a downgrade)")
+                        _nr_img_changed = bool(_nr_img_m) and not _nr_keep_img and \
                             _nr_img_m.group(0).strip() != f'image: {NODERED_IMAGE}'
                         if _nr_img_changed:
                             content = _NODERED_IMAGE_LINE_RE.sub(
@@ -127046,33 +130632,21 @@ def _post_update_auto_deploy():
                     changed = False
                     if 'editorTheme' not in content:
                         print("Post-update: adding editorTheme to Node-RED settings.js")
-                        content = content.replace(
-                            '};',
-                            """,
-  editorTheme: {
+                        content = _nr_settings_add_property(content, """  editorTheme: {
     header: {
       title: 'infra-TAK Node-RED  —  <a href="/configurator" target="_blank" style="color:#2ec4b6;text-decoration:underline">Open Configurator</a>'
     }
-  }
-};""",
-                            1
-                        )
+  }""")
                         changed = True
                     if 'httpStatic' not in content:
                         print("Post-update: adding httpStatic to Node-RED settings.js")
-                        content = content.replace('};', ",\n  httpStatic: '/data/public'\n};", 1)
+                        content = _nr_settings_add_property(content, "  httpStatic: '/data/public'")
                         changed = True
                     if 'functionGlobalContext' not in content:
                         print("Post-update: adding functionGlobalContext to Node-RED settings.js")
-                        content = content.replace(
-                            '};',
-                            """,
-  functionGlobalContext: {
+                        content = _nr_settings_add_property(content, """  functionGlobalContext: {
     nodeHttps: require('https')
-  }
-};""",
-                            1
-                        )
+  }""")
                         changed = True
                     if 'contextStorage' not in content:
                         print("Post-update: adding contextStorage (localfilesystem) to Node-RED settings.js")
@@ -127142,18 +130716,12 @@ def _post_update_auto_deploy():
                                 print("Post-update: in-memory context exported (normalised) to filesystem before migration")
                         except Exception as ctx_e:
                             print(f"Post-update: context pre-export warning (non-fatal): {ctx_e}")
-                        content = content.replace(
-                            '};',
-                            """,
-  contextStorage: {
+                        content = _nr_settings_add_property(content, """  contextStorage: {
     default: {
       module: 'localfilesystem',
       config: { flushInterval: 0 }
     }
-  }
-};""",
-                            1
-                        )
+  }""")
                         changed = True
                     if changed:
                         with open(settings_path, 'w') as f:
@@ -127364,16 +130932,7 @@ def _post_update_auto_deploy():
                         return
                     if not (_nr_cfg.get('remote', {}).get('host') or '').strip():
                         return
-                    _cmd = (
-                        'cd ~/node-red 2>/dev/null && test -f docker-compose.yml || '
-                        '{ echo "[remote-nr] no compose — skipped"; exit 0; }; '
-                        f'if grep -qF "image: {NODERED_IMAGE}" docker-compose.yml; '
-                        f'then echo "[remote-nr] already on {NODERED_IMAGE}"; exit 0; fi; '
-                        'sed -i -E "s#^([[:space:]]*image:[[:space:]]*)nodered/node-red:[^[:space:]]+[[:space:]]*\\$'
-                        f'#\\1{NODERED_IMAGE}#" docker-compose.yml && '
-                        'docker compose pull --quiet 2>&1 && '
-                        'docker compose up -d 2>&1'
-                    )
+                    _cmd = _nodered_remote_image_cmd()
                     print(f"Post-update: moving remote Node-RED to {NODERED_IMAGE}...")
                     _ok, _out = _module_run(_nr_cfg, _cmd, timeout=1800)
                     for _line in (_out or '').strip().splitlines()[:10]:
@@ -128077,6 +131636,8 @@ def _post_update_auto_deploy():
             print("Post-update: auto-deploy complete")
 
         def _run_post_update_guarded():
+            _pu_ok = False      # ops #1330: stamped as done only when the run returned
+            _pu_err = ''
             try:
                 _w = 0
                 while _stack_job_running() and _w < 3 * 3600:
@@ -128086,17 +131647,18 @@ def _post_update_auto_deploy():
                     _w += 10
                 _POST_UPDATE_ACTIVE['on'] = True
                 _run_post_update()
+                _pu_ok = True
             except Exception as _e:
+                _pu_err = str(_e) or type(_e).__name__
                 print(f"Post-update: migration thread error: {_e}", flush=True)
             finally:
                 _POST_UPDATE_ACTIVE['on'] = False
                 try:
                     s_done = load_settings()
-                    s_done['last_console_version'] = VERSION
-                    if cur_sha:
-                        s_done['last_console_sha'] = cur_sha
+                    _pu_stamped, _pu_msg = _post_update_finish_settings(
+                        s_done, _pu_ok, VERSION, cur_sha, _pu_err or 'the run did not finish')
                     save_settings(s_done)
-                    print(f"Post-update: last_console_version saved as {VERSION} (sha {cur_sha[:7] or 'n/a'})", flush=True)
+                    print(f"Post-update: {_pu_msg}", flush=True)
                 except Exception as _e:
                     print(f"Post-update: failed to save last_console_version: {_e}", flush=True)
                 try:
@@ -128277,6 +131839,48 @@ def _startup_broker_converge():
 _startup_broker_converge()
 
 
+def _f2b_start_if_down(_log=None):
+    """Make sure fail2ban is running: start it unless it is active or still starting.
+
+    ops #1342: the ufw lock switch stops fail2ban and starts it again some steps later.
+    A step in between that raised or timed out used to leave fail2ban stopped, and on
+    Debian nothing else starts it. This is the one place that puts it back. Starting an
+    active unit is not needed, so an active fail2ban is left alone. Never raises."""
+    try:
+        act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+        if act in ('active', 'activating'):
+            return act
+        r = subprocess.run(_sudo_wrap(['systemctl', 'start', 'fail2ban']),
+                           capture_output=True, text=True, timeout=120)
+        if _log:
+            _log(f"fail2ban: was {act or 'unknown'} after the lock switch; started it again "
+                 f"({'ok' if r.returncode == 0 else f'start FAILED, rc {r.returncode}'})")
+        return 'started' if r.returncode == 0 else 'failed'
+    except Exception as e:
+        if _log:
+            _log(f"fail2ban: could not check or start it after the lock switch (non-fatal): {str(e)[:120]}")
+        return 'error'
+
+
+def _f2b_enabled_but_down(act):
+    """True when fail2ban is enabled at boot but not running, or still stopping
+    (`act` is the is-active answer: inactive, failed or deactivating).
+
+    ops #1342: the console may have died between the lock switch's stop and its start, so
+    the next boot finds fail2ban stopped, or its stop still unbanning. A unit that was
+    disabled (uninstall) or never installed reads as not enabled, so it is left alone.
+    Never raises."""
+    if act not in ('inactive', 'failed', 'deactivating'):
+        return False
+    try:
+        en = subprocess.run(_sudo_wrap(['systemctl', 'is-enabled', 'fail2ban']),
+                            capture_output=True, text=True, timeout=15).stdout.strip()
+        return en == 'enabled'
+    except Exception:
+        return False
+
+
 def _startup_f2b_ufw_lock_switch():
     """Move fail2ban's jails from the stock `ufw` action to the locked `infratak-ufw`
     action, once per box, then repair IPv4 again (now and 3 minutes later).
@@ -128287,8 +131891,18 @@ def _startup_f2b_ufw_lock_switch():
     it unbans every IP through the OLD, unlocked action. So the console stops fail2ban
     while holding the ufw lock (one exact argv the broker allows), and no other ufw
     writer can run until every one of those unbans is done. If that stop is refused or
-    fails, nothing is changed and the next start tries again."""
+    fails, nothing is changed and the next start tries again.
+
+    ops #1342: once the stop has been tried, fail2ban is ALWAYS put back (a `finally`),
+    whatever happens in between (a stop that times out, a write that raises). If the
+    console itself dies in that window, the next start finds fail2ban either still
+    stopping (`deactivating`: the cut-off switch's stop is still unbanning; wait for it
+    under the same lock) or already stopped, and starts it when it is enabled
+    (_f2b_enabled_but_down). Before this, each case left no jail running, and on Debian
+    nothing else starts fail2ban."""
     _log = lambda m: print(f"Startup migration: {m}", flush=True)
+    stop_tried = False
+    started = False
     try:
         if _distro_family() == 'rhel' or _fw_backend() != 'ufw':
             return
@@ -128296,43 +131910,62 @@ def _startup_f2b_ufw_lock_switch():
             return
         stale = _f2b_stale_ufw_jails()
         outdated = _f2b_ufw_action_outdated()
-        if stale or outdated:
+        try:
+            changes = bool(stale or outdated)
             act = subprocess.run(_sudo_wrap(['systemctl', 'is-active', 'fail2ban']),
                                  capture_output=True, text=True, timeout=15).stdout.strip()
-            if act == 'active':
-                r = subprocess.run(
-                    # Literal path on purpose: broker/scan_enforce_coverage.py (and the broker's
-                    # one exact allowed argv, FLOCK_F2B_STOP_ARGV) read the argv shape, and a
-                    # variable shows up as <var> and is reported as a denied call site.
-                    # tests/test_ufw_lock_and_parity.py keeps it equal to _UFW_LOCK_PATH.
-                    _sudo_wrap(['flock', '-w', '90', '/run/infratak-ufw.lock', 'systemctl', 'stop', 'fail2ban']),
-                    capture_output=True, text=True, timeout=300)
+            down = _f2b_enabled_but_down(act)
+            cut_off = down and act == 'deactivating'    # an earlier switch's stop is still running
+            revive = down and not cut_off               # enabled, stopped
+            if (changes and act == 'active') or cut_off:
+                stop_tried = True
+                try:
+                    r = subprocess.run(
+                        # Literal path on purpose: broker/scan_enforce_coverage.py (and the broker's
+                        # one exact allowed argv, FLOCK_F2B_STOP_ARGV) read the argv shape, and a
+                        # variable shows up as <var> and is reported as a denied call site.
+                        # tests/test_ufw_lock_and_parity.py keeps it equal to _UFW_LOCK_PATH.
+                        _sudo_wrap(['flock', '-w', '90', '/run/infratak-ufw.lock', 'systemctl', 'stop', 'fail2ban']),
+                        capture_output=True, text=True, timeout=300)
+                except subprocess.TimeoutExpired:
+                    _log("fail2ban: the stop under the ufw lock took over 300 s — putting fail2ban "
+                         "back; jails stay on the stock ufw action and the next console start "
+                         "tries again")
+                    return
                 if r.returncode != 0:
                     _log(f"fail2ban: could not stop it under the ufw lock (rc {r.returncode}: "
                          f"{(r.stderr or r.stdout or '').strip()[:120]}) — jails stay on the stock "
                          f"ufw action; the next console start tries again")
                     return
-            if not _f2b_ensure_ufw_action():
-                _log("fail2ban: could not write the infratak-ufw action — jails stay on ufw")
-                if act == 'active':
-                    subprocess.run(_sudo_wrap(['systemctl', 'start', 'fail2ban']),
-                                   capture_output=True, text=True, timeout=120)
-                return
-            for path, txt in stale:
-                _write_priv(path, _F2B_STALE_UFW_RE.sub(r'\g<1>infratak-ufw', txt))
-            names = ', '.join(os.path.basename(p) for p, _ in stale)
-            if act == 'active':
+            if changes:
+                if not _f2b_ensure_ufw_action():
+                    _log("fail2ban: could not write the infratak-ufw action — jails stay on ufw")
+                    return
+                for path, txt in stale:
+                    _write_priv(path, _F2B_STALE_UFW_RE.sub(r'\g<1>infratak-ufw', txt))
+            else:
+                _f2b_ensure_ufw_action()          # keep the file current (a later release may change it)
+            if stop_tried or revive:
                 r2 = subprocess.run(_sudo_wrap(['systemctl', 'start', 'fail2ban']),
                                     capture_output=True, text=True, timeout=120)
+                started = True      # set after the call: if it raised, the finally tries again
                 how = 'restarted' if r2.returncode == 0 else f'start FAILED (rc {r2.returncode})'
+                if revive or cut_off:
+                    how = ('was enabled but not running, or still stopping (stopped by hand, or an earlier '
+                           'lock switch may have been cut off), so ' + ('started' if r2.returncode == 0 else how))
             else:
                 how = f'not running ({act or "unknown"}), left stopped'
-            if stale:
-                _log(f"fail2ban: jails moved to the locked infratak-ufw action ({names}); fail2ban {how}")
-            else:
-                _log(f"fail2ban: infratak-ufw action updated (IPv6 bans use ufw prepend); fail2ban {how}")
-        else:
-            _f2b_ensure_ufw_action()          # keep the file current (a later release may change it)
+            if changes:
+                names = ', '.join(os.path.basename(p) for p, _ in stale)
+                if stale:
+                    _log(f"fail2ban: jails moved to the locked infratak-ufw action ({names}); fail2ban {how}")
+                else:
+                    _log(f"fail2ban: infratak-ufw action updated (IPv6 bans use ufw prepend); fail2ban {how}")
+            elif stop_tried or revive:
+                _log(f"fail2ban: enabled but not running at console start; fail2ban {how}")
+        finally:
+            if stop_tried and not started:
+                _f2b_start_if_down(_log)
         _ufw_ipv4_parity_heal(_log)
 
         def _later():
@@ -128665,9 +132298,24 @@ except Exception as _e:
 # "vipspng: libpng read error"). Rows that cannot be decoded have never rendered
 # and crash the API, so deleting them loses nothing. Boot-time so a console
 # Update Now is enough to heal an affected box — no SSH.
+def _nr_settings_add_property(content, prop):
+    """Node-RED settings.js text with `prop` (one `name: value` property) added to what the file
+    exports. It is appended as its own statement, `module.exports = Object.assign(module.exports
+    || {}, {...});`, which is valid wherever the file's own braces fall. The code used to put the
+    property in front of the FIRST `};` in the file, so an operator's settings.js with an earlier
+    `};` (a helper object, a function body) got the key in the wrong place and Node-RED could not
+    start (ops #1343). This is the same form nodered/deploy.sh already uses for contextStorage."""
+    return (content.rstrip('\n') + '\nmodule.exports = Object.assign(module.exports || {}, {\n'
+            + prop.strip('\n').rstrip(',') + '\n});\n')
+
+
+# ops #1343: a bad row is copied to icons_corrupt_backup before it is deleted, and nothing is
+# deleted at all when more than this many rows look bad: that is not a truncated upload, it is
+# a wrong test or a damaged table, and a person should look first.
+_CLOUDTAK_ICON_HEAL_MAX_ROWS = 5
 _CLOUDTAK_ICON_HEAL_SQL = r"""
 DO $heal$
-DECLARE r RECORD; bin bytea; bad boolean; n integer := 0;
+DECLARE r RECORD; bin bytea; bad boolean; n integer := 0; bads tid[] := '{}'; cap integer := __MAX_BAD_ROWS__;
 BEGIN
   FOR r IN SELECT ctid, iconset, name, data FROM icons LOOP
     bad := false;
@@ -128686,14 +132334,23 @@ BEGIN
       bad := true;
     END;
     IF bad THEN
-      RAISE NOTICE 'deleting undecodable icon % / %', r.iconset, r.name;
-      DELETE FROM icons WHERE ctid = r.ctid;
+      RAISE NOTICE 'undecodable icon % / %', r.iconset, r.name;
+      bads := bads || r.ctid;
       n := n + 1;
     END IF;
   END LOOP;
+  IF n > cap THEN
+    RAISE NOTICE 'icon heal: % rows look corrupt, more than %: deleted none', n, cap;
+    RETURN;
+  END IF;
+  IF n > 0 THEN
+    CREATE TABLE IF NOT EXISTS icons_corrupt_backup (LIKE icons);
+    INSERT INTO icons_corrupt_backup SELECT * FROM icons WHERE ctid = ANY(bads);
+    DELETE FROM icons WHERE ctid = ANY(bads);
+  END IF;
   RAISE NOTICE 'icon heal: % corrupt row(s) deleted', n;
 END $heal$;
-"""
+""".replace('__MAX_BAD_ROWS__', str(_CLOUDTAK_ICON_HEAL_MAX_ROWS))
 
 
 def _selfheal_cloudtak_corrupt_icons(plog=None):
@@ -128888,7 +132545,7 @@ try:
                 cloudtak_deploy_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {m}")
                 print(f"[startup-garage] {m}", flush=True)
             _gl("CloudTAK store repair: this CloudTAK version keeps its files in Garage — finishing the switch")
-            _ok, _err = _cloudtak_garage_converge(_ct, _gl, start=True)
+            _ok, _err = _cloudtak_garage_converge(_ct, _gl, start=True, restart_on_fail=True)
             _gl("✓ CloudTAK store repaired — CloudTAK is running on Garage" if _ok
                 else f"✗ CloudTAK store repair failed: {_err}")
             cloudtak_deploy_status.update({'running': False, 'complete': _ok, 'error': not _ok})
@@ -129016,6 +132673,11 @@ _MODULE_CTX = {
     '_install_docker_engine': _install_docker_engine,
     '_get_authentik_env_value': _get_authentik_env_value,
     '_ensure_authentik_tvr_app': _ensure_authentik_tvr_app,
+    # meshrelay seams (ops #973): the `ptt` account (broker op), its Authentik proxy app, and
+    # the firewall "closed to the outside" call (ufw deny / firewalld remove)
+    '_ensure_meshrelay_account': _ensure_meshrelay_account,
+    '_ensure_authentik_meshrelay_app': _ensure_authentik_meshrelay_app,
+    '_fw_deny': _fw_deny,
     '_deregister_authentik_proxy_app': _deregister_authentik_proxy_app,
     '_w1_reassert_app_mfa': _w1_reassert_app_mfa,   # ATLAS (ops #985): a new app gets the MFA gate on a Hardened box
     # simulator seams (v10.1.61) — deployment config, Authentik API base, console VERSION;
@@ -129036,6 +132698,8 @@ _MODULE_CTX = {
     'audit': audit,
     '_f2b_arm_clientfeed_jail': _f2b_arm_clientfeed_jail,
     '_f2b_disarm_clientfeed_jail': _f2b_disarm_clientfeed_jail,
+    '_f2b_arm_meshrelay_jail': _f2b_arm_meshrelay_jail,
+    '_f2b_disarm_meshrelay_jail': _f2b_disarm_meshrelay_jail,
     # ATLAS MDM needs this Authentik helper, which this file
     # already defines and did not previously hand to a module.
     '_outpost_add_providers_safe': _outpost_add_providers_safe,
@@ -129306,6 +132970,31 @@ def clientfeed_page():
         feed_host = f'{_ip}:5001' if _ip else ''
     return render_template('clientfeed.html', settings=settings, modules=modules,
                            clientfeed=state, feed_host=feed_host, version=VERSION)
+
+@app.route('/meshrelay')
+@login_required
+def meshrelay_page():
+    """MeshRelay PTT server page (ops #973)."""
+    from flask import abort
+    if not mod_registry.MODULES.get('meshrelay'):
+        abort(404)
+    mr = mod_registry.meshrelay
+    try:
+        mr.expire_first_password(mod_registry.get_ctx())      # the first admin password lives 24 hours
+    except Exception:
+        pass
+    settings = load_settings()
+    modules = detect_modules()
+    state = modules.get('meshrelay', {})
+    host = _get_service_domain(settings, 'meshrelay')
+    _job = mod_registry.job_state('meshrelay')
+    return render_template('meshrelay.html', settings=settings, modules=modules, meshrelay=state,
+                           mr_host=host, mr_url=(f'https://{_pub_hostport(host)}' if host else ''),
+                           mr_version=(settings.get('meshrelay') or {}).get('tag', ''),
+                           mr_pinned=mr.RELEASE['tag'], mr_pin_problem=mr.pin_problem(arch=_host_arch()),
+                           mr_ptt_port=mr.PTT_PORT, mr_first_password=settings.get(mr.FIRST_PW_KEY, ''),
+                           mr_notice=mr.NOTICE, mr_source=mr.NOTICE_SOURCE,
+                           deploying=_job.get('running', False), version=VERSION)
 
 try:
     import threading as _threading_sh
