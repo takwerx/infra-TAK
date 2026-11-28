@@ -266,6 +266,7 @@ def _compose_up(box):
 @pytest.fixture(autouse=True)
 def _guard(monkeypatch):
     # a stray real sleep or a real subprocess must not leak out of these tests
+    # shared-sleep-ok: a no-op that records nothing, so another thread's sleep cannot land in any list (ops #1444)
     monkeypatch.setattr(_real_time, 'sleep', lambda s: None)
 
 
