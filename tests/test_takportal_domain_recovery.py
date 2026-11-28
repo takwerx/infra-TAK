@@ -127,6 +127,7 @@ def test_tak_url_is_left_alone_when_tak_server_is_not_on_this_box():
 
 def _merge_ns(existing, relay=False):
     ns = {'_takportal_get_existing_settings': lambda: dict(existing),
+          '_takportal_read_settings_state': lambda: ('ok', dict(existing), ''),
           '_takportal_build_settings_dict': lambda s: dict(BUILT),
           '_takportal_settings_value_is_blank': lambda v: v is None or (isinstance(v, str) and not v.strip())}
     return _load(['_takportal_template_placeholder_keys', '_takportal_with_required_prefixes',

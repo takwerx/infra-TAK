@@ -1,0 +1,13 @@
+# Tests that already patched time.sleep on the shared time module when .github/ci/shared_sleep_check.py was
+# added (ops #1446). Format: path under tests/, then how many patches the file may keep.
+# A file may keep these and never add one. When you fix a file (give the code under test its own time
+# stand-in), delete its line. See the top of shared_sleep_check.py for why and for the fix.
+test_atlas_roster.py 1
+test_console_watchdogs_honour_authentik_update.py 1
+test_ldap_fqdn_move_backoff_ops128.py 1
+test_ldap_outpost_token_missing_provider_ops663.py 1   # fixed by ops #1444 (PR 808): drop this line when that merges
+test_os_upgrade_histories_ops285.py 2
+test_postgres_followups_ops755.py 1
+test_postgres_security_ops754.py 1
+test_webadmin_password_never_overwritten_gh654.py 1
+test_webodm_reapply_db_upgrade_ops1328.py 1

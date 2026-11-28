@@ -291,6 +291,63 @@ def test_takserver_update_factory_records_every_variant():
     assert "_mod_result_start('takserver'" in body and "_tracked_finish('takserver'" in body
 
 
+def _tak_job_ns(h, version):
+    """The real _tak_update_job from app.py, on top of the real result recorder (the h fixture),
+    with only the installed-version probe and the checkpoint writer replaced."""
+    import time
+    src = APP[APP.index('def _tak_update_job('):APP.index('plugin_install_log = []')]
+    h.update(time=time, _tak_update_record=lambda *a, **k: None, _get_takserver_version_info=version)
+    exec(compile(src, 'app.py', 'exec'), h)
+    return h['_tak_update_job']
+
+
+def test_takserver_update_records_the_installed_version_as_from(h):
+    # infra-TAK #815 / ops #1451: the failure card said "? -> 5.8 migration" because "from" was empty.
+    seen = {}
+
+    def worker(pkg):
+        # the worker replaces the package, so the version must be read BEFORE it runs
+        seen['during'] = dict(h['_mod_result_last']('takserver'))
+        status.update(running=False, error=True)
+        log.append('✗ The package installer failed (exit 126)')
+    status, log = {'running': True, 'error': False}, []
+    job = _tak_job_ns(h, lambda: {'version': '5.7-RELEASE43'})('5.8 migration', worker, log, status)
+    job('/tmp/takserver.deb')
+    assert seen['during']['outcome'] == 'running'
+    assert seen['during']['from'] == '5.7-RELEASE43' and seen['during']['to'] == '5.8 migration'
+    last = h['_mod_result_last']('takserver')
+    assert last['outcome'] == 'failed' and last['from'] == '5.7-RELEASE43'
+    assert last['to'] == '5.8 migration'
+
+
+def test_takserver_update_writes_the_running_record_before_it_asks_for_the_version(h):
+    # A slow dpkg-query or rpm must not delay the "running" record: a reload in that time would
+    # still show the old failure card.
+    seen = {}
+
+    def version():
+        seen['at_probe'] = dict(h['_mod_result_last']('takserver') or {})
+        return {'version': '5.7-RELEASE43'}
+    status, log = {'running': True, 'error': False}, []
+    _tak_job_ns(h, version)('upgrade', lambda *a: None, log, status)('/tmp/takserver.deb')
+    assert seen['at_probe'].get('outcome') == 'running'
+    assert h['_mod_result_last']('takserver')['outcome'] == 'ok'
+
+
+@pytest.mark.parametrize('probe', [
+    lambda: (_ for _ in ()).throw(RuntimeError('rpm: command timed out')),
+    lambda: {'version': ''},
+    lambda: {},
+])
+def test_takserver_update_still_runs_when_no_version_can_be_read(h, probe):
+    ran = []
+    status, log = {'running': True, 'error': False}, []
+    _tak_job_ns(h, probe)('upgrade', lambda *a: ran.append(1), log, status)('/tmp/takserver.deb')
+    assert ran == [1]
+    last = h['_mod_result_last']('takserver')
+    assert last['outcome'] == 'ok' and last['from'] == ''
+
+
 def test_registry_modules_get_the_seams_and_use_them():
     ctx = APP[APP.index('_MODULE_CTX = {'):APP.index('_MODULE_CTX = {') + 600]
     assert "'mod_result_start': _mod_result_start" in ctx and "'tracked_finish': _tracked_finish" in ctx

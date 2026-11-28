@@ -142,6 +142,7 @@ def _merge(existing, adopt):
     ns = _load(['_takportal_template_placeholder_keys', '_takportal_with_required_prefixes',
                 '_takportal_merged_settings_json'], {
         '_takportal_get_existing_settings': lambda: dict(existing),
+        '_takportal_read_settings_state': lambda: ('ok', dict(existing), ''),
         '_takportal_build_settings_dict': lambda s: dict(BUILT),
         '_takportal_settings_value_is_blank': lambda v: v is None or (isinstance(v, str) and not v.strip()),
     }, consts=('TAKPORTAL_DOMAIN_KEYS', 'TAKPORTAL_AUTH_ADOPT_KEYS', 'TAKPORTAL_AUTHORITATIVE_KEYS',

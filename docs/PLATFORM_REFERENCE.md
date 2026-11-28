@@ -67,6 +67,8 @@ Each entry says where the fact comes from. `✅ verified <date> on <box>` means 
 - ✅ verified 2026-11-26 on fresh-install ubuntu-22.04-arm64 (TAK Server 5.8 R104 and R105 hardened bundles, non-root console): the `takserver_pgsql` volume holds `PG_VERSION` (value 18) at the volume ROOT, read with `docker run --rm --user 0 -v takserver_pgsql:/from --entrypoint sh takserver -c 'cat /from/PG_VERSION'` through the console's broker. A 5.7-era image mounts the volume one level higher and looks for `<volume>/15/data`, so it finds nothing in that volume and starts an EMPTY cluster. The update reads the volume in the layout of the NEW zip and refuses when the data is not there.
 - ✅ verified 2026-11-26 on the same box: the new images build while the old containers keep running; `docker tag` of the old image under a spare tag and a retag back put the old version in place again after a failed start (failed on purpose by holding host port 8446).
 - ✅ verified 2026-11-26: `pg_dump` of the `cot` database as `martiuser` refuses (`permission denied for table`) when a table in it belongs to `postgres`; the update treats a failed dump as a stop before any change.
+- ✅ verified 2026-11-27 on fresh-install ubuntu-22.04-arm64 (TAK Server 5.8 R104 hardened, Docker 29.10.1): the hardened database image builds TAK's schema on its FIRST start. A brand-new EMPTY `takserver_pgsql` volume answers `max(schema_version)` = 106, and TAK starts healthy on it with no data. So the schema cannot tell the box's own database from a new empty one (ops #1367). The update tells them apart by age instead: after the old failed update (it only removed containers) the volume is older than the half-built bundle folder; the 5.8 migration makes the volume after it unpacks the folder. `docker volume inspect -f '{{.CreatedAt}}'` prints `2026-11-27T16:21:09Z`.
+- ✅ verified 2026-11-27 on the same box: `docker inspect takserver` answers for the IMAGE of that name when no container exists, so a "no container" test uses `docker container inspect`.
 - Not verified on a box: the 5.7 layout (`<volume>/15/data`): no 5.7 Docker bundle is in our files folder. It is read from the Dockerfile only.
 
 ## CloudTAK: a video link on a CoT is pulled by CloudTAK's media server, by the name in the link (ops #1424)
@@ -84,6 +86,19 @@ Each entry says where the fact comes from. `✅ verified <date> on <box>` means 
 
 - infra-TAK links the docs home page from the header of the CloudTAK page (`templates/cloudtak.html`, `id="ct-docs-link"`), opening in a new tab.
 - ✅ verified 2026-11-20 from the Studio: both URLs return HTTP 200 with the titles above. Not checked: whether every page of the site stays at the same path in later CloudTAK releases.
+
+## CloudTAK database (PostGIS image): never start an older PostgreSQL on newer data
+
+**Source (official):** https://github.com/docker-library/postgres (PostgreSQL 18 images moved the data directory to `/var/lib/postgresql/18/docker` and the image volume to `/var/lib/postgresql`; 17 and older use `/var/lib/postgresql/data`; the image sets `PG_MAJOR` in its environment). https://www.postgresql.org/docs/current/app-pg-upgrade.html (a server cannot start on a data directory from a newer major).
+
+- CloudTAK's own compose pins `postgis/postgis:17-3.4-alpine` with no named volume (an anonymous volume). ✅ verified 2026-11-27 for CloudTAK v14.4.0 (GitHub contents API).
+- `docker cp CONTAINER:/var/lib/postgresql/data/PG_VERSION -` (or `.../18/docker/PG_VERSION`) reads the data's major from a running, stopped or restarting container; it needs no running server. ✅ verified 2026-11-27 on a Studio colima VM with real `postgres:17-alpine` and `postgres:18-alpine` containers, including a `postgres:17-alpine` container restarting on PostgreSQL 18 data.
+- So infra-TAK's postgis pin (`POSTGIS_IMAGE`) is forced only when the data is on the pin's major or older, or cannot be read; newer data keeps the image the container already runs, else no image line (ops #1335).
+
+## ETL shim state file (`/data/stacks.json`)
+
+- Our own file, not an outside contract. It holds `"__format": 1` (a key no CloudFormation stack name can have; `CreateStack` names start with a letter). The shim refuses to serve on a higher or unreadable format, keeps entries it cannot run instead of dropping them, and copies the file aside (`.bak-pre-format`, `.bak-<time>` at most 5, `.corrupt-<time>`). Shims before this change drop an entry they cannot run and rewrite the file without it (ops #1335).
+- ✅ verified 2026-11-27: the previous shim code loads a file that holds `__format` and drops only that key, keeping every layer.
 
 ## Customer states: what Update does to a box that is not "the last release, built by us"
 

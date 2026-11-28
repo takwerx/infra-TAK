@@ -2382,6 +2382,9 @@ async function startTakUpdate(){
     var r=await fetch('/api/takserver/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'});
     var d=await r.json();
     if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';msg.style.whiteSpace='normal';msg.style.lineHeight='1.5';msg.style.display='block';msg.style.marginTop='8px';}if(btn)btn.disabled=false;return;}
+    // The red "Last update failed" card is from the previous update. The server now records
+    // this update as running, and a reload does not show the card. Remove it here also.
+    document.querySelectorAll('.module-last-result[data-module="takserver"]').forEach(function(c){c.remove();});
     var wrap=document.getElementById('upgrade-log-wrap');if(wrap)wrap.style.display='block';
     var el=document.getElementById('upgrade-log');if(el)el.textContent='Connecting...';
     upgradeLogIndex=0;pollUpgradeLog();
