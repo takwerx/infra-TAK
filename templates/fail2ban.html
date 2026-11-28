@@ -95,7 +95,7 @@
 <div style="font-size:15px;font-weight:600;margin-bottom:8px">fail2ban is not installed</div>
 <div style="font-size:13px;color:var(--text-dim);max-width:480px;margin:0 auto 20px;line-height:1.6">
 Blocks brute-force login attempts on Authentik and port scans on TAK Server.
-Bans IPs via UFW and sends Guard Dog email alerts.
+Bans IPs via UFW and logs every ban to Guard Dog. Routine bans are not emailed; see Ban emails below.
 </div>
 <button id="install-btn" class="btn-primary" onclick="startInstall()" style="margin-bottom:16px">Install Fail2ban</button>
 <div id="install-log-box" style="display:none;background:#060910;border:1px solid var(--border);border-radius:8px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:220px;overflow-y:auto;white-space:pre-wrap;text-align:left;max-width:580px;margin:0 auto"></div>
@@ -118,6 +118,19 @@ If this box sits behind a reverse proxy, cloud load balancer, or gateway (Azure 
 <button class="btn btn-primary" onclick="saveTrustedCidrs()">Save trusted networks</button>
 <span id="f2b-trusted-msg" style="font-size:12px"></span>
 </div>
+</div>
+
+<!-- Ban emails (ops #1395) -->
+<div class="card" id="f2b-mail-card" style="margin-bottom:8px">
+<div class="card-title">✉️ Ban emails</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:6px;line-height:1.6">
+Bots bump into a public server all day, so routine bans are <strong>not emailed</strong>. They stay on this page and in the Guard Dog log. You get an email only when a person needs to look: a TAK device with a certificate is blocked, or someone failed SSH passwords for a real account, or a login to SSH, this console or Authentik worked right after 3 or more failed guesses from the same address, or fail2ban itself stopped working (service down, a jail not running, a ban that failed). Each cause is mailed once a day, and at most 3 such emails a day. Addresses on your trusted list are never mailed about.
+</div>
+<label style="display:flex;align-items:center;gap:8px;margin-top:12px;font-size:13px;cursor:pointer">
+<input type="checkbox" id="f2b-daily-summary" onchange="saveBanSummary(this.checked)">
+Also send one short summary a day (ban count and top sources)
+</label>
+<div id="f2b-daily-summary-msg" style="font-size:12px;margin-top:6px"></div>
 </div>
 
 <!-- Repeat Offender Protection -->
@@ -329,7 +342,7 @@ Block an IPv4 address or a whole range yourself, for good or for a set number of
 </label>
 </div>
 </div>
-<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Watches failed SSH logins &mdash; from the system auth log, or the systemd journal on boxes without rsyslog. Guard Dog email alert fires on ban. Default thresholds are stricter than Authentik — SSH brute-force is higher severity.</div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Watches failed SSH logins &mdash; from the system auth log, or the systemd journal on boxes without rsyslog. Every ban is logged to Guard Dog. An email is sent only when the failed passwords were for a real account on this server (not root or admin guesses). Default thresholds are stricter than Authentik — SSH brute-force is higher severity.</div>
 
 <div id="ssh-enabled-section" style="display:none">
 <div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
@@ -414,7 +427,7 @@ Block an IPv4 address or a whole range yourself, for good or for a set number of
 </label>
 </div>
 </div>
-<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors the <code>mediamtx</code> systemd service log for <strong>failed stream authentication</strong> — credential guessing against RTSP/RTMP/SRT/WebRTC. Successful stream pulls are never counted, so a client opening many streams at once (a video wall, a multi-feed dashboard) cannot be banned by this jail. Guard Dog email alert fires on ban.<br><span style="color:var(--text-dim)">A ban here blocks the <strong>media ports only</strong> (1935/8322/8554/8555/8888/8889 tcp, 8000/8001/8189/8890 udp), so it does not cut the banned IP off from TAK Server or this console. Repeat offenders keep earning media-scoped bans — the <em>Repeat Offenders</em> jail below is set to skip this one, because an all-ports ban is exactly what this scoping exists to prevent.</span></div>
+<div style="font-size:12px;color:var(--text-dim);margin-top:8px">Monitors the <code>mediamtx</code> systemd service log for <strong>failed stream authentication</strong> — credential guessing against RTSP/RTMP/SRT/WebRTC. Successful stream pulls are never counted, so a client opening many streams at once (a video wall, a multi-feed dashboard) cannot be banned by this jail. Every ban is logged to Guard Dog; routine bans are not emailed.<br><span style="color:var(--text-dim)">A ban here blocks the <strong>media ports only</strong> (1935/8322/8554/8555/8888/8889 tcp, 8000/8001/8189/8890 udp), so it does not cut the banned IP off from TAK Server or this console. Repeat offenders keep earning media-scoped bans — the <em>Repeat Offenders</em> jail below is set to skip this one, because an all-ports ban is exactly what this scoping exists to prevent.</span></div>
 
 <div id="mediamtx-enabled-section" style="display:none">
 <div class="stat-grid" style="margin-top:20px;margin-bottom:8px">
@@ -950,7 +963,28 @@ function saveTrustedCidrs() {
     }).catch(()=>{ if (msg) { msg.style.color = 'var(--red)'; msg.textContent = 'Network error'; } showToast('Network error', 'error'); });
 }
 
+function loadBanSummary() {
+  fetch('/api/fail2ban/ban-summary').then(r=>r.json()).then(d=>{
+    var cb = document.getElementById('f2b-daily-summary');
+    if (cb && d.ok) cb.checked = !!d.enabled;
+    var msg = document.getElementById('f2b-daily-summary-msg');
+    if (msg && d.ok && !d.alert_email_set) {
+      msg.style.color = 'var(--yellow)';
+      msg.textContent = 'No alert email address is set in Guard Dog, so no ban emails are sent.';
+    }
+  }).catch(()=>{});
+}
+
+function saveBanSummary(on) {
+  fetch('/api/fail2ban/ban-summary', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled: !!on})})
+    .then(r=>r.json()).then(d=>{
+      if (d.ok) { showToast(on ? 'Daily ban summary turned on.' : 'Daily ban summary turned off.', 'success'); loadBanSummary(); }
+      else { showToast(d.error || 'Save failed', 'error'); loadBanSummary(); }
+    }).catch(()=>{ showToast('Network error', 'error'); loadBanSummary(); });
+}
+
 loadTrustedCidrs();
+loadBanSummary();
 loadStatus();
 loadLog();
 setInterval(function(){ loadStatus(); loadLog(); }, 30000);

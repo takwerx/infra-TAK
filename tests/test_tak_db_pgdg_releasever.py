@@ -177,7 +177,7 @@ def test_both_build_paths_patch_the_db_dockerfile_before_building():
     deploy = deploy[:deploy.index('✓ Images built')]
     assert deploy.index('_patch_tak_db_pgdg_releasever(build_ctx, _db_df, log_step)') \
         < deploy.index('docker build -t takserver_db')
-    upgrade = APP[APP.index('Step 4/6: Building new TAK Server images'):]
+    upgrade = APP[APP.index('Step 5/7: Building new TAK Server images'):]
     upgrade = upgrade[:upgrade.index('✓ Images built')]
     assert upgrade.index('_patch_tak_db_pgdg_releasever(new_ctx, _db_df, ulog)') \
-        < upgrade.index('docker build -t takserver_db')
+        < upgrade.index('docker build -t {db_new}')    # ops #1326: built under a temporary tag

@@ -227,11 +227,46 @@ jobs:
           echo "::endgroup::"
           exit "$fail"
 
+  # 4. Secret check (ops #1433): no commit may add a key, token or password. A public repo's history
+  #    is public for ever, so the only fix for a leaked value is to rotate it; this stops the next one
+  #    before it merges. It scans every commit of the change (a PR: the commits on top of its base;
+  #    a push to dev or main: the pushed commits), not just the final files, because a key added and
+  #    removed inside one PR still stays in history. The scanner is gitleaks, downloaded at a pinned
+  #    version and checked against a pinned SHA-256 (.github/ci/secret_scan.sh). No secret, no write
+  #    permission, no third-party action. The first step is the proof test: it plants a made-up key
+  #    in a throw-away repo and fails the job if the check does not go red.
+  secret-scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Proof test (the check must go red on a planted key and green on a clean change)
+        run: bash .github/ci/test_secret_scan.sh
+      - name: Scan the commits of this change
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            bash .github/ci/secret_scan.sh "origin/${BASE_REF}..HEAD"
+          elif git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            bash .github/ci/secret_scan.sh "${BEFORE_SHA}..${AFTER_SHA}"
+          else
+            # A new branch or a force-push: no usable "before". Look at the newest commits instead.
+            bash .github/ci/secret_scan.sh --last 50
+          fi
+
   # One stable name to require in branch protection. A skipped scanners job counts as
   # passed; a failed or cancelled one does not.
   checks-ok:
     if: always()
-    needs: [compile, shellcheck, pytest, console-deps, scanners]
+    needs: [compile, shellcheck, pytest, console-deps, scanners, secret-scan]
     runs-on: ubuntu-24.04
     steps:
       - env:
