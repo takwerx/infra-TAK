@@ -101,7 +101,7 @@ FWD_PORTS="$WEB_PORTS $TAK_PORTS $MEDIA_PORTS $RA_PORTS $MDM_PORTS $VIDEO_PORTS 
 # below are protocol-agnostic, and WireGuard carries UDP natively. It was simply never
 # written. RTSP's UDP transport (8000/8001) stays out on purpose — our MediaMTX ships
 # `rtspTransports: [tcp]`, so no client negotiates it.
-UDP_FWD_PORTS="${UDP_FWD_PORTS:-8890 3479 18890}"   # 8890 SRT · 3479 CoTURN control · 18890 CloudTAK SRT
+UDP_FWD_PORTS="${UDP_FWD_PORTS:-8890 3479 18890 5000}"   # 8890 SRT · 3479 CoTURN control · 18890 CloudTAK SRT · 5000 MeshRelay phones
 PROBER_PORT="5099"
 PROBER_DIR="/opt/takwerx-prober"
 PROBER_TOKEN_FILE="/etc/takwerx-prober.token"

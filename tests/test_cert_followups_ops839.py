@@ -168,15 +168,29 @@ def _rollback_ns(tmp_path, docker, ids_stub=None):
     (snap / 'UserAuthenticationFile.xml').write_text('<x/>')
     sub = _FakeSubprocess(docker)
     lines = []
+    cfg_calls = {'n': 0}
+
+    def _cfg(_settings):
+        # ops #1337: the first call is the early look at the deployment (before TAK stops); the
+        # second one is step 6 (pg_restore), where this stub ends the run.
+        cfg_calls['n'] += 1
+        if cfg_calls['n'] > 1:
+            raise _Done()
+        return {'mode': 'single_server'}
+
     ns = {
         'subprocess': sub, 'os': os, 're': re, 'shlex': shlex, 'SNAPSHOT_DIR': str(snaps), 'TAK_CONTAINER': 'takserver',
         '_sudo_wrap': lambda c: list(c), '_validate_snapshot_label': lambda l: (True, l),
         '_tak_is_container': lambda: True,
         '_tak_systemctl': lambda action: f'docker {action} takserver',
         '_tak_ca_private_lockdown': lambda plog=None, **kw: ([], []),
-        'load_settings': lambda: (_ for _ in ()).throw(_Done()),       # step 6 starts here
+        'load_settings': lambda: {},
+        '_get_tak_deployment_config': _cfg,
+        '_tak_snapshot': lambda label, plog=None: (True, {'db_dump': True}),
+        '_tak_prune_snapshots': lambda source, keep: None,
+        'datetime': __import__('datetime').datetime,
     }
-    _load(ns, ['_tak_container_ids', '_tak_rollback'])
+    _load(ns, ['_tak_container_ids', '_tak_swap_certs', '_tak_rollback'])
     if ids_stub:
         ns['_tak_container_ids'] = ids_stub
     return ns, sub, lines
