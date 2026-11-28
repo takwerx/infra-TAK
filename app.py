@@ -57623,7 +57623,7 @@ _CT_POSTGIS_NOTED = set()
 def _cloudtak_postgis_state(remote_cfg=None):
     """What the CloudTAK postgis container holds (ops #1335): {'data_major': int or None,
     'image': str, 'image_major': int or None}. data_major is the PostgreSQL major in the data
-    directory (PG_VERSION, read with `docker cp`, so a stopped container works); None when it
+    directory (PG_VERSION, copied out with `docker cp`, so a stopped container works); None when it
     cannot be read: no container yet (no data to protect), Docker not answering, no cluster.
     Never raises."""
     out = {'data_major': None, 'image': '', 'image_major': None}
@@ -57642,8 +57642,6 @@ def _cloudtak_postgis_state(remote_cfg=None):
                 elif key == 'MAJOR' and val.isdigit():
                     out['data_major'] = int(val)
             return out
-        import io as _io
-        import tarfile as _tarfile
         r = subprocess.run(_sudo_wrap(['docker', 'ps', '-a', '-q', '-f', 'name=postgis']),
                            capture_output=True, text=True, timeout=20)
         ids = (r.stdout or '').split() if r.returncode == 0 else []
@@ -57660,18 +57658,29 @@ def _cloudtak_postgis_state(remote_cfg=None):
             pm = re.search(r'^PG_MAJOR=(\d+)', ins.stdout or '', re.M)
             if pm:
                 out['image_major'] = int(pm.group(1))
-        for d in _CT_POSTGIS_DATA_DIRS:
-            cp = subprocess.run(_sudo_wrap(['docker', 'cp', f'{cid}:/var/lib/postgresql/{d}/PG_VERSION', '-']),
-                                capture_output=True, timeout=30)
-            if cp.returncode != 0 or not cp.stdout:
-                continue
-            with _tarfile.open(fileobj=_io.BytesIO(cp.stdout)) as tf:
-                member = next((m for m in tf.getmembers() if m.isfile()), None)
-                text = tf.extractfile(member).read().decode('utf-8', 'replace') if member else ''
-            vm = re.match(r'\s*(\d+)', text)
-            if vm:
-                out['data_major'] = int(vm.group(1))
-                break
+        # The file is copied to a private folder and read from there. `docker cp CONTAINER:PATH -`
+        # (the tar on stdout) gives an EMPTY answer through the broker on a non-root console
+        # (ops #1335, nuc): the data major would never be read and the pin would be forced again.
+        tmp = tempfile.mkdtemp(prefix='ct-pgv-')
+        try:
+            for d in _CT_POSTGIS_DATA_DIRS:
+                dest = os.path.join(tmp, 'PG_VERSION')
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+                cp = subprocess.run(_sudo_wrap(['docker', 'cp', f'{cid}:/var/lib/postgresql/{d}/PG_VERSION', tmp + '/']),
+                                    capture_output=True, timeout=30)
+                if cp.returncode != 0 or not os.path.isfile(dest):
+                    continue
+                with open(dest, 'r', encoding='utf-8', errors='replace') as fh:
+                    text = fh.read(64)
+                vm = re.match(r'\s*(\d+)', text)
+                if vm:
+                    out['data_major'] = int(vm.group(1))
+                    break
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
     except Exception:
         pass
     return out

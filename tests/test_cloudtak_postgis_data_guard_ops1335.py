@@ -28,6 +28,7 @@ test is the shipped text.
 
 import ast
 import io
+import os
 import pathlib
 import re
 import subprocess as _real_subprocess
@@ -98,7 +99,12 @@ class FakeDocker:
         if argv[:2] == ['docker', 'cp']:
             m = re.fullmatch(r'abc123:/var/lib/postgresql/(.+)/PG_VERSION', argv[2])
             if m and m.group(1) in self.files:
-                return types.SimpleNamespace(returncode=0, stdout=_tar(self.files[m.group(1)] + '\n'), stderr=b'')
+                # the broker on a non-root console (nuc, ops #1335) gives an EMPTY stdout for
+                # `docker cp C:PATH -`; a copy to a host folder works, so that is what the guard asks for
+                assert argv[3] != '-' and argv[3].endswith('/'), argv
+                with open(os.path.join(argv[3], 'PG_VERSION'), 'w') as fh:
+                    fh.write(self.files[m.group(1)] + '\n')
+                return types.SimpleNamespace(returncode=0, stdout=b'', stderr=b'')
             return types.SimpleNamespace(returncode=1, stdout=b'',
                                          stderr=b'Error: No such container:path: abc123:/var/lib/postgresql/x')
         raise AssertionError(f'unexpected docker call {argv}')
@@ -113,7 +119,7 @@ GUARD_NAMES = ('_cloudtak_postgis_state', '_cloudtak_postgis_guard')
 
 def _ns(docker, ssh=None, settings_remote=None, required=True):
     ns = {
-        'os': __import__('os'), 're': re,
+        'os': os, 're': re, 'shutil': __import__('shutil'), 'tempfile': __import__('tempfile'),
         'subprocess': types.SimpleNamespace(run=docker.run, PIPE=_real_subprocess.PIPE,
                                             STDOUT=_real_subprocess.STDOUT),
         '_sudo_wrap': lambda argv: list(argv),
@@ -217,6 +223,18 @@ def test_a_guard_error_keeps_the_pin():
     logs = []
     assert ns['_cloudtak_postgis_guard'](PIN, {}, False, log=logs.append) == PIN
     assert 'skipped' in logs[0]
+
+
+def test_the_local_read_copies_to_a_folder_and_leaves_none_behind(tmp_path, monkeypatch):
+    # `docker cp C:PATH -` answers with nothing through the broker on a non-root console (nuc), so the
+    # guard must copy to a folder; the folder is private to this read and is removed afterwards
+    made = []
+    real_mkdtemp = __import__('tempfile').mkdtemp
+    monkeypatch.setattr('tempfile.mkdtemp', lambda **kw: made.append(real_mkdtemp(dir=tmp_path, **kw)) or made[-1])
+    d = FakeDocker(files={'18/docker': '18'}, image='postgres:18-alpine', image_major='18')
+    assert _guard(d)[0] == 'postgres:18-alpine'
+    assert len(made) == 1 and not os.path.exists(made[0])
+    assert all(c[3] != '-' for c in d.cps)
 
 
 # ---- a CloudTAK on a remote host
