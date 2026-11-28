@@ -12871,17 +12871,27 @@ def _update_plain_git_error(err):
     return err
 
 
-def _update_rollback_snapshot(prev, running_version, head_tag, now_utc, head_sha=''):
-    """The `console_rollback` record to save at the start of an Update Now click.
+def _update_rollback_snapshot(prev, running_version, head_tag, now_utc, head_sha='',
+                              target_version='', target_sha=''):
+    """The `console_rollback` record to save just before an Update Now click moves HEAD.
 
     ops #1329: if an earlier click already recorded this RUNNING version and it is still the
     version running, keep that record. Click one moves HEAD; when the restart never comes,
     click two used to read the NEW tag from HEAD and make it the rollback target.
     ops #1330: the record also holds the commit (`sha`) and a `label`; the tag is set only when
-    HEAD is exactly on one. The `v{version}` guess stays only when git could say neither."""
+    HEAD is exactly on one. The `v{version}` guess stays only when git could say neither.
+    ops #1427: keep the earlier record too when this click does not change the version
+    (`target_version` is the VERSION of the tree it moves to) and either HEAD is an untagged
+    commit (a dev box moves to a new commit with the same VERSION string: the record for the
+    version before is still the way back, and HEAD only names the commit that ran a moment ago)
+    or the click moves nothing (`target_sha` is HEAD: the same release clicked twice). A HEAD
+    exactly on a release tag is itself the best way back, so it gets its own record."""
     prev = prev if isinstance(prev, dict) else {}
+    same_version = bool(target_version) and target_version == running_version
+    moves_nothing = bool(target_sha) and target_sha == head_sha
     if (prev.get('available') and (prev.get('tag') or prev.get('sha'))
-            and prev.get('version') == running_version):
+            and (prev.get('version') == running_version
+                 or (same_version and (not head_tag or moves_nothing)))):
         return prev
     tag = head_tag or ('' if head_sha else f'v{running_version}')
     return {
@@ -13165,18 +13175,9 @@ def update_apply():
             pass
         return jsonify(payload)
 
-    # v0.9.3: Record current version for one-step rollback before updating
-    try:
-        _s = load_settings()
-        # ops #1329 (item 4): after an interrupted click (HEAD moved, restart never came) HEAD
-        # names the NEW tag; a second click used to record that as the rollback target. The
-        # helper keeps the record the first click made for the version that is running.
-        # ops #1330: it also stores the commit, and a tag only when HEAD is exactly on one.
-        _s['console_rollback'] = _console_rollback_snapshot(
-            console_dir, VERSION, _s.get('console_rollback'))
-        save_settings(_s)
-    except Exception:
-        pass
+    # v0.9.3: the record for one-step rollback is saved before HEAD moves; see the save just
+    # before the checkout below (ops #1427: it used to be saved here, at the start of every click,
+    # so a click that failed at the fetch or the pre-check replaced the way back too).
 
     _apply_settings = load_settings()
     _apply_channel = (_apply_settings.get('update_channel') or 'main').strip().lower()
@@ -13243,6 +13244,22 @@ def update_apply():
         # ops #1329 (item 5): a checkout cut off by a power loss or a kill leaves .git/index.lock,
         # and every later click returned raw git text until someone cleared it over SSH.
         _update_clear_stale_git_locks(console_dir)
+
+        # v0.9.3: record the current version for one-step rollback, right before HEAD moves.
+        # ops #1329 (item 4): after an interrupted click (HEAD moved, restart never came) HEAD
+        # names the NEW tag; a second click used to record that as the rollback target. The
+        # helper keeps the record the first click made for the version that is running.
+        # ops #1330: it also stores the commit, and a tag only when HEAD is exactly on one.
+        # ops #1427: it also keeps the earlier record when this click keeps the version (a dev
+        # commit with the same VERSION, the same release twice), and nothing is saved when the
+        # click stopped at the fetch or the pre-check above.
+        try:
+            _s = load_settings()
+            _s['console_rollback'] = _console_rollback_snapshot(
+                console_dir, VERSION, _s.get('console_rollback'), target_ref=target_ref)
+            save_settings(_s)
+        except Exception:
+            pass
 
         checkout = _git(['checkout', '--force', target_ref], timeout=30)
         if checkout.returncode != 0 and '.lock' in _git_err(checkout).lower():
@@ -13820,13 +13837,15 @@ _ROLLBACK_PIN_WATCH = (
 )
 
 
-def _console_rollback_snapshot(console_dir, version, prev=None):
+def _console_rollback_snapshot(console_dir, version, prev=None, target_ref=''):
     """The record Update Now keeps for the Rollback button, taken before the update moves HEAD.
     The tag is set only when HEAD is exactly on one. It used to fall back to `v{version}`, which
     on a dev box (an untagged commit, with the same version string as the next release) is a tag
     that does not exist yet or sits on another commit. The commit is recorded too, so the
     Rollback goes to what really ran (ops #1330). `prev` is the record already saved: a second
     click after an interrupted update keeps it (ops #1329, see _update_rollback_snapshot).
+    `target_ref` is where this click moves to (ops #1427): its VERSION is read with git, and a
+    click that keeps the version keeps `prev` too. '' or unreadable: the record is made as before.
     Raises when git cannot be run."""
     def _git_out(*args):
         r = subprocess.run(
@@ -13837,8 +13856,21 @@ def _console_rollback_snapshot(console_dir, version, prev=None):
     sha = _git_out('rev-parse', 'HEAD').lower()
     if not _ROLLBACK_SHA_RE.fullmatch(sha):
         sha = ''
+    target_version = target_sha = ''
+    if str(target_ref or '').startswith('refs/'):
+        try:
+            m = re.search(r'''^VERSION\s*=\s*["']([^"']+)["']''',
+                          _git_out('grep', '-h', '-E', '-e', r'^VERSION = ', target_ref, '--', 'app.py'),
+                          re.M)
+            target_version = m.group(1) if m else ''
+            target_sha = _git_out('rev-parse', '--verify', '-q', f'{target_ref}^{{commit}}').lower()
+            if not _ROLLBACK_SHA_RE.fullmatch(target_sha):
+                target_sha = ''
+        except Exception:
+            target_version = target_sha = ''
     return _update_rollback_snapshot(
-        prev, version, tag, datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), head_sha=sha)
+        prev, version, tag, datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'), head_sha=sha,
+        target_version=target_version, target_sha=target_sha)
 
 
 def _rollback_git(console_dir, args, timeout=30):
