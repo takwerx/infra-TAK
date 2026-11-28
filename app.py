@@ -32805,6 +32805,21 @@ def _pg_image_version(image):
     return '%d.%d' % v if v else ''
 
 
+def _pg_compose_service_image(stack_dir, service):
+    """The image `docker compose up` would start for `service`, as Compose resolves it (the .env and
+    the `:-` defaults applied), or '' when it cannot be read (ops #1331)."""
+    r = _pg_run(['docker', 'compose', 'config'], timeout=60, cwd=stack_dir)
+    if r.returncode != 0:
+        return ''
+    try:
+        import yaml as _yaml
+        doc = _yaml.safe_load(r.stdout or '') or {}
+        img = ((doc.get('services') or {}).get(service) or {}).get('image')
+    except Exception:
+        return ''
+    return img.strip() if isinstance(img, str) else ''
+
+
 def _pg_wait_healthy(cid, seconds=90):
     """True once the container's server accepts connections (pg_isready), within `seconds`."""
     end = time.time() + seconds
@@ -32846,6 +32861,22 @@ def _postgres_compose_converge(log, stacks=POSTGRES_COMPOSE_STACKS):
                 out[key] = 'failed'
                 continue
             have, now, image = _pg_container_image_state(cid)
+            # ops #1331: the image `up -d` will START is the one the COMPOSE FILE names, not the one
+            # the running container was made from. If someone changed the compose tag to another
+            # PostgreSQL major (postgres:16 to postgres:17), a data directory written by 16 meets 17,
+            # and 17 refuses to start on it: the database is down and the stack with it. A major
+            # change needs dump and restore (https://www.postgresql.org/docs/current/upgrading.html),
+            # never a recreate, so this stops it here, with a line that says why.
+            compose_image = _pg_compose_service_image(stack_dir, service) or image
+            comp_ver = _pg_image_version(compose_image) if compose_image else ''
+            run_major, comp_major = _pg_version_tuple(ver), _pg_version_tuple(comp_ver)
+            if run_major and comp_major and run_major[0] != comp_major[0]:
+                log(f"{label}: the compose file names {compose_image} (PostgreSQL {comp_ver}) but the database "
+                    f"holds PostgreSQL {run_major[0]} data — a major change needs a dump and restore, not a "
+                    f"recreate. Leaving the running database alone; put the compose tag back to PostgreSQL "
+                    f"{run_major[0]}.")
+                out[key] = 'skipped'
+                continue
             if not have or not now or have == now:
                 log(f"{label}: no newer database image is published yet — the next update tries again")
                 out[key] = 'waiting'
@@ -32853,7 +32884,7 @@ def _postgres_compose_converge(log, stacks=POSTGRES_COMPOSE_STACKS):
             # A rebuilt tag is not necessarily a fixed one (CloudTAK's postgis was rebuilt on Nov 9,
             # still PostgreSQL 17.11): read what is in the pulled image and restart the database
             # only for a build that carries the fix.
-            new_img = _pg_image_version(image)
+            new_img = comp_ver
             if not new_img or _pg_releases_missing(new_img):
                 log(f"{label}: the newest published database image has PostgreSQL {new_img or 'unknown'}, "
                     f"not the security fix yet — leaving the running database alone, the next update tries again")
@@ -48430,6 +48461,14 @@ def _get_authentik_target_release(settings=None, installed=None):
     channel = (settings.get('update_channel') or 'main').strip().lower()
     if channel == 'dev':
         target = _get_authentik_latest_release_tag() or AUTHENTIK_DEV_RELEASE
+        # ops #1331: AUTHENTIK_UPGRADE_STEPS names only the families BELOW the vetted one, so a dev
+        # box on 2026.5.x whose upstream latest is 2026.11.x went straight there and skipped 2026.8
+        # (Authentik refuses a database that skipped a family). The vetted release is the step for
+        # the family between the two.
+        if installed:
+            _fi, _ft = _ak_ver_tuple(installed)[:2], _ak_ver_tuple(target)[:2]
+            if len(_fi) == 2 and len(_ft) == 2 and _fi < _ak_ver_tuple(AUTHENTIK_VETTED_RELEASE)[:2] < _ft:
+                target = AUTHENTIK_VETTED_RELEASE
     else:
         target = AUTHENTIK_VETTED_RELEASE
     return _ak_upgrade_hop(installed, target) if installed else target
@@ -48609,6 +48648,159 @@ def _ak_resolved_authentik_tags(ak_dir=None):
     if _r.returncode != 0:
         return False, set(), ((_r.stderr or _r.stdout or '').strip()[-300:] or 'no output')
     return True, _ak_tags_from_text(_r.stdout or ''), ''
+
+
+# ops #1331: the version an Authentik image REALLY holds. Tag text cannot say it: a floating tag
+# (`2026.8`, `latest`) can sit on any later build, and a hand `docker tag` can point `2026.8` at
+# 2026.11.0-rc2 (box-proved, ops #1311). The server's own `authentik_version()` is the answer.
+_AK_FULL_VERSION_RE = re.compile(r'(?<![\d.])(\d{4})\.(\d{1,2})\.(\d{1,3})(?:-[0-9A-Za-z][0-9A-Za-z.\-]*)?(?![\d.])')
+_AK_VERSION_PROBE_PY = 'from authentik import authentik_version; print(authentik_version())'
+
+
+def _ak_version_from_output(out):
+    """(year, month, patch) from the LAST line of `out` that holds a full Authentik version, or None.
+    Only the last line counts: Python or a login shell may print warnings first."""
+    for _line in reversed([l.strip() for l in (out or '').splitlines() if l.strip()]):
+        _m = _AK_FULL_VERSION_RE.search(_line)
+        if _m:
+            return tuple(int(_x) for _x in _m.groups())
+        return None
+    return None
+
+
+def _ak_current_version(ak_dir=None, fallback_tag=''):
+    """Which Authentik this box runs, or would start, read before Update changes anything (ops #1331).
+
+    Returns {'ok': True, 'tag', 'tuple': (year, month, patch), 'what'} or {'ok': False, 'error', 'hint'}.
+    1. The RUNNING authentik-server container answers with its own version. That is what wrote the
+       database, so it beats any tag text, including a floating one.
+    2. A stopped stack is judged by what `docker compose config` would start: the `.env` pin wins over
+       the compose default (the old code read only the compose default, so a crash-looping box that
+       `.env` had pinned newer passed the guard).
+    3. A tag that is not a full version (`2026.8`, `latest`) is resolved through the image it names.
+    Anything it cannot read is an error, never a guess. Read-only: no write, no restart."""
+    _d = ak_dir or os.path.expanduser('~/authentik')
+    _hint = 'Wait until Authentik is healthy (or start it), then press Update again.'
+    _tag, _what = '', ''
+    try:
+        _ps = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', 'name=authentik-server',
+                                         '--format', '{{.Names}} {{.Image}}']),
+                             capture_output=True, text=True, timeout=15)
+        _row = ((_ps.stdout or '').strip().splitlines() or [''])[0].split() if _ps.returncode == 0 else []
+    except Exception:
+        _row = []
+    if len(_row) >= 2:
+        _name, _img = _row[0], _row[1]
+        try:
+            _ex = subprocess.run(_sudo_wrap(['docker', 'exec', _name, 'python', '-c', _AK_VERSION_PROBE_PY]),
+                                 capture_output=True, text=True, timeout=60)
+            _t = _ak_version_from_output(_ex.stdout) if _ex.returncode == 0 else None
+        except Exception:
+            _t = None
+        if _t:
+            return {'ok': True, 'tag': '%d.%d.%d' % _t, 'tuple': _t, 'what': 'the running server'}
+        _tag, _what = (_img.rsplit(':', 1)[1] if ':' in _img else ''), 'the running server image tag'
+    else:
+        _cok, _ctags, _cerr = _ak_resolved_authentik_tags(_d)
+        _ctags = {t for t in _ctags if t}
+        if _cok and _ctags:
+            # server and ldap share one tag; with two different ones, the higher decides.
+            _tag = sorted(_ctags, key=lambda t: _ak_ver_tuple(t))[-1]
+            _what = 'the tag docker compose would start'
+        else:
+            _tag = _ak_env_tag(_d)
+            _what = 'the .env pin'
+            if not _tag:
+                _cf = ''
+                try:
+                    with open(os.path.join(_d, 'docker-compose.yml')) as _f:
+                        _cf = _f.read()
+                except Exception:
+                    _cf = ''
+                _m = re.search(r'AUTHENTIK_TAG:-([^\s}]+)', _cf)
+                _tag, _what = (_m.group(1).strip('"\'') if _m else ''), 'the compose file pin'
+        if not _tag:
+            _tag = (fallback_tag or '').strip()
+            _what = 'the version the console read'
+    _tag = (_tag.split() or [''])[0].lstrip('vV')
+    _m = _AK_FULL_VERSION_RE.fullmatch(_tag)
+    if _m:
+        return {'ok': True, 'tag': _tag, 'tuple': tuple(int(_x) for _x in _m.groups()), 'what': _what}
+    if not _tag:
+        return {'ok': False, 'error': 'there is no Authentik tag to read', 'hint': _hint}
+    # A floating tag: ask the image that tag points at on this box.
+    try:
+        _run = subprocess.run(_sudo_wrap(['docker', 'run', '--rm', '--network', 'none', '--entrypoint', 'python',
+                                          'ghcr.io/goauthentik/server:' + _tag, '-c', _AK_VERSION_PROBE_PY]),
+                              capture_output=True, text=True, timeout=120)
+        _t = _ak_version_from_output(_run.stdout) if _run.returncode == 0 else None
+    except Exception:
+        _t = None
+    if _t:
+        return {'ok': True, 'tag': '%d.%d.%d' % _t, 'tuple': _t, 'what': 'the image behind tag "%s"' % _tag[:40]}
+    return {'ok': False,
+            'error': (f'{_what} names "{_tag[:40]}", which is not a version number, and the image behind '
+                      f'it did not say which version it holds, so infra-TAK cannot tell whether the '
+                      f'update would go backwards'),
+            'hint': _hint}
+
+
+def _ak_resolved_authentik_images(ak_dir=None):
+    """Authentik image repositories (no tag) that `docker compose config` resolves. (ok, set, err).
+    Used to pull the target images BEFORE any pin is written (ops #1331)."""
+    _d = ak_dir or os.path.expanduser('~/authentik')
+    try:
+        _r = subprocess.run(_sudo_wrap(['docker', 'compose', 'config']),
+                            cwd=_d, capture_output=True, text=True, timeout=90)
+    except Exception as _e:
+        return False, set(), str(_e)[:200]
+    if _r.returncode != 0:
+        return False, set(), ((_r.stderr or _r.stdout or '').strip()[-300:] or 'no output')
+    return True, set(re.findall(r'(ghcr\.io/goauthentik/[A-Za-z0-9_.\-/]+?):[^\s"\']+', _r.stdout or '')), ''
+
+
+AK_FAMILY_DUMP_MIN_FREE = 1024 ** 3            # a family move needs this much free disk for its dump
+AK_POSTGRES_CONTAINER = 'authentik-postgresql-1'
+
+
+def _ak_family_move(cur_tuple, target_tuple):
+    """True when going from `cur_tuple` to `target_tuple` crosses an Authentik release family
+    (2026.5 -> 2026.8). A family move runs database migrations that do not go back."""
+    return len(cur_tuple) >= 2 and len(target_tuple) >= 2 and tuple(target_tuple[:2]) > tuple(cur_tuple[:2])
+
+
+def _ak_premove_dump(plog=None):
+    """Dump the Authentik database before a family move (ops #1331). (True, path) or (False, why).
+
+    The move runs migrations the old image cannot read, so the rollback of a failed move is the
+    dump, not the old image. Goes through the broker's `stack_pg_dump` op on a non-root console,
+    into the same root-only tree as the full-stack backup. Nothing was changed when this fails."""
+    _log = plog or (lambda m: None)
+    _free = _stack_backup_free_bytes()
+    if _free is not None and _free < AK_FAMILY_DUMP_MIN_FREE:
+        return False, (f'only {_free // 1024 ** 2} MB is free for the database dump a family move takes '
+                       f'(needs {AK_FAMILY_DUMP_MIN_FREE // 1024 ** 2} MB)')
+    try:
+        _r = subprocess.run(_sudo_wrap(['docker', 'ps', '--filter', f'name={AK_POSTGRES_CONTAINER}',
+                                        '--format', '{{.Names}}']),
+                            capture_output=True, text=True, timeout=15)
+        _up = AK_POSTGRES_CONTAINER in (_r.stdout or '').split()
+    except Exception:
+        _up = False
+    if not _up:
+        return False, 'the Authentik database container is not running, so it cannot be dumped'
+    _label = 'authentik-family-move-' + datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    _dest = os.path.join(STACK_BACKUP_DIR, _label)
+    try:
+        _makedirs_priv(STACK_BACKUP_DIR, mode=0o711)
+        _makedirs_priv(_dest, mode=0o700)
+        _size, _ = _stack_pg_dump_priv(AK_POSTGRES_CONTAINER, os.path.join(_dest, 'authentik.pgdump'), timeout=900)
+    except Exception as _e:
+        return False, 'the database dump failed (%s)' % str(_e)[:200]
+    if not _size:
+        return False, 'the database dump came out empty'
+    _log('  Authentik database dumped before the family move: %s/authentik.pgdump (%d KB)' % (_dest, _size // 1024))
+    return True, os.path.join(_dest, 'authentik.pgdump')
 
 
 # ops #1322: ONE read-only SSH call that says which Authentik a REMOTE host has. Constant text, no
@@ -75088,6 +75280,15 @@ def authentik_control():
         # confirm the running image afterwards instead of assuming.
         import re as _re
         _inst = (_get_authentik_version_info().get('version') or '').strip()
+        # ops #1331: `_inst` above is TAG TEXT. A floating tag (`2026.8`, `latest`) or a stopped
+        # stack whose `.env` pins something newer than the compose default says nothing about what
+        # wrote the database. Read what really runs (or would start), and refuse what we cannot read,
+        # the same as the remote branch does since ops #1322. Nothing is changed before this.
+        _cur = _ak_current_version(ak_dir, fallback_tag=_inst)
+        if not _cur['ok']:
+            return jsonify({'error': f'Refusing to update Authentik: {_cur["error"]}. '
+                                     f'Nothing was changed. {_cur.get("hint") or ""}'.strip()}), 500
+        _inst_text, _inst = _inst, _cur['tag']
         # v10.2.25: the next safe hop from what is running — a box on 2026.2.x goes to
         # the 2026.5 step (AUTHENTIK_UPGRADE_STEPS) first, because 2026.8 will not start on a
         # database that skipped 2026.5.
@@ -75099,10 +75300,37 @@ def authentik_control():
         # Never walk a box BACKWARDS. The badge only offers Update when target > running,
         # but the button is always live — and now that the .env pin actually converges, a
         # downgrade would TAKE where before .env silently absorbed it.
-        if _inst and _ak_ver_tuple(_inst) > _ak_ver_tuple(latest):
-            return jsonify({'error': f'Refusing to downgrade Authentik: v{_inst} is running, '
-                                     f'this channel targets v{latest}. Promote the vetted '
-                                     f'release instead of downgrading a live IdP.'}), 409
+        if _inst and _cur['tuple'] > (_ak_ver_tuple(latest) + (0, 0, 0))[:3]:
+            return jsonify({'error': f'Refusing to downgrade Authentik: v{_inst} '
+                                     f'({_cur["what"]}), this channel targets v{latest}. Promote the vetted '
+                                     f'release instead of downgrading a live IdP. Nothing was changed.'}), 409
+        # ops #1331: a move to a new release FAMILY runs database migrations the old image cannot
+        # read, so the old image is not a rollback. Dump the database first; no dump, no move.
+        _family = {'move': _ak_family_move(_cur['tuple'], (_ak_ver_tuple(latest) + (0, 0, 0))[:3]), 'dump': ''}
+        if _family['move']:
+            _mod_result_step('authentik', 'dump the database before the family move')
+            _dok, _dres = _ak_premove_dump()
+            if not _dok:
+                return jsonify({'error': f'Refusing to move Authentik from v{_inst} to v{latest}: {_dres}. '
+                                         f'This move changes the database, so it needs a dump first. '
+                                         f'Nothing was changed. Fix that, then press Update again.'}), 500
+            _family['dump'] = _dres
+        # ops #1331: pull the target images BEFORE any file is written. A kill (or a registry that
+        # does not answer) during the pull used to leave the new pin in compose and `.env` while the
+        # old containers ran; the next `compose up -d` (Guard Dog, Reconfigure, startup) then moved
+        # the box with no update marker. Now the pin is written with the images already here.
+        _mod_result_step('authentik', 'pull the images')
+        _iok, _imgs, _ierr = _ak_resolved_authentik_images(ak_dir)
+        if not _iok:
+            return jsonify({'error': f'docker compose config failed - refusing to update '
+                                     f'a stack we cannot resolve: {_ierr}. Nothing was changed.'}), 500
+        for _repo in sorted(_imgs):
+            _pp = _run_priv_chain([['docker', 'pull', f'{_repo}:{latest}']], 'and', timeout=360, cwd=ak_dir)
+            if _pp is None or _pp.returncode != 0:
+                _perr = (((_pp.stdout or '') + '\n' + (_pp.stderr or '')) if _pp else '').strip()
+                return jsonify({'error': f'Could not pull {_repo}:{latest}: '
+                                         f'{_update_error_line(_perr) or _perr[-400:] or "no output"}. '
+                                         f'Nothing was changed.'}), 500
         # v10.2.8 W10b: a failed update must leave NOTHING changed. The pin is converged BEFORE
         # the pull, so a failed pull used to leave compose/.env pointing at the new tag — and the
         # next `compose up` (a post-update Reconfigure, a restart, a reboot) quietly pulled and
@@ -75124,7 +75352,7 @@ def authentik_control():
                     restored.append('.env')
             except Exception as _rpe:
                 return f'could NOT restore the previous tag pin ({str(_rpe)[:120]})'
-            return (f"the tag pin was restored to v{_inst or 'previous'} ({' + '.join(restored)})"
+            return (f"the tag pin was restored to v{_inst_text or _inst or 'previous'} ({' + '.join(restored)})"
                     if restored else 'no tag pin had been changed')
         try:
             _mod_result_step('authentik', f'pin the tag to {latest}')
@@ -75211,6 +75439,10 @@ def authentik_control():
                         _rb = _run_priv_chain([['docker', 'compose', 'up', '-d']], 'and', timeout=360, cwd=ak_dir)
                         _rp += ('; restarted on the previous version' if _rb is not None and _rb.returncode == 0
                                 else '; the previous version did NOT come back up either — check the Authentik containers')
+                        if _family['dump']:
+                            # ops #1331: the new image may have migrated the database before it failed.
+                            _rp += (f'; the database may already have been changed by v{latest}, so the previous '
+                                    f'version may not start. A dump taken before the move is at {_family["dump"]}')
                     return jsonify({'error': f'Authentik pull/recreate failed ({_which}): '
                                              f'{_real or _err[-400:] or "no output"} ({_rp})'}), 500
             # (e) Confirm the RUNNING image before claiming success, and only prune once it
@@ -75228,14 +75460,15 @@ def authentik_control():
                 if _run_tag:
                     break
             _authentik_release_cache['tag'] = None
+            _dump_note = (f' A dump taken before the move is at {_family["dump"]}.' if _family['dump'] else '')
             if not _run_tag:
                 return jsonify({'error': f'Authentik did not come back up after the update to '
                                          f'v{latest} (no authentik-server container running). '
-                                         f'Images were NOT pruned - check the Docker logs.'}), 500
+                                         f'Images were NOT pruned - check the Docker logs.{_dump_note}'}), 500
             if _run_tag != latest:
                 return jsonify({'error': f'Update did not take: authentik-server is running '
                                          f'v{_run_tag}, expected v{latest}. Images were NOT '
-                                         f'pruned.'}), 500
+                                         f'pruned.{_dump_note}'}), 500
             _run_priv_chain([['docker', 'image', 'prune', '-f']], 'and', timeout=120, cwd=ak_dir)
             # Re-run the idle-load converge against the NEW image (scheduler patch only if
             # this image still carries the typo). Background: it waits for the server.
@@ -91198,10 +91431,28 @@ entries:
         # A fresh compose download is a fresh database — straight to the channel target.
         ak_tag = _get_authentik_target_release(
             installed=None if _compose_fresh_download else _get_authentik_version_info().get('version'))
+        # ops #1331: never lower the pin under a server that really runs newer. The version tests
+        # below read TAG TEXT; a floating `2026.8` or `latest` pin on a newer build compares as older
+        # (or as nothing) and was rewritten to the vetted tag, so the next `up -d` ran an older image
+        # on a newer database. Read what really runs and, if it is newer than the target, leave both
+        # pins alone (the same rule as the Update button).
+        _dep_hold = False
+        if not _compose_fresh_download:
+            try:
+                _dc = _ak_current_version(ak_dir)
+                if _dc['ok']:
+                    _tgt3 = (_ak_ver_tuple(ak_tag) + (0, 0, 0))[:3]
+                    if _dc['tuple'] > _tgt3:
+                        _dep_hold = True
+                        plog(f"  Authentik runs v{_dc['tag']} ({_dc['what']}), newer than target {ak_tag} - tag pins left alone")
+                    elif _dc['tag'] != (_get_authentik_version_info().get('version') or ''):
+                        ak_tag = _get_authentik_target_release(installed=_dc['tag'])
+            except Exception as _dce:
+                plog(f"  ! could not read the version that really runs ({_dce}) - using the tag text")
         plog(f"  Authentik version target: {ak_tag}")
         for i, l in enumerate(lines):
             m = re.search(r'AUTHENTIK_TAG:-([^}]+)', l)
-            if m:
+            if m and not _dep_hold:
                 cur_tag = m.group(1).strip()
                 if cur_tag != ak_tag:
                     if _compose_fresh_download:
@@ -91225,7 +91476,9 @@ entries:
         # only the Update button would leave that half of the path still lying.
         try:
             _env_pin = _ak_env_tag(ak_dir)
-            if _env_pin and _env_pin != ak_tag:
+            if _env_pin and _dep_hold:
+                plog(f"  .env pins AUTHENTIK_TAG={_env_pin}, which runs newer than target {ak_tag} - left alone")
+            elif _env_pin and _env_pin != ak_tag:
                 if _compose_fresh_download or _ak_ver_tuple(ak_tag) > _ak_ver_tuple(_env_pin):
                     _ak_env_pin_tag(ak_tag, ak_dir, plog)
                 else:
