@@ -84850,6 +84850,201 @@ def _tak_stuck_mass_check(plog):
     return done
 
 
+# ops #1426 (found with CloudTAK 14.4.2, ops #1410): a TAK user that exists BOTH as a local user
+# (UserAuthenticationFile.xml, the "flat file") and in LDAP, with DIFFERENT groups, makes TAK Server
+# and CloudTAK ask each other for ever. With default="ldap" and x509useGroupCache="true" (infra-TAK's
+# setting) every certificate login of that user sets the cached groups from the flat file and then
+# from LDAP (X509Authenticator), so the cache changes twice per login and TAK Server sends `t-x-g-c`;
+# CloudTAK answers each one with a groups call, which is a new login. CloudTAK's API then logs 30 to
+# 300 "refreshed channels" lines a second and runs hot while a browser session is open (box load 8 to
+# 13 on 4 vCPU). Verified on a fresh install: the same groups in both places, or the user in one place
+# only, give 0 lines a second. Only the flat-file copy of `webadmin` is ours to remove (infra-TAK
+# already removes it when Authentik is installed, `_remove_webadmin_from_userauth`); a user of any
+# other name belongs to the operator, so that one is only reported.
+_TAK_UAF_CONFLICT_TICK_S = 300
+_TAK_UAF_CONFLICT_REMIND_S = 7 * 86400
+_TAK_UAF_CONFLICT_REMOVED_MAIL_GAP_S = 3600
+_tak_uaf_conflict_last = {'at': 0.0}
+
+
+def _tak_uaf_file_users(content):
+    """{lower-case name: (name, role, {group names})} for the users of UserAuthenticationFile.xml
+    text that have an identifier (a user name; certificate-only entries have none). The groups are
+    the group list, IN list and OUT list together. None when the text is not XML."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(content)
+    except Exception:
+        return None
+    out = {}
+    for el in root.iter():
+        if el.tag.rsplit('}', 1)[-1] != 'User':
+            continue
+        ident = (el.get('identifier') or '').strip()
+        if not ident:
+            continue
+        groups = set()
+        for c in el:
+            if c.tag.rsplit('}', 1)[-1] in ('groupList', 'groupListIN', 'groupListOUT'):
+                t = (c.text or '').strip()
+                if t:
+                    groups.add(t)
+        out[ident.lower()] = (ident, (el.get('role') or '').strip(), groups)
+    return out
+
+
+def _tak_uaf_ldap_conflicts():
+    """ops #1426: the users that are in TAK's flat file AND in LDAP with different groups, as
+    [{'name', 'role', 'file_groups', 'ldap_groups'}] (groups sorted). [] when there are none.
+    None when it cannot be told: no LDAP wiring, no flat file, split TAK (the file is on the other
+    box), no LDAP answer. Read-only."""
+    settings = load_settings()
+    try:
+        if _get_tak_deployment_config(settings).get('mode') == 'two_server':
+            return None
+    except Exception:
+        pass
+    if not os.path.exists('/opt/tak/CoreConfig.xml') or not _coreconfig_has_ldap():
+        return None
+    try:
+        content = _read_priv('/opt/tak/UserAuthenticationFile.xml')
+    except Exception:
+        content = ''
+    users = _tak_uaf_file_users(content) if content else None
+    if users is None:
+        return None
+    if not users:
+        return []
+    ldap_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD')
+    if not ldap_pass or not _ensure_ldapsearch():
+        return None
+    in_ldap = _ldap_users_tak_groups(ldap_pass, [v[0] for v in users.values()])
+    if in_ldap is None:
+        return None
+    ldap_by_lower = {k.lower(): v for k, v in in_ldap.items()}
+    out = []
+    for low, (name, role, fgroups) in sorted(users.items()):
+        if low not in ldap_by_lower:
+            continue
+        lgroups = set(ldap_by_lower[low])
+        if lgroups != fgroups:
+            out.append({'name': name, 'role': role,
+                        'file_groups': sorted(fgroups), 'ldap_groups': sorted(lgroups)})
+    return out
+
+
+def _tak_remove_flatfile_user(name):
+    """ops #1426: remove ONE user from TAK Server's flat file so the RUNNING TAK Server stops
+    using it (no restart). Returns (ok, how). TAK Server keeps the file in memory, so the file
+    is not edited by hand: TAK's own user-management call changes both."""
+    api = 'https://127.0.0.1:8443/user-management/api/delete-user/' + urllib.parse.quote(name, safe='')
+    res, err = _tak_admin_marti_req(api, timeout=30, method='DELETE')
+    try:
+        left = _tak_uaf_file_users(_read_priv('/opt/tak/UserAuthenticationFile.xml') or '') or {}
+    except Exception:
+        left = None
+    if res is not None and left is not None and name.lower() not in left:
+        return True, 'removed through TAK Server'
+    return False, f'TAK Server did not remove it ({str(err or "user is still in the file")[:120]})'
+
+
+def _tak_uaf_conflict_alert(plog, conflicts, removed):
+    """ops #1426: the Guard Dog mail for a flat-file user that is also in LDAP with other groups.
+    `conflicts` is what stays as it is, `removed` the names the console removed. Plain words;
+    never raises."""
+    try:
+        settings = load_settings()
+        to_addr = (settings.get('guarddog_alert_email') or '').strip()
+        if not to_addr:
+            plog("  TAK duplicate-user check: Guard Dog alert email SUPPRESSED (no recipient configured)")
+            return
+        ident = _guarddog_server_identifier(settings) or socket.gethostname()
+        lines = []
+        if removed:
+            lines.append(f"Guard Dog removed the local TAK user {', '.join(repr(n) for n in removed)}. "
+                         f"Authentik (LDAP) has a user with the same name and other groups. With both, "
+                         f"TAK Server and CloudTAK kept asking each other for the groups, and the "
+                         f"CloudTAK server ran hot while a browser was open. The user still signs in "
+                         f"through Authentik. You do not need to do anything.")
+        for c in conflicts:
+            lines.append(f"The user '{c['name']}' exists as a local TAK user (groups: "
+                         f"{', '.join(c['file_groups']) or 'none'}) and in Authentik (groups: "
+                         f"{', '.join(c['ldap_groups']) or 'none'}). With different groups, TAK Server and "
+                         f"CloudTAK can keep asking each other for the groups, and the CloudTAK server "
+                         f"runs hot while a browser is open. Guard Dog does not change this user. "
+                         f"Remove the local user in the TAK Server admin page, or give both the same groups.")
+        if not lines:
+            return
+        subj = (f"⚠ A TAK user is in two places with different groups ({ident})" if conflicts else
+                f"✓ Guard Dog fixed a duplicate TAK user ({ident})")
+        _guarddog_send_alert_email_via_relay(to_addr, subj, '\n\n'.join(lines) + f"\n\nConsole: {ident}\n\n— Guard Dog")
+    except Exception as e:
+        plog(f"  TAK duplicate-user check: Guard Dog alert email failed: {str(e)[:120]}")
+
+
+def _tak_uaf_conflict_check(plog, force=False):
+    """ops #1426: one run of the duplicate-user check, at most every `_TAK_UAF_CONFLICT_TICK_S`.
+    Removes the flat-file `webadmin` when LDAP has `webadmin` with ROLE_ADMIN (the same admin still
+    signs in), reports any other duplicate, and sends one Guard Dog mail per change (again after
+    `_TAK_UAF_CONFLICT_REMIND_S` while it stays). Returns {'conflicts': [...], 'removed': [...]},
+    or None when nothing was checked."""
+    tag = 'TAK duplicate-user check'
+    now = time.time()
+    st = _tak_uaf_conflict_last
+    if not force and now - st['at'] < _TAK_UAF_CONFLICT_TICK_S:
+        return None
+    st['at'] = now
+    if _console_update_in_progress():
+        return None
+    conflicts = _tak_uaf_ldap_conflicts()
+    if conflicts is None:
+        return None
+    settings = load_settings()
+    saved = dict(settings.get('tak_uaf_conflict') or {})
+    if not conflicts:
+        if saved:
+            settings.pop('tak_uaf_conflict', None)
+            save_settings(settings)
+            plog(f"  {tag}: no user is in the flat file and in LDAP with different groups any more")
+        return {'conflicts': [], 'removed': []}
+    removed = []
+    for c in conflicts:
+        if c['name'].lower() != 'webadmin':
+            continue
+        if 'ROLE_ADMIN' not in c['ldap_groups']:
+            plog(f"  {tag}: 'webadmin' is in LDAP without ROLE_ADMIN: NOT removing the local copy "
+                 f"(it would take the admin login away)")
+            continue
+        ok, how = _tak_remove_flatfile_user(c['name'])
+        plog(f"  {tag}: local user '{c['name']}' (groups {', '.join(c['file_groups']) or 'none'}) has other groups "
+             f"than in LDAP ({', '.join(c['ldap_groups']) or 'none'}): {how}")
+        if ok:
+            removed.append(c['name'])
+    left = [c for c in conflicts if c['name'] not in removed]
+    sig = '|'.join(f"{c['name']}:{','.join(c['file_groups'])}:{','.join(c['ldap_groups'])}" for c in left)
+    mail_removed = bool(removed) and now - float(saved.get('removed_epoch') or 0) >= _TAK_UAF_CONFLICT_REMOVED_MAIL_GAP_S
+    mail_left = bool(left) and (sig != saved.get('sig') or now - float(saved.get('mailed_epoch') or 0) >= _TAK_UAF_CONFLICT_REMIND_S)
+    if mail_left:
+        for c in left:
+            plog(f"  {tag}: user '{c['name']}' is a local TAK user and in LDAP with different groups "
+                 f"(local: {', '.join(c['file_groups']) or 'none'}; LDAP: {', '.join(c['ldap_groups']) or 'none'}). "
+                 f"TAK Server and CloudTAK can ask each other for ever. Not changed: remove the local user or "
+                 f"give both the same groups")
+    if mail_removed or mail_left:
+        _tak_uaf_conflict_alert(plog, left if mail_left else [], removed if mail_removed else [])
+        cur = dict(saved)
+        if mail_removed:
+            cur['removed_epoch'] = now
+        if mail_left:
+            cur.update(sig=sig, mailed_epoch=now)
+        if not left:
+            cur.pop('sig', None)
+            cur.pop('mailed_epoch', None)
+        settings['tak_uaf_conflict'] = cur
+        save_settings(settings)
+    return {'conflicts': conflicts, 'removed': removed}
+
+
 def _tak_stuck_mass_loop():
     log = lambda m: print(f"[tak-stuck-check] {m}", flush=True)
     while True:
@@ -84862,6 +85057,10 @@ def _tak_stuck_mass_loop():
             _tak_groupless_clients_check(log)     # ops #1039: one named phone with no groups
         except Exception as e:
             log(f"groupless-client check error (non-fatal): {str(e)[:200]}")
+        try:
+            _tak_uaf_conflict_check(log)          # ops #1426: a TAK user in the flat file and in LDAP
+        except Exception as e:
+            log(f"duplicate-user check error (non-fatal): {str(e)[:200]}")
 
 
 def _tak_stuck_mass_escalate(plog, n_stuck, n_total, minutes, tak_up_min):
