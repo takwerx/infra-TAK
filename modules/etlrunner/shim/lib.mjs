@@ -94,6 +94,42 @@ export function normalizeFn(fn) {
     return { ...fn, Env: env, MemorySize: clampMem(fn.MemorySize), Timeout: Math.min(900, Math.max(1, Number(fn.Timeout) || 60)) };
 }
 
+// ---- state file (stacks.json) ----
+// ops #1335. The file maps StackName -> { id, status, created, desc, fn }. It carries a format
+// number under a key no StackName can have (names start with a letter), so a shim that is OLDER
+// than the file can tell, and a shim never rewrites a file it does not understand. Older shims
+// (before this) see the key as "not a runnable function" and drop only that entry.
+export const STATE_FORMAT = 1;
+export const STATE_FORMAT_KEY = '__format';
+
+// Read the text of a stacks.json. status:
+//   'ok'      stacks (runnable, normalised) and held (entries this shim cannot run: kept, written
+//             back untouched, never dropped); format is 0 for a file written before the key existed.
+//   'newer'   the file's format is higher than `supported`, or is not a whole number: leave it alone.
+//   'corrupt' not JSON, or not an object.
+export function parseState(text, supported = STATE_FORMAT) {
+    let raw;
+    try { raw = JSON.parse(text); } catch (e) { return { status: 'corrupt', error: e.message }; }
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { status: 'corrupt', error: 'not an object' };
+    let format = 0;
+    if (Object.prototype.hasOwnProperty.call(raw, STATE_FORMAT_KEY)) {
+        format = raw[STATE_FORMAT_KEY];
+        if (!Number.isInteger(format) || format < 1 || format > supported) return { status: 'newer', format };
+    }
+    const stacks = Object.create(null), held = Object.create(null);
+    for (const [name, s] of Object.entries(raw)) {
+        if (name === STATE_FORMAT_KEY) continue;
+        const fn = normalizeFn(s?.fn);
+        if (fn && fn.FunctionName === name) stacks[name] = { ...s, fn };
+        else held[name] = s;
+    }
+    return { status: 'ok', format, stacks, held };
+}
+
+export function serializeState(stacks, held = {}) {
+    return JSON.stringify({ [STATE_FORMAT_KEY]: STATE_FORMAT, ...held, ...stacks }, null, 1);
+}
+
 // ---- schedules: EventBridge semantics, UTC ----
 // EventBridge's floor is one minute; anything below is clamped up (a 1 ms loop is a DoS).
 export const RATE_MIN_MS = 60_000;

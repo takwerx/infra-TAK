@@ -2586,7 +2586,7 @@ threading.Thread(target=_warm_update_cache_bg, daemon=True).start()
 
 _json_file_cache = {}  # path -> ((mtime_ns, size), text); invalidated on any file change
 
-def _load_json_cached(p):
+def _load_json_cached_with_text(p):
     """Read+parse a small JSON config with an mtime/size cache: one stat() per call, a
     real disk read only when the file actually changes. Returns a FRESH dict each call
     (json.loads) so callers can safely read-modify-write. {} on missing/unreadable.
@@ -2600,7 +2600,7 @@ def _load_json_cached(p):
     try:
         st = os.stat(p)
     except OSError:
-        return {}
+        return {}, ''
     key = (st.st_mtime_ns, st.st_size)
     cached = _json_file_cache.get(p)
     if not cached or cached[0] != key:
@@ -2608,15 +2608,48 @@ def _load_json_cached(p):
             with open(p) as f:
                 cached = (key, f.read())
         except OSError:
-            return {}
+            return {}, ''
         _json_file_cache[p] = cached
     try:
-        return json.loads(cached[1])
+        return json.loads(cached[1]), cached[1]
+    except Exception:
+        return {}, cached[1]
+
+
+def _load_json_cached(p):
+    """The parsed dict only (see _load_json_cached_with_text)."""
+    return _load_json_cached_with_text(p)[0]
+
+class _LoadedSettings(dict):
+    """The dict load_settings() returns. It remembers the file text it was read from, so
+    save_settings() can tell which keys THIS caller changed and write only those on top of
+    the file as it is now (ops #1378). Without it every save wrote the caller's whole dict:
+    a deploy thread that loaded settings, ran for minutes and saved at the end put back the
+    old value of every key another thread wrote in between. The post-update stamp
+    (last_console_version) was lost that way on a fresh install, 21 minutes after it was
+    saved. A plain dict (a copy, a dict built by hand) has no baseline and is saved whole,
+    as before."""
+    _base_text = None
+
+
+def _settings_baseline(s):
+    """The key/value pairs `s` held when it was read (or last saved), or None for a dict
+    that did not come from load_settings(). An unparseable baseline is {}: every key of the
+    caller then counts as changed, which is what a whole-file save did before."""
+    text = getattr(s, '_base_text', None)
+    if text is None:
+        return None
+    try:
+        base = json.loads(text) if text else {}
     except Exception:
         return {}
+    return base if isinstance(base, dict) else {}
+
 
 def load_settings():
-    s = _load_json_cached(os.path.join(CONFIG_DIR, 'settings.json'))
+    s, _text = _load_json_cached_with_text(os.path.join(CONFIG_DIR, 'settings.json'))
+    s = _LoadedSettings(s)
+    s._base_text = _text
     # Type guard: a core identity key persisted with a non-scalar type (e.g. server_ip
     # written as [null, null] from an unpacked (ip, source) tuple) crashes every
     # `(settings.get(...) or '').strip()` — including at module import, so the console
@@ -2642,10 +2675,48 @@ CORE_SETTINGS_KEYS = ('ssl_mode', 'fqdn', 'server_ip', 'os_type', 'os_name',
                       'pkg_mgr', 'arch', 'console_port', 'install_dir')
 _settings_write_lock = threading.Lock()
 
+_MISSING = object()
+
+def _merge_settings_with_disk(s, base, disk):
+    """`disk` (the file now) with only the changes `s` made since it was read as `base`:
+    keys added or changed in `s` are set, keys removed from `s` are removed, every other key
+    stays as the file has it. Returns the merged dict and the sorted names of keys that
+    another writer added, changed or removed since `base` and that this merge therefore
+    kept (names only, never values: settings hold passwords)."""
+    merged = dict(disk)
+    kept = []
+    for k in set(s) | set(base) | set(disk):
+        in_s, in_b = k in s, k in base
+        if (in_s != in_b) or (in_s and s[k] != base[k]):
+            if in_s:
+                merged[k] = s[k]
+            else:
+                merged.pop(k, None)
+        elif disk.get(k, _MISSING) != base.get(k, _MISSING):
+            kept.append(k)
+    return merged, sorted(kept)
+
 def save_settings(s):
     os.makedirs(CONFIG_DIR, exist_ok=True)
     p = os.path.join(CONFIG_DIR, 'settings.json')
     with _settings_write_lock:
+        # (0) Keep other writers' keys (ops #1378). A dict from load_settings() carries the
+        # text it was read from; write only what this caller changed on top of the file as
+        # it is now. Any failure here falls back to the old whole-dict save below.
+        _caller_view = s
+        _base = _settings_baseline(s)
+        if _base is not None:
+            try:
+                with open(p) as _f:
+                    _disk = json.loads(_f.read())
+                if isinstance(_disk, dict):
+                    _merged, _kept = _merge_settings_with_disk(s, _base, _disk)
+                    if _kept:
+                        print(f"[save_settings] kept keys another writer changed since this "
+                              f"caller read the file: {_kept}", flush=True)
+                    s = _merged
+            except Exception:
+                pass
         # (3) Never-drop guard. Fast path: when the caller carries every core key (the
         # overwhelming common case — callers do load→modify→save) we skip the disk read
         # entirely. A core key is only ever MISSING from the incoming dict on the
@@ -2697,6 +2768,13 @@ def save_settings(s):
                 except Exception:
                     pass
             raise
+        # The caller may keep using its dict and save it again: what it holds now is the
+        # new baseline, so a later removal of a key it added here still removes it.
+        if isinstance(_caller_view, _LoadedSettings):
+            try:
+                _caller_view._base_text = json.dumps(_caller_view)
+            except Exception:
+                _caller_view._base_text = None
 
 def _read_os_release():
     """(os_type, os_name) from /etc/os-release, mapped exactly as start.sh detect_os()
@@ -53163,7 +53241,9 @@ def mediamtx_recovery(_try_guarded=False):
         if not (deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip()):
             try:
                 _ut = _read_priv(_tp_unit) or ''
-                _ut_new = _mediamtx_editor_unit_with_prestart(_ut)
+                # ops #1400: the dash on ExecStartPre and the trusted-proxies line are set here, in
+                # Python, not by `sed -i` (which logged two SELinux denials per Patch on Rocky).
+                _ut_new = _mediamtx_editor_unit_for_patch(_mediamtx_editor_unit_with_prestart(_ut), _tp_line)
                 if _ut_new != _ut:
                     _write_priv(_tp_unit, _ut_new)
             except Exception:
@@ -53183,13 +53263,15 @@ def mediamtx_recovery(_try_guarded=False):
             for _svc in _restart_after:
                 if _svc != 'mediamtx-webeditor':
                     subprocess.run(_sudo_wrap(['systemctl', 'start', _svc]), capture_output=True, timeout=60)
+        # A remote host's unit is edited over SSH with sed (it has no console domain to deny it);
+        # a local one was edited in Python above (ops #1400).
         cmd = (
-            ('mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
+            (('mv /tmp/ensure_overlay.py /opt/mediamtx-webeditor/ensure_overlay.py && chmod 755 /opt/mediamtx-webeditor/ensure_overlay.py && '
+              "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
+              f"if grep -q '^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=' {_tp_unit} 2>/dev/null; then "
+              f"sed -i 's|^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=.*|{_tp_line}|' {_tp_unit}; "
+              f"else sed -i '/^\\[Service\\]/a {_tp_line}' {_tp_unit} 2>/dev/null; fi; ")
              if _is_remote else '') +
-            "sed -i 's|^ExecStartPre=/usr/bin/python3|ExecStartPre=-/usr/bin/python3|' /etc/systemd/system/mediamtx-webeditor.service 2>/dev/null; "
-            f"if grep -q '^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=' {_tp_unit} 2>/dev/null; then "
-            f"sed -i 's|^Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}=.*|{_tp_line}|' {_tp_unit}; "
-            f"else sed -i '/^\\[Service\\]/a {_tp_line}' {_tp_unit} 2>/dev/null; fi; "
             'systemctl daemon-reload 2>/dev/null; systemctl restart mediamtx-webeditor 2>/dev/null; true'
         )
         ok_run, out = _module_run_root(deploy_cfg, cmd, timeout=25)   # ops #890: mv/sed/systemctl need root
@@ -57631,6 +57713,135 @@ MEDIA_INFRA_MULTIARCH = True
 POSTGIS_IMAGE = 'postgis/postgis:17-3.7-alpine'
 POSTGIS_IMAGE_ARM64 = 'imresamu/postgis:17-3.6-alpine'
 
+# ops #1335: the pin above is forced on every box at every console start, so it must never push a
+# database back to a PostgreSQL major older than its own data ("database files are incompatible
+# with server", the ops #1306 shape: a crash loop with no way to start). PostgreSQL 18 images keep
+# the cluster in /var/lib/postgresql/18/docker, older ones in /var/lib/postgresql/data.
+# `docker cp` reads PG_VERSION from a stopped or crash-looping container too.
+_CT_POSTGIS_DATA_DIRS = ('data',) + tuple(f'{n}/docker' for n in range(18, 24))
+_CT_POSTGIS_IMAGE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/:@-]{0,199}')
+# The same read on a remote CloudTAK host. Prints IMAGE <name>, IMGMAJOR <n> and MAJOR <n> lines;
+# NONE when there is no postgis container there.
+_CT_POSTGIS_REMOTE_PROBE_SH = (
+    'CID=$(docker ps -a -q -f name=postgis | head -1); [ -n "$CID" ] || { echo NONE; exit 0; }; '
+    'echo "IMAGE $(docker inspect -f \'{{.Config.Image}}\' "$CID" 2>/dev/null)"; '
+    'echo "IMGMAJOR $(docker inspect -f \'{{range .Config.Env}}{{println .}}{{end}}\' "$CID" 2>/dev/null '
+    '| sed -n \'s/^PG_MAJOR=//p\' | head -1)"; '
+    'for d in ' + ' '.join(_CT_POSTGIS_DATA_DIRS) + '; do '
+    'v=$(docker cp "$CID:/var/lib/postgresql/$d/PG_VERSION" - 2>/dev/null | tar -xO 2>/dev/null); '
+    'if [ -n "$v" ]; then echo "MAJOR ${v%%.*}"; exit 0; fi; done; echo UNKNOWN'
+)
+_CT_POSTGIS_NOTED = set()
+
+
+def _cloudtak_postgis_state(remote_cfg=None):
+    """What the CloudTAK postgis container holds (ops #1335): {'data_major': int or None,
+    'image': str, 'image_major': int or None}. data_major is the PostgreSQL major in the data
+    directory (PG_VERSION, copied out with `docker cp`, so a stopped container works); None when it
+    cannot be read: no container yet (no data to protect), Docker not answering, no cluster.
+    Never raises."""
+    out = {'data_major': None, 'image': '', 'image_major': None}
+    try:
+        if remote_cfg:
+            ok, txt = _ssh_probe(remote_cfg, _CT_POSTGIS_REMOTE_PROBE_SH, timeout=40)
+            if not ok:
+                return out
+            for line in (txt or '').splitlines():
+                key, _, val = line.strip().partition(' ')
+                val = val.strip()
+                if key == 'IMAGE':
+                    out['image'] = val
+                elif key == 'IMGMAJOR' and val.isdigit():
+                    out['image_major'] = int(val)
+                elif key == 'MAJOR' and val.isdigit():
+                    out['data_major'] = int(val)
+            return out
+        r = subprocess.run(_sudo_wrap(['docker', 'ps', '-a', '-q', '-f', 'name=postgis']),
+                           capture_output=True, text=True, timeout=20)
+        ids = (r.stdout or '').split() if r.returncode == 0 else []
+        if not ids:
+            return out
+        cid = ids[0]
+        ins = subprocess.run(
+            _sudo_wrap(['docker', 'inspect', '--type', 'container', '-f',
+                        '{{.Config.Image}}{{println}}{{range .Config.Env}}{{println .}}{{end}}', cid]),
+            capture_output=True, text=True, timeout=20)
+        if ins.returncode == 0:
+            lines = (ins.stdout or '').splitlines()
+            out['image'] = (lines[0].strip() if lines else '')
+            pm = re.search(r'^PG_MAJOR=(\d+)', ins.stdout or '', re.M)
+            if pm:
+                out['image_major'] = int(pm.group(1))
+        # The file is copied to a private folder and read from there. `docker cp CONTAINER:PATH -`
+        # (the tar on stdout) gives an EMPTY answer through the broker on a non-root console
+        # (ops #1335, nuc): the data major would never be read and the pin would be forced again.
+        tmp = tempfile.mkdtemp(prefix='ct-pgv-')
+        try:
+            for d in _CT_POSTGIS_DATA_DIRS:
+                dest = os.path.join(tmp, 'PG_VERSION')
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
+                # a named file, not a folder: through the broker a folder target gets a file called `f`
+                cp = subprocess.run(_sudo_wrap(['docker', 'cp', f'{cid}:/var/lib/postgresql/{d}/PG_VERSION', dest]),
+                                    capture_output=True, timeout=30)
+                if cp.returncode != 0 or not os.path.isfile(dest):
+                    continue
+                try:
+                    with open(dest, 'r', encoding='utf-8', errors='replace') as fh:
+                        text = fh.read(64)
+                except PermissionError:
+                    # a root docker made the copy (0600, root): read it the way docker was run
+                    cat = subprocess.run(_sudo_wrap(['cat', dest]), capture_output=True, text=True, timeout=20)
+                    text = (cat.stdout or '')[:64] if cat.returncode == 0 else ''
+                vm = re.match(r'\s*(\d+)', text)
+                if vm:
+                    out['data_major'] = int(vm.group(1))
+                    break
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    except Exception:
+        pass
+    return out
+
+
+def _cloudtak_postgis_guard(pin_image, settings, is_remote, log=None):
+    """ops #1335: the postgis image line for the CloudTAK override. `pin_image` when the data
+    is on the pin's PostgreSQL major or older, or unknown (no container, Docker not answering).
+    When the data is NEWER than the pin, the pin would start an older server on it and the
+    database would crash-loop, so it is not forced: the image the container already runs is kept
+    when that image can read the data, else '' (no image line, the compose file's own pin is
+    used) and the reason is logged once in plain words. Never raises."""
+    _log = log or (lambda m: print(f'[cloudtak] {m}', flush=True))
+    try:
+        pm = re.match(r'[^:]+:(\d+)', pin_image)
+        pin_major = int(pm.group(1)) if pm else 0
+        remote_cfg = None
+        if is_remote:
+            remote_cfg = (_get_cloudtak_deployment_config(settings).get('remote') or None)
+            if not remote_cfg:
+                return pin_image
+        st = _cloudtak_postgis_state(remote_cfg)
+        data = st['data_major']
+        if data is None or not pin_major or data <= pin_major:
+            return pin_image
+        keep = ''
+        if (st['image'] and _CT_POSTGIS_IMAGE_RE.fullmatch(st['image'])
+                and (st['image_major'] or 0) >= data):
+            keep = st['image']
+        msg = (f"CloudTAK's database holds PostgreSQL {data} data, newer than the PostgreSQL {pin_major} "
+               f"that infra-TAK pins ({pin_image}). The pin is NOT forced: an older server cannot start on "
+               + (f"newer data. The database keeps running {keep}." if keep else
+                  "newer data. No image is set here, so CloudTAK's own image line applies."))
+        if msg not in _CT_POSTGIS_NOTED:
+            _CT_POSTGIS_NOTED.add(msg)
+            _log(msg)
+        return keep
+    except Exception as e:
+        _log(f'PostGIS data check skipped ({str(e)[:120]}); keeping the pin')
+        return pin_image
+
 # ops #202: containers that make outbound TLS trust the HOST's CA bundle, not the one baked
 # into their image. An image's bundle is frozen at build time, so when a CA update removes a
 # root, the host drops it and the container keeps trusting it.
@@ -57813,6 +58024,12 @@ def _cloudtak_build_override_yml(settings):
     # ops #110: postgis pin. Arch is only known for a CloudTAK on this box; a remote host gets
     # the amd64 tag, the same single-arch repo upstream's own pin already pointed it at.
     postgis_image = POSTGIS_IMAGE_ARM64 if (not _ct_is_remote and _host_arch() == 'arm64') else POSTGIS_IMAGE
+    # ops #1335: never force the pin onto data a newer PostgreSQL wrote ('' = leave the image alone).
+    try:
+        postgis_image = _cloudtak_postgis_guard(postgis_image, settings, _ct_is_remote)
+    except Exception:
+        pass
+    postgis_image_line = f'    image: {postgis_image}\n' if postgis_image else ''
     # ops #202: media (MediaMTX pulling external sources, Node for proxy leases) trusts the
     # host CA bundle. Local only: the bundle path is this box's, like the console cert above.
     media_ca_env, media_ca_vols = ('', '') if _ct_is_remote else _container_ca_trust(node=True)
@@ -57879,8 +58096,7 @@ services:
 {media_ca_env}{media_ca_vol_block}  postgis:
     # ops #110: infra-TAK pins postgis itself — CloudTAK's 17-3.4-alpine tag is frozen at
     # PostgreSQL 17.0. Same PG major; PostGIS extensions are updated after the swap.
-    image: {postgis_image}
-    environment:
+{postgis_image_line}    environment:
       POSTGRES_PASSWORD: "${{POSTGRES_PASSWORD:-docker}}"
 {_sim_networks_top}"""
 
@@ -66479,6 +66695,14 @@ def _startup_webodm_local_admin():
         print(f"Startup migration: WebODM admin check error (non-fatal): {_e}")
 
 
+def _webodm_plugin_clear_sh(plugin_dir):
+    """Shell text that removes the old WebODM overlay plugin folder as root (ops #1381). The folder
+    holds root-owned __pycache__ files the WebODM container wrote, so the SSH user cannot delete it.
+    Does nothing, and runs no sudo, when the folder is not there (first deploy)."""
+    q = shlex.quote(plugin_dir)
+    return f'[ ! -e {q} ] || ' + _as_root_sh(f'rm -rf {q}')
+
+
 def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     """Deploy WebODM on a remote host via SSH (mirrors Node-RED remote pattern)."""
     import secrets as _sec
@@ -66554,8 +66778,16 @@ def _run_webodm_deploy_remote(settings, deploy_cfg, plog):
     if not ok:
         _webodm_deploy_status.update({'running': False, 'error': True})
         return
+    # ops #1381: the running WebODM container (root) writes __pycache__/*.pyc into this bind-mounted
+    # folder, so a non-root SSH user cannot delete it ("Permission denied" on the second Reapply).
+    # Remove the old folder as root (ops #890 wrapper); a first deploy has no folder and needs no sudo.
+    ok, out = _module_run(deploy_cfg, _webodm_plugin_clear_sh(f'{wo_dir_remote}/plugins/webodm-tak-overlay'),
+                          timeout=60, log_fn=plog)
+    if not ok:
+        plog(f'✗ Plugin clone failed: could not remove the old plugin folder: {(out or "")[-300:]}')
+        _webodm_deploy_status.update({'running': False, 'error': True})
+        return
     ok, out = _module_run(deploy_cfg,
-        f'rm -rf {wo_dir_remote}/plugins/webodm-tak-overlay && '
         f'git clone --depth=1 --branch {WEBODM_OVERLAY_REF} {WEBODM_OVERLAY_REPO} '
         f'{wo_dir_remote}/plugins/webodm-tak-overlay 2>&1 && '
         f'[ "$(git -C {wo_dir_remote}/plugins/webodm-tak-overlay rev-parse HEAD)" = {WEBODM_OVERLAY_SHA} ] && '
@@ -67348,6 +67580,19 @@ def webodm_ready():
     return jsonify({'ready': False, 'status': status_msg, 'url': wo_url})
 
 
+def _webodm_db_clear_sh(db_dir):
+    """Shell text that removes the WebODM Postgres data folder as root on a remote host (ops #1445).
+    The folder (`<webodm dir>/db`) belongs to the database container's user (uid 999, mode 700), so a
+    non-root SSH user cannot delete it: the old `rm -rf ... 2>/dev/null; true` printed nothing, exited 0
+    and left the old data (and its admin login) for the next Deploy. Runs no sudo when the folder is not
+    there. Refuses any path that is not an absolute `.../db`, because this runs `rm -rf` as root."""
+    d = (db_dir or '').strip()
+    if not d.startswith('/') or d.rstrip('/').rsplit('/', 1)[-1] != 'db' or d.rstrip('/') == '/db':
+        raise ValueError(f'refusing to remove {d!r}: not an absolute WebODM db folder')
+    q = shlex.quote(d.rstrip('/'))
+    return f'[ ! -e {q} ] || ' + _as_root_sh(f'rm -rf {q}')
+
+
 @app.route('/api/webodm/uninstall', methods=['POST'])
 @login_required
 def webodm_uninstall():
@@ -67365,7 +67610,26 @@ def webodm_uninstall():
         _module_run(deploy_cfg,
             f'docker compose -f {compose_path_remote} down --volumes 2>/dev/null; true',
             timeout=90)
-        _module_run(deploy_cfg, f'rm -rf {wo_dir_remote}/db 2>/dev/null; true', timeout=15)
+        # ops #1445: the db folder is owned by the container's database user, so remove it as root and
+        # report a failure. Under sudo a bare `~` is root's home, so resolve it to the SSH user's home first.
+        if wo_dir_remote == '~' or wo_dir_remote.startswith('~/'):
+            _ok_home, _home = _module_run(deploy_cfg, 'echo $HOME', timeout=10)
+            _home = (_home or '').strip()
+            if not _ok_home or not _home.startswith('/'):
+                return jsonify({'error': 'Could not read the home folder on the remote host, so the WebODM '
+                                         'database was not removed. WebODM is still marked as installed: '
+                                         'check the SSH connection and press Uninstall again.'}), 500
+            wo_dir_remote = _home + wo_dir_remote[1:]
+        try:
+            _clear_cmd = _webodm_db_clear_sh(f'{wo_dir_remote}/db')
+        except ValueError as _e:
+            return jsonify({'error': str(_e)}), 500
+        _ok_clear, _out_clear = _module_run(deploy_cfg, _clear_cmd, timeout=60)
+        if not _ok_clear:
+            return jsonify({'error': f'Could not remove the WebODM database folder {wo_dir_remote}/db on the '
+                                     f'remote host: {(_out_clear or "").strip()[-300:]}. WebODM is still marked as '
+                                     'installed. The SSH user needs passwordless sudo (or be root); fix that '
+                                     'and press Uninstall again.'}), 500
     else:
         import shutil as _sh
         wo_dir = _webodm_dir()   # ~/webodm OR (flipped box) /root/webodm
@@ -104735,7 +104999,10 @@ def takserver_update():
     # exists only to keep the PG-15 wedge away from the plain path. Take the ordinary
     # upgrade below for it.
     _gate_base = _tak_target_version_gate
-    if _is58 and _tak_already_on_58():
+    # ops #1367: a container box whose bundle is 5.8 and whose volume is PostgreSQL 18 has nothing
+    # to migrate EVEN WHEN its database container is down (an older failed update left it so);
+    # "already on 5.8" above asks the running database and misses that box.
+    if _is58 and (_tak_already_on_58() or (_tak_is_container() and _tak_container_on_58_data())):
         _is58 = False
         _gate_base = lambda *_a: None
     # ops #1336: a split box whose database (Server One) is already on PostgreSQL 18 has no
@@ -108245,13 +108512,19 @@ def _tak_db_volume_layout(volume=None):
         script = ('r=none; [ -s /from/PG_VERSION ] && r=$(cat /from/PG_VERSION); l=none; '
                   'for f in /from/*/data/PG_VERSION; do [ -s "$f" ] && l=$(cat "$f"); done; '
                   'echo "ROOT=$r LEGACY=$l"')
-        r = subprocess.run(_sudo_wrap([
-            'docker', 'run', '--rm', '--user', '0', '-v', f'{vol}:/from',
-            '--entrypoint', 'sh', TAK_CONTAINER, '-c', script],),
-            capture_output=True, text=True, timeout=180)
+        # The app image first, then the database image: a box an older update left with no
+        # containers can have lost one of the two image tags (ops #1367). Either one has `sh`.
+        m = None
+        for image in (TAK_CONTAINER, TAK_DB_IMAGE):
+            r = subprocess.run(_sudo_wrap([
+                'docker', 'run', '--rm', '--user', '0', '-v', f'{vol}:/from',
+                '--entrypoint', 'sh', image, '-c', script],),
+                capture_output=True, text=True, timeout=180)
+            m = re.search(r'ROOT=(\S+)\s+LEGACY=(\S+)', r.stdout or '') if r.returncode == 0 else None
+            if m:
+                break
     except Exception:
         return None
-    m = re.search(r'ROOT=(\S+)\s+LEGACY=(\S+)', r.stdout or '') if r.returncode == 0 else None
     if not m:
         return None
 
@@ -108289,16 +108562,125 @@ def _tak_volume_check(hardened, image_major, vol):
     return True, ''
 
 
-def _tak_container_update_preflight(zip_path, old_ctx, ulog, check_volume=True):
+def _tak_container_missing(name):
+    """True when Docker has NO container of that name (any state), False when it has one, None
+    when Docker could not be asked. `docker container inspect`, not `docker inspect`: the plain
+    form also answers for an IMAGE of that name, and the `takserver` image is still there."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'container', 'inspect', '-f', '{{.Id}}', name]),
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            return False
+        ps = subprocess.run(_sudo_wrap(['docker', 'ps', '-q']),
+                            capture_output=True, text=True, timeout=30)
+        return True if ps.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _tak_docker_time(text):
+    """Seconds since the epoch for a Docker CreatedAt ('2026-11-27T16:21:09Z', or with a fraction
+    or an offset like '+02:00'), or None when it cannot be read. Pure."""
+    m = re.match(r'\s*(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:\.\d+)?\s*(Z|[+-]\d\d:?\d\d)?\s*$',
+                 text or '')
+    if not m:
+        return None
+    import calendar
+    secs = calendar.timegm(tuple(int(x) for x in m.groups()[:6]) + (0, 0, 0))
+    off = m.group(7)
+    if off and off != 'Z':
+        secs -= (-1 if off[0] == '-' else 1) * (int(off[1:3]) * 3600 + int(off[-2:]) * 60)
+    return secs
+
+
+def _tak_volume_predates_folder(folder):
+    """True when the database volume is OLDER than the bundle folder, False when it is newer, None
+    when that cannot be read (ops #1367). The failed update that made the folder only removed
+    containers, so the volume is older than the folder and still holds the box's data. The 5.8
+    migration removes the volume, unpacks the folder and then makes the volume again: there the
+    volume is NEWER, and may hold a new, empty database (the hardened database image builds TAK's
+    schema on its first start, so the schema cannot tell the two apart; box test, ops #1367)."""
+    try:
+        r = subprocess.run(_sudo_wrap(['docker', 'volume', 'inspect', '-f', '{{.CreatedAt}}',
+                                       TAK_DB_VOLUME]), capture_output=True, text=True, timeout=30)
+        made = _tak_docker_time(r.stdout) if r.returncode == 0 else None
+        if made is None:
+            return None
+        return made <= os.path.getmtime(folder)
+    except Exception:
+        return None
+
+
+def _tak_container_on_58_data():
+    """True when this container box already holds TAK Server 5.8 DATA that needs no migration:
+    the bundle folder /opt/tak points into is 5.8 AND the database volume holds a PostgreSQL 18
+    cluster at its root. Read-only. Needs no running database container.
+
+    ops #1367: a box an older console left half-finished (containers and the old folder gone)
+    fails the "already on 5.8" test of `_tak_already_on_58`, which asks the RUNNING database, and
+    was sent to the 5.7 -> 5.8 migration, which stops with "nothing to migrate from". A volume
+    that is PostgreSQL 18 has nothing to migrate whatever the containers are doing. A 5.7 box
+    (5.7 folder, PostgreSQL 15 volume), a box with no volume and a volume with no cluster in it
+    all stay False."""
+    try:
+        if not _tak_is_container():
+            return False
+        key = _tak_release_key(os.path.basename(os.path.dirname(os.path.realpath('/opt/tak'))))
+        if not key or key[:2] < TAK_GATE_BLOCK_FROM:
+            return False
+        vol = _tak_db_volume_layout()
+        return bool(vol and vol.get('exists') and vol.get('root') == TAK_PG_MAJOR)
+    except Exception:
+        return False
+
+
+def _tak_container_update_preflight(zip_path, old_ctx, ulog, check_volume=True, allow_resume=False):
     """Everything the container update can know BEFORE it touches anything. Returns
-    (info, error): `error` is a plain-words refusal (nothing was changed) or ''."""
+    (info, error): `error` is a plain-words refusal (nothing was changed) or ''.
+
+    allow_resume (ops #1367): the zip is the folder /opt/tak already points to, and Docker has no
+    `takserver` container. That is a box an older update stopped half way (it removed the containers
+    first and failed at the image build). `info['resume']` is then True and the folder is rebuilt in
+    place. With the container present the same zip stays refused as "already installed"."""
     try:
         info = _tak_zip_bundle_info(zip_path)
     except ValueError as e:
         return None, str(e)
+    info['resume'] = False
     if info['top'] == os.path.basename(old_ctx):
-        return None, ('This zip is the version that is already installed (%s). Nothing was '
-                      'changed. Upload a different takserver-docker zip.' % info['top'])
+        gone = _tak_container_missing(TAK_CONTAINER) if allow_resume else False
+        if not gone:
+            return None, ('This zip is the version that is already installed (%s). Nothing was '
+                          'changed. Upload a different takserver-docker zip.%s'
+                          % (info['top'], '' if gone is not None else
+                             ' (Docker could not say whether the TAK Server container exists, '
+                             'so a rebuild in place was not tried.)'))
+        old_tak = os.path.join(old_ctx, 'tak')
+        missing = [n for n, p in (
+            ('the Docker files', None if _tak_is_bundle_dir(old_ctx) else 'x'),
+            ('certs/files/takserver.jks',
+             None if os.path.exists(os.path.join(old_tak, 'certs', 'files', 'takserver.jks')) else 'x'),
+            ('CoreConfig.xml', None if os.path.exists(os.path.join(old_tak, 'CoreConfig.xml')) else 'x'),
+        ) if p]
+        if missing:
+            return None, ('TAK Server is not running and its folder %s is not complete (missing: %s), '
+                          'so it cannot be rebuilt in place. Nothing was changed. Restore the folder '
+                          'from a backup or redeploy TAK Server.' % (info['top'], ', '.join(missing)))
+        older = _tak_volume_predates_folder(old_ctx)
+        if older is not True:
+            return None, ('TAK Server is not running and this zip is the folder already in use, but the '
+                          'update could not confirm that your database is the one this folder was made '
+                          'for (%s). Starting TAK Server on a new, EMPTY database would look like lost '
+                          'data, so nothing was changed. A copy of the earlier PostgreSQL 15 database (a '
+                          'volume named %s_pre58_...) and the export under ~/tak-docker/snapshots may '
+                          'still exist. Do not delete them.'
+                          % ('the database volume is newer than the folder, which happens when the 5.8 '
+                             'migration recreated it' if older is False else
+                             'the age of the database volume could not be read', TAK_DB_VOLUME))
+        info['resume'] = True
+        ulog('  TAK Server has no container and this zip is the folder already in use (an earlier '
+             'update stopped half way). The database volume is older than the folder, so it is the '
+             'one this box has always used. It will be rebuilt in place from that folder.')
     cur = _tak_release_key(os.path.basename(old_ctx))
     new = _tak_release_key(os.path.basename(zip_path)) or _tak_release_key(info['top'])
     if cur and new and new < cur:
@@ -108486,9 +108868,14 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True, migration=Fals
 
         # 1) Read-only checks. Nothing is changed until these pass.
         ulog("Step 1/7: Checking the zip against this server (nothing is changed yet)...")
-        info, err = _tak_container_update_preflight(zip_path, old_ctx, ulog, check_volume=not migration)
+        info, err = _tak_container_update_preflight(zip_path, old_ctx, ulog, check_volume=not migration,
+                                                    allow_resume=not migration)
         if err:
             return _fail(err)
+        resume = bool(info.get('resume'))     # ops #1367: rebuild the folder /opt/tak already points to
+        if resume:
+            kept_msg = ('TAK Server was already stopped by the earlier update, and this try '
+                        'changed nothing.')
 
         # 2) Backup outside the bundle (the 5.8 migration made its own export).
         backup_dir = ''
@@ -108501,46 +108888,57 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True, migration=Fals
 
         # 3) Extract the new bundle ALONGSIDE the old (no wipe — keeps the old certs reachable for
         #    an in-place broker copy; both dirs are inside the allowlisted ~/tak-docker root).
-        ulog("Step 3/7: Unpacking new bundle...")
         new_ctx = os.path.join(TAK_DOCKER_ROOT, info['top'])
         new_tak = os.path.join(new_ctx, 'tak')
 
         def _drop_new(why):
-            """Failure BEFORE the swap: remove the half-prepared new folder, old TAK is untouched."""
+            """Failure BEFORE the swap: remove the half-prepared new folder, old TAK is untouched.
+            A rebuild in place (resume) has no other folder: it is never removed."""
+            if resume:
+                return _fail(f"{why} {kept_msg} The bundle folder was not changed.")
             if os.path.realpath('/opt/tak') != os.path.realpath(new_tak):
                 subprocess.run(_sudo_wrap(['rm', '-rf', new_ctx]), capture_output=True, timeout=120)
             return _fail(f"{why} {kept_msg} The old bundle folder was not changed.")
-        try:
-            import zipfile
-            with zipfile.ZipFile(zip_path) as zf:
-                _safe_extract_zip(zf, TAK_DOCKER_ROOT, apply_modes=True)
-        except Exception as e:
-            return _drop_new(f"Failed to extract the new bundle: {str(e)[:160]}.")
-        _tak_bundle_repair_exec_bits(TAK_DOCKER_ROOT, ulog)
-        if not _tak_is_bundle_dir(new_ctx):
-            return _drop_new("No takserver-docker bundle found after unpacking (not an official zip).")
-        ulog(f"✓ New bundle: {info['top']}")
+        if resume:
+            ulog("Step 3/7: The bundle folder is already unpacked (an earlier update stopped half way). "
+                 "Using it as it is: no unpack, no copying, nothing deleted.")
+            _tak_bundle_repair_exec_bits(TAK_DOCKER_ROOT, ulog)
+            ulog(f"✓ Bundle: {info['top']}")
+            ulog("Step 4/7: Certs, CoreConfig and plugins are already in this folder. Nothing to carry over.")
+        else:
+            ulog("Step 3/7: Unpacking new bundle...")
+            try:
+                import zipfile
+                with zipfile.ZipFile(zip_path) as zf:
+                    _safe_extract_zip(zf, TAK_DOCKER_ROOT, apply_modes=True)
+            except Exception as e:
+                return _drop_new(f"Failed to extract the new bundle: {str(e)[:160]}.")
+            _tak_bundle_repair_exec_bits(TAK_DOCKER_ROOT, ulog)
+            if not _tak_is_bundle_dir(new_ctx):
+                return _drop_new("No takserver-docker bundle found after unpacking (not an official zip).")
+            ulog(f"✓ New bundle: {info['top']}")
 
-        # 4) Carry the PRESERVED certs / CoreConfig / UserAuthenticationFile over old -> new (in
-        #    place, broker). Copies only: the old folder is not changed or deleted here.
-        ulog("Step 4/7: Carrying over certs, CoreConfig, settings and plugins (preserved)...")
-        subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=30)
-        subprocess.run(_sudo_wrap(['mkdir', '-p', os.path.join(new_tak, 'certs')]), capture_output=True, timeout=10)
-        subprocess.run(_sudo_wrap(['cp', '-rp', os.path.join(old_tak, 'certs', 'files'), os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=120)
-        for f in ('CoreConfig.xml', 'UserAuthenticationFile.xml'):
-            subprocess.run(_sudo_wrap(['cp', '-p', os.path.join(old_tak, f), os.path.join(new_tak, f)]), capture_output=True, timeout=30)
-        _carry_cert_metadata(old_tak, new_tak, ulog)
-        if not os.path.exists(os.path.join(new_tak, 'certs', 'files', 'takserver.jks')):
-            return _drop_new("Certs did not carry over (takserver.jks missing in new bundle).")
-        _tak_setenv_carry(old_tak, new_tak, backup_dir, ulog)
-        _tak_carry_missing(os.path.join(old_tak, 'lib'), os.path.join(new_tak, 'lib'), ulog, 'plugin jars')
-        _tak_carry_missing(os.path.join(old_tak, 'conf', 'plugins'),
-                           os.path.join(new_tak, 'conf', 'plugins'), ulog, 'plugin settings')
-        ulog("✓ certs + CoreConfig carried over (old folder untouched)")
+            # 4) Carry the PRESERVED certs / CoreConfig / UserAuthenticationFile over old -> new (in
+            #    place, broker). Copies only: the old folder is not changed or deleted here.
+            ulog("Step 4/7: Carrying over certs, CoreConfig, settings and plugins (preserved)...")
+            subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=30)
+            subprocess.run(_sudo_wrap(['mkdir', '-p', os.path.join(new_tak, 'certs')]), capture_output=True, timeout=10)
+            subprocess.run(_sudo_wrap(['cp', '-rp', os.path.join(old_tak, 'certs', 'files'), os.path.join(new_tak, 'certs', 'files')]), capture_output=True, timeout=120)
+            for f in ('CoreConfig.xml', 'UserAuthenticationFile.xml'):
+                subprocess.run(_sudo_wrap(['cp', '-p', os.path.join(old_tak, f), os.path.join(new_tak, f)]), capture_output=True, timeout=30)
+            _carry_cert_metadata(old_tak, new_tak, ulog)
+            if not os.path.exists(os.path.join(new_tak, 'certs', 'files', 'takserver.jks')):
+                return _drop_new("Certs did not carry over (takserver.jks missing in new bundle).")
+            _tak_setenv_carry(old_tak, new_tak, backup_dir, ulog)
+            _tak_carry_missing(os.path.join(old_tak, 'lib'), os.path.join(new_tak, 'lib'), ulog, 'plugin jars')
+            _tak_carry_missing(os.path.join(old_tak, 'conf', 'plugins'),
+                               os.path.join(new_tak, 'conf', 'plugins'), ulog, 'plugin settings')
+            ulog("✓ certs + CoreConfig carried over (old folder untouched)")
 
         # 5) Build the new-version images under TEMPORARY tags. TAK keeps running. Tags `takserver`
         #    and `takserver_db` still name the OLD images; they move only after both builds work.
-        ulog("Step 5/7: Building new TAK Server images (minutes on arm64; TAK Server keeps running)...")
+        ulog("Step 5/7: Building new TAK Server images (minutes on arm64; %s)..."
+             % ("TAK Server is already stopped" if resume else "TAK Server keeps running"))
         _app_df, _db_df = _tak_bundle_dockerfiles(new_ctx)
         if not _app_df:
             return _drop_new('No TAK Dockerfiles under %s/docker - is this an official takserver-docker zip?' % new_ctx)
@@ -108570,14 +108968,44 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True, migration=Fals
 
         # 6) Stop and swap. Downtime starts here.
         ulog("Step 6/7: Stopping the old containers and starting the new ones (DB volume reused)...")
-        def _start_stack(ctx, tak_dir):
+        def _db_holds_tak_data():
+            """Resume only (ops #1367): before TAK starts, the database must answer and carry TAK's
+            schema. This does NOT prove the data is there: the hardened database image builds the
+            schema on its first start, so a brand-new empty volume passes (box test). It catches a
+            database that cannot be read or has no schema (a cluster in the wrong place). That the
+            volume is the box's own is checked earlier, in `_tak_volume_predates_folder`."""
+            pw = _tak58_db_password()
+            pgmajor = info.get('pg_major') or TAK_PG_MAJOR        # the zip's database, 15 on a 5.7 bundle
+            # 5.8 schemas are numbered from V100 up; an older bundle only has to have SOME schema.
+            need = _TAK58_MIN_SCHEMA_VERSION if pgmajor >= TAK_PG_MAJOR else 1
+            sv = None
+            for _try in range(18):
+                pgbin = _tak58_container_pgbin(TAK_DB_CONTAINER, pgmajor) if pw else None
+                if pgbin:
+                    sv = _tak58_container_schema_version(TAK_DB_CONTAINER, pgbin, pw)
+                    if sv is not None:
+                        break
+                time.sleep(5)
+            if sv is not None and sv >= need:
+                ulog("  ✓ The database answers and has TAK Server's schema (version %d)." % sv)
+                return True
+            ulog("✗ The database could not be read, or it has no TAK Server schema (schema version %s). "
+                 "TAK Server was NOT started, because it would build a new, EMPTY database and look "
+                 "wiped. Nothing was deleted: the database volume %s is untouched."
+                 % ('unknown' if sv is None else sv, TAK_DB_VOLUME))
+            return False
+
+        def _start_stack(ctx, tak_dir, before_tak=None):
             """Create + start both containers on the SAME volume + network. True when every
-            docker command worked. NO `docker volume rm`."""
+            docker command worked. NO `docker volume rm`. `before_tak` runs once the database
+            container is up and TAK is not started yet; False from it stops the start."""
             ok = rc(f'docker network inspect {TAK_DOCKER_NET} >/dev/null 2>&1 || docker network create {TAK_DOCKER_NET}', timeout=30)
             ok &= rc(f'docker run {_tak_db_volume_mount(ctx)} '
                      f'-v {shlex.quote(tak_dir)}:/opt/tak:z --restart=always --network {TAK_DOCKER_NET} '
                      f'--network-alias tak-database --name {TAK_DB_CONTAINER} -d {TAK_DB_IMAGE}', timeout=120)
             time.sleep(8)
+            if before_tak is not None and not before_tak():
+                return False
             # CREATE (not run -d) so the Authentik LDAP network is attached BEFORE the JVM starts.
             # If TAK boots without the LDAP net reachable, it loads its group cache EMPTY -> every user
             # resolves to "not a member of any group" -> "no channels", needing a manual restart+resync.
@@ -108592,17 +109020,27 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True, migration=Fals
             ok &= rc(f'docker start {TAK_CONTAINER}', timeout=90)
             return ok
         subprocess.run(_sudo_wrap(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER]), capture_output=True, timeout=90)
-        subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
-        rc(f'ln -sfn {shlex.quote(new_tak)} /opt/tak', timeout=15)
+        if not resume:                  # a rebuild in place already has /opt/tak on this folder
+            subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
+            rc(f'ln -sfn {shlex.quote(new_tak)} /opt/tak', timeout=15)
         dk(['docker', 'tag', db_new, TAK_DB_IMAGE]); dk(['docker', 'tag', app_new, TAK_CONTAINER])
         # The hardened 5.8 images run as tak:0 / postgres:0, not root, and the tree they
         # mount was written by the console user (and the certs carried over from the old
         # bundle keep their old ownership). Same fix as the deploy path, same reason —
         # a no-op on the pre-hardened images, which run as root inside the container.
         _container_own_tree(new_tak, ulog)
-        if not _start_stack(new_ctx, new_tak):
+        if not _start_stack(new_ctx, new_tak, before_tak=_db_holds_tak_data if resume else None):
             if migration:
                 return _fail("The new containers did not start. The database was not touched; see the output above.")
+            if resume:
+                # No old version to put back: TAK was already stopped. Remove what this try made
+                # (containers only) so pressing Update again with the same zip can rebuild.
+                dk(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER], 90)
+                _drop_tags(db_new, app_new, db_old, app_old)
+                return _fail("TAK Server did not start. It stays stopped. The bundle folder %s and the "
+                             "database volume %s are untouched. Read the lines above, fix the cause and "
+                             "press Update again with the same zip. Backup: %s."
+                             % (old_ctx, TAK_DB_VOLUME, backup_dir or 'none'))
             ulog("✗ The new containers did not start. Putting the old version back...")
             dk(['docker', 'rm', '-f', TAK_CONTAINER, TAK_DB_CONTAINER], 90)
             subprocess.run(_sudo_wrap(['rm', '-f', '/opt/tak']), capture_output=True, timeout=10)
@@ -108663,6 +109101,8 @@ def run_takserver_upgrade_container(zip_path, mark_complete=True, migration=Fals
                 ulog(f"⚠ Some files could not be moved, so the old folder was KEPT at {old_ctx}.")
         else:
             _drop_tags(db_new, app_new)
+            if resume and _up:          # nothing to roll back to: the earlier images were never a version in use
+                _drop_tags(db_old, app_old)
         # Re-sync the TAK Portal to the recreated TAK JVM — the rotation does this (Step 7) and
         # it's exactly what 'patches the Portal back to working' on native. The upgrade recreated
         # the containers, so the Portal must refresh its client cert + CA and reconnect, or
@@ -128123,12 +128563,37 @@ def _mediamtx_editor_reclaim(plog=None):
     return stopped
 
 
+def _mediamtx_editor_relabel_pylib():
+    """ops #1400: give the editor's package folder the SELinux label the policy says it
+    has. `pip --target` builds each wheel in /tmp and moves it, so the compiled files
+    (markupsafe's `_speedups*.so`) keep the `tmp_t` label; the console's check then
+    `execute`s them as `tmp_t` and the kernel logs a denial on every run (a refusal once the
+    console's domain enforces). `restorecon` sets the policy default (`usr_t`). RHEL with
+    SELinux on only; best effort, never raises. True when restorecon ran clean."""
+    if _distro_family() != 'rhel' or not os.path.isdir(_MEDIAMTX_EDITOR_PYLIB):
+        return False
+    try:
+        if (subprocess.run(['getenforce'], capture_output=True, text=True,
+                           timeout=10).stdout or '').strip() in ('', 'Disabled'):
+            return False
+        r = subprocess.run(_sudo_wrap(['restorecon', '-R', _MEDIAMTX_EDITOR_PYLIB]),
+                           capture_output=True, timeout=120)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def _mediamtx_editor_pylib_ok():
     """True when the editor's packages import from _MEDIAMTX_EDITOR_PYLIB with nothing else:
     no user site, no HOME, the console's own environment left out. The dir is the console's
-    and world-readable, so the console's answer is the editor's answer."""
+    and world-readable, so the console's answer is the editor's answer.
+
+    ops #1400: the files get their policy label first (see _mediamtx_editor_relabel_pylib), so
+    the check never loads a `tmp_t` file, on a fresh install or on a box that kept the label
+    from an older install."""
     if not os.path.isdir(_MEDIAMTX_EDITOR_PYLIB):
         return False
+    _mediamtx_editor_relabel_pylib()
     try:
         r = subprocess.run(['/usr/bin/python3', '-s', '-c', _MEDIAMTX_EDITOR_PY_IMPORTS],
                            capture_output=True, text=True, timeout=30,
@@ -128388,6 +128853,31 @@ def _mediamtx_editor_unit_with_prestart(txt):
             done = True
         out.append(ln)
     return '\n'.join(out) if done else txt
+
+
+def _mediamtx_editor_unit_for_patch(txt, tp_line):
+    """The editor unit text after the two edits "Patch web editor" makes, done in Python
+    (ops #1400). They were `sed -i` calls: `sed -i` writes a temp file and asks SELinux for a
+    file-create label (`setfscreate`), which the console's domain does not hold, so every Patch
+    on Rocky logged two denials. Same result as the sed lines, line for line:
+      - `ExecStartPre=/usr/bin/python3 ...` becomes `ExecStartPre=-/usr/bin/python3 ...`
+        (a failing pre-step must not stop the editor);
+      - every `Environment=INFRATAK_TRUSTED_PROXIES=...` line becomes `tp_line`; with none, one
+        is added after the `[Service]` line (nothing is added when there is no such line).
+    Idempotent: a unit that is already right comes back unchanged."""
+    key = f'Environment={_MEDIAMTX_TRUSTED_PROXIES_KEY}='
+    out, seen = [], False
+    for ln in (txt or '').split('\n'):
+        if ln.startswith('ExecStartPre=/usr/bin/python3'):
+            ln = 'ExecStartPre=-' + ln[len('ExecStartPre='):]
+        if ln.startswith(key):
+            ln, seen = tp_line, True
+        out.append(ln)
+    if not seen:
+        i = next((n for n, ln in enumerate(out) if ln.startswith('[Service]')), None)
+        if i is not None:
+            out.insert(i + 1, tp_line)
+    return '\n'.join(out)
 
 
 def _startup_heal_mediamtx_editor_prestart():
