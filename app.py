@@ -64601,6 +64601,184 @@ def _cloudtak_api_stability_watch(cloudtak_dir, plog, remote_cfg=None, seconds=1
         return False, f'the stability check failed: {str(e)[:160]}'
 
 
+# ── ops #1325: never put the OLD CloudTAK back onto a database the NEW one already changed ──
+# CloudTAK 14.1.0's migration 0232 drops the old chat tables the moment the new api boots. A
+# failed update used to roll the code back anyway and say "nothing was lost": the old api then
+# ran on a changed database. Before `up -d` we copy the database (pg_dump) and note a
+# fingerprint of its schema; when the update fails afterwards we read the fingerprint again.
+# Same = the new api never changed anything, roll back as before. Different = do NOT roll back.
+_CT_DB_CONTAINER = 'cloudtak-postgis-1'
+_CT_UPDATE_DUMP_KEEP = 2
+_CT_UPDATE_DUMP_REMOTE_DIR = '~/CloudTAK-update-dumps'
+# BASE TABLES only: an extension upgrade (PostGIS) changes its views, never the tables CloudTAK owns.
+_CT_DB_SCHEMA_SQL = ("SELECT md5(coalesce(string_agg(c.table_schema||'.'||c.table_name||'.'||c.column_name"
+                     "||':'||c.data_type, ',' ORDER BY c.table_schema, c.table_name, c.column_name), '')) "
+                     "FROM information_schema.columns c JOIN information_schema.tables t "
+                     "ON t.table_schema = c.table_schema AND t.table_name = c.table_name "
+                     "WHERE t.table_type = 'BASE TABLE' AND c.table_schema NOT IN ('pg_catalog','information_schema')")
+_CT_DB_MIGRATIONS_SQL = 'SELECT count(*) FROM drizzle.__drizzle_migrations'
+_CT_DB_SIZE_SQL = "SELECT pg_database_size('gis')"
+_CT_UPDATE_DUMP_MIN_SPARE = 512 * 1024 ** 2
+
+
+def _cloudtak_psql(sql, remote_cfg=None):
+    """(rc, stdout stripped, error text) for one psql -tAc in the CloudTAK database container."""
+    rc, out, err = _cloudtak_docker(['docker', 'exec', _CT_DB_CONTAINER, 'psql', '-U', 'docker', '-d', 'gis',
+                                     '-tAc', sql], remote_cfg=remote_cfg, timeout=60)
+    return rc, (out or '').strip(), (err or '')
+
+
+def _cloudtak_db_fingerprint(remote_cfg=None):
+    """A short string that changes when the CloudTAK database schema or its migration count
+    changes. '' = could not be read. Never raises."""
+    try:
+        rc, schema, _e = _cloudtak_psql(_CT_DB_SCHEMA_SQL, remote_cfg)
+        if rc != 0 or not re.fullmatch(r'[0-9a-f]{32}', schema):
+            return ''
+        rc, mig, err = _cloudtak_psql(_CT_DB_MIGRATIONS_SQL, remote_cfg)
+        if rc == 0 and re.fullmatch(r'\d+', mig):
+            return f'{schema}:{mig}'
+        if 'does not exist' in err or 'does not exist' in mig:
+            return f'{schema}:-'      # no migrations table (yet): the schema alone decides
+        return ''
+    except Exception:
+        return ''
+
+
+def _cloudtak_update_dumps_prune_local(plog=None):
+    """Keep the newest _CT_UPDATE_DUMP_KEEP local update dumps. Never raises."""
+    try:
+        s = load_settings()
+        lst = sorted(s.get('cloudtak_update_dumps') or [], key=lambda b: b.get('created') or '', reverse=True)
+        gone = set()
+        for b in lst[_CT_UPDATE_DUMP_KEEP:]:
+            label = b.get('label') or ''
+            if not _STACK_BACKUP_LABEL_RE.match(label) or '..' in label or not label.startswith('cloudtak-update-'):
+                continue
+            r = subprocess.run(_sudo_wrap(['rm', '-rf', os.path.join(STACK_BACKUP_DIR, label)]),
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode == 0:
+                gone.add(label)
+        if gone:
+            s = load_settings()
+            s['cloudtak_update_dumps'] = [b for b in (s.get('cloudtak_update_dumps') or []) if b.get('label') not in gone]
+            save_settings(s)
+    except Exception as e:
+        if plog:
+            plog(f"  ⚠ Could not remove an older database copy ({str(e)[:120]})")
+
+
+def _cloudtak_update_db_dump(plog, remote_cfg=None):
+    """Copy the CloudTAK database (pg_dump -Fc) just before the update restarts it.
+    Returns (path, problem, skip). path '' + skip False = a REAL failure (disk full, pg_dump
+    error): the caller stops the update, nothing has changed yet. skip True = the copy cannot
+    be made on this box (database container missing, or an older broker that has no such op):
+    the caller goes on, with the old rollback rules. Never raises."""
+    stamp = datetime.utcnow().strftime('%Y%m%d-%H%M%S')
+    try:
+        rc, size_s, _e = _cloudtak_psql(_CT_DB_SIZE_SQL, remote_cfg)
+        if rc != 0 or not size_s.isdigit():
+            return '', f"CloudTAK's database ({_CT_DB_CONTAINER}) could not be read", True
+        need = int(size_s) + _CT_UPDATE_DUMP_MIN_SPARE
+        free = None
+        if remote_cfg is not None:
+            fok, fout = _ssh_probe(remote_cfg, "df -Pk \"$HOME\" | awk 'NR==2{print $4}'", timeout=30)
+            if fok and re.fullmatch(r'\d+', (fout or '').strip()):
+                free = int((fout or '').strip()) * 1024
+        else:
+            free = _stack_backup_free_bytes()
+        if free is not None and free < need:
+            return '', (f"there is not enough free disk space to copy CloudTAK's database first "
+                        f"({free // 1024 ** 2} MB free, {need // 1024 ** 2} MB needed)"), False
+        if remote_cfg is not None:
+            d = _CT_UPDATE_DUMP_REMOTE_DIR
+            f = f'{d}/cloudtak-{stamp}.pgdump'
+            cmd = (f'mkdir -p {d} && chmod 700 {d} && (umask 077; docker exec {_CT_DB_CONTAINER} '
+                   f'pg_dump -U docker -Fc gis > {f}) && test -s {f} || {{ rm -f {f}; exit 1; }}; '
+                   f'for x in $(ls -1t {d}/cloudtak-*.pgdump | tail -n +{_CT_UPDATE_DUMP_KEEP + 1}); '
+                   f'do rm -f "$x"; done; test -s {f}')
+            ok, out = _ssh_probe(remote_cfg, cmd, timeout=3600)
+            if not ok:
+                return '', f"copying CloudTAK's database on the remote host failed: {(out or '')[-160:].strip()}", False
+            return f, '', False
+        label = f'cloudtak-update-{stamp}'
+        path = f'{STACK_BACKUP_DIR}/{label}/cloudtak.pgdump'
+        try:
+            _stack_pg_dump_priv(_CT_DB_CONTAINER, path, timeout=3600)
+        except Exception as e:
+            msg = str(e)
+            if 'unknown op' in msg:
+                return '', 'this console\'s root helper is older than the database copy step', True
+            return '', f"copying CloudTAK's database failed: {msg[:200]}", False
+        s = load_settings()
+        s['cloudtak_update_dumps'] = (s.get('cloudtak_update_dumps') or []) + [
+            {'label': label, 'created': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')}]
+        save_settings(s)
+        _cloudtak_update_dumps_prune_local(plog)
+        return path, '', False
+    except Exception as e:
+        return '', f"copying CloudTAK's database failed: {str(e)[:200]}", False
+
+
+def _cloudtak_update_db_guard(plog, remote_cfg=None):
+    """Run once, after a good build and before anything is restarted. Returns a dict:
+    ok False = stop the update ('problem' says why; nothing has changed yet); 'path' = the
+    database copy (''= none); 'fp' = the schema fingerprint ('' = unreadable). Never raises."""
+    g = {'ok': True, 'path': '', 'fp': '', 'problem': '', 'remote': remote_cfg is not None}
+    try:
+        g['fp'] = _cloudtak_db_fingerprint(remote_cfg)
+        path, problem, skip = _cloudtak_update_db_dump(plog, remote_cfg)
+        if path:
+            g['path'] = path
+            plog(f"  ✓ Copied CloudTAK's database to {path} before restarting"
+                 f"{' (on the CloudTAK host)' if remote_cfg is not None else ''}. The {_CT_UPDATE_DUMP_KEEP} newest copies are kept.")
+        elif problem and not skip:
+            g['ok'] = False
+            g['problem'] = problem
+        elif problem:
+            plog(f"  ⚠ No database copy was made: {problem}. The update goes on.")
+        if g['ok'] and not g['fp']:
+            plog("  ⚠ Could not read CloudTAK's database before restarting, so a failed update is checked the old way.")
+    except Exception as e:
+        plog(f"  ⚠ Database copy step errored (the update goes on): {str(e)[:160]}")
+    return g
+
+
+def _cloudtak_update_db_moved(guard, plog, remote_cfg=None, sleep=None):
+    """After a failed update: did the new CloudTAK change the database since the guard read it?
+    True = yes (do NOT roll back). False = no, or it cannot be told (the old rollback rules
+    apply). Never raises."""
+    try:
+        sleep = sleep or time.sleep
+        before = (guard or {}).get('fp') or ''
+        if not before:
+            return False
+        now = ''
+        for _i in range(4):
+            now = _cloudtak_db_fingerprint(remote_cfg)
+            if now:
+                break
+            sleep(5)
+        if not now:
+            plog("  ⚠ Could not check whether the new CloudTAK changed its database. Rolling back the old way.")
+            return False
+        return now != before
+    except Exception:
+        return False
+
+
+def _cloudtak_update_db_moved_lines(guard):
+    """The plain-words lines for an update that is NOT undone because the database moved on."""
+    path = (guard or {}).get('path') or ''
+    lines = ["  Not rolling back: the new CloudTAK already upgraded its database, and the previous version cannot use it."]
+    if path:
+        where = ' on the CloudTAK host' if (guard or {}).get('remote') else ''
+        lines.append(f"  A copy of the database from just before this update is at {path}{where}.")
+    lines.append("  Fix the cause above, then press Update again."
+                 + (" Restore the copy only if you want the old data back: it removes anything saved since." if path else ''))
+    return lines
+
+
 def _cloudtak_update_failed_note(plog, hints=None):
     plog("  CloudTAK is still running on the previous build — nothing was removed.")
     if any(str(h).strip().startswith(_CT_REPEATABLE_CAUSES) for h in (hints or ())):
@@ -65338,6 +65516,15 @@ def run_cloudtak_update():
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #1325: copy the database and note its schema BEFORE anything is stopped or restarted.
+            _db_guard = _cloudtak_update_db_guard(plog, remote_cfg=remote_cfg)
+            if not _db_guard['ok']:
+                plog(f"✗ Update stopped before restarting: {_db_guard['problem']}")
+                _cloudtak_revert_checkout(prev_sha, plog, remote_cfg=remote_cfg)
+                _cloudtak_restore_images(_ct_snap, plog, remote_cfg=remote_cfg)
+                plog("  CloudTAK is still running on the previous version — nothing was changed. Fix the cause above, then press Update again.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
             _r_store_sh = "test -d ~/CloudTAK/.docker-store && echo yes"
             _had_minio_store = _ssh_probe(remote_cfg, _r_store_sh, timeout=20)[0]
             if _cloudtak_remote_compose_is_garage(remote_cfg):
@@ -65363,6 +65550,12 @@ def run_cloudtak_update():
                     _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=remote_cfg)
                     plog("  Not rolling back: this update already moved CloudTAK's files into Garage,")
                     plog("  which the previous version cannot read. Fix the cause above and press Update again.")
+                elif _cloudtak_update_db_moved(_db_guard, plog, remote_cfg=remote_cfg):
+                    # ops #1325: the new api already upgraded the database; the old code cannot use it.
+                    _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=remote_cfg)
+                    for _l in _cloudtak_update_db_moved_lines(_db_guard):
+                        plog(_l)
+                    plog(f"✗ CloudTAK update failed at docker compose up -d: {_why}")
                 else:
                     if _cloudtak_rollback_after_failed_up(None, prev_sha, _ct_snap, plog,
                                                           expect_version=from_ver, remote_cfg=remote_cfg):
@@ -65459,6 +65652,16 @@ def run_cloudtak_update():
                 _cloudtak_update_failed_note(plog)
                 cloudtak_deploy_status.update({'running': False, 'error': True})
                 return
+            # ops #1325: copy the database and note its schema BEFORE anything is stopped or restarted.
+            _db_guard = _cloudtak_update_db_guard(plog)
+            if not _db_guard['ok']:
+                plog(f"✗ Update stopped before restarting: {_db_guard['problem']}")
+                _undo_plugin_moves()
+                _cloudtak_revert_checkout(prev_sha, plog, cloudtak_dir=cloudtak_dir)
+                _cloudtak_restore_images(_ct_snap, plog)
+                plog("  CloudTAK is still running on the previous version — nothing was changed. Fix the cause above, then press Update again.")
+                cloudtak_deploy_status.update({'running': False, 'error': True})
+                return
             # v10.2.7: CloudTAK >= 13.102.0 keeps its files in Garage. Upstream's migrate-store
             # procedure, AFTER the build succeeded and BEFORE anything is recreated: the old
             # containers kept serving through the build, and if the move fails they are started
@@ -65494,6 +65697,12 @@ def run_cloudtak_update():
                     _cloudtak_drop_rollback_pins(_ct_snap)
                     plog("  Not rolling back: this update already moved CloudTAK's files into Garage,")
                     plog("  which the previous version cannot read. Fix the cause above and press Update again.")
+                elif _cloudtak_update_db_moved(_db_guard, plog):
+                    # ops #1325: the new api already upgraded the database; the old code cannot use it.
+                    _cloudtak_drop_rollback_pins(_ct_snap)
+                    for _l in _cloudtak_update_db_moved_lines(_db_guard):
+                        plog(_l)
+                    plog(f"✗ CloudTAK update failed at docker compose up -d: {_why}")
                 else:
                     _undo_plugin_moves()
                     if _cloudtak_rollback_after_failed_up(cloudtak_dir, prev_sha, _ct_snap, plog,
@@ -65535,6 +65744,11 @@ def run_cloudtak_update():
                 _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=(remote_cfg if is_remote else None))
                 plog("  Not rolling back: this update already moved CloudTAK's files into Garage,")
                 plog("  which the previous version cannot read. Open the CloudTAK log, fix the cause, then press Update again.")
+            elif _cloudtak_update_db_moved(_db_guard, plog, remote_cfg=(remote_cfg if is_remote else None)):
+                # ops #1325: the new api already upgraded the database; the old code cannot use it.
+                _cloudtak_drop_rollback_pins(_ct_snap, remote_cfg=(remote_cfg if is_remote else None))
+                for _l in _cloudtak_update_db_moved_lines(_db_guard):
+                    plog(_l)
             else:
                 _undo_plugin_moves()
                 if _cloudtak_rollback_after_failed_up(None if is_remote else cloudtak_dir, prev_sha, _ct_snap, plog,

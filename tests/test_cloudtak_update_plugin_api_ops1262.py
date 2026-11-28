@@ -291,11 +291,11 @@ def test_the_watch_runs_after_the_heals_and_before_the_success_line():
 def test_the_rollback_pins_live_until_the_watch_has_passed():
     s = _update_src()
     w = s.index('_cloudtak_api_stability_watch(')
-    # a drop of the pins before the watch (outside the "files already moved, no rollback" case)
-    # would leave the rollback with no old images to put back
+    # a drop of the pins before the watch (outside the "files already moved" and, ops #1325,
+    # "database already upgraded" no-rollback cases) would leave the rollback with no old images
     for m in re.finditer(r'_cloudtak_drop_rollback_pins\(_ct_snap', s[:w]):
         near = s[m.start():m.start() + 250]
-        assert 'Not rolling back' in near, near
+        assert 'Not rolling back' in near or '_cloudtak_update_db_moved_lines' in near, near
     # and once the watch has passed, the pins are dropped before the success line
     ok_line = s.index('\u2713 CloudTAK updated to')
     assert s.rindex('_cloudtak_drop_rollback_pins(_ct_snap', 0, ok_line) > w
