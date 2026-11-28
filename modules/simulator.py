@@ -384,21 +384,131 @@ def _enroll(username, password, cert_path, ca_path, version, plog, settings=None
     plog(f'  ✓ enrolled {username}: subject {subj}, CA bundle {ca_pem.count("BEGIN CERTIFICATE")} cert(s)')
 
 
+def _certs_dir():
+    return os.path.join(SIM_INSTALL_DIR, 'certs')
+
+
+def _dir_is_writable(d):
+    """A REAL write probe (create + remove a file), not os.access(): the answer that matters
+    is whether the console can make `lanes.json.tmp` and the lane certs in `d`."""
+    probe = os.path.join(d, f'.write-probe-{os.getpid()}')
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError:
+        return False
+    os.close(fd)
+    try:
+        os.remove(probe)
+    except OSError:
+        pass
+    return True
+
+
+def _console_user():
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return 'takwerx'
+
+
+def _owner_fix_hint():
+    return (f'run "sudo chown -R {_console_user()}:{_console_user()} {SIM_INSTALL_DIR}" on the '
+            f'server, then try again')
+
+
 def _write_lanes_json(settings):
     """`~/tak-simulator/certs/lanes.json` = {lane_id: channel} for the engine (W9): it
     defaults `/live` and a lane-less `/run` to every enrolled lane on its recorded channel.
     Rewritten at deploy and on every lane change; 600 like the certs beside it."""
-    d = os.path.join(SIM_INSTALL_DIR, 'certs')
+    d = _certs_dir()
     if not os.path.isdir(d):
         return
     m = {str(r['id']): r['channel'] for r in (settings.get('simulator_lanes') or [])
          if r.get('id') and r.get('channel')}
     path = os.path.join(d, 'lanes.json')
     tmp = f'{path}.tmp'
-    with open(tmp, 'w') as f:
-        json.dump(m, f)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    try:
+        # A leftover tmp the console cannot open for writing (another user's file) is removed
+        # first: unlink needs write on the folder only, not on the file (GH infra-TAK #772).
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+        with open(tmp, 'w') as f:
+            json.dump(m, f)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except PermissionError as e:
+        raise RuntimeError(f'the console cannot write to {d} ({e.strerror}) — {_owner_fix_hint()}') from e
+
+
+def _heal_certs_dir(plog):
+    """GH infra-TAK #772: the `certs` folder (600 lane certs + lanes.json) can be owned by
+    another user, so the console gets [Errno 13] writing lanes.json.tmp and every rebuild
+    stops at step 1. The console owns `~/tak-simulator` itself and may rename a folder inside
+    it, but it has no broker rule to chown it. So an unwritable `certs` folder is renamed
+    aside and a fresh one (700, the console's own) is made.
+
+    Returns the aside path (the caller re-enrolls the lanes, then deletes or restores it),
+    or None when nothing was wrong. Raises RuntimeError with the manual fix when even the
+    rename is refused (the install folder itself is another user's)."""
+    d = _certs_dir()
+    if os.getuid() == 0 or not os.path.isdir(d) or _dir_is_writable(d):
+        return None
+    stale = f'{d}.unwritable-{time.strftime("%Y%m%d%H%M%S")}'
+    try:
+        os.rename(d, stale)
+        os.makedirs(d, mode=0o700)
+    except OSError as e:
+        try:                      # never leave the install with no certs folder at all
+            if not os.path.isdir(d) and os.path.isdir(stale):
+                os.rename(stale, d)
+        except OSError:
+            pass
+        raise RuntimeError(f'the certs folder {d} belongs to another user and cannot be '
+                           f'replaced ({e.strerror}) — {_owner_fix_hint()}') from e
+    plog(f'  ⚠ {d} was not writable by the console — set it aside as {os.path.basename(stale)} '
+         f'and made a new one; lane certificates are issued again below')
+    return stale
+
+
+def _reenroll_lanes(ctx, settings, plog):
+    """Issue every recorded lane its certificate again (the old ones sat in the folder that
+    was set aside). `_ensure_lane` enrolls any lane whose cert file is missing."""
+    for rec in list(settings.get('simulator_lanes') or []):
+        if rec.get('id') and rec.get('channel'):
+            _ensure_lane(ctx, rec['id'], rec['channel'], plog)
+
+
+def _undo_heal(stale, plog):
+    """Put the set-aside certs folder back (the re-enrollment failed): the engine must never
+    be left pointing at an empty folder."""
+    d = _certs_dir()
+    try:
+        shutil.rmtree(d, ignore_errors=True)
+        os.rename(stale, d)
+        plog(f'  ↩ put the original certs folder back ({os.path.basename(stale)} -> certs)')
+    except OSError as e:
+        plog(f'  ✗ could not put the original certs folder back ({e.strerror}); it is {stale}')
+
+
+def _heal_and_reenroll(ctx, plog):
+    """Heal an unwritable certs folder and re-enroll the lanes; roll back if that fails.
+    Returns True when the folder was replaced (the caller then recreates the container so it
+    mounts the new folder instead of the one that was set aside)."""
+    stale = _heal_certs_dir(plog)
+    if not stale:
+        return False
+    try:
+        _reenroll_lanes(ctx, ctx['load_settings'](), plog)
+        _write_lanes_json(ctx['load_settings']())
+    except Exception as exc:
+        _undo_heal(stale, plog)
+        raise RuntimeError(f'could not issue the lane certificates again: {exc}') from exc
+    plog(f'  · The old folder {os.path.basename(stale)} is left in place (it is not ours to delete); '
+         f'remove it when convenient: sudo rm -rf {stale}')
+    return True
 
 
 def _lane_record(settings, lane_id):
@@ -485,11 +595,24 @@ def _copy_presets(plog):
 
 
 def _video_base(ctx, settings):
-    """rtsp://<host>:8554 when MediaMTX or TAK Video Restreamer is installed, else ''."""
+    """rtsp://<stream host>:8554 when MediaMTX or TAK Video Restreamer is installed, else ''.
+
+    The host is the media server's own name (stream.<fqdn>, or the operator's custom name),
+    the same name the MediaMTX editor hands out. Not the bare fqdn (ops #1424): CloudTAK's media
+    server pulls an RTSP link itself, and only the stream.<fqdn> name is pinned to this box
+    (ops #560, _cloudtak_stream_host_pin). Pulled through the bare fqdn, the request leaves the
+    box and comes back from the wrong address (MediaMTX answers 401) or never comes back (home
+    network, no NAT hairpin). A box with no domain keeps its address."""
     modules = ctx['detect_modules'](fresh=True)
-    if not (modules.get('mediamtx', {}).get('installed') or modules.get('tak_video_restreamer', {}).get('installed')):
+    key = ('mediamtx' if modules.get('mediamtx', {}).get('installed')
+           else 'tak_video_restreamer' if modules.get('tak_video_restreamer', {}).get('installed')
+           else '')
+    if not key:
         return ''
-    host = (settings.get('fqdn') or '').strip() or (settings.get('server_ip') or '').strip()
+    host = ''
+    if (settings.get('fqdn') or '').strip():
+        host = (ctx['_get_service_domain'](settings, key) or '').strip()
+    host = host or (settings.get('server_ip') or '').strip()
     return f'rtsp://{host}:8554' if host else ''
 
 
@@ -658,6 +781,7 @@ def deploy(ctx, job, params):
         os.makedirs(SIM_INSTALL_DIR, mode=0o700, exist_ok=True)
         os.chmod(SIM_INSTALL_DIR, 0o755)
         os.makedirs(os.path.join(SIM_INSTALL_DIR, 'certs'), mode=0o700, exist_ok=True)
+        _heal_and_reenroll(ctx, plog)       # GH #772: a certs folder left by another user
         rec = _ensure_lane(ctx, '1', SIM_DEFAULT_CHANNEL, plog)
         plog(f'  ✓ lane 1 = {rec["user"]} on {rec["channel"]}, cert {rec["cert"]}')
 
@@ -766,6 +890,8 @@ def _run_rebuild(ctx):
         version = ctx.get('VERSION', 'dev')
         st, _ = _ctl(settings, 'POST', '/stop', {}, timeout=40)
         plog('━━━ Step 1/3: Re-staging engine source ━━━')
+        healed = _heal_and_reenroll(ctx, plog)      # GH #772: certs folder owned by another user
+        settings = ctx['load_settings']()
         _stage_build_dir(plog)
         _copy_presets(plog)
         _write_env(ctx, settings, settings.get('simulator_control_token') or '', version, plog)
@@ -773,7 +899,9 @@ def _run_rebuild(ctx):
         _write_lanes_json(settings)          # W9: pre-director installs have no lanes.json yet
         plog('━━━ Step 2/3: Rebuilding image ━━━')
         _ensure_network(ctx, plog)
-        r = ctx['_broker_compose'](SIM_INSTALL_DIR, 'up -d --build', timeout=600)
+        # A replaced certs folder is a new directory: the running container still mounts the
+        # one that was set aside, so it is recreated even when the image did not change.
+        r = ctx['_broker_compose'](SIM_INSTALL_DIR, 'up -d --build --force-recreate' if healed else 'up -d --build', timeout=600)
         plog((r.stdout + r.stderr).strip()[-600:] or '(no output)')
         if r.returncode != 0:
             raise RuntimeError('docker compose build failed')

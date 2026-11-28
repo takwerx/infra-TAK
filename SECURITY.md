@@ -21,3 +21,7 @@ Please do not disclose it publicly until a fix is released.
 ## Scope
 
 The console and its modules, the broker and helper services, the install and deploy scripts, and how infra-TAK configures TAK Server, Authentik, Caddy, CloudTAK, TAK Portal and the other services it manages. infra-TAK runs CJIS-class deployments, so responsible disclosure protects real agencies: please give us time to ship a fix before you disclose. Vulnerabilities in the upstream projects themselves belong with those projects.
+
+## How we keep infra-TAK secure
+
+The paper [infra-TAK security practices](docs/SECURITY-PRACTICES.md) ([PDF](docs/infra-TAK-security-practices.pdf)) says how we build, test and patch, what is still open, and how to suggest something we should test.

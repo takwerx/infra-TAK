@@ -55,7 +55,8 @@ LEGACY = '''services:
 def _ns():
     """Exec the pins, the rewrite helper and the compose template out of app.py."""
     want = {'WEBODM_VERSION', 'WEBODM_IMAGES', 'WEBODM_DOCKER_COMPOSE', '_webodm_pin_images',
-            'WEBODM_OLEFILE_STRIP', '_webodm_strip_olefile'}
+            'WEBODM_OLEFILE_STRIP', '_webodm_strip_olefile',
+            '_IMAGE_EXACT_TAG_RE', '_image_ref_parts', '_image_exact_version', '_image_ahead_of_pin'}
     ns = {'re': re}
     for node in TREE.body:
         names = ({t.id for t in node.targets if isinstance(t, ast.Name)} if isinstance(node, ast.Assign)
@@ -174,8 +175,9 @@ def test_startup_migration_skips_a_root_box_without_webodm():
 def test_update_writes_the_pins_before_pulling():
     body = ast.get_source_segment(APP, next(
         n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == '_run_webodm_update'))
-    assert body.index('_webodm_pin_images(') < body.index("_webodm_compose(wo_dir, 'pull'")
-    assert '_write_priv(compose_path' in body
+    # ops #1328: the pins go to the shared routine, which pulls them from a side file and writes
+    # the compose last (see test_webodm_v4_upgrade_ops579.py for the order on a box)
+    assert body.index('_webodm_pin_images(') < body.index('_webodm_move_to_new_images(')
 
 
 def test_update_offered_against_the_pin_not_upstream_latest():

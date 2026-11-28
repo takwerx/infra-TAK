@@ -187,7 +187,8 @@ def _three_name_host(monkeypatch, tmp_path, settings_extra=None):
         'wait_for_apt_lock': lambda plog, log: None,
         '_pkg_install': lambda pkgs, log_fn=None, timeout=0: (True, ''),
         '_sudo_wrap': lambda c: list(c),
-        '_read_priv': lambda p: 'myhostname = tak-host.lan\nrelayhost =\n',
+        '_read_priv': lambda p: ('myhostname = tak-host.lan\nrelayhost =\n'
+                                 if p == '/etc/postfix/main.cf' else ''),
         '_write_priv': lambda p, text, perm=None, **k: writes.append((p, text)),
         '_safe_alert_emails': _safe_emails,
         '_takportal_push_settings': lambda plog: False,
@@ -251,7 +252,7 @@ def test_a_literal_myorigin_reaches_both_maps_after_the_last_write(monkeypatch, 
     monkeypatch.setattr(er, '_read_name_file', lambda path: '', raising=False)
     writes = []
     ctx = {'_safe_alert_emails': _safe_emails, '_sudo_wrap': lambda c: list(c),
-           '_read_priv': lambda p: 'relayhost =\n',
+           '_read_priv': lambda p: 'relayhost =\n' if p == '/etc/postfix/main.cf' else '',
            '_write_priv': lambda p, text, perm=None, **k: writes.append((p, text))}
     ok, _ = er.sync_root_alias(
         ctx, {'fqdn': FQDN, 'guarddog_alert_email': 'ops@real.example'},
